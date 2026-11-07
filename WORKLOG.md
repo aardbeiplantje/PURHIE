@@ -405,6 +405,86 @@ Based on measurements:
 
 ---
 
+## Estimated Speeds: DeepSeek V4.1-Flash & GLM-5.3-Flash
+
+**Hardware:** Strix Halo, gfx1151, 128 GB UMA, ~256 GB/s peak bandwidth
+
+Both models are MoE with top-8 expert routing. Only **active params** matter for generation speed â the total model size (178B / 320B) determines storage, not throughput.
+
+### Generation Speed Estimates (ROCmFP4_FAST, 4.25 bpw)
+
+| Model | Total | Active | Bytes/token | Est. Gen (tok/s) | Basis |
+|-------|-------|--------|-------------|------------------|-------|
+| Nemotron-3-Super-120B-A12B | 120B | **12B** | ~6 GB | **40â50** | 30B-A3B at Q8_0 = 62 tok/s (fewer active params at FP4) |
+| Qwen3.8-Flash-Next (177B) | 177B | **38B** | ~20 GB | **34â38** | Measured |
+| GLM-5.3-Flash (320B) | 320B | **18B** | ~9.5 GB | **30â40** | Fewer active params than Flash, but more layers + complex attention (DSA indexer, KDA) |
+| DeepSeek V4.1-Flash (178B) | 178B | **38B** | ~20 GB | **25â35** | Same active params as Flash, but compressed attention + indexer overhead |
+
+### Bandwidth Model
+
+Generation is bandwidth-bound. Bytes per token = active_params Ã bpw:
+- 12B active Ã 4.25 bpw = ~6 GB/token â faster
+- 18B active Ã 4.25 bpw = ~9.5 GB/token â moderate
+- 38B active Ã 4.25 bpw = ~20 GB/token â slower
+
+At UMA peak 256 GB/s:
+- 12B active â theoretical max ~43 tok/s
+- 18B active â theoretical max ~27 tok/s
+- 38B active â theoretical max ~13 tok/s
+
+**These are upper bounds.** Real speed is lower due to:
+- Non-expert layers (attention, norms) add overhead
+- MoE routing overhead (~14 us per router call, 48 calls per layer)
+- Architecture-specific kernels (DSA indexer, KDA, hyper-connections)
+- Memory overhead (KV cache, recurrent state)
+
+### Expert pin/unpin impact
+
+Without expert pin/unpin (model > 128 GB on disk):
+- Expert reads hit NVMe at 3â5 GB/s
+- Speed drops to **0.7â4.3 tok/s** (NVMe-bound expert reads only, no compute)
+- Only the 18Bâ38B active params matter; the rest is on disk
+
+With expert pin/unpin (active params pinned in RAM):
+- Estimates above hold
+- 26% of expert reads off NVMe â 2.6â4.3 tok/s
+- All-resident bandwidth ceiling: 26â30 tok/s at FP8, 49â57 at FP4
+
+### Quantization fit in 128 GB
+
+| Quantization | bpw | DeepSeek V4.1-Flash | GLM-5.3-Flash | Fits 128 GB? |
+|-------------|-----|--------------------|---------------|--------------|
+| IQ2_XXS | 2.06 | ~93 GB | ~120 GB | **Yes** |
+| IQ4_XS | 4.25 | ~192 GB | ~170 GB | **No** |
+| ROCmFP4_FAST | 4.25 | ~192 GB | ~170 GB | **No** |
+| ROCmFP4 | 4.5 | ~200 GB | ~178 GB | **No** |
+
+At IQ2_XXS (~93â120 GB), both models fit in 128 GB without pin/unpin. At IQ4_XS / ROCmFP4_FAST, pin/unpin is required for acceptable speed.
+
+### Architecture overheads
+
+**DeepSeek V4:**
+- Compressed attention with ratios `[0,0,4]` (no compression, no compression, full compression)
+- Indexer: top-k selection over pooled keys (same machinery as GLM's DSA)
+- Full-rank hyper-connections (different from qwen4exp's low-rank)
+- Compression adds scoring overhead but reduces KV cache
+
+**GLM-5.3:**
+- Kimi Delta Attention (KDA): per-channel diagonal decay, state update `S *= exp(g_c)` per channel
+- DSA indexer: top-2048 selection over k=4-pooled index (11 layers only, 34 layers are linear attention)
+- Full-rank hyper-connections with Sinkhorn normalization
+- First 3 layers are dense FFN (not MoE)
+
+### Prediction basis
+
+- **Nemotron-3-Super-120B-A12B at ROCmFP4**: existing model in `/models/`, not yet profiled. Estimate based on Qwen3-30B-A3B (Q8_0, 62 tok/s) scaled by active params.
+- **Qwen3.8-Flash-Next at ROCmFP4_FAST**: measured at 34â38 tok/s on gfx1151.
+- **DeepSeek V4.1-Flash**: same active params as Flash (38B), but indexer compression overhead reduces speed.
+- **GLM-5.3-Flash**: fewer active params (18B) but more architectural overhead (DSA, KDA, Sinkhorn).
+
+
+---
+
 ## Appendix: Technical Details
 
 ### ROCmFP4_FAST Format
