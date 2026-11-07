@@ -527,3 +527,57 @@ wmma_q80<WS, NT>  // WS = weight staging policy, NT = number of 16-token sub-til
 - Pre-scaled weights: > 35 TOPS if LDS allows
 - Expert kernel: > 20% improvement on MoE prefill time
 - Overall: > 15% improvement on Qwen3.8-27B generation tok/s
+
+---
+
+## Performance Speed Comparison
+
+**Hardware:** Strix Halo, gfx1151, 128 GB UMA, ~256 GB/s peak bandwidth
+
+### Generation Speeds by Model
+
+| Model | Active Params | Total Params | Quantization | Size | Gen (tok/s) | Bandwidth | Basis |
+|-------|--------------|--------------|--------------|------|-------------|-----------|-------|
+| Qwen3-0.6B | 0.6B | 0.6B | Q8_0 | 0.6 GB | **184** | ~100 GB/s | Small model, compute-bound |
+| Qwen3.5-0.8B | 0.8B | 0.8B | UD-Q8_K_XL | 1.2 GB | **120** | ~110 GB/s | Small model, compute-bound |
+| Llama-3.2-1B | 1B | 1B | Q8_0 | 1.3 GB | **139** | ~105 GB/s | Small model, compute-bound |
+| Qwen3.5-4B | 4B | 4B | ROCmFP4 | 2.9 GB | **59** | ~160 GB/s | Approaching bandwidth limit |
+| Qwen3.6-35B-A3B | **3B** | 35B | ROCmFP4 | 20 GB | **62** | ~180 GB/s | MoE, 256 experts top-8 |
+| Qwen3-30B-A3B | **3B** | 30B | Q8_0 | 32 GB | **50** | ~170 GB/s | MoE, 128 experts top-8 |
+| Qwen3.5-122B-A10B | **10B** | 122B | UD-Q4_K_XL | 77 GB | **22.6** | ~190 GB/s | MoE, large total size |
+| Qwen3.8-Flash-Next | **38B** | 177B | Q4_0_ROCMFP4_FAST | 94 GB | **34â38** | ~195 GB/s | MoE, 512 experts top-10 |
+| Qwen3.8-27B (dense) | 27B (all) | 27B | Q4_0_ROCMFP4_FAST | 14.6 GB | **13.8** | ~200 GB/s | Dense, bandwidth-bound |
+| Qwen3.5-27B (dense) | 27B (all) | 27B | BF16 | 54 GB | **4.1** | ~250 GB/s | Dense, at peak bandwidth |
+
+### Estimated Speeds (Unmeasured)
+
+| Model | Active Params | Total Params | Quantization | Est. Size | Est. Gen (tok/s) | Basis |
+|-------|--------------|--------------|--------------|-----------|------------------|-------|
+| Nemotron-3-Super-120B-A12B | **12B** | 120B | ROCmFP4_FAST | ~60 GB | **40â50** | Scaled from 35B-A3B (3B active, 62 tok/s) |
+| DeepSeek V4.1-Flash | **38B** | 178B | ROCmFP4_FAST | ~95 GB | **25â35** | Same active as Flash-Next, indexer overhead |
+| GLM-5.3-Flash | **18B** | 320B | ROCmFP4_FAST | ~170 GB | **30â40** | Fewer active than Flash, more layers + DSA |
+
+### Key Observations
+
+1. **Active params dominate generation speed.** Qwen3.6-35B-A3B (3B active) runs at 62 tok/s while Qwen3.8-27B (27B all) runs at 13.8 tok/s â despite the 35B model being larger total. Only active parameters are touched per token.
+
+2. **Bandwidth ceiling at ~250 GB/s.** Qwen3.5-27B BF16 hits peak UMA bandwidth (4.1 tok/s at ~250 GB/s). MoE models stay below this because active params Ã bpw < total bandwidth.
+
+3. **MoE routing overhead.** Qwen3-30B-A3B (Q8_0, 50 tok/s) runs slower than Qwen3.6-35B-A3B (ROCmFP4, 62 tok/s) despite similar active params â ROCmFP4's lower bpw (4.25 vs 8) streams fewer bytes.
+
+4. **Dense models are bandwidth-bound.** Qwen3.8-27B at 200 GB/s of weights is near UMA peak. Further speedups require smaller footprint (already at 4.25 bpw) or caching improvements.
+
+5. **Expert count matters.** 256 experts (35B-A3B) route faster than 512 experts (Flash-Next), but the bigger factor is active params Ã bpw.
+
+### Bandwidth Model
+
+Generation is bandwidth-bound. Bytes per token = active_params Ã bpw:
+- 0.6B @ Q8_0 (16 bpw) = ~1.9 GB/token â compute-bound
+- 4B @ ROCmFP4 (4.5 bpw) = ~2.2 GB/token â approaching bandwidth
+- 3B active @ ROCmFP4 (4.25 bpw) = ~13 GB/token â bandwidth-bound
+- 38B active @ ROCmFP4 (4.25 bpw) = ~162 GB/token â peak bandwidth
+- 12B active @ ROCmFP4 (4.25 bpw) = ~51 GB/token â bandwidth-bound
+
+At UMA peak 256 GB/s, theoretical max tok/s = 256 / (active_params Ã bpw / 1000).
+- 3B active @ 4.25 bpw â ~60 tok/s (matches measured 62 tok/s)
+- 38B active @ 4.25 bpw â ~6 tok/s (but measured 34-38 tok/s due to partial compute overlap)
