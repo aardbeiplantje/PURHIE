@@ -193,6 +193,21 @@ Identity: the user (nginx X-Remote-User; a Keycloak JWT later), the client addre
   quality check at long context (not only that it runs). The 16 GB KV budget caps it at about 600k positions at F16
   even then. Keep in mind; not started.
 
+## Future architectures
+
+- **gpt-oss** (user, 2026-11-04).
+- **deepseek2** (user, 2026-11-04).
+- **glm4** (user, 2026-11-04).
+- **phi3** (user, 2026-11-04).
+- **gemma2 / gemma3** (user, 2026-11-04).
+- **Mistral** (user, 2026-11-04): llama architecture, SentencePiece tokenizer.
+
+## Future infrastructure
+
+- **ROCmFP4_FAST WMMA kernel work** (user, 2026-11-04: "move on, table this for now"). Tabled because Phase 1 profiling on Qwen3.8-27B (14 GB, `matvec_q8_q4_0_rocmfp4_fast` at 81.8% of GPU time) shows generation is bandwidth-bound (202 GB/s of weights, near UMA peak of 256 GB/s), not compute-bound. WMMA kernels (`matmul_wmma_q4_0_rocmfp4_fast`) account for only 12.2% of GPU time and are used only for prefill (T â¥ 32 tokens). For T=1 generation, forcing WMMA would waste compute on padding, add LDS staging traffic, and increase epilogue overhead â ~5-10% more power for the same output. WMMA is the right choice for prefill (amortizes weight reads across 64+ tokens); the bottleneck for generation is `matvec_q8_q4_0_rocmfp4_fast` (single-token int8 path), and optimization must target model-level changes (smaller footprint, already at 4.25 bpw) or caching, not kernel-level tweaks.
+- **CPAN release of ROCm::Inference, Minijinja and Web::Route** (user, 2026-11-05: the Docker image builds them
+  from source).
+
 ## Open leads
 
 Speed:
@@ -233,13 +248,6 @@ Tests and API:
   tools (<|python_tag|> brave_search.call(...)) not parsed; Nemotron's reply format (check against its template).
 - The XS module lacks inference_prefill_logits, model_name and set_seed (add when a Perl user needs them); a C
   API channel flag for reply kinds only if a non-Perl user needs it.
-
-## Tabled
-
-- Older architectures: gpt-oss, deepseek2, glm4, phi3, gemma2 / gemma3, Mistral (user, 2026-11-04).
-- The ROCmFP4_FAST WMMA kernel work (user, 2026-11-04: "move on, table this for now").
-- A CPAN release of ROCm::Inference, Minijinja and Web::Route (user, 2026-11-05: the Docker image builds them
-  from source).
 
 ## Tried and rejected (measured; do not repeat without a new idea)
 
