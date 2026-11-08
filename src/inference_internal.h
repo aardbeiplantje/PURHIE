@@ -250,6 +250,10 @@ struct inference_model {
     // I/O. A null callback costs one pointer check per fire site. See inference.h for the event types.
     inference_event_cb event_cb = nullptr;
     void* event_user = nullptr;
+    // A prompt prefilled in chunks (a stream's prefill_chunk): inference_prefill's progress events count from
+    // evt_base of evt_total tokens and evt_ms milliseconds (the chunks before), not from its own call. 0: its own
+    int evt_base = 0, evt_total = 0;
+    double evt_ms = 0.0;
 
     double eps = 1e-5;                                  // normalization epsilon
     int full_attention_interval = 0;                   // informational only; use LayerWeights::kind

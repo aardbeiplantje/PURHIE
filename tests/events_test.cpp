@@ -140,6 +140,60 @@ int main(int argc, char** argv) {
     check(hits == 1, "the prefill stops after the step that asked");
     inference_free_model(m);
 
+    // 2c. a stream whose prompt goes in by chunks (prefill_chunk, as --parallel does): the events of one prefill, its
+    // progress over the whole prompt, and the same tokens as without chunks
+    printf("stream prefill in chunks\n");
+    for (int chunk : {0, 100}) {
+        m = fresh(model, 4096, nullptr);
+        Log s;
+        inference_set_event_cb(m, record, &s);
+        inference_gen_options o = inference_gen_default_options();
+        o.max_new_tokens = 4;
+        o.sampler.temperature = 0.0f;
+        o.prefill_chunk = chunk;
+        inference_stream_t* st = inference_stream_begin(m, longp.data(), (int)longp.size(), &o);
+        check(st != nullptr, "the stream begins");
+        int src = 1;
+        while (st && (src = inference_stream_step(st, nullptr, nullptr, nullptr, nullptr)) > 0) {}
+        check(src == 0, "the stream runs to its end");
+        inference_stream_free(st);
+        check(count(s, INFERENCE_EVT_PREFILL_BEGIN) == 1, chunk ? "chunks: one PREFILL_BEGIN" : "one PREFILL_BEGIN");
+        check(count(s, INFERENCE_EVT_PREFILL_END) == 1, chunk ? "chunks: one PREFILL_END" : "one PREFILL_END");
+        bool mono = true, end_last = false;
+        int last_n = 0, prog = 0;
+        for (size_t i = 0; i < s.ev.size(); ++i) {
+            const inference_event& e = s.ev[i];
+            if (e.type == INFERENCE_EVT_PREFILL_PROGRESS) {
+                mono = mono && e.n0 > last_n && e.n0 < e.n1 && e.n1 == (int)longp.size();
+                last_n = e.n0;
+                ++prog;
+            }
+            if (e.type == INFERENCE_EVT_PREFILL_END) {
+                end_last = e.n0 == (int)longp.size() && e.ms > 0.0;
+                for (size_t j = i + 1; j < s.ev.size(); ++j) end_last = end_last && s.ev[j].type != INFERENCE_EVT_PREFILL_PROGRESS;
+            }
+        }
+        check(prog >= 1 && mono, chunk ? "chunks: progress increases, over the whole prompt" : "progress increases");
+        check(end_last, chunk ? "chunks: PREFILL_END after the last progress, n0 the prompt" : "PREFILL_END n0 the prompt");
+        if (chunk) check(prog >= (int)longp.size() / chunk - 1, "chunks: a progress event per chunk");
+        inference_free_model(m);
+    }
+    m = fresh(model, 4096, nullptr);
+    hits = 0;
+    inference_set_event_cb(m, cancel_cb, &hits);
+    {
+        inference_gen_options o = inference_gen_default_options();
+        o.max_new_tokens = 4;
+        o.prefill_chunk = 100;
+        inference_stream_t* st = inference_stream_begin(m, longp.data(), (int)longp.size(), &o);
+        int src = 1;
+        while (st && (src = inference_stream_step(st, nullptr, nullptr, nullptr, nullptr)) > 0) {}
+        check(src == INFERENCE_ERR_CANCELLED && hits == 1, "chunks: a nonzero progress return cancels the stream's prefill");
+        check(st && inference_stream_step(st, nullptr, nullptr, nullptr, nullptr) == 0, "and the stream is over");
+        inference_stream_free(st);
+    }
+    inference_free_model(m);
+
     // 3. the draft events, with a draft head: one per verify pass, the accepted count within the proposed
     if (draft) {
         printf("draft events (head %s)\n", draft);

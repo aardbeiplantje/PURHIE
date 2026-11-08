@@ -199,10 +199,12 @@ sub load {
         }
         die "--store needs every layer's KV history: --swa-ring 0 (the default with --store)\n"
             if $o{store} && swa_ring($m);
-        store_open($m, $o{store}) if $o{store};
-        my ($bytes, $files) = store_usage($o{store});
-        $LOG->info('store', model => $r->{id}, event => 'open', msg => sprintf('KV store %s: %d files, %.2f GB, %d tokens a block',
-                   $o{store}, $files, $bytes / 2**30, store_stats($m)->{block_tokens}));
+        if ($o{store}) {
+            store_open($m, $o{store});
+            my ($bytes, $files) = store_usage($o{store});
+            $LOG->info('store', model => $r->{id}, event => 'open', msg => sprintf('KV store %s: %d files, %.2f GB, %d tokens a block',
+                       $o{store}, $files, $bytes / 2**30, store_stats($m)->{block_tokens}));
+        }
     }
     # --parallel N: N sequences (conversations at once), each a KV cache of the context; sequence 0 and N - 1 more
     $r->{pool} = [ map { { seq => $_, job => undef, prompt => [] } } 0, $emb ? () : map { seq_new($m) } 2 .. $parallel ];
@@ -475,6 +477,7 @@ sub request_ctx {
     # when the server read the request (Web::Route: after the requests before it, so a busy server shows here), and how
     # long it waited before that: now less the time nginx sent it (X-Request-Start: nginx's $msec, when the route sets it)
     $q->{accepted} = $req->{accepted};
+    $q->{client_gone} = $req->{client_gone};  # (Web::Route: true once the client has closed its end)
     if (my ($sent) = ($h{'x-request-start'} // '') =~ /(\d+(?:\.\d+)?)\s*\z/) {
         $q->{wait_ms} = 1000 * ($req->{accepted} - $sent) if $req->{accepted};
     }
@@ -547,26 +550,40 @@ sub store_trim {
                                                      scalar @gone, $now / 2**30, $o{'store-max'}));
 }
 
-# The engine's events for a model (set_event_handler at load): the request in progress on it ($r->{cur}) labels them
+# The engine's events for a model (set_event_handler at load): the request in progress on it ($r->{cur}) labels them;
+# with --parallel, the job on the event's sequence
 sub on_event {
     my ($r, $ev, $info) = @_;
-    my $q = $r->{cur} // {};
+    my $q = $r->{cur};
+    if (!$q && defined $info->{seq}) {
+        my ($slot) = grep { $_->{job} && $_->{seq} == $info->{seq} } @{ $r->{pool} // [] };
+        $q = $slot->{job}{q} if $slot;
+    }
+    $q //= {};
     my %f = (model => $r->{id}, event => $ev, map { ($_ => $q->{$_}) } qw(user ip conv req));
     my ($n0, $n1, $ms) = @$info{qw(n0 n1 ms)};
-    $q->{prefill_n} = $n0, $q->{prefill_ms} = $ms if $ev eq 'prefill_end';  # for pp/s
+    # (a --parallel job's prompt goes in by chunks between the other jobs' tokens: the engine reports them as one
+    # prefill, its progress over the whole prompt)
     if ($ev eq 'prefill_progress') {
+        $q->{prefill_at} = $n0;  # (where a cancel finds it)
         $LOG->progress($q->{req} // $r->{id}, $n0, $n1, %f);
         # the client is asked whether it is still there: an SSE comment (clients ignore it) also keeps a proxy from timing
-        # out. A failed write means it has gone: the prefill is cancelled (a true return from here)
-        if (my $w = $q->{write}) {
-            unless ($w->(sprintf(": prefill %d%%\n\n", $n1 ? 100 * $n0 / $n1 : 100))) {
-                $LOG->warn_(%f, msg => sprintf('client gone during the prefill, after %d of %d tok: cancelled', $n0, $n1));
-                return 1;
-            }
+        # out. A failed write means it has gone: the prefill is cancelled (a true return from here). A plain JSON reply
+        # has nothing to write: the socket tells (client_gone; nginx closes its upstream when its client leaves)
+        # (a --parallel job: Web::Route's on_close cancels it, between its chunks)
+        my $w = $q->{write};
+        my $gone = $w ? !$w->(sprintf(": prefill %d%%\n\n", $n1 ? 100 * $n0 / $n1 : 100))
+                      : !$q->{chunked} && $q->{client_gone} && $q->{client_gone}->();
+        if ($gone) {
+            $LOG->warn_(%f, msg => sprintf('client gone during the prefill, after %d of %d tok: cancelled', $n0, $n1));
+            $LOG->progress_end($q->{req}) if $q->{req};
+            $q->{gone} = 1;
+            return 1;
         }
     } elsif ($ev eq 'prefill_end') {
-        my $rate = $ms > 0 ? sprintf('%.0f', 1000 * $n0 / $ms) : '-';
-        $LOG->info('prefill', %f, msg => sprintf('prefill done: %d tok in %.2f s (%s tok/s), %d store blocks', $n0, $ms / 1000, $rate, $n1));
+        # the prompt's (a thinking budget's close is a second, small prefill: not this one)
+        @$q{qw(prefill_n prefill_ms)} = ($n0, $ms) unless $q->{prefill_logged};
+        prefill_done_line($q, %f, blocks => $n1);
     } elsif ($ev eq 'prefill_begin') {
         $LOG->debug('prefill', %f, msg => "prefill of $n0 tok");
     } elsif ($ev eq 'draft') {
@@ -577,6 +594,48 @@ sub on_event {
         $LOG->debug('store', %f, msg => "$ev: $n0, $n1");
     }
     return 0;  # only a prefill_progress return of true cancels (the loggers' return values are not that)
+}
+
+# The prefill's line, once the request's prompt is in
+sub prefill_done_line {
+    my ($q, %f) = @_;
+    return if $q->{prefill_logged}++;
+    $LOG->progress_end($q->{req}) if $q->{req};
+    my $blocks = delete $f{blocks} // 0;
+    my ($n, $ms) = ($q->{prefill_n} // 0, $q->{prefill_ms} // 0);
+    my $rate = $ms > 0 ? sprintf('%.0f', 1000 * $n / $ms) : '-';
+    $LOG->info('prefill', %f, event => 'prefill_end',
+               msg => sprintf('prefill done: %d tok in %.2f s (%s tok/s), %d store blocks', $n, $ms / 1000, $rate, $blocks));
+}
+
+# A line every 5 s while a reply runs: the phase (thinking, answer or a tool call), its tokens and its rate. $n: the
+# reply's tokens so far
+sub gen_progress {
+    my ($q, $n, $now) = @_;
+    return unless $q->{first_at} && $now - ($q->{gen_log_t} // $q->{first_at}) >= 5;
+    $q->{gen_log_t} = $now;
+    my $rate = sub { my ($k, $t) = @_; $k > 0 && $t > 0 ? sprintf('%.1f', $k / $t) : '-' };
+    my $msg;
+    if (($q->{kind} // '') eq 'tool_call') {
+        my $ts = $q->{ts} // {};
+        $msg = sprintf('tool call %s: %d params done, %d B of arguments, %d tok in the reply, %s tg/s',
+                       $ts->{name} // '?', $ts->{n} // 0, $ts->{bytes} // 0, $n, $rate->($n, $now - $q->{first_at}));
+    } elsif (defined $q->{think_end}) {
+        my $ans = $n - ($q->{think_tok} // 0);
+        $msg = sprintf('answer %d tok, %s tg/s (thinking %d tok)', $ans, $rate->($ans, $now - $q->{think_end}),
+                       $q->{think_tok} // 0);
+    } else {
+        $msg = sprintf('%s %d tok, %s tg/s', ($q->{kind} // 'reasoning') eq 'reasoning' ? 'thinking' : 'answer', $n,
+                       $rate->($n, $now - $q->{first_at}));
+    }
+    $LOG->info('generation', log_fields($q), event => 'generating', msg => $msg);
+}
+
+# --debug-stream: what goes to the client, a line per piece
+sub debug_stream {
+    my ($q, $kind, $piece) = @_;
+    $LOG->info('stream', log_fields($q), event => $kind eq 'tool_call' ? 'tool' : $kind, msg => $J->encode($piece))
+        if $o{'debug-stream'};
 }
 
 # The access line of a request (Web::Route's log): the same formatter as the rest
@@ -615,25 +674,16 @@ route::post '/v1/chat/completions' => sub {
                 $q->{tail} = substr(($q->{tail} // '') . detokenize($m, [ $_[0] ]), -64);
                 $q->{think_end} = $now if index($q->{tail}, $close) >= 0;
             }
-            # a line every 5 s while the reply runs: the phase (thinking or answer), its tokens and its rate
-            if ($now - ($q->{gen_log_t} // $q->{first_at}) >= 5) {
-                $q->{gen_log_t} = $now;
-                my $rate = sub { my ($n, $t) = @_; $n > 0 && $t > 0 ? sprintf('%.1f', $n / $t) : '-' };
-                my $msg;
-                if (($q->{kind} // '') eq 'tool_call') {
-                    my $ts = $q->{ts} // {};
-                    $msg = sprintf('tool call %s: %d params done, %d B of arguments, %d tok in the reply, %s tg/s',
-                                   $ts->{name} // '?', $ts->{n} // 0, $ts->{bytes} // 0, $completion_tokens,
-                                   $rate->($completion_tokens, $now - $q->{first_at}));
-                } elsif (defined $q->{think_end}) {
-                    my $ans = $completion_tokens - ($q->{think_tok} // 0);
-                    $msg = sprintf('answer %d tok, %s tg/s (thinking %d tok)', $ans,
-                                   $rate->($ans, $now - $q->{think_end}), $q->{think_tok} // 0);
-                } else {
-                    $msg = sprintf('thinking %d tok, %s tg/s', $completion_tokens,
-                                   $rate->($completion_tokens, $now - $q->{first_at}));
-                }
-                $LOG->info('generation', log_fields($q), event => 'generating', msg => $msg);
+            gen_progress($q, $completion_tokens, $now);
+        }
+        # a plain JSON reply writes nothing until the end: the socket tells whether its client is still there
+        if (!$q->{write} && $q->{client_gone} && Time::HiRes::time() - ($q->{gone_t} // 0) > 0.5) {
+            $q->{gone_t} = Time::HiRes::time();
+            if ($q->{client_gone}->()) {
+                $LOG->warn_(log_fields($q), event => 'generation',
+                            msg => "client gone after $completion_tokens tok of the reply: stopped");
+                $q->{gone} = 1;
+                return 1;
             }
         }
         # a keep-alive comment every 5 s while nothing else is written: a proxy keeps the connection, and a failed write
@@ -656,6 +706,8 @@ route::post '/v1/chat/completions' => sub {
         local $r->{busy} = 1;
         local $r->{cur} = $q;
         my ($content, $why, $msg) = eval { chat($m, $messages, $opts) };
+        # its client left (the prefill cancelled, or the reply stopped): nobody reads a reply; nginx logs 499 too
+        error(499, 'client closed the request') if $q->{gone};
         error(400, $@ =~ s/ at \S+ line \d+\.?\n?\z//r) unless $msg;
         done_line($q, $usage->(), $prefill, finish_reason($why, $msg));
         my %out = (role => 'assistant', content => $content);
@@ -688,12 +740,12 @@ route::post '/v1/chat/completions' => sub {
                 if ($kind eq 'tool_call') {  # the call as it is written: its name, then its arguments a parameter at a time
                     $q->{ts} = $ts;
                     for my $d (tool_stream_feed($ts, $text)) {
-                        $LOG->info('stream', log_fields($q), event => 'tool', msg => $J->encode($d)) if $o{'debug-stream'};
+                        debug_stream($q, $kind, $d);
                         $gone = 1 unless $chunk->({ tool_calls => [ $d ] }, undef);
                     }
                     return $gone;
                 }
-                $LOG->info('stream', log_fields($q), event => $kind, msg => $J->encode($text)) if $o{'debug-stream'};
+                debug_stream($q, $kind, $text);
                 $gone = 1 unless $chunk->({ ($kind eq 'reasoning' ? 'reasoning_content' : 'content') => $text }, undef);
                 return $gone;
             } });
@@ -763,6 +815,13 @@ sub release {
 
 sub cancel {
     my ($job) = @_;
+    if (my $q = !$job->{done} && $job->{q}) {  # (its client left: Web::Route's on_close)
+        my $where = !$job->{chat} ? 'while queued'
+                  : $job->{completion} ? "after $job->{completion} tok of the reply"
+                  : sprintf('during the prefill, after %d of %d tok', $q->{prefill_at} // 0, $q->{pf_total} // 0);
+        $LOG->warn_(log_fields($q), event => 'cancel', msg => "client gone $where: cancelled");
+        $LOG->progress_end($q->{req}) if $q->{req};
+    }
     $job->{done} = 1;
     $job->{chat} = undef;  # frees its stream
     release($job);
@@ -786,24 +845,39 @@ sub job_output {
         push @{ $job->{out} }, ": keep-alive\n\n";
         $job->{last_out} = $now;
     }
-    if (@$deltas && $job->{q}) {
-        my $now = Time::HiRes::time();
-        $job->{q}{ttft} //= 1000 * ($now - $job->{q}{t0});
-        $job->{q}{first_at} //= $now;
+    my $q = $job->{q} // {};
+    # the first token: the reply begins
+    if ($job->{completion} > 0 && !$q->{first_at}) {
+        $q->{ttft} = 1000 * ($now - $q->{t0}) if $q->{t0};
+        $q->{first_at} = $now;
     }
-    if ($job->{stream}) {
-        for my $d (@$deltas) {
-            my ($text, $kind) = @$d;
-            if ($kind eq 'tool_call') {  # streamed as it is written (see tool_stream_feed)
-                push @{ $job->{out} }, map { chunk($job, { tool_calls => [ $_ ] }, undef) } tool_stream_feed($job->{ts} //= tool_stream_new(), $text) if $job->{stream};
-                next;
-            }
-            push @{ $job->{out} }, chunk($job, { ($kind eq 'reasoning' ? 'reasoning_content' : 'content') => $text }, undef);
+    # the reply's phases (as the sequential path tracks them, for the progress lines and the done line's tg/s split)
+    my $ts = $job->{ts} //= tool_stream_new();
+    for my $d (@$deltas) {
+        my ($text, $kind) = @$d;
+        $q->{saw_reasoning} = 1 if $kind eq 'reasoning';
+        if ($kind ne 'reasoning' && $q->{saw_reasoning} && !defined $q->{think_end}) {
+            $q->{think_end} = $now;
+            $q->{think_tok} = $job->{completion};
         }
+        $q->{kind} = $kind;
+        if ($kind eq 'tool_call') {  # streamed as it is written (see tool_stream_feed)
+            $q->{ts} = $ts;
+            for my $p (tool_stream_feed($ts, $text)) {
+                debug_stream($q, $kind, $p);
+                push @{ $job->{out} }, chunk($job, { tool_calls => [ $p ] }, undef) if $job->{stream};
+            }
+            next;
+        }
+        debug_stream($q, $kind, $text);
+        push @{ $job->{out} }, chunk($job, { ($kind eq 'reasoning' ? 'reasoning_content' : 'content') => $text }, undef)
+            if $job->{stream};
     }
+    gen_progress($q, $job->{completion}, $now) unless $job->{finished};
     return unless $job->{finished};
     my ($content, $why, $msg) = @{ $job->{finished} };
-    done_line($job->{q}, { prompt_tokens => $job->{prompt_tokens} // 0, completion_tokens => $job->{completion} }, undef, finish_reason($why, $msg)) if $job->{q};
+    done_line($q, { prompt_tokens => $job->{prompt_tokens} // 0, completion_tokens => $job->{completion} }, $job->{prefill},
+              finish_reason($why, $msg)) if $job->{q};
     my %usage = (prompt_tokens => $job->{prompt_tokens} // 0, completion_tokens => $job->{completion},
                  total_tokens => ($job->{prompt_tokens} // 0) + $job->{completion});
     if ($job->{stream}) {
@@ -850,10 +924,22 @@ sub tick {
             $slot->{job} = $job;
             $slot->{prompt} = $job->{prompt};
             seq_select($m, $slot->{seq});
-            $job->{chat} = eval { chat_start($m, $job->{messages}, $job->{opts}) };
+            {
+                local $r->{cur} = $job->{q};  # (its events: the prompt synced with the sequence, the store's blocks)
+                $job->{chat} = eval { chat_start($m, $job->{messages}, $job->{opts}) };
+            }
             $job->{q}{queued_ms} = 1000 * (Time::HiRes::time() - $job->{queued}) if $job->{q};
             if (!$job->{chat}) { job_error($job, $@); next }
             $job->{prompt_tokens} = $job->{chat}->prompt_tokens;
+            # what the prompt reuses from the sequence and the store, and what the steps prefill (a chunk each)
+            $job->{prefill} = [ last_prompt_stats($m) ];
+            if (my $q = $job->{q}) {
+                $q->{chunked} = 1;
+                $q->{pf_total} = $job->{prefill}[1];
+                $LOG->debug('prefill', log_fields($q), event => 'prompt',
+                            msg => sprintf('prompt %d tok: %d reused, %d to prefill in chunks of %d, seq %d',
+                                           $job->{prompt_tokens}, @{ $job->{prefill} }, $job->{opts}{prefill_chunk}, $slot->{seq}));
+            }
             push @{ $r->{running} }, $job;
         }
         next unless @{ $r->{running} };
@@ -1050,7 +1136,11 @@ C<minimal> turn thinking off, as before.
 =item --[no]debug-stream
 
 Logs every delta the server sends a client (its text as JSON, and each tool call piece) at the info level, so the
-stream can be checked. Sequential requests only (the parallel path is not covered yet).
+stream can be checked; with C<--parallel> too (a plain JSON reply's pieces as well, which are not streamed).
+
+A client that leaves stops its request: during the prefill (an event stream: the keep-alive write fails; a plain JSON
+request: the socket shows it closed), or during the reply. With C<--parallel>, the job is dropped between rounds (a
+prompt in chunks: between them). The log says where it stopped.
 
 =item --log-level error|warn|info|debug|none
 

@@ -7,7 +7,7 @@ use Carp qw(croak);
 use Exporter 'import';
 use IO::Select;
 use IO::Socket::UNIX;
-use Socket qw(SOCK_STREAM);
+use Socket qw(SOCK_STREAM MSG_PEEK MSG_DONTWAIT);
 use Time::HiRes ();
 use JSON::PP ();
 
@@ -210,6 +210,16 @@ sub _read_request {
     return (\%req);
 }
 
+# Has the client closed its end? The request is read whole, so a readable socket with nothing to peek at is
+# its end (bytes past the request, a pipelined one, are not: they stay for the reader)
+sub _peer_closed {
+    my ($c) = @_;
+    return 0 unless IO::Select->new($c)->can_read(0);
+    my $got = recv($c, my $peek, 1, MSG_PEEK | MSG_DONTWAIT);
+    return 1 unless defined $got;  # an error (ECONNRESET): gone
+    return length($peek) ? 0 : 1;
+}
+
 # Writes all of $data, false when the client is gone
 sub _send {
     my ($c, $data) = @_;
@@ -312,7 +322,10 @@ sub run {
                 my $c = $srv->accept or next;  # (a signal ends the wait)
                 my $t0 = Time::HiRes::time();
                 my ($req, $status, $msg) = _read_request($c, \%o);
-                $req->{accepted} = $t0 if $req;  # when the loop read it: after the requests before it, so it shows a busy server
+                if ($req) {
+                    $req->{accepted} = $t0;  # when the loop read it: after the requests before it, so it shows a busy server
+                    $req->{client_gone} = sub { _peer_closed($c) };
+                }
                 my $res = $req ? dispatch($req) : $status ? json({ error => $msg }, $status) : undef;
                 if ($res && ref $res->[2] eq 'Web::Route::Pull') {
                     if (_respond($c, $req, $res) && $req->{method} ne 'HEAD') {
@@ -458,7 +471,10 @@ The handler gets a hash: C<method>, C<path> (as sent), C<query> (the raw query s
 decoded: a key given more than once becomes an array reference), C<params> (from the pattern), C<headers>
 (names lower-cased; repeated headers joined with C<, >), C<body> (the raw bytes), C<json> (the body decoded,
 for a JSON content type; invalid JSON gets 400 before the handler runs), C<protocol> and C<remote> (nginx's
-C<X-Real-IP> or C<X-Forwarded-For>).
+C<X-Real-IP> or C<X-Forwarded-For>). From C<run>, also C<accepted> (when the loop read the request) and
+C<client_gone>: a code reference, true once the client has closed its end, so a long handler that writes nothing
+(a plain JSON reply) can stop early. It does not block; nginx closes its upstream connection when its client
+leaves (unless C<proxy_ignore_client_abort>).
 
 =head2 Responses
 

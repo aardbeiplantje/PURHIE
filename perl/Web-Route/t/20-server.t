@@ -33,6 +33,21 @@ route::get '/endless' => sub {
     });
 };
 
+my $quiet = "$dir/quiet";
+route::get '/quiet' => sub {
+    my ($r) = @_;
+    my $t0 = time;
+    while (time - $t0 < 3) {
+        if ($r->{client_gone}->()) {
+            open my $f, '>', $quiet or die; printf $f 'gone after %.2f s', time - $t0; close $f;
+            return 'gone';
+        }
+        return 'stayed' if $r->{args}{then} && time - $t0 > 0.5;
+        sleep 0.02;
+    }
+    'timeout';
+};
+
 my $pid = fork // die "fork: $!";
 if (!$pid) {
     open STDERR, '>', "$dir/err" or die;
@@ -106,6 +121,20 @@ for (1 .. 100) { last if -s $flag; sleep 0.05 }
 open my $f, '<', $flag;
 my $n = <$f> // 0;
 ok($n > 0 && $n < 2000, "the handler saw the client go after $n events");
+
+# client_gone: a handler that writes nothing sees its client leave (and not while it stays)
+my ($c2, $got2) = conn();
+print $c2 "GET /quiet?then=stay HTTP/1.1\r\n\r\n";
+{ local $/; $got2 = <$c2> }
+like($got2, qr/\r\n\r\nstayed\z/, 'client_gone stays false while the client waits');
+$c2 = conn();
+print $c2 "GET /quiet HTTP/1.1\r\n\r\n";
+sleep 0.2;
+close $c2;
+for (1 .. 100) { last if -s $quiet; sleep 0.05 }
+open my $f2, '<', $quiet;
+my $q2 = <$f2> // '';
+like($q2, qr/^gone after [0-9.]+ s\z/, "client_gone saw the client leave ($q2)");
 
 # SIGTERM: the server stops and removes its socket
 kill TERM => $pid;

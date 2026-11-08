@@ -8,7 +8,7 @@
 1. **Qwen3.8-Flash-Next from BF16** (section below): the model's own MTP layer as its draft head; a batch's PLE rows
    read from disk in parallel.
 2. **Concurrent runs** in rocm-inference-server (section below).
-3. **Server logging** (section below): implemented; the server test and the Flash soak run are open.
+3. **Server logging** (section below): implemented and tested (`t/62-server-log.t`); the Flash soak run is open.
 4. **GLM-5.3-Flash (`glm5_next`) as an architecture** (section below): the gate is memory capacity, not kernels -
    95% of its 320B params are expert weights, and none of FP8 / FP4 / Q4_0 fits 128 GB, so nothing runs until the
    expert pin / unpin decision below is made. Start with the tiny GGUF generator, not the kernels.
@@ -165,16 +165,18 @@ each per round; GPU sharing); long prefills in chunks between other requests' to
 off the request path (between rounds, or in a second process); fairness and queue limits per user (with the
 logging's user and conversation id); llama-server on the same GPU.
 
-## Server logging (implemented, not yet run end to end)
+## Server logging (implemented; the Flash soak is open)
 
 The engine's event hook (C), its Perl binding (`set_event_handler`), the formatter `ROCm::Inference::Log`, the server's
-lines (start, done, prefill progress, loads, access) and the options `--log-level`, `--log-format`, `--log-color` are
-in. Unit tests: `t/05-log.t` (formatter), `t/15-events.t` (GPU, a real generate). Not yet run:
-- **Server test** (`t/60-server.t`, to extend): the server on a tiny model with `--log-level debug --log-format json`,
-  one chat request; the captured lines parsed as JSON, in order: prefill_begin, prefill_progress (up to the total),
-  prefill_end, the first token, done. The first token has no line yet: the done line carries the first-token time.
+lines (start, done, prefill progress, generating every 5 s, loads, access, cancels) and the options `--log-level`,
+`--log-format`, `--log-color`, `--debug-stream` are in, for sequential and `--parallel` requests alike (a chunked
+stream prompt reports as one prefill). A client that leaves cancels its prefill also for a plain JSON request
+(Web::Route's `client_gone`). Tests: `t/05-log.t`, `t/15-events.t`, `tests/events_test` (chunked streams too), and
+`t/62-server-log.t` (Qwen3.5-4B: the lines in order, `--debug-stream`, cancels mid-prefill; both modes). Open:
 - **Soak on the Flash model**: one request with a long prompt; the prefill ticks visible in real time, no per-token
   lines. Needs a model location that pins (see the draft-head item under Open leads).
+- With `--parallel`, the done line's store counters (`kv` line) are the model's over the request, so another job's
+  blocks can show in them.
 Identity: the user (nginx X-Remote-User; a Keycloak JWT later), the client address (X-Real-IP), and the conversation
 id (the X-LLamaCPP-Id-slot header of the opencode fixups). The docker repo's nginx needs `proxy_set_header
 X-Remote-User` on /rocm/ (not done here).

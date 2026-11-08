@@ -1681,7 +1681,9 @@ int inference_prefill(inference_model_t* m, const int32_t* tokens, int n) {
         m->n_past += len;
         m->seq.insert(m->seq.end(), tokens + done, tokens + done + len);
         done += len;
-        if (evt && done < n && fire_event(m, INFERENCE_EVT_PREFILL_PROGRESS, done, n, ms_since(t0)) != 0) {
+        if (evt && done < n &&
+            fire_event(m, INFERENCE_EVT_PREFILL_PROGRESS, m->evt_base + done, m->evt_total > 0 ? m->evt_total : n,
+                       m->evt_ms + ms_since(t0)) != 0) {
             set_error("prefill cancelled by the event handler after %d of %d tokens", done, n);
             return INFERENCE_ERR_CANCELLED;  // the tokens so far are in the sequence (and its KV cache), as after any prefill step
         }
@@ -2303,19 +2305,45 @@ struct inference_stream {
     std::vector<int32_t> pp;
     size_t pp_at = 0, pp_ck = SIZE_MAX;
     int snap_at = -1;
+    // the events of a chunked prompt are those of one prefill (as inference_generate's): begin at stream_begin,
+    // progress after each chunk over the whole of pp, end after the last; pp_ms the prefill's time so far (the
+    // chunks', not the other sequences' steps between them), store0 the store attachments before the prompt's sync
+    double pp_ms = 0.0;
+    long long store0 = 0;
 };
 
-// The next chunk of a stream's prompt (its sequence selected); the checkpoint when it gets there
+// The next chunk of a stream's prompt (its sequence selected); the checkpoint when it gets there. An error (a
+// cancel by the event handler included) ends the stream: the prompt's tokens so far stay in the sequence
 static int stream_prefill_chunk(inference_stream_t* st) {
     inference_model_t* m = st->m;
-    size_t n = std::min(st->pp.size() - st->pp_at, (size_t)std::max(st->o.prefill_chunk, 1));
+    const size_t total = st->pp.size();
+    size_t n = std::min(total - st->pp_at, (size_t)std::max(st->o.prefill_chunk, 1));
     if (st->pp_ck > st->pp_at) n = std::min(n, st->pp_ck - st->pp_at);
     m->store_snapshot_at = st->snap_at;
+    m->evt_base = (int)st->pp_at, m->evt_total = (int)total, m->evt_ms = st->pp_ms;
+    const auto t0 = std::chrono::steady_clock::now();
     int rc = inference_prefill(m, st->pp.data() + st->pp_at, (int)n);
+    m->evt_base = m->evt_total = 0, m->evt_ms = 0.0;
     st->pp_at += n;
     if (rc == 0 && st->pp_at == st->pp_ck) rc = save_checkpoint(m);
+    st->pp_ms += ms_since(t0);
     m->store_snapshot_at = -1;
-    if (st->pp_at == st->pp.size()) st->pp.clear(), st->pp_at = 0;
+    if (rc == 0 && m->event_cb) {
+        if (st->pp_at < total) {
+            if (fire_event(m, INFERENCE_EVT_PREFILL_PROGRESS, (int)st->pp_at, (int)total, st->pp_ms) != 0) {
+                set_error("prefill cancelled by the event handler after %zu of %zu tokens", st->pp_at, total);
+                rc = INFERENCE_ERR_CANCELLED;
+            }
+        } else {
+            fire_event(m, INFERENCE_EVT_PREFILL_END, (int)total, (int)(m->st_attached - st->store0), st->pp_ms);
+        }
+    }
+    if (rc != 0) {
+        st->pp.clear(), st->pp_at = 0;
+        st->done = true;
+        return rc;
+    }
+    if (st->pp_at == total) st->pp.clear(), st->pp_at = 0;
     return rc;
 }
 
@@ -2331,6 +2359,10 @@ inference_stream_t* inference_stream_begin(inference_model_t* m, const int32_t* 
     m->store_snapshot_at = snap_at;
     int rc = 0, from = -1;  // from: prefill_chunk, the prompt's tokens from there on are prefilled by the steps
     const bool chunked = o.prefill_chunk > 0;
+    const bool evt = m->event_cb != nullptr;
+    const long long store0 = m->st_attached;
+    const auto tp0 = std::chrono::steady_clock::now();
+    if (evt) fire_event(m, INFERENCE_EVT_PREFILL_BEGIN, n_prompt, 0, 0.0);  // as inference_generate
     if (o.reuse_prefix && n_prompt > 0) {
         rc = sync_prompt(m, prompt_ids, n_prompt, o.checkpoint_tail, chunked ? &from : nullptr);
     } else if (n_prompt > 0) {
@@ -2350,6 +2382,10 @@ inference_stream_t* inference_stream_begin(inference_model_t* m, const int32_t* 
         const size_t L = st->pp.size(), tail = std::min((size_t)std::max(o.checkpoint_tail, 0), L / 2);
         if (tail > 0 && qwen_model_is_recurrent(m->qwen)) st->pp_ck = L - tail;
         st->snap_at = snap_at;
+        st->pp_ms = ms_since(tp0);  // (the sync: the store's blocks mapped)
+        st->store0 = store0;
+    } else if (evt && n_prompt > 0) {  // all in already: the prefill's end
+        fire_event(m, INFERENCE_EVT_PREFILL_END, m->last_prefilled, (int)(m->st_attached - store0), ms_since(tp0));
     }
     st->m = m;
     st->seq = m->cur_seq;

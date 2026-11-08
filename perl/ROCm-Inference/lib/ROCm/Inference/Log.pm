@@ -90,6 +90,9 @@ sub progress {
     return $self->emit('info', 'prefill', %f, msg => sprintf('prefill %d%%  %d/%d tok', $pct, $done, $total));
 }
 
+# progress_end($key): the job is over (done, or stopped short of its total): its throttle state goes
+sub progress_end { delete $_[0]{progress}{ $_[1] }; return }
+
 1;
 
 __END__

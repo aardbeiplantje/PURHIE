@@ -321,9 +321,14 @@ typedef struct inference_event {
     double ms;       // elapsed milliseconds since the event's begin (0 when not measured)
 } inference_event;
 
+// inference_generate* and inference_stream_begin fire PREFILL_BEGIN / END once per prompt. A stream with
+// prefill_chunk reports its chunks (each prefilled by a later inference_stream_step*) as that one prefill: a
+// PROGRESS after each chunk, its counts over the whole prompt, ms the chunks' time so far; END after the last.
+//
 // The callback's return value: nonzero on INFERENCE_EVT_PREFILL_PROGRESS cancels the prefill after that step
-// (INFERENCE_ERR_CANCELLED); the other events ignore it, so a host that wants to stop a generation does it with
-// the on_token callback. A host may also stop by failing (in Perl, a die) on PREFILL_PROGRESS.
+// (INFERENCE_ERR_CANCELLED; a stream's step returns it and the stream is over); the other events ignore it, so a
+// host that wants to stop a generation does it with the on_token callback. A host may also stop by failing (in
+// Perl, a die) on PREFILL_PROGRESS.
 typedef int (*inference_event_cb)(void* user, const inference_event* ev);
 
 // Register (or, with cb == NULL, clear) a model's event handler. The handler outlives any single call: the
