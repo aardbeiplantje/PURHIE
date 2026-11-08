@@ -759,6 +759,7 @@ store_stats(h)
     (void)hv_stores(hv, "blocks_attached", newSViv((IV)st.blocks_attached));
     (void)hv_stores(hv, "snapshots_saved", newSViv((IV)st.snapshots_saved));
     (void)hv_stores(hv, "snapshots_restored", newSViv((IV)st.snapshots_restored));
+    (void)hv_stores(hv, "snapshots_dropped", newSViv((IV)st.snapshots_dropped));
     (void)hv_stores(hv, "tokens_from_store", newSViv((IV)st.tokens_from_store));
     (void)hv_stores(hv, "block_tokens", newSViv(st.block_tokens));
     (void)hv_stores(hv, "block_bytes", newSViv((IV)st.block_bytes));

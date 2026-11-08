@@ -237,10 +237,14 @@ struct inference_model {
     int store_dirfd = -1;
     int store_snapshot_every = 0;                       // snapshot every N block boundaries (0: only prompt ends)
     int store_snapshot_at = -1;                         // block boundary of the current prompt's end: snapshot too
+    // The sequence's last prompt-end snapshot that is off the spacing (snapshot_on_grid) and that it wrote itself:
+    // the next prompt's end on the same chain, deeper, supersedes it, and it is deleted (store_end_k 0: none)
+    Hash store_end{};
+    int store_end_k = 0;
     Hash store_root{};                                  // chain hash before block 0 (model and layout identity)
     std::vector<Hash> chain;                            // chain[i]: hash after block i of seq
     size_t published = 0;                               // full blocks of seq that are in the store
-    long long st_published = 0, st_attached = 0, st_snap_saved = 0, st_snap_restored = 0, st_tokens = 0;
+    long long st_published = 0, st_attached = 0, st_snap_saved = 0, st_snap_restored = 0, st_tokens = 0, st_snap_dropped = 0;
     std::unordered_map<std::string, std::string> chat_templates;  // inference_chat_template, by name
     int lm_head_q8 = 0;                                 // inference_set_lm_head_q8: use an int8 copy of the LM head
     uint64_t seed = 0;                                  // inference_generate sampler seed
@@ -301,6 +305,8 @@ struct inference_model::SeqCtx {
     std::vector<inference_model::Hash> chain;
     size_t published = 0;
     int store_snapshot_at = -1;
+    inference_model::Hash store_end{};
+    int store_end_k = 0;
     bool used = false;
 };
 

@@ -39,6 +39,13 @@ for my $turn (1 .. 6) {  # the main agent: each request appends to the last (reu
 ok($reused > 0, "the main agent's turns reuse the sequence ($reused tokens on the last)");
 my $main_len = @$ids;
 my %before = map { $_->{name} => 1 } store_files($dir);
+my $rsts = grep { /\.rst\z/ } keys %before;
+my $grid = int(int($main_len / $B) / 4);  # store_open's default spacing: every 4th block at this depth
+SKIP: {
+    skip 'not a recurrent model: no snapshots', 2 unless $rsts;
+    ok($rsts <= $grid + 1, "the main agent keeps $rsts snapshots: the spacing's $grid and its latest prompt end");
+    ok(store_stats($m)->{snapshots_dropped} > 0, store_stats($m)->{snapshots_dropped} . ' superseded prompt-end snapshots deleted');
+}
 
 my $sub = join ' ', map { "Line $_ of the subagent's own prompt." } 1 .. 120;
 for my $turn (1 .. 3) {  # a subagent on the same sequence: a different prefix from the first token

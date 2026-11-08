@@ -1317,6 +1317,8 @@ static void seq_swap(inference_model_t* m, inference_model::SeqCtx& c) {
     std::swap(m->chain, c.chain);
     std::swap(m->published, c.published);
     std::swap(m->store_snapshot_at, c.store_snapshot_at);
+    std::swap(m->store_end, c.store_end);
+    std::swap(m->store_end_k, c.store_end_k);
 }
 
 int inference_seq_new(inference_model_t* m) {
@@ -1514,8 +1516,21 @@ static int store_save_state(inference_model_t* m, const inference_model::Hash& h
     return 0;
 }
 
+// The snapshot spacing: every snapshot_every-th block boundary over the first 16 x snapshot_every blocks, then
+// half as dense with each doubling of the depth (8 per doubling): a prompt that leaves a stored chain at block k
+// resumes at most about k / 8 blocks before it, and a long conversation keeps O(log) snapshots, not one every few
+// blocks (Qwen3.6-35B: 62.8 MB each; 130k tokens = 508 blocks: 40 instead of 127). Only depth decides, so a
+// shared prefix gets the same snapshots in every conversation
+static bool snapshot_on_grid(const inference_model_t* m, int k) {
+    const int e = m->store_snapshot_every;
+    if (e <= 0 || k <= 0) return false;
+    long long step = e;
+    while (k >= 16 * step) step *= 2;
+    return k % step == 0;
+}
+
 static bool snapshot_boundary(const inference_model_t* m, int k) {
-    return k > 0 && (k == m->store_snapshot_at || (m->store_snapshot_every > 0 && k % m->store_snapshot_every == 0));
+    return k > 0 && (k == m->store_snapshot_at || snapshot_on_grid(m, k));
 }
 
 // After a forward pass: publish the blocks it completed, and snapshot the state at a chosen block boundary
@@ -1537,8 +1552,25 @@ static int store_after_forward(inference_model_t* m) {
     }
     const int B = kv_B(m), k = m->n_past / B;
     if (m->n_past % B == 0 && snapshot_boundary(m, k) && state_bytes(m) > 0) {
-        int snap = m->st_snap_saved;
+        const long long snap = m->st_snap_saved;
         if (store_save_state(m, m->chain[k - 1]) != 0) return -1;
+        if (k == m->store_snapshot_at) {
+            // a prompt's end: the sequence's previous prompt end on this chain, off the spacing and written by it,
+            // is superseded (a resume of the chain restores the deepest snapshot; the spacing's stay for the rest)
+            const int j = m->store_end_k;
+            const bool on_chain = j > 0 && (size_t)j <= m->chain.size() && m->chain[(size_t)j - 1] == m->store_end;
+            if (on_chain && j == k) {
+                // the same prompt end again (a resend): it stays the one to supersede
+            } else {
+                if (on_chain && j < k && unlinkat(m->store_dirfd, store_name(m->store_end, "rst").c_str(), 0) == 0)
+                    ++m->st_snap_dropped;
+                m->store_end_k = 0;
+                if (m->st_snap_saved > snap && !snapshot_on_grid(m, k)) {  // (one that existed is others' too)
+                    m->store_end = m->chain[(size_t)k - 1];
+                    m->store_end_k = k;
+                }
+            }
+        }
         fire_event(m, INFERENCE_EVT_STORE, (int)(m->st_attached - reused0), (int)(m->st_snap_saved - snap), 0.0);
     }
     return 0;
@@ -2093,8 +2125,9 @@ int inference_store_open(inference_model_t* m, const char* dir, int snapshot_eve
     m->chain.clear();
     m->published = 0;  // each sequence's full blocks are published by its next forward pass
     for (inference_model::SeqCtx* q : m->seqs)
-        if (q) q->chain.clear(), q->published = 0;
-    m->st_published = m->st_attached = m->st_snap_saved = m->st_snap_restored = m->st_tokens = 0;
+        if (q) q->chain.clear(), q->published = 0, q->store_end_k = 0;
+    m->st_published = m->st_attached = m->st_snap_saved = m->st_snap_restored = m->st_tokens = m->st_snap_dropped = 0;
+    m->store_end_k = 0;
     return 0;
 }
 
@@ -2125,7 +2158,7 @@ void inference_store_close(inference_model_t* m) {
     m->chain.clear();
     m->published = 0;
     for (inference_model::SeqCtx* q : m->seqs)
-        if (q) q->chain.clear(), q->published = 0;
+        if (q) q->chain.clear(), q->published = 0, q->store_end_k = 0;
 }
 
 int inference_store_get_stats(const inference_model_t* m, inference_store_stats* st) {
@@ -2134,6 +2167,7 @@ int inference_store_get_stats(const inference_model_t* m, inference_store_stats*
     st->blocks_attached = m->st_attached;
     st->snapshots_saved = m->st_snap_saved;
     st->snapshots_restored = m->st_snap_restored;
+    st->snapshots_dropped = m->st_snap_dropped;
     st->tokens_from_store = m->st_tokens;
     st->block_tokens = m->kvc ? kv_cache_block_tokens(m->kvc) : 0;
     st->block_bytes = m->kvc ? (long long)kv_cache_block_bytes(m->kvc) : 0;

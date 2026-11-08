@@ -340,8 +340,10 @@ int inference_set_event_cb(inference_model_t* model, inference_event_cb cb, void
 // ---- KV block store (Phase 22b): prompts shared across sessions, processes and restarts.
 // With a store open, every full KV block (inference_store_get_stats: block_tokens positions, all layers) is
 // published as a file <chain hash>.kvb in dir, and the recurrent state (hybrid models) is saved as <chain hash>.rst
-// at chosen block boundaries: every snapshot_every-th one (0: none) and the last one of each
-// inference_generate_stream prompt. The chain hash covers the model, the layout and every token up to the end of
+// at chosen block boundaries: every snapshot_every-th one over the first 16 x snapshot_every blocks, then half as
+// dense with each doubling of the depth (0: none), and the last one of each prompt. A sequence's prompt-end
+// snapshot off that spacing is deleted when its next prompt on the same chain ends deeper (a conversation keeps
+// its latest end, not one per request). The chain hash covers the model, the layout and every token up to the end of
 // the block, so equal prefixes give equal names. A reuse_prefix prompt then starts from the deepest block chain in
 // the store that ends in a snapshot, when that reaches further than the current sequence: the blocks are mapped
 // in place (no copy), the snapshot is read back. Store blocks are never written; the files can be deleted at
@@ -359,6 +361,7 @@ typedef struct inference_store_stats {
     int block_tokens;              // positions per block
     long long block_bytes;         // size of a .kvb file
     long long snapshot_bytes;      // size of a .rst file (0: no recurrent layers)
+    long long snapshots_dropped;   // superseded prompt-end snapshots this model deleted
 } inference_store_stats;
 
 int inference_store_get_stats(const inference_model_t* model, inference_store_stats* stats);
