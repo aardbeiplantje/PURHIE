@@ -1920,6 +1920,13 @@ static int store_lookup(inference_model_t* m, const int32_t* p, int n, std::vect
         hs->push_back(h);
         if (!recurrent || store_has(m, store_name(h, "rst"), state_bytes(m))) best = j;
     }
+    // This prompt uses these files, whether the sequence holds them already or they are mapped in: they are used
+    // now (the LRU eviction's mtime). Else a conversation that goes on in the sequence (opencode's main agent) leaves
+    // its prefix at the age it was written, and when another conversation took the sequence meanwhile, the
+    // resume finds the oldest files, its own first blocks, evicted. Of the snapshots only the deepest: the one a
+    // resume restores (the others would keep a snapshot for almost every block of a long conversation)
+    for (const inference_model::Hash& h : *hs) store_touch(m, store_name(h, "kvb"));
+    if (recurrent && best > 0) store_touch(m, store_name((*hs)[(size_t)best - 1], "rst"));
     hs->resize((size_t)best);
     return best * B;
 }

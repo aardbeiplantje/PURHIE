@@ -157,11 +157,16 @@ sequences are dropped (the engine does not have them; tried for llama.cpp withou
 - **Not done:** the store on by default; a disk tier; a measured switch on the 27B model. Estimate: its KV is 69,632
   bytes per token (F16), so a 12k prefix is 0.84 GB and /data reads at 6.5 GB/s; a switch should take seconds
   against the 227 s re-prefill in the logs. Unmeasured.
-- **Open (user, 2026-11-08):** with Qwen3.6-35B, opencode runs more agents, and an agent that continues after another
-  one ran seems to lose its prefill cache. Needs the user's request list and the `kv` / `evict` / done lines of the
-  affected request: whether its prefix was evicted, or its recurrent snapshot (every 4 blocks and at the prompt's
-  end) does not cover where the re-rendered prompt diverges, or opencode reorders / rewrites the earlier messages.
-Next: that question; then measure a 27B switch with `--store` on /dev/shm and decide the default (run.sh).
+- **Fixed (2026-11-08): a resumed agent lost its prefix.** opencode's log (505 requests, all `id_slot` 5) is one main
+  agent, append-only, with compaction requests and a subagent between; after the subagent the main agent resumed a
+  ~130k-token prefix from the store and found it evicted: blocks were touched only when mapped from the store, so
+  a conversation going on in the sequence kept its first blocks at their write time, the oldest files, while each
+  request writes a 62.8 MB snapshot (Qwen3.6-35B: 5 MB blocks; 458 requests ~28 GB > 16 GB). Now every lookup
+  touches the prompt's blocks and its deepest snapshot (`t/45-store-lru.t`). Not changed: a snapshot per request
+  is a lot of writing for a long conversation; the 10 identical resends in the log (5 each before two compactions,
+  at ~210k tokens) look like failed requests, whose replies the log does not have.
+Next: watch the resume on the deployment (the `kv` line's mapped blocks); then measure a 27B switch with `--store` on
+/dev/shm and decide the default (run.sh).
 
 The server serves one request at a time unless `--parallel N`, which batches N conversations of one model (not
 with a draft head); with `--models-dir` each loaded model has its own sequences and the loop steps them in turn. A
