@@ -169,6 +169,11 @@ sequences are dropped (the engine does not have them; tried for llama.cpp withou
   with depth (8 per doubling past 64 blocks), and a sequence's superseded prompt-end snapshot is deleted. Open: the
   10 identical resends in the log (5 each before two compactions, at ~210k tokens) look like failed requests,
   whose replies the log does not have.
+- **Fixed (2026-11-08): each new user message re-prefilled the previous turn.** Qwen3.6's template renders an
+  assistant message's reasoning only after the last user message, so a new one changed the whole previous turn
+  (requests5.log #5: 20,070 of the old prompt's tokens; the deployment's log: 20,424 prefilled). The server now sets
+  `preserve_thinking` (`--no-preserve-thinking`; a request's `chat_template_kwargs` wins): 0 re-prefilled. opencode
+  sends `reasoning_content` back (37,203 of 39,613 assistant messages in requests4.log).
 Next: watch the resume on the deployment (the `kv` line's mapped blocks) and `--parallel 2` there.
 
 The server serves one request at a time unless `--parallel N`, which batches N conversations of one model (not

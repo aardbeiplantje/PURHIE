@@ -22,7 +22,7 @@ my %o = (listen => './rocm-inference.sock', max_tokens => 0, 'models-margin' => 
          'thinking-low' => 2048, 'thinking-medium' => 8192, 'thinking-high' => 0, 'store-max' => 16);  # thinking budgets by reasoning_effort (0: none)
 GetOptions(\%o, 'model=s', 'models-dir=s', 'models-max=i', 'models-margin=f', 'kv-budget=f', 'listen=s', 'mode=s', 'ctx=i',
            'name=s', 'draft=s', 'store=s', 'max_tokens=i', 'swa-ring=i', 'stage=s', 'recache', 'kv-type=s',
-           'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'log!', 'log-level=s', 'log-format=s', 'log-color=s',
+           'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'preserve-thinking!', 'log!', 'log-level=s', 'log-format=s', 'log-color=s',
            'thinking-low=i', 'thinking-medium=i', 'thinking-high=i',
            'store-max=f', 'debug-stream!', 'help')
     or pod2usage(2);
@@ -348,6 +348,10 @@ sub options {
         $vars{enable_thinking} = defined $effort ? ($effort =~ /^(?:none|minimal)\z/ ? 0 : 1) : $o{thinking}
             if defined $effort || defined $o{thinking};
     }
+    # Qwen3.6's template drops the reasoning of the assistant messages before the last user message: a new user message
+    # re-renders the whole previous turn (its tool calls and results), and its tokens are prefilled again. With
+    # preserve_thinking the history renders the same every time (templates without the variable ignore it)
+    $vars{preserve_thinking} = JSON::PP::true() if !exists $vars{preserve_thinking} && ($o{'preserve-thinking'} // 1);
     # the request's max_tokens, else up to the context's end (finish_reason length); --max_tokens N caps both
     my $want = $p->{max_completion_tokens} // $p->{max_tokens};
     $want = $r->{ctx} if !defined $want || $want < 1;
@@ -1120,6 +1124,14 @@ C<max_completion_tokens> is honoured up to it; without one a reply goes on until
 =item --[no]thinking
 
 Thinking on or off when a request does not say (default: the chat template's default).
+
+=item --[no]preserve-thinking
+
+Render the reasoning of every earlier assistant message (the template variable C<preserve_thinking>; default on; a
+request's C<chat_template_kwargs> decides for itself). Qwen3.6's template otherwise drops it from the messages before
+the last user message, so each new user message changes the rendering of the whole previous turn, and all of it is
+prefilled again (an agent's turn: its tool calls and results, often 10-20k tokens). The prompt keeps the reasoning
+the client sends back (C<reasoning_content>), so it is longer. Templates without the variable ignore it.
 
 =item --[no]log
 
