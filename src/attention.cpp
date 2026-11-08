@@ -34,6 +34,10 @@ static bool g_gqa_off = false;
 // attn_flash takes batches of at least this many tokens. QMATVEC_NO_WMMA (qmatvec.h) also turns it off, so
 // that prefill can be compared bit for bit with token by token.
 static const int kFlashMinT = 16;
+// Prefill (attention_set_prefill): attn_flash for batches of every size, its position ranges sized per tile, at least
+// `g_prefill_chunk` (a range past a token's own adds an exact zero in the combine), so that a token's attention does
+// not depend on how its prompt was cut into batches. 0: off (decoding, verify passes)
+static int g_prefill_chunk = 0;
 // attn_flash splits a token's positions until the launch has this many workgroups (4 per WGP of the 20)
 static const long long kFlashWgs = 160;
 static bool g_flash_off = false;
@@ -118,6 +122,15 @@ hipError_t attention_forward(const float* qfull, const float* k, const float* v,
                                   freq_base, eps, q, part_ml, part_acc, out, &o, q8, stream);
 }
 
+void attention_set_prefill(int n_ctx) {
+    if (n_ctx <= 0 || getenv("QMATVEC_PREFILL_SPLIT_VARIANT")) { g_prefill_chunk = 0; return; }
+    // the smallest range (the kernel sizes a tile's ranges max(this, its end / ATTN_MAX_SPLITS)): at least ATTN_CHUNK
+    // positions, so that a token has at most min(n_ctx / ATTN_CHUNK, ATTN_MAX_SPLITS) ranges, the partial-result
+    // slots it has (attention_part_slots); (void)n_ctx otherwise: the ranges depend on positions only
+    g_prefill_chunk = ATTN_CHUNK;
+    if (const char* v = getenv("ATTN_PREFILL_RMIN")) g_prefill_chunk = std::max(ATTN_CHUNK, atoi(v));  // (tuning)
+}
+
 hipError_t attention_forward_opts(const float* qfull, const float* k, const float* v, const float* q_norm,
                                   const float* k_norm, __half* K, __half* V, int kv_shift, long long kv_bstride,
                                   int n_q, int n_kv, int n_rot, int pos0, int T, float freq_base, float eps, float* q,
@@ -191,7 +204,7 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
     else if (g_flash_h1t4[hi][kq]) flash = g_flash_h1t4[hi][kq], nh = 1, tt = 4;
     // waves per (head, token tile): attention.hip's ATTN_FLASH_SP (2 for D 256, which splits its dims over them)
     const int sp = D == 256 && ds == 1 ? 2 : 1;
-    if (T >= kFlashMinT && !g_flash_off && flash) {
+    if ((T >= kFlashMinT || g_prefill_chunk > 0) && !g_flash_off && flash) {
         // Ranges of positions per token (each a multiple of 16 positions, at most ATTN_MAX_SPLITS): only as many
         // as it takes to give the GPU ~kFlashWgs workgroups. A prefill batch has enough without splitting, and
         // every split costs partial results written and merged (one split: Gemma-4 prefill +10%, Qwen3.6 +4%);
@@ -202,9 +215,18 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
         n_split = std::min(n_split, std::min(nc, ATTN_MAX_SPLITS));
         int chunk = ((n_last + n_split - 1) / n_split + 15) / 16 * 16;
         n_split = (n_last + chunk - 1) / chunk;
+        if (g_prefill_chunk > 0) {  // prefill: ranges per tile (the kernel: chunk < 0), as many as the last tile needs
+            const int a = 16 * tt, end = (n_last + a - 1) / a * a;
+            const int r = std::max(g_prefill_chunk, ((end + ATTN_MAX_SPLITS - 1) / ATTN_MAX_SPLITS + 15) / 16 * 16);
+            n_split = (end + r - 1) / r;
+            chunk = -g_prefill_chunk;
+        }
+        if ((long long)T * n_split > slots) return hipErrorInvalidValue;  // (the caller's partial-result slots)
         void* a_flash[] = {(void*)&qc, &K, &V, &kv_stride, &kv_shift, &kv_bstride, &pos0, &T, &n_q, &n_kv, &chunk,
                            &scale, &part_ml, &part_acc, &window};
-        e = hipModuleLaunchKernel(flash, (unsigned)(n_q / nh * ds), (unsigned)((T + 16 * tt - 1) / (16 * tt)),
+        // (the kernel's token tiles are aligned to absolute positions: one more workgroup row when pos0 is not)
+        e = hipModuleLaunchKernel(flash, (unsigned)(n_q / nh * ds),
+                                  (unsigned)((pos0 % (16 * tt) + T + 16 * tt - 1) / (16 * tt)),
                                   (unsigned)n_split, (unsigned)(32 * nh * tt * sp), 1, 1, 0, stream, a_flash, nullptr);
         if (e != hipSuccess) return e;
         void* a_comb[] = {&part_ml, &part_acc, &n_split, &n_q, (void*)&qfull, &out, &o, &gated, &vrot};

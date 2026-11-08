@@ -1149,11 +1149,13 @@ int main(int argc, char** argv) {
         std::vector<float> plogits(V);
         if (qwen_model_prefill(qm, tokens.data(), T, 0, plogits.data()) != 0) { fprintf(stderr, "prefill failed\n"); return 1; }
         qwen_model_set_layer_callback(qm, nullptr, nullptr);
-        // With the WMMA prefill kernels (batches of 32+ tokens, or QMATVEC_WMMA_MIN_T for tests) the float
-        // accumulation order differs. A ~1e-9 difference can flip an int8 activation rounding (one Q8 step) and,
-        // in the MoE, a near-tie expert choice; both propagate (measured: 4B layer 0 3.7e-9, layer 1 8e-6; 35B
-        // smooth to 1e-5, then a jump at a routing flip). ggml behaves the same under any reordering. So the check
-        // becomes: every layer within cos 0.99 of token by token and of the reference, and the reference's top-1.
+        // Prefill runs the WMMA kernels for every batch size (its prefill mode: split-invariant, tests/split_verify),
+        // decoding the per-token ones: the float accumulation order differs. A ~1e-9 difference can flip an int8
+        // activation rounding (one Q8 step) and, in the MoE, a near-tie expert choice; both propagate (measured: 4B
+        // layer 0 3.7e-9, layer 1 8e-6; 35B smooth to 1e-5, then a jump at a routing flip). ggml behaves the same
+        // under any reordering. So the check becomes: every layer within min_cos of the reference, within what that
+        // allows of token by token (each within angle t of the reference: 2 t of each other, cos 2 c^2 - 1; 35B Q4_0:
+        // 0.989 / 0.989 of the reference, 0.980 of each other), and the reference's top-1.
         double dmax = 0.0;
         for (size_t i = 0; i < ctx.l_out.size(); ++i) dmax = std::max(dmax, (double)std::fabs(pctx.l_out[i] - ctx.l_out[i]));
         double lmax = 0.0;
@@ -1177,7 +1179,8 @@ int main(int argc, char** argv) {
         for (int i = 1; i < V; ++i)
             if (plogits[i] > plogits[pbest]) pbest = i;
         const bool exact = dmax == 0.0 && lmax == 0.0;
-        const bool pok = exact || (pcos >= min_cos() && rcos > min_cos() && pbest == next_token);
+        const double tok_cos = 2.0 * min_cos() * min_cos() - 1.0;  // (the bound the reference's implies)
+        const bool pok = exact || (pcos >= tok_cos && rcos > min_cos() && pbest == next_token);
         if (!pok) ++g_fail;
         printf("  [%s] prefill (%d tokens, one call, max batch %d) vs token by token: %s max |d| l_out %.3g, logits %.3g;"
                " worst layer cos vs token by token %.6f, vs reference %.6f\n",

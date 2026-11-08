@@ -242,27 +242,10 @@ Speed:
   matmul_f_id (no model here has them); BF16 FFN down (K 17408) the slowest shape (23 TFLOPS).
 
 Quality / correctness:
-- **Prefill is not split-invariant** (analysed 2026-11-08, Qwen3.5-4B and Qwen3-0.6B, a 2000-token prompt cut in two
-  at 26 points). Exact with every WMMA path off (`QMATVEC_NO_WMMA=1`); DeltaNet is invariant. Two causes:
-  1. Matmuls: batches of 32+ tokens run the WMMA kernels, smaller ones the per-token-exact kernels, a 1-token
-     prefill batch the decode path: a piece under 32 tokens sums in another order. Otherwise the grouping does not
-     matter (`QMATVEC_WMMA_MIN_T=1`: exact but for 1-token pieces).
-  2. Flash attention: the key positions are split into ranges whose size the host picks per batch (from T and the
-     batch end, to fill the GPU), and the D-256 kernel also depends on the batch start's parity (odd starts differ,
-     even exact); batches under 16 tokens take attn_partial. A fixed range size (an experiment, ATTN_FLASH_CHUNK)
-     removed the range part; the parity part needs the kernel.
-  Size: max |logit diff| 0.25 (0.6B) / 0.63 (4B), KL up to 2e-7 / 1.6e-5, the top token never changed at the
-  prompt's end; but greedy replies (200 tokens) differed in 3 of 16 cut runs (4B, from token 21 or 61): the same
-  prompt answers differently when part of it came from the sequence, the store or `--parallel` chunks. Not less
-  accurate: perplexity -0.14% (4B) / +0.08% (0.6B) without WMMA, inside the noise. Cost of switching WMMA off:
-  prefill 1954 -> 642 tok/s (4B, 2k tokens), not an option. Small pieces on WMMA (`QMATVEC_WMMA_MIN_T=1`): +8
-  tokens 36.6 -> 45.4 ms, +20 48.5 -> 41.5 ms, whole prompts within ~5%.
-  To make prefill invariant at WMMA speed: (a) prefill batches of every size on the WMMA kernels, 1-token ones too
-  (a prefill flag down to qmatvec); (b) flash for every prefill batch size, with key ranges fixed per model (not
-  per batch: an empty range adds an exact zero in the combine); (c) the D-256 parity dependence found and removed
-  in the kernel, or batch starts kept even (the engine picks them: checkpoints, store blocks, micro-batches); (d)
-  a quick-tier test: every cut gives the at-once logits. Decode (T = 1) stays as it is: prefill vs decode is not
-  the point, prefill vs prefill is. Undecided (user).
+- Prefill is split-invariant now (ARCHITECTURE.md section 5). Open: the tests that allowed for the old WMMA
+  differences between cuts (store_verify.sh and seq_verify compare first tokens, generate_verify a tolerance) can
+  demand bit-exactness; the full tier's perplexity baselines of the models not run here (the Flash model, the 122B
+  and 120B files) need `tests/regress.sh --update` on those rows (prefill attention rounds differently now).
 - Draft events are not verified: `events_test MODEL DRAFT` is written but not run. The Flash model (122.8 GB file) shares
   the work host's 124 GB with the user's deployment: a load from /models paged in 48 GB in 11 min (~70 MB/s,
   2026-11-08) and was stopped so as not to evict the deployment's model. Flash work needs a window with the

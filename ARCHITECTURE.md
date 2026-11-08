@@ -18,7 +18,8 @@ commit 7d4ed63 has them all).
   tile of tokens.
 - **Exactness by construction.** Every batched kernel sums each token in the order of its single-token kernel,
   so a prompt fed at once, token by token, split, restored from a checkpoint or verified speculatively gives
-  the same bits (with `QMATVEC_NO_WMMA=1`; see section 5).
+  the same bits (with `QMATVEC_NO_WMMA=1`; see section 5). Prefill against prefill is exact with WMMA on as well:
+  a prompt cut anywhere into batches gives the bits of the whole (section 5).
 - **Verified against a reference.** llama.cpp (the ROCmFPX fork in `llama.cpp/`, CPU build) is an oracle only:
   `tools/ref_oracle/ref_dump` dumps its activations, the tests compare with them. Nothing links it.
 - **Thin bindings.** The C API is architecture neutral; the Perl module maps it function by function (handle
@@ -133,7 +134,27 @@ reference (also the F32 router logits in prefill: `matmul_f32_tile`). Their inte
 (one scale per 32 values) adds a block's two 16-value WMMA dots in int32 and scales once, the same per-block term as
 the dot4 kernels, so only the order of the float sum over blocks differs (within ~5e-6 relative of the dot4
 kernels). `QMATVEC_NO_WMMA=1` (all), `QMATVEC_NO_WMMA_MM=1` (matmuls), `ATTN_NO_FLASH=1` (attention) switch them
-off; the exactness tests run with `QMATVEC_NO_WMMA=1`.
+off; the exactness tests against decoding run with `QMATVEC_NO_WMMA=1`.
+
+Prefill is split-invariant with WMMA on (2026-11-08): however a prompt is cut into batches (a prefix reused from
+the sequence or the store, `--parallel`'s chunks, the micro-batches), every token gets the bits it gets in the
+whole prompt (`tests/split_verify`: every layer of every token and the logits, on Qwen3-0.6B, Qwen3.5-4B and
+Qwen3.6-35B; `tests/attn_split_verify`: the attention kernel alone). Before, a cut changed greedy replies in 3 of
+16 runs (Qwen3.5-4B, 200 tokens). What it takes:
+- A prefill mode (qwen_model's `prefill()` sets it for its forward passes; decoding, verify passes and batched
+  decoding keep theirs): every batch size, one token included, takes the large-batch kernels (the WMMA matmuls,
+  the expert-grouped MoE path, the 16-bit activation copy; no one- or few-token paths), and flash attention takes
+  batches of every size (`qmatvec_set_prefill`, `attention_set_prefill`).
+- Flash attention's query tiles are aligned to absolute positions (rows before the batch or past its end are inert
+  padding), and its position ranges are sized per tile from the tile's absolute end (max(256, end / 8)), not per
+  batch: a token always has the same tile, blocks and ranges.
+- In a tile's diagonal block the P V WMMA runs twice, on the even and on the odd positions: the WMMA adds positions
+  in pairs, and a pair with one nonzero product rounds differently by the sign of the other, zero, product (p = 0
+  times the V of a masked position: the next token's when the batch goes on, else zero). Measured with
+  `ATTN_SPLIT_VMOD` in `tests/attn_split_verify`.
+Cost (Qwen3.6-35B, 262k context): whole prompts unchanged; a short piece after 30k tokens 57 ms for 8 tokens (was
+74), 77 for 20 (was 74), 142 for 100 (was 140). `QMATVEC_PREFILL_SPLIT_VARIANT=1` turns the prefill mode off (A/B;
+the kernel changes stay). Accuracy unchanged: perplexity within 0.014% of the all-exact path (100 chunks).
 
 ## 6. Models
 

@@ -36,6 +36,12 @@ hipError_t qmatvec_launch(int type, const void *W, size_t row_bytes, const float
 // The same for T rows of x [K] -> y [N]: one batched launch (F32 and the matmul_f kernels bit-identical to
 // qmatvec_launch per row; F16 / BF16 batches of 32+ tokens on WMMA tiles unless QMATVEC_NO_WMMA),
 // else one qmatvec_launch per row.
+// Prefill mode on / off (qwen_model's prefill sets it around its forward passes): batches of every size, one row
+// included, on the WMMA kernels and the few-token paths skipped, so that a row's sums do not depend on how the prompt
+// was cut into batches. QMATVEC_PREFILL_SPLIT_VARIANT set: never on (A/B). Off: decoding, verify passes, batched decoding.
+void qmatvec_set_prefill(int on);
+int qmatvec_prefill(void);
+
 hipError_t qmatvec_launch_batch(int type, const void *W, size_t row_bytes, const float *x, float *y, int N, int K,
                                 int T, hipStream_t stream);
 

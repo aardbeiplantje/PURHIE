@@ -40,6 +40,13 @@ static hipFunction_t g_lr_fast = nullptr;         // matvec_q8_lr_q4_0_rocmfp4_f
 static hipFunction_t g_fn_q8t[QMV_MAX_TYPE];     // int8 kernels for 2..4 tokens, matvec_q8t_<type>
 static bool g_use_wmma = true;
 static int g_wmma_min_t = 32;  // smaller batches, and N < 64 (a 64-row tile mostly padding), stay on matmul_q8_<type>
+// Prefill (qmatvec_set_prefill): batches of every size on the WMMA kernels, so that a prompt's rows get the same
+// sums however the prompt is cut into batches (else a piece under g_wmma_min_t rows sums in the other order)
+static int g_prefill = 0;
+static inline int wmma_min_t() { return g_prefill ? 1 : g_wmma_min_t; }
+
+void qmatvec_set_prefill(int on) { g_prefill = on && !getenv("QMATVEC_PREFILL_SPLIT_VARIANT"); }
+int qmatvec_prefill(void) { return g_prefill; }
 #define QMV_MM_TB 16      // tokens per tile, must match MM_TB in matvec_q.hip
 #define QMV_WM_ROWS 128       // weight rows per workgroup of matmul_wmma[_id]_<rocmfp4 type>, WM_ROWS in matvec_q.hip
 #define QMV_WM_THREADS 256    // its block size
@@ -263,7 +270,7 @@ static unsigned wf_grid(int N, int T) {
 }
 
 int qmatvec_half_supported(int type, const void *W, size_t row_bytes, int N, int K, int T) {
-    return type >= 0 && type < QMV_MAX_TYPE && g_fn_wmmaf[type] && g_use_wmma && T >= g_wmma_min_t && N >= 64 &&
+    return type >= 0 && type < QMV_MAX_TYPE && g_fn_wmmaf[type] && g_use_wmma && T >= wmma_min_t() && N >= 64 &&
            K % 8 == 0 && row_bytes >= (size_t)K * 2 && row_bytes % 16 == 0 && ((uintptr_t)W & 15) == 0;
 }
 
@@ -292,14 +299,14 @@ hipError_t qmatvec_launch_batch(int type, const void *W, size_t row_bytes, const
 
 hipError_t qmatvec_launch_batch_h(int type, const void *W, size_t row_bytes, const float *x, uint16_t *xh,
                                   size_t xh_bytes, float *y, int N, int K, int T, hipStream_t stream) {
-    if (T > 1 && type == QT_F32 && g_mm_f32 && K % (4 * QMV_F32_PARTS) == 0 && row_bytes == (size_t)K * 4 &&
+    if ((T > 1 || g_prefill) && type == QT_F32 && g_mm_f32 && K % (4 * QMV_F32_PARTS) == 0 && row_bytes == (size_t)K * 4 &&
         (((uintptr_t)W | (uintptr_t)x) & 15) == 0) {
         long long rb = (long long)row_bytes;
         void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K, &T};
         // Prefill batches in the WMMA mode: the tiled kernel (another summation order, like the WMMA kernels;
         // decoding, verify passes and QMATVEC_NO_WMMA keep matvec_f32's order)
         hipError_t e;
-        if (g_use_wmma && g_mm_f32_tile && T >= g_wmma_min_t && K % 32 == 0)
+        if (g_use_wmma && g_mm_f32_tile && T >= wmma_min_t() && K % 32 == 0)
             e = hipModuleLaunchKernel(g_mm_f32_tile, (unsigned)((N + 63) / 64), (unsigned)((T + 63) / 64), 1, 256, 1,
                                       1, 0, stream, args, nullptr);
         else
@@ -505,7 +512,7 @@ hipError_t qmatvec_launch_q8_batch(int type, const void *W, size_t row_bytes, co
     if (T <= 0 || row_bytes != qt_row_size(type, K) || row_bytes % 4 != 0 || ((uintptr_t)W & 3) != 0 ||
         (long long)T * K > q->max_k || ldy < N)
         return hipErrorInvalidValue;
-    if (T > 1 && ldy == N && qmatvec_q8_few_supported(type, K, T)) {  // a few tokens: weights decoded once
+    if (T > 1 && !g_prefill && ldy == N && qmatvec_q8_few_supported(type, K, T)) {  // a few tokens: weights decoded once
         const void *Ws[] = {W};
         const int Ns[] = {N};
         float *ys[] = {y};
@@ -518,7 +525,7 @@ hipError_t qmatvec_launch_q8_batch(int type, const void *W, size_t row_bytes, co
     long long rb = (long long)row_bytes;
     OScale osc = oscale1(W);
     void *args[] = {(void *)&W, &rb, (void *)&q8, (void *)&d8, (void *)&bs, (void *)&y, &ldy, &N, &K, &T, &osc};
-    if (g_use_wmma && g_fn_wmma[type] && T >= g_wmma_min_t && N >= 64 && K % wmma_k_multiple(type) == 0) {
+    if (g_use_wmma && g_fn_wmma[type] && T >= wmma_min_t() && N >= 64 && K % wmma_k_multiple(type) == 0) {
         // tiles of 64 tokens x 128 rows (Q8_0-activation types, 256 threads) or 64 rows (K-quants, 128 threads);
         // bs: the K-quants' group sums (for the mins), Q5_1's block sums (offsets)
         const int rows = kq ? 64 : QMV_WM_ROWS, threads = kq ? 128 : QMV_WM_THREADS;

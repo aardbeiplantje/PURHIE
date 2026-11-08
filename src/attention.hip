@@ -34,6 +34,7 @@
 #include "q8_device.h"
 
 #define CH 256  // positions per attn_partial chunk (ATTN_CHUNK in attention.h)
+#define ATTN_RANGES 8  // a prefill token's position ranges at most (ATTN_MAX_SPLITS in attention.h)
 
 // KV cache row of position p, in __half units from the layer's row 0: blocks of 2^kv_shift positions, kv_bstride
 // apart, rows kv_stride apart inside a block (kv_cache.h). A contiguous cache is kv_shift = 30.
@@ -484,9 +485,18 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
     const int sp = w % SP, wt = w / SP;  // this wave's part of the tile's D, its tile
     const int hg = blockIdx.x / DS, ds = blockIdx.x % DS, hw = wt % NH, tw = wt / NH;
     const int h = hg * NH + hw, g0 = hg * NH / (n_q / n_kv_heads), gw = hw * NG / NH;
-    const int zt = blockIdx.y * FT * TT, z0 = zt + FT * tw, c = blockIdx.z, n_chunks = gridDim.z;
+    // The workgroup's FT * TT token rows are aligned to absolute positions (pos0 rounded down to a multiple of
+    // FT * TT; rows before pos0 or past T are padding: zero Q, not written), and its blocks run to the rows' absolute
+    // end: a token is always in the same tile with the same blocks, however its prompt was cut into batches (a row
+    // that passes more masked blocks than in another cut can differ: masked blocks add exact zeros, but the WMMA
+    // accumulation does not keep every value through them bit for bit)
+    const int zt = blockIdx.y * FT * TT - pos0 % (FT * TT), z0 = zt + FT * tw, c = blockIdx.z, n_chunks = gridDim.z;
     const int zmax = min(T, zt + FT * TT) - 1;              // last token of the workgroup's tiles
-    const int npos = min(chunk, pos0 + zmax + 1 - c * chunk);  // chunk positions any token of the tiles sees
+    // chunk < 0 (prefill): ranges sized by the rows' absolute end E alone, max(-chunk, E / 8) rounded up to 16 (at most
+    // 8 per token, each a fixed function of its tile), so that a token's ranges do not depend on its batch; the
+    // ranges past a tile's own are empty (an exact zero in the combine)
+    if (chunk < 0) chunk = max(-chunk, ((pos0 + zt + FT * TT + ATTN_RANGES - 1) / ATTN_RANGES + 15) / 16 * 16);
+    const int npos = min(chunk, pos0 + zt + FT * TT - c * chunk);  // chunk positions up to the rows' absolute end
     const int nb = npos > 0 ? (npos + FB - 1) / FB : 0;
     const int lo0 = window > 0 ? pos0 + zt + 1 - window : 0;  // the first token's first position
     const int drow = KQ ? kvq_drow<KQ>(kv_stride) : 0;        // quantized rows: values per row
@@ -495,7 +505,7 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
     for (int idx = lane + 32 * sp; idx < FT * D / 4; idx += 32 * SP) {
         const int rr = idx / (D / 4), d = 4 * (idx % (D / 4));
         float4 x = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        if (z0 + rr < T) x = *(const float4*)(q + ((size_t)(z0 + rr) * n_q + h) * D + d);
+        if (z0 + rr >= 0 && z0 + rr < T) x = *(const float4*)(q + ((size_t)(z0 + rr) * n_q + h) * D + d);
         sQ[wt][rr][d] = (_Float16)x.x, sQ[wt][rr][d + 1] = (_Float16)x.y;
         sQ[wt][rr][d + 2] = (_Float16)x.z, sQ[wt][rr][d + 3] = (_Float16)x.w;
     }
@@ -633,8 +643,10 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
         bool rescale = false;
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
-            const int pz = pos0 + z0 + 2 * r + hi, pp = P0 + i;
-            const float sv = pp <= pz && (window <= 0 || pp > pz - window) ? s[r] * scale : -INFINITY;
+            const int zr = z0 + 2 * r + hi, pz = pos0 + zr, pp = P0 + i;
+            // (padding rows, before the batch or past its end, see nothing: inert)
+            const float sv = zr >= 0 && zr < T && pp <= pz && (window <= 0 || pp > pz - window) ? s[r] * scale
+                                                                                               : -INFINITY;
             const float mn = fmaxf(m[r], row16_max(sv));
             alpha[r] = mn == -INFINITY || mn == m[r] ? 1.0f : __expf(m[r] - mn);
             rescale |= alpha[r] != 1.0f;
@@ -644,21 +656,38 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
             sP[wt][2 * r + hi][i] = (_Float16)p;  // (the tile's SP waves write the same values)
         }
         // The previous acc rescaled by exp(m_old - m_new): skipped (wave-uniform) when no row of the wave has a
-        // new maximum, as in most blocks once the running maxima settle; the same values as multiplying by 1.0
+        // new maximum, as in most blocks once the running maxima settle. A row whose maximum stayed keeps its values
+        // (a select, not acc * 1.0: the multiply flushes denormals to zero, so a row's result would depend on whether
+        // another token of its tile rescaled, i.e. on how the prompt was cut into batches)
         if (__ballot(rescale) != 0) {
 #pragma unroll
             for (int dt = 0; dt < DT; ++dt)
 #pragma unroll
-                for (int r = 0; r < 8; ++r) acc[dt][r] *= alpha[r];
+                for (int r = 0; r < 8; ++r) acc[dt][r] = alpha[r] != 1.0f ? acc[dt][r] * alpha[r] : acc[dt][r];
         }
         __syncthreads();  // sP rows are read by other lanes
 
-        // acc += P V
+        // acc += P V. The WMMA sums its positions in pairs (2 j, 2 j + 1), and the result of a pair with one product
+        // nonzero depends on the sign of the other, zero, product (p = 0 times a V of either sign; measured:
+        // tests/attn_split_verify). A token at an even position has its last position and the first masked one in
+        // one pair, and that masked position's V is the next token's when the batch goes on, else zero: so in the
+        // block that holds the tile's own positions (wave-uniform), the even and the odd positions go in separate
+        // WMMAs (V with the other half zeroed), and every pair has a +0 product beside a nonzero one, however the
+        // prompt was cut into batches
         const v16h a = *(const v16h*)&sP[wt][i][0];
+        const bool diag = P0 + FB - 1 > pos0 + z0;  // positions after the tile's first token (masked for some rows)
 #pragma unroll
         for (int dt = 0; dt < DT; ++dt) {
             const v16h bv = *(const v16h*)&sVt[gw][(sp * DT + dt) * 16 + i][0];
-            acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bv, acc[dt]);
+            if (diag) {
+                typedef unsigned u8v __attribute__((ext_vector_type(8)));
+                const u8v w = __builtin_bit_cast(u8v, bv);
+                const v16h ev = __builtin_bit_cast(v16h, w & 0x0000ffffu), od = __builtin_bit_cast(v16h, w & 0xffff0000u);
+                acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, ev, acc[dt]);
+                acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, od, acc[dt]);
+            } else {
+                acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bv, acc[dt]);
+            }
         }
     }
 
@@ -667,7 +696,7 @@ __device__ __forceinline__ void attn_flash_body(const float* q, const __half* K,
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int z = z0 + 2 * r + hi;
-        if (z >= T) continue;
+        if (z < 0 || z >= T) continue;
         const size_t pc = ((size_t)z * n_q + h) * n_chunks + c;
         if (i == 0 && ds == 0 && sp == 0) {
             part_ml[2 * pc] = m[r];

@@ -90,6 +90,8 @@ DEQUANT_VERIFY   = $(BINDIR)/dequant_verify
 MATVEC_VERIFY    = $(BINDIR)/matvec_verify
 # Phase 20 Step 3c: engine pieces vs the llama.cpp reference activations (ref_dump acts). Run from build/co.
 FORWARD_VERIFY   = $(BINDIR)/forward_verify
+# Prefill split invariance: a prompt cut anywhere gives the at-once bits (tests/regress.sh); run from build/co
+SPLIT_VERIFY     = $(BINDIR)/split_verify
 # Perplexity on a text as llama.cpp's llama-perplexity computes it (tests/regress.sh); run from build/co
 PERPLEXITY       = $(BINDIR)/perplexity
 # Long-context retrieval: a pass key hidden in a long text at several depths (tests/regress.sh); run from build/co
@@ -102,6 +104,7 @@ EMBED_VERIFY     = $(BINDIR)/embed_verify
 ATTN_VERIFY      = $(BINDIR)/attn_verify
 # Decode attention (F16 / Q8_0 cache, per query head / per KV head) vs a CPU reference; no model. Run from build/co
 ATTN_DECODE_VERIFY = $(BINDIR)/attn_decode_verify
+ATTN_SPLIT_VERIFY = $(BINDIR)/attn_split_verify
 
 # Phase 4: Model architecture kernels
 
@@ -291,8 +294,14 @@ $(QWEN_MODEL_LIB): $(QWEN_SRCS) $(QWEN_HDRS) $(SRCDIR)/inference.h $(SRCDIR)/ggu
 $(QWEN_DEMO): $(SRCDIR)/demo_qwen.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/matvec_q.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/gpu_ops.co
 	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/demo_qwen.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
 
+$(SPLIT_VERIFY): $(TESTSDIR)/split_verify.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/split_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
+
 $(FORWARD_VERIFY): $(TESTSDIR)/forward_verify.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/matvec_q.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/gpu_ops.co
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/forward_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
+
+$(ATTN_SPLIT_VERIFY): $(TESTSDIR)/attn_split_verify.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/attention.co
+	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/attn_split_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
 
 $(ATTN_DECODE_VERIFY): $(TESTSDIR)/attn_decode_verify.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/attention.co
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/attn_decode_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
@@ -409,4 +418,4 @@ verify_minimal: $(TEST_TARGET)
 	./$(TEST_TARGET) 2>&1 || echo "Test exited with code $?"
 
 # Last, so that every variable above is defined when its prerequisites are expanded
-all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(ATTN_DECODE_VERIFY) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(PERPLEXITY) $(PASSKEY) $(GENERATE_VERIFY) $(EVENTS_TEST) $(GEMMA4_VERIFY) $(SEQ_VERIFY) $(EMBED_VERIFY) $(QWEN4EXP_VERIFY) $(MTP_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY) $(CAPI_SMOKE) $(STORE_VERIFY)
+all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(ATTN_DECODE_VERIFY) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(PERPLEXITY) $(PASSKEY) $(GENERATE_VERIFY) $(EVENTS_TEST) $(GEMMA4_VERIFY) $(SEQ_VERIFY) $(EMBED_VERIFY) $(QWEN4EXP_VERIFY) $(MTP_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY) $(CAPI_SMOKE) $(STORE_VERIFY) $(SPLIT_VERIFY) $(ATTN_SPLIT_VERIFY)

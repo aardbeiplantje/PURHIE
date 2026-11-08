@@ -598,7 +598,7 @@ struct QwenModel {
     // the 16-bit copy, which the WMMA matmuls read (from 32 rows, QMATVEC_WMMA_MIN_T's default).
     const qmatvec_q8* q8_for(int K, int T, bool q8_0_rows = false) const {
         const bool fit = K % (q8_0_rows ? 32 : 256) == 0 && (long long)K * T <= s.q8_max_k;
-        const bool i8 = use_q8 && fit, h = use_h && fit && T >= 32;
+        const bool i8 = use_q8 && fit, h = use_h && fit && (T >= 32 || inv);
         return i8 ? (h ? &s.q8h : &s.q8) : h ? &s.qh : nullptr;
     }
 
@@ -635,7 +635,7 @@ struct QwenModel {
         prof.bytes[c] += (double)W.row_bytes * W.N;
         const bool q8 = q8_src == x && q8_k == W.K && q8_t == T && qmatvec_q8_supported(W.type, W.K);
         hipError_t e = hipSuccess;
-        if (q8 && T == 1) e = qmatvec_launch_q8(W.type, W.data, W.row_bytes, &s.q8, y, W.N, W.K, 0);
+        if (q8 && T == 1 && !inv) e = qmatvec_launch_q8(W.type, W.data, W.row_bytes, &s.q8, y, W.N, W.K, 0);
         else if (q8) e = qmatvec_launch_q8_batch(W.type, W.data, W.row_bytes, &s.q8, y, W.N, W.N, W.K, T, 0);
         else if (qmatvec_half_supported(W.type, W.data, W.row_bytes, W.N, W.K, T) &&
                  (size_t)T * W.K * 2 <= s.xh_bytes) {
@@ -657,13 +657,13 @@ struct QwenModel {
     // the type and K; otherwise two matvecs. Each output row has the same arithmetic either way.
     bool matvec_pair(const QuantWeight& A, const QuantWeight& B, const float* x, float* ya, float* yb, int T,
                      ProfCat c) {
-        if (T == 1 && q8_src == x && q8_k == A.K && q8_t == 1 && A.type == B.type && A.K == B.K &&
+        if (T == 1 && !inv && q8_src == x && q8_k == A.K && q8_t == 1 && A.type == B.type && A.K == B.K &&
             A.row_bytes == B.row_bytes && qmatvec_q8_supported(A.type, A.K)) {
             prof.bytes[c] += (double)A.row_bytes * (A.N + B.N);
             return check(qmatvec_launch_q8_pair(A.type, A.data, A.N, ya, B.data, B.N, yb, A.row_bytes, &s.q8, A.K, 0),
                          "matvec pair");
         }
-        if (T >= 2 && T <= 4) return matvec_multi({{&A, ya}, {&B, yb}}, x, T, c);  // one launch where they match
+        if (T >= 2 && T <= 4 && !inv) return matvec_multi({{&A, ya}, {&B, yb}}, x, T, c);  // one launch where they match
         return matvec(A, x, ya, T, c) && matvec(B, x, yb, T, c);
     }
 
@@ -675,7 +675,7 @@ struct QwenModel {
         std::vector<MvOut> todo(list);
         while (!todo.empty()) {
             const QuantWeight& A = *todo[0].w;
-            if (q8_src != x || q8_k != A.K || q8_t != T || !qmatvec_q8_few_supported(A.type, A.K, T)) {
+            if (inv || q8_src != x || q8_k != A.K || q8_t != T || !qmatvec_q8_few_supported(A.type, A.K, T)) {
                 if (!matvec(A, x, todo[0].y, T, c)) return false;
                 todo.erase(todo.begin());
                 continue;
@@ -904,11 +904,11 @@ struct QwenModel {
     bool moe_core(const LayerWeights& L, int T) {
         const int E = eng->n_embd, NE = eng->n_expert, NU = eng->n_expert_used, FE = eng->n_ff_exp;
         const int FS = eng->n_ff_shexp;
-        if (T == 1 && shared_as_slot(L)) return moe_core_one(L);
+        if (T == 1 && !inv && shared_as_slot(L)) return moe_core_one(L);
         // A prefill batch groups its (token, slot) entries by expert for the expert-tiled matmuls. A few tokens
         // (a speculative verify pass) take the per-token kernels, which give exactly what decoding them one at a
         // time gives
-        const bool grouped = T >= 8;
+        const bool grouped = T >= 8 || inv;
         if (grouped)  // the largest tile all three expert matrices' kernels take
             s.g_tile = std::min({qmatvec_id_batch_tile(L.We_gate.type, FE, E),
                                  qmatvec_id_batch_tile(L.We_up.type, FE, E),
@@ -1055,6 +1055,10 @@ struct QwenModel {
     // at bat[r].pos, on its KV caches. The matmuls take all rows at once (each weight read once for all
     // sequences); attention and the recurrent layers run row by row, each with its sequence selected (use_seq).
     const qwen_seq_token* bat = nullptr;
+    // Prefill (prefill(), not decoding / verify passes / batched decoding): every batch size takes the kernels of a
+    // large batch (no one-token or few-token paths), here and in qmatvec / attention (their prefill modes), so that a
+    // prompt's tokens get the same sums however it is cut into batches (chunks, a store resume, prefix reuse)
+    bool inv = false;
     ShmRegion seqs_logits_mem;  // the LM head's rows, before they go to their sequences' logits
     float* seqs_logits = nullptr;
     int seqs_logits_rows = 0;
@@ -1305,7 +1309,7 @@ struct QwenModel {
         const qmatvec_q8* qe = q8_for(E, T);
         // (a few tokens: the separate norm kernels spread a row over the GPU; one workgroup per row doing the whole
         // chain made generating 11% slower)
-        const bool fuse = gemma_fuse && L.moe && T >= 32;
+        const bool fuse = gemma_fuse && L.moe && (T >= 32 || inv);
         gemma_xn_ready = false;
         // dense MLP -> s.proj (fused: the router's input in s.sh_out too)
         const qmatvec_q8* qf = q8_for(FF, T, true);
@@ -1334,7 +1338,7 @@ struct QwenModel {
                 !check(gpu_moe_router(s.r_logits, s.sh_out, nullptr, s.ids, s.wts, s.sg, NE, NU, E, T, 0, 0),
                        "moe_router"))
                 return false;
-            const bool grouped = T >= 8;
+            const bool grouped = T >= 8 || inv;
             if (grouped)
                 s.g_tile = std::min(qmatvec_id_batch_tile(L.We_gate_up.type, 2 * FE, E),
                                     qmatvec_id_batch_tile(L.We_down.type, E, FE));
@@ -1536,7 +1540,7 @@ struct QwenModel {
             if (!matvec(L.W_lat_down, s.xn, s.lat, T, P_FFN) || !produced(s.lat, ME, T)) return false;
             xe = s.lat;
         }
-        const bool grouped = T >= 8;
+        const bool grouped = T >= 8 || inv;
         if (grouped) {
             s.g_tile = std::min(qmatvec_id_batch_tile(L.We_up.type, FE, ME), qmatvec_id_batch_tile(L.We_down.type, ME, FE));
             if (!check(gpu_moe_group(s.ids, T, NU, NE, s.g_tile, s.g_tok, s.g_pair, s.g_ntiles, s.g_tile_e,
@@ -1669,7 +1673,7 @@ struct QwenModel {
             return false;
         // SiLU, padding and quantizing in the matvec (one token; a 2..4-token version, every workgroup quantizing
         // all rows, was slower than hc_lowrank + the few-token matvec)
-        if (T == 1 && ql && qmatvec_q8_lr_supported(U.type, U.K)) {
+        if (T == 1 && !inv && ql && qmatvec_q8_lr_supported(U.type, U.K)) {
             prof.bytes[c] += (double)U.row_bytes * U.N;
             if (!check(qmatvec_launch_q8_lr(U.type, U.data, U.row_bytes, s.hlo, R, U.K, 1.0f / (float)HC, s.hgate,
                                             U.N, 0),
@@ -2075,6 +2079,20 @@ struct QwenModel {
     // Leaves the logits of the last token in s.logits (and logits_out, if given).
     int prefill(const int* tokens, int n, int pos0, float* logits_out) {
         if (n <= 0) { qwen_set_error("empty prefill"); return -1; }
+        // the prefill modes (see inv) for these forward passes only
+        struct Mode {
+            QwenModel* m;
+            explicit Mode(QwenModel* q) : m(q) {
+                m->inv = !getenv("QMATVEC_PREFILL_SPLIT_VARIANT");
+                qmatvec_set_prefill(m->inv);
+                attention_set_prefill(m->inv && m->eng->kvc ? kv_cache_n_ctx(m->eng->kvc) : 0);
+            }
+            ~Mode() {
+                m->inv = false;
+                qmatvec_set_prefill(0);
+                attention_set_prefill(0);
+            }
+        } mode(this);
         for (int done = 0; done < n;) {
             const int T = std::min(s.B, n - done);
             if (forward(tokens + done, T, pos0 + done, done + T == n ? logits_out : nullptr) != 0) return -1;

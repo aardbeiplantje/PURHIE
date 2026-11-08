@@ -87,6 +87,12 @@ typedef struct {
                            // caller's sizing); 0: those of this call's T. More let decoding use smaller chunks.
 } attention_opts;
 
+// Prefill mode (qwen_model's prefill sets it around its forward passes, n_ctx > 0; 0: off): the flash kernel for
+// batches of every size, its position ranges sized per tile from the tile's absolute end (max(ATTN_CHUNK, end /
+// ATTN_MAX_SPLITS)), not per batch, so that a token's attention is the same however its prompt was cut into batches.
+// ATTN_PREFILL_RMIN: a larger smallest range (tuning)
+void attention_set_prefill(int n_ctx);
+
 hipError_t attention_forward_opts(const float* qfull, const float* k, const float* v, const float* q_norm,
                                   const float* k_norm, __half* K, __half* V, int kv_shift, long long kv_bstride,
                                   int n_q, int n_kv, int n_rot, int pos0, int T, float freq_base, float eps, float* q,
