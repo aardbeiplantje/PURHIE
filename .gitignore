@@ -59,3 +59,6 @@ perl/*/pm_to_blib
 perl/*/*.c
 perl/*/*.bs
 refdata/
+
+# Request body logs from the deployment (opencode prompts: never commit)
+requests*.log
