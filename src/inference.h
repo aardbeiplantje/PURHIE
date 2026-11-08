@@ -353,6 +353,14 @@ int inference_set_event_cb(inference_model_t* model, inference_event_cb cb, void
 int inference_store_open(inference_model_t* model, const char* dir, int snapshot_every);
 void inference_store_close(inference_model_t* model);
 
+// Lazy prompt-end snapshots (lazy 1; 0, the default: written at every prompt's end). A sequence holds its last
+// prompt end in memory (one state-sized slot per sequence) and writes it only when it leaves that chain: a prompt
+// that diverges before it (another conversation on the sequence), inference_reset, inference_seq_free,
+// inference_store_close (and so inference_free_model), or inference_store_set_lazy(model, 0). A conversation that
+// goes on writes none (Qwen3.6-35B: 62.8 MB a request); the spaced snapshots are written as before. Lost on a crash:
+// a resume then starts from the deepest spaced snapshot. Returns 0, negative on error.
+int inference_store_set_lazy(inference_model_t* model, int lazy);
+
 typedef struct inference_store_stats {
     long long blocks_published;    // blocks this model wrote to the store
     long long blocks_attached;     // store blocks mapped into the sequence
@@ -362,6 +370,7 @@ typedef struct inference_store_stats {
     long long block_bytes;         // size of a .kvb file
     long long snapshot_bytes;      // size of a .rst file (0: no recurrent layers)
     long long snapshots_dropped;   // superseded prompt-end snapshots this model deleted
+    long long snapshots_held;      // prompt-end snapshots held in memory instead of written (inference_store_set_lazy)
 } inference_store_stats;
 
 int inference_store_get_stats(const inference_model_t* model, inference_store_stats* stats);

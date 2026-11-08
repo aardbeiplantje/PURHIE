@@ -212,13 +212,15 @@ less well and 2 is best; the adaptive default is within ~1% of the best fixed co
   checkpoints of it (`checkpoint_tail` tokens before their end) to restart from.
 - **KV block store** (`inference_store_open`): every full 256-token block of a sequence is published as a file
   named by the SHA-256 chain hash of its tokens (`<hash>.kvb`, the root hash covers the model and the layout),
-  with recurrent-state snapshots (`.rst`) every N blocks and at each prompt's last boundary. A new sequence maps
+  with recurrent-state snapshots (`.rst`) every N blocks (sparser with depth: 8 per doubling past 16 N) and at each
+  prompt's last boundary: written there (eager), or held in a state slot per sequence and written when the sequence
+  leaves that chain or the store closes (lazy, `inference_store_set_lazy`, the server's default). A new sequence maps
   the longest stored prefix in place (copy on write before writing into shared blocks) and resumes from its
   deepest snapshot; any process sharing the directory benefits. Eviction is deleting files (policy in
-  `ROCm::Inference::Store`).
-  Status (2026-11-07): opt-in in the server (`--store DIR`; the Docker repo's `ROCM_STORE`, empty by default);
-  verified across processes with `tests/store_verify.sh` (four phases, Qwen3-0.6B); the server does not yet evict or
-  spill to a disk tier (the policy exists in `ROCm::Inference::Store`, unused by the server); not measured on the 27B.
+  `ROCm::Inference::Store`; a lookup touches the blocks a prompt uses, so LRU keeps a conversation's prefix).
+  Status (2026-11-08): opt-in in the server (`--store DIR`, trimmed to `--store-max` GB after each request, LRU;
+  the Docker repo's `ROCM_STORE`); verified across processes with `tests/store_verify.sh` and `t/45-store-lru.t`. A
+  27B conversation switch: 0.79 s through the store against 36.8 s re-prefilled (12.6k tokens). No disk tier yet.
 - **Events** (`inference_set_event_cb`, per model): prefill begin / progress / end, checkpoint, KV-store attach
   and publish, draft verify passes, context full. A struct per event (type, sequence, two counts, milliseconds),
   delivered synchronously on the caller's thread; the callback does no I/O. Without a callback, one null check per

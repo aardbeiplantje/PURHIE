@@ -748,6 +748,14 @@ store_close(h)
   CODE:
     inference_store_close(handle_ptr(aTHX_ h, 0));
 
+void
+store_set_lazy(h, lazy)
+    SV* h
+    int lazy
+  CODE:
+    const int rc = inference_store_set_lazy(handle_ptr(aTHX_ h, 0), lazy);
+    if (rc != 0) croak_last(aTHX_ "store_set_lazy", rc);
+
 SV*
 store_stats(h)
     SV* h
@@ -760,6 +768,7 @@ store_stats(h)
     (void)hv_stores(hv, "snapshots_saved", newSViv((IV)st.snapshots_saved));
     (void)hv_stores(hv, "snapshots_restored", newSViv((IV)st.snapshots_restored));
     (void)hv_stores(hv, "snapshots_dropped", newSViv((IV)st.snapshots_dropped));
+    (void)hv_stores(hv, "snapshots_held", newSViv((IV)st.snapshots_held));
     (void)hv_stores(hv, "tokens_from_store", newSViv((IV)st.tokens_from_store));
     (void)hv_stores(hv, "block_tokens", newSViv(st.block_tokens));
     (void)hv_stores(hv, "block_bytes", newSViv((IV)st.block_bytes));

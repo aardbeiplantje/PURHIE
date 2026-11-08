@@ -24,7 +24,7 @@ GetOptions(\%o, 'model=s', 'models-dir=s', 'models-max=i', 'models-margin=f', 'k
            'name=s', 'draft=s', 'store=s', 'max_tokens=i', 'swa-ring=i', 'stage=s', 'recache', 'kv-type=s',
            'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'preserve-thinking!', 'log!', 'log-level=s', 'log-format=s', 'log-color=s',
            'thinking-low=i', 'thinking-medium=i', 'thinking-high=i',
-           'store-max=f', 'debug-stream!', 'help')
+           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'help')
     or pod2usage(2);
 # The log: --nolog is level none; --log-level, --log-format, --log-color are checked by the formatter
 our $LOG = eval { ROCm::Inference::Log->new(level => ($o{log} // 1) ? ($o{'log-level'} // 'info') : 'none',
@@ -38,6 +38,9 @@ die "--draft goes with --model\n" if $o{draft} && !$o{model};
 die "--models-dir: no directory $o{'models-dir'}\n" if $o{'models-dir'} && !-d $o{'models-dir'};
 my $parallel = $o{parallel} // 1;
 die "--parallel N: 1 or more\n" if $parallel < 1;
+$o{'store-snapshots'} //= 'lazy';
+die "--store-snapshots: lazy or eager\n" unless $o{'store-snapshots'} =~ /\A(?:lazy|eager)\z/;
+die "--store-snapshot-every N: 0 or more\n" if ($o{'store-snapshot-every'} // 4) < 0;
 die "--parallel: not with --draft (speculative decoding is single-sequence)\n" if $parallel > 1 && $o{draft};
 my $kv_type = $o{'kv-type'} // 'auto';
 die "--kv-type: auto, f16, q8_0 or q4_0\n" unless $kv_type =~ /\A(?:auto|f16|q8_0|q4_0)\z/;
@@ -200,10 +203,13 @@ sub load {
         die "--store needs every layer's KV history: --swa-ring 0 (the default with --store)\n"
             if $o{store} && swa_ring($m);
         if ($o{store}) {
-            store_open($m, $o{store});
+            store_open($m, $o{store}, $o{'store-snapshot-every'} // 4);
+            store_set_lazy($m, $o{'store-snapshots'} eq 'lazy' ? 1 : 0);
             my ($bytes, $files) = store_usage($o{store});
-            $LOG->info('store', model => $r->{id}, event => 'open', msg => sprintf('KV store %s: %d files, %.2f GB, %d tokens a block',
-                       $o{store}, $files, $bytes / 2**30, store_stats($m)->{block_tokens}));
+            $LOG->info('store', model => $r->{id}, event => 'open',
+                       msg => sprintf('KV store %s: %d files, %.2f GB, %d tokens a block; snapshots %s, every %d blocks',
+                                      $o{store}, $files, $bytes / 2**30, store_stats($m)->{block_tokens},
+                                      $o{'store-snapshots'}, $o{'store-snapshot-every'} // 4));
         }
     }
     # --parallel N: N sequences (conversations at once), each a KV cache of the context; sequence 0 and N - 1 more
@@ -983,6 +989,17 @@ if ($o{'models-dir'}) {
 run(listen => $o{listen}, log => $LOG->enabled('info') ? \&access_line : 0, defined $o{mode} ? (mode => oct $o{mode}) : (),
     $parallel > 1 ? (tick => \&tick) : ());
 
+# SIGINT / SIGTERM: the stores closed before the exit, so that the snapshots held in memory (--store-snapshots lazy)
+# are written (the exit's own clean-up runs in no set order)
+if ($o{store}) {
+    for my $r (grep { $_->{m} } values %M) {
+        my $held = store_stats($r->{m})->{snapshots_held};
+        my $saved = store_stats($r->{m})->{snapshots_saved};
+        eval { store_close($r->{m}); 1 } or $LOG->warn_(model => $r->{id}, event => 'store', msg => "close failed: $@");
+        $LOG->info('store', model => $r->{id}, event => 'close', msg => "KV store closed (snapshots: $saved written, $held held)");
+    }
+}
+
 
 __END__
 
@@ -1114,6 +1131,20 @@ A KV block store (e.g. under F</dev/shm>): prompt prefixes are reused across con
 
 The most the store may hold (default 16 GB): after each request the least recently used blocks are deleted to stay under
 it. Deleting a block a sequence maps is safe; a block that is needed again is prefilled again.
+
+=item --store-snapshots lazy|eager
+
+When a recurrent model's state is saved at the end of each prompt (hybrid models such as Qwen3.5 / 3.6: 62.8 MB on
+Qwen3.6-35B-A3B). C<lazy> (the default): held in memory, one per conversation slot, and written only when the
+conversation leaves its sequence (another conversation takes it, or the server stops): a conversation that goes on
+writes none. C<eager>: written at every prompt's end (the previous one of the same conversation is deleted). A crash
+loses a held one: a resume then starts from the deepest spaced snapshot.
+
+=item --store-snapshot-every N
+
+The spacing of the other snapshots, in blocks (default 4; 0: prompt ends only): every N-th block over the first 16 x N,
+then half as dense with each doubling of the depth. A prompt that leaves a stored conversation resumes from the
+deepest one before that point.
 
 =item --max_tokens N
 

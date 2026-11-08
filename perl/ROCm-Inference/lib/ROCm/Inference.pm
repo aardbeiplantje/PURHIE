@@ -23,7 +23,7 @@ our @EXPORT_OK = qw(
     tokenize detokenize chat_template bos_id eos_id token_is_eog vocab_size
     n_ctx n_past reset prefill decode_token get_logits
     generate last_prompt_stats last_error
-    store_open store_close store_stats store_block_names
+    store_open store_close store_set_lazy store_stats store_block_names
     chat_render chat reply_tags
     STOP_NONE STOP_EOG STOP_MAX_TOKENS STOP_STRING STOP_CALLBACK STOP_CONTEXT_FULL
 );
@@ -638,13 +638,21 @@ C<on_token> (called with the token id and the text that is ready; return true to
 
 Attach a KV block store: a directory (e.g. under F</dev/shm>) that holds the KV cache of every full
 block of every sequence as a file named by the chained hash of its tokens, plus recurrent-state snapshots
-every C<$snapshot_every> blocks and at the end of each prompt. Prompts generated with C<reuse_prefix> then
-start from the longest prefix any process stored, mapped in place without copying. The files are plain:
-delete them to evict (the library touches them when used), move them to other storage and back.
+every C<$snapshot_every> blocks (sparser with depth: 8 per doubling past 16 x C<$snapshot_every>) and at the end of
+each prompt. Prompts generated with C<reuse_prefix> then start from the longest prefix any process stored, mapped in
+place without copying. The files are plain: delete them to evict (the library touches them when used), move them to
+other storage and back.
+
+=item store_set_lazy($m, $lazy)
+
+With a true C<$lazy>, a prompt's end snapshot is held in memory (one per sequence) and written only when the sequence
+leaves that conversation (a prompt that diverges before it, C<reset>, C<store_close>, freeing the model): a
+conversation that goes on writes none. False (the default) writes one at every prompt's end.
 
 =item store_stats($m)
 
 A hash ref: C<blocks_published>, C<blocks_attached>, C<snapshots_saved>, C<snapshots_restored>,
+C<snapshots_dropped> (superseded prompt ends deleted), C<snapshots_held> (prompt ends held instead of written: lazy),
 C<tokens_from_store>, C<block_tokens>, C<block_bytes>, C<snapshot_bytes>.
 
 =item store_block_names($m, \@ids)

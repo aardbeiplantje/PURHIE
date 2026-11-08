@@ -68,6 +68,7 @@ static int fire_event(inference_model* m, int type, int n0, int n1, double ms) {
 }
 
 static void seq_reset(inference_model_t* m);
+static int store_flush_held(inference_model_t* m);
 static void free_seqs(inference_model_t* m);
 
 // All internal types (QuantWeight, LayerWeights, inference_model) are
@@ -1319,6 +1320,8 @@ static void seq_swap(inference_model_t* m, inference_model::SeqCtx& c) {
     std::swap(m->store_snapshot_at, c.store_snapshot_at);
     std::swap(m->store_end, c.store_end);
     std::swap(m->store_end_k, c.store_end_k);
+    std::swap(m->store_held, c.store_held);
+    std::swap(m->store_held_k, c.store_held_k);
 }
 
 int inference_seq_new(inference_model_t* m) {
@@ -1370,6 +1373,11 @@ int inference_seq_free(inference_model_t* m, int seq) {
         set_error("no sequence %d", seq);
         return INFERENCE_ERR_INVALID_ARG;
     }
+    if (m->store_dirfd >= 0 && m->seqs[seq]->store_held_k > 0) {  // its held snapshot to the store first
+        const int was = m->cur_seq;
+        if (inference_seq_select(m, seq) == 0) (void)store_flush_held(m);
+        if (inference_seq_select(m, was) != 0) return -1;
+    }
     if (seq == m->cur_seq && inference_seq_select(m, 0) != 0) return -1;
     if (qwen_model_seq_free(m->qwen, seq) != 0) { set_error("%s", qwen_model_last_error()); return -1; }
     inference_model::SeqCtx& c = *m->seqs[seq];
@@ -1403,7 +1411,9 @@ static void seq_reset(inference_model_t* m) {
 }
 
 void inference_reset(inference_model_t* m) {
-    if (m) seq_reset(m);
+    if (!m) return;
+    (void)store_flush_held(m);  // (the conversation is over: its held snapshot to the store)
+    seq_reset(m);
 }
 
 int inference_n_past(const inference_model_t* m) {
@@ -1484,17 +1494,10 @@ static int ensure_writable(inference_model_t* m, int p, int n) {
     return 0;
 }
 
-// The recurrent state as <hash>.rst: written to an anonymous file, linked under its name once complete
-static int store_save_state(inference_model_t* m, const inference_model::Hash& h) {
-    size_t bytes = 0;
-    void* mem = qwen_model_state_memory(m->qwen, &bytes);
-    if (!mem || bytes == 0) return 0;  // no recurrent layers
+// A recurrent state (mem, bytes: the live one or a held slot, after qwen_model_sync) as <hash>.rst: written to an
+// anonymous file, linked under its name once complete
+static int store_write_state(inference_model_t* m, const inference_model::Hash& h, const void* mem, size_t bytes) {
     const std::string name = store_name(h, "rst");
-    if (store_has(m, name)) {
-        store_touch(m, name);
-        return 0;
-    }
-    if (qwen_model_sync(m->qwen) != 0) { set_error("sync failed: %s", qwen_model_last_error()); return -1; }
     const int fd = openat(m->store_dirfd, ".", O_TMPFILE | O_RDWR | O_CLOEXEC, 0644);
     if (fd < 0) { set_error("store: cannot create a state file: %s", strerror(errno)); return -1; }
     for (size_t done = 0; done < bytes;) {
@@ -1514,6 +1517,43 @@ static int store_save_state(inference_model_t* m, const inference_model::Hash& h
     if (rc != 0 && err != EEXIST) { set_error("store: linking %s failed: %s", name.c_str(), strerror(err)); return -1; }
     if (rc == 0) ++m->st_snap_saved;
     return 0;
+}
+
+// The live recurrent state as <hash>.rst (an existing one is touched)
+static int store_save_state(inference_model_t* m, const inference_model::Hash& h) {
+    size_t bytes = 0;
+    void* mem = qwen_model_state_memory(m->qwen, &bytes);
+    if (!mem || bytes == 0) return 0;  // no recurrent layers
+    const std::string name = store_name(h, "rst");
+    if (store_has(m, name)) {
+        store_touch(m, name);
+        return 0;
+    }
+    if (qwen_model_sync(m->qwen) != 0) { set_error("sync failed: %s", qwen_model_last_error()); return -1; }
+    return store_write_state(m, h, mem, bytes);
+}
+
+// The state slot that holds a lazy prompt-end snapshot (after the checkpoints' slots 0 .. kInferenceCheckpoints - 1)
+static const int kStoreSlot = 4;
+
+// The current sequence's held prompt-end snapshot (lazy mode) to the store, if any: it is leaving that chain
+static int store_flush_held(inference_model_t* m) {
+    const int k = m->store_held_k;
+    m->store_held_k = 0;
+    if (k <= 0 || m->store_dirfd < 0) return 0;
+    const std::string name = store_name(m->store_held, "rst");
+    if (store_has(m, name)) {
+        store_touch(m, name);
+        return 0;
+    }
+    if (qwen_model_sync(m->qwen) != 0) { set_error("sync failed: %s", qwen_model_last_error()); return -1; }
+    size_t bytes = 0;
+    const void* mem = qwen_model_state_slot_memory(m->qwen, kStoreSlot, &bytes);
+    if (!mem || bytes != state_bytes(m)) return 0;
+    const long long snap = m->st_snap_saved;
+    const int rc = store_write_state(m, m->store_held, mem, bytes);
+    fire_event(m, INFERENCE_EVT_STORE, 0, (int)(m->st_snap_saved - snap), 0.0);
+    return rc;
 }
 
 // The snapshot spacing: every snapshot_every-th block boundary over the first 16 x snapshot_every blocks, then
@@ -1552,6 +1592,20 @@ static int store_after_forward(inference_model_t* m) {
     }
     const int B = kv_B(m), k = m->n_past / B;
     if (m->n_past % B == 0 && snapshot_boundary(m, k) && state_bytes(m) > 0) {
+        if (m->store_lazy && k == m->store_snapshot_at && !snapshot_on_grid(m, k)) {
+            // lazy: the prompt's end in a state slot, not written. A next prompt end on the chain replaces it for
+            // free; it is written when the sequence leaves the chain (store_flush_held)
+            const std::string name = store_name(m->chain[(size_t)k - 1], "rst");
+            if (store_has(m, name)) {
+                store_touch(m, name);
+            } else if (!(m->store_held_k == k && m->store_held == m->chain[(size_t)k - 1])) {
+                if (qwen_model_state_save(m->qwen, kStoreSlot) != 0) { set_error("state snapshot hold failed"); return -1; }
+                m->store_held = m->chain[(size_t)k - 1];
+                m->store_held_k = k;
+                ++m->st_snap_held;
+            }
+            return 0;
+        }
         const long long snap = m->st_snap_saved;
         if (store_save_state(m, m->chain[k - 1]) != 0) return -1;
         if (k == m->store_snapshot_at) {
@@ -1902,6 +1956,7 @@ static size_t stop_prefix_tail(const std::string& s, const std::vector<std::stri
 // Save the recurrent state as the checkpoint at the current position (kInferenceCheckpoints slots, the oldest
 // one is replaced)
 static const int kInferenceCheckpoints = 4;
+static_assert(kStoreSlot >= kInferenceCheckpoints, "the held snapshot's slot is not a checkpoint's");
 
 static int save_checkpoint(inference_model_t* m) {
     int slot = (int)m->ckpts.size();
@@ -2030,6 +2085,12 @@ static int sync_prompt(inference_model_t* m, const int32_t* p, int n, int tail, 
             start = ck >= 0 ? m->ckpts[ck].pos : 0;
         }
     }
+    // a held prompt-end snapshot (lazy) the prompt leaves, or does not resume from (an earlier start), goes to the
+    // store now, so that the lookup below and later requests find it
+    if (m->store_held_k > 0) {
+        const size_t hb = (size_t)m->store_held_k * (size_t)kv_B(m);
+        if ((L < hb || (size_t)start < hb) && store_flush_held(m) != 0) return -1;
+    }
     std::vector<inference_model::Hash> hs;
     const int from_store = store_lookup(m, p, n, &hs);
     if (from_store > start) {
@@ -2125,9 +2186,9 @@ int inference_store_open(inference_model_t* m, const char* dir, int snapshot_eve
     m->chain.clear();
     m->published = 0;  // each sequence's full blocks are published by its next forward pass
     for (inference_model::SeqCtx* q : m->seqs)
-        if (q) q->chain.clear(), q->published = 0, q->store_end_k = 0;
-    m->st_published = m->st_attached = m->st_snap_saved = m->st_snap_restored = m->st_tokens = m->st_snap_dropped = 0;
-    m->store_end_k = 0;
+        if (q) q->chain.clear(), q->published = 0, q->store_end_k = 0, q->store_held_k = 0;
+    m->st_published = m->st_attached = m->st_snap_saved = m->st_snap_restored = m->st_tokens = m->st_snap_dropped = m->st_snap_held = 0;
+    m->store_end_k = m->store_held_k = 0;
     return 0;
 }
 
@@ -2150,15 +2211,38 @@ int inference_store_block_names(const inference_model_t* m, const int32_t* token
     return (int)names.size();
 }
 
+// Every sequence's held snapshot (lazy mode) to the store
+static void store_flush_all(inference_model_t* m) {
+    if (m->store_dirfd < 0) return;
+    const int was = m->cur_seq;
+    (void)store_flush_held(m);
+    for (size_t j = 0; j < m->seqs.size(); ++j) {
+        const inference_model::SeqCtx* q = m->seqs[j];
+        if ((int)j == was || !q || (j > 0 && !q->used) || q->store_held_k <= 0) continue;
+        if (inference_seq_select(m, (int)j) == 0) (void)store_flush_held(m);
+    }
+    if (m->cur_seq != was) (void)inference_seq_select(m, was);
+}
+
+int inference_store_set_lazy(inference_model_t* m, int lazy) {
+    clear_error();
+    if (!m) { set_error("Invalid arguments"); return INFERENCE_ERR_INVALID_ARG; }
+    if (!lazy) store_flush_all(m);
+    m->store_lazy = lazy ? 1 : 0;
+    return 0;
+}
+
 void inference_store_close(inference_model_t* m) {
     if (!m || m->store_dirfd < 0) return;
+    store_flush_all(m);
     close(m->store_dirfd);
     m->store_dirfd = -1;
     m->store_dir.clear();
     m->chain.clear();
     m->published = 0;
     for (inference_model::SeqCtx* q : m->seqs)
-        if (q) q->chain.clear(), q->published = 0, q->store_end_k = 0;
+        if (q) q->chain.clear(), q->published = 0, q->store_end_k = 0, q->store_held_k = 0;
+    m->store_end_k = m->store_held_k = 0;
 }
 
 int inference_store_get_stats(const inference_model_t* m, inference_store_stats* st) {
@@ -2168,6 +2252,7 @@ int inference_store_get_stats(const inference_model_t* m, inference_store_stats*
     st->snapshots_saved = m->st_snap_saved;
     st->snapshots_restored = m->st_snap_restored;
     st->snapshots_dropped = m->st_snap_dropped;
+    st->snapshots_held = m->st_snap_held;
     st->tokens_from_store = m->st_tokens;
     st->block_tokens = m->kvc ? kv_cache_block_tokens(m->kvc) : 0;
     st->block_bytes = m->kvc ? (long long)kv_cache_block_bytes(m->kvc) : 0;

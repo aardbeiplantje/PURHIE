@@ -166,7 +166,11 @@ sequences are dropped (the engine does not have them; tried for llama.cpp withou
   a conversation going on in the sequence kept its first blocks at their write time, the oldest files, while each
   request writes a 62.8 MB snapshot (Qwen3.6-35B: 5 MB blocks; 458 requests ~28 GB > 16 GB). Now every lookup
   touches the prompt's blocks and its deepest snapshot (`t/45-store-lru.t`). And fewer snapshots (272f5e7): sparser
-  with depth (8 per doubling past 64 blocks), and a sequence's superseded prompt-end snapshot is deleted. Open: the
+  with depth (8 per doubling past 64 blocks), and a sequence's superseded prompt-end snapshot is deleted. And (2026-11-08) lazy
+  prompt ends, the server's default (`--store-snapshots lazy|eager`, `--store-snapshot-every N`): held in a state
+  slot per sequence and written when the sequence leaves the chain, on reset / seq free / store close, and on the
+  server's SIGTERM (the Docker repo's llama.sh now forwards docker stop's SIGTERM; before, nginx was PID 1 and the
+  server was SIGKILLed). A conversation that goes on writes no prompt-end snapshot; a crash loses the held one. Open: the
   10 identical resends in the log (5 each before two compactions, at ~210k tokens) look like failed requests,
   whose replies the log does not have.
 - **Fixed (2026-11-08): each new user message re-prefilled the previous turn.** Qwen3.6's template renders an

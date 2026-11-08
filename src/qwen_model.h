@@ -97,6 +97,9 @@ int qwen_model_state_restore(qwen_model_t* model, int slot);
 // layers), for writing it to a file and reading it back (the KV block store). Only after qwen_model_sync: the GPU
 // may still be writing it; a CPU write is seen by the next forward pass.
 void* qwen_model_state_memory(qwen_model_t* model, size_t* bytes);
+// A saved slot (qwen_model_state_save) of the current sequence in host memory, as qwen_model_state_memory (after
+// qwen_model_sync); NULL when that slot was never saved
+void* qwen_model_state_slot_memory(qwen_model_t* model, int slot, size_t* bytes);
 // Wait for the model's queued GPU work. Returns 0, -1 on error.
 int qwen_model_sync(qwen_model_t* model);
 

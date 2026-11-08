@@ -2151,6 +2151,12 @@ void* qwen_model_state_memory(qwen_model_t* model, size_t* bytes) {
     return model ? model->rs.mem.base : nullptr;
 }
 
+void* qwen_model_state_slot_memory(qwen_model_t* model, int slot, size_t* bytes) {
+    void* p = model && slot >= 0 && slot < (int)model->rs.ckpt.size() ? model->rs.ckpt[slot].base : nullptr;
+    if (bytes) *bytes = p ? model->rs.mem.total : 0;
+    return p;
+}
+
 int qwen_model_sync(qwen_model_t* model) { return model && model->sync() ? 0 : -1; }
 
 int qwen_model_state_save(qwen_model_t* model, int slot) {
