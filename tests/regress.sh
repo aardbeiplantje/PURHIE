@@ -16,6 +16,10 @@
 #   pk    passkey <model> <text> <args> (a pass key found at every context length and depth): exit 0
 #   mv    matvec_verify <model> <args = tensors>: exit 0
 #   test  <args = a test binary and its arguments; the model, if any, is its first argument>: exit 0
+#   sh    <args = a script in tests/ and its arguments; the model, if any, is its first argument>: exit 0
+#   perl  prove in <args = a Perl distribution's directory>, built there first (perl Makefile.PL, make), the model,
+#         if any, as ROCM_INFERENCE_TEST_MODEL; PERL5LIB has the repo's Minijinja, ROCm::Inference and Web::Route
+#         (skipped while perl-minijinja-xs is not built: its scripts/setup-minijinja.sh, then make)
 # Paths may use $VARS (exported here: REFS). Runs from build/co, as the binaries expect; logs in $REGRESS_LOGS
 # (default /tmp/regress-logs).
 set -u
@@ -99,6 +103,29 @@ while IFS= read -r line; do
             if [ "$model" = - ]; then ../$bin "$@" > "$log" 2>&1; else ../$bin "$model" "$@" > "$log" 2>&1; fi
             rc=$?; ok=$([ $rc = 0 ] && echo 1 || echo 0)
             msg="$(tail -1 "$log") (exit $rc)" ;;
+        sh)
+            set -- $args
+            script=../../tests/$1; shift
+            if [ "$model" = - ]; then "$script" "$@" > "$log" 2>&1; else "$script" "$model" "$@" > "$log" 2>&1; fi
+            rc=$?; ok=$([ $rc = 0 ] && echo 1 || echo 0)
+            msg="$(tail -1 "$log") (exit $rc)" ;;
+        perl)
+            root=$(cd ../.. && pwd)
+            mj=$root/perl-minijinja-xs/blib
+            if [ ! -d "$mj/arch" ]; then
+                printf "SKIP  %-28s perl-minijinja-xs is not built (%s)\n" "$name" "$mj"; skip=$((skip + 1))
+                echo "$line" >> "$new"; continue
+            fi
+            dir=$root/$args
+            lib="$mj/lib:$mj/arch:$root/perl/ROCm-Inference/blib/lib:$root/perl/ROCm-Inference/blib/arch:$root/perl/Web-Route/lib"
+            kdir=$PWD  # the kernels just built (build/co)
+            (
+                cd "$dir" && { [ -f Makefile ] || perl Makefile.PL; } && make \
+                && PERL5LIB="$lib${PERL5LIB:+:$PERL5LIB}" INFERENCE_KERNEL_DIR=$kdir \
+                   ROCM_INFERENCE_TEST_MODEL=$([ "$model" = - ] || echo "$model") prove -b t/
+            ) > "$log" 2>&1
+            rc=$?; ok=$([ $rc = 0 ] && echo 1 || echo 0)
+            msg="$(grep -E '^Files=' "$log" | tail -1 | cut -d, -f1-2) $(grep -E '^Result:' "$log" | tail -1) (exit $rc)" ;;
         *) ok=0 msg="unknown kind $kind" ;;
     esac
     printf "%s  %-28s %s  [%ds]\n" "$([ "$ok" = 1 ] && echo PASS || echo FAIL)" "$name" "$msg" $((SECONDS - t0))

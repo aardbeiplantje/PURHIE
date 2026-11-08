@@ -258,9 +258,9 @@ Quality / correctness:
   the test's buffer overrun fixed on 2026-11-04 (5e6e9e6). Close after a few clean runs.
 
 Tests and API:
-- Fold the remaining verifiers into the regression suite: generate_verify, store_verify.sh, mtp_verify (needs
-  the draft head), the Perl t/ suite (Minijinja and Web::Route on PERL5LIB; `t/60-server.t` wants Qwen3.5-4B:
-  on Qwen3-0.6B its "is 91 prime" answer checks fail).
+- In `make regress` (2026-11-08): kv_verify, generate_verify, events_test, seq_verify (0.6B, 4B), store_verify.sh,
+  and the Perl suites (Web::Route, Minijinja, ROCm::Inference with the server tests on Qwen3.5-4B). Still out:
+  mtp_verify and `events_test MODEL DRAFT` (the Flash model and its draft head; the model does not pin here).
 - Untested: Mistral (llama architecture, SentencePiece tokenizer), Llama-3.1-8B (no files); Llama 3.1's built-in
   tools (<|python_tag|> brave_search.call(...)) not parsed; Nemotron's reply format (check against its template).
 - The XS module lacks inference_prefill_logits, model_name and set_seed (add when a Perl user needs them); a C

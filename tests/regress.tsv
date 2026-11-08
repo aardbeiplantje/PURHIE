@@ -7,6 +7,16 @@
 # kernels and the C API
 quick	test	attn_decode	-	attn_decode_verify --no-timing	-	-
 quick	test	capi_smoke	/models/Qwen3-0.6B-Q8_0.gguf	capi_smoke	-	-
+quick	test	kv_cache	-	kv_verify	-	-
+quick	test	generate_qwen3_06b	/models/Qwen3-0.6B-Q8_0.gguf	generate_verify	-	-
+quick	test	events_qwen3_06b	/models/Qwen3-0.6B-Q8_0.gguf	events_test	-	-
+quick	test	seq_qwen3_06b	/models/Qwen3-0.6B-Q8_0.gguf	seq_verify	-	-
+quick	test	seq_qwen35_4b	/models/Qwen3.5-4B-ROCMFP4.gguf	seq_verify	-	-
+quick	sh	store_qwen3_06b	/models/Qwen3-0.6B-Q8_0.gguf	store_verify.sh	-	-
+# the Perl modules and the server (t/60-server.t's answers want a 4B model, not the 0.6B)
+quick	perl	perl_web_route	-	perl/Web-Route	-	-
+quick	perl	perl_minijinja	-	perl-minijinja-xs	-	-
+quick	perl	perl_rocm_inference	/models/Qwen3.5-4B-ROCMFP4.gguf	perl/ROCm-Inference	-	-
 quick	pk	pk_qwen3_06b	/models/Qwen3-0.6B-Q8_0.gguf	--ctx 4096,16384 --kv q8_0	-	-
 # small models
 quick	ppl	qwen25_05b	/data/hf/qwen-gguf/qwen2.5-0.5b-instruct-q8_0.gguf	--ctx 512 --chunks 20	16.8243	0.2
