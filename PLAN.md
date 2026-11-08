@@ -154,19 +154,22 @@ sequences are dropped (the engine does not have them; tried for llama.cpp withou
 - **Switching reads the prefix back** instead of prefilling it: a sequence resumes from any stored prefix.
 - **Eviction: in.** The server trims the store to `--store-max` GB (default 16) after each request, least recently
   used first, and logs what each request mapped and published (`kv` and `evict` lines).
-- **Not done:** the store on by default; a disk tier; a measured switch on the 27B model. Estimate: its KV is 69,632
-  bytes per token (F16), so a 12k prefix is 0.84 GB and /data reads at 6.5 GB/s; a switch should take seconds
-  against the 227 s re-prefill in the logs. Unmeasured.
+- **Measured (2026-11-08): a 27B switch.** Qwen3.8-27B, store on /dev/shm: A (12,628 tokens) cold in 35.8 s, B
+  (5,892) takes the sequence, A resumes with 12,544 tokens from the store and 93 prefilled in 0.79 s; re-prefilled
+  without the store 36.8 s (47x). 27B store files: 16 MB blocks (64 KB/token), 149.6 MB snapshots; A and B together
+  3.9 GB, 2.8 GB of it snapshots. At 16 GB, one 130k-token 27B conversation (8 GB of blocks, ~40 snapshots = 6 GB)
+  nearly fills the store: `--store-max` 32+ on the deployment (/dev/shm is RAM, shared with the models).
+- **Not done:** a disk tier; the store on by default in run.sh (the deployment sets ROCM_STORE_DIR already).
 - **Fixed (2026-11-08): a resumed agent lost its prefix.** opencode's log (505 requests, all `id_slot` 5) is one main
   agent, append-only, with compaction requests and a subagent between; after the subagent the main agent resumed a
   ~130k-token prefix from the store and found it evicted: blocks were touched only when mapped from the store, so
   a conversation going on in the sequence kept its first blocks at their write time, the oldest files, while each
   request writes a 62.8 MB snapshot (Qwen3.6-35B: 5 MB blocks; 458 requests ~28 GB > 16 GB). Now every lookup
-  touches the prompt's blocks and its deepest snapshot (`t/45-store-lru.t`). Not changed: a snapshot per request
-  is a lot of writing for a long conversation; the 10 identical resends in the log (5 each before two compactions,
-  at ~210k tokens) look like failed requests, whose replies the log does not have.
-Next: watch the resume on the deployment (the `kv` line's mapped blocks); then measure a 27B switch with `--store` on
-/dev/shm and decide the default (run.sh).
+  touches the prompt's blocks and its deepest snapshot (`t/45-store-lru.t`). And fewer snapshots (272f5e7): sparser
+  with depth (8 per doubling past 64 blocks), and a sequence's superseded prompt-end snapshot is deleted. Open: the
+  10 identical resends in the log (5 each before two compactions, at ~210k tokens) look like failed requests,
+  whose replies the log does not have.
+Next: watch the resume on the deployment (the `kv` line's mapped blocks) and `--parallel 2` there.
 
 The server serves one request at a time unless `--parallel N`, which batches N conversations of one model (not
 with a draft head); with `--models-dir` each loaded model has its own sequences and the loop steps them in turn. A
