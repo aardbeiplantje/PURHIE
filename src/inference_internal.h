@@ -46,6 +46,8 @@ enum LayerKind : int8_t {
     LAYER_LINEAR_ATTN = 1,  // Gated DeltaNet: attn_qkv, attn_gate, ssm_* tensors
     LAYER_MAMBA2      = 2,  // Nemotron-H: a Mamba-2 mixer (ssm_in, conv1d, the selective scan, ssm_out), no FFN
     LAYER_FFN         = 3,  // Nemotron-H: an FFN block alone (MoE or dense, squared ReLU), no token mixer
+    LAYER_MLA_ATTN    = 4,  // GLM-5.3-Flash: MLA with low-rank projections (attn_q_a/b, attn_kv_a, attn_k_b/v_b)
+    LAYER_KDA         = 5,  // GLM-5.3-Flash: Kimi Delta Attention (per-channel decay DeltaNet variant)
 };
 
 // Hyper-connection mixer (qwen4exp): the residual is n_hc parallel streams of n_embd. In place of every RMSNorm,
@@ -83,6 +85,13 @@ struct LayerWeights {
     const float* ssm_dt = nullptr;                    // [dt_rank] F32, ssm_dt.bias
     const float* ssm_a = nullptr;                     // [dt_rank] F32, -exp(A_log)
     const float* ssm_norm = nullptr;                  // [d_state] F32, per-head gated RMSNorm gamma
+
+    // MLA (GLM-5.3-Flash): low-rank Q/K/V projections
+    QuantWeight W_q_a, W_q_b;                         // attn_q_a/b: [n_embd, q_lora_rank] / [q_lora_rank, HQ*HD]
+    const float* attn_q_a_norm = nullptr;             // [q_lora_rank] F32, Q projection norm
+    const float* attn_kv_a_norm = nullptr;            // [kv_lora_rank] F32, KV projection norm
+    QuantWeight W_kv_a, W_k_b, W_v_b;                 // attn_kv_a_mqa / k_b / v_b: KV projections
+    QuantWeight W_attn_out;                           // attn_out: [HQ*HD, n_embd], attention output projection
 
     // Mixture of experts (qwen35moe, Phase 20 Step 6): replaces the dense FFN when moe
     bool moe = false;
@@ -133,6 +142,44 @@ struct LayerWeights {
     const float* exp_probs_b = nullptr;               // [n_expert]: added to the router's sigmoid for the choice only
     QuantWeight W_lat_down, W_lat_up;                 // Super: ffn_latent_down [lat x n_embd] / _up [n_embd x lat]:
                                                       // the experts work on (and output) lat-wide rows
+
+    // DeepSeek V4 (deepseek2): MLA with output LoRA, compressed attention, hyper-connections, DSA indexer.
+    // Hyper-connections use full-rank Sinkhorn normalization (different from qwen4exp's low-rank HcMix).
+    QuantWeight hc_attn_base;                         // [hc_mix]: hyper-connection attention base
+    QuantWeight hc_attn_fn;                           // [hc_dim x hc_mix]: hyper-connection attention function
+    const float* hc_attn_scale = nullptr;             // [3]: attention scale factors
+    QuantWeight hc_ffn_base;                          // [hc_mix]: hyper-connection FFN base
+    QuantWeight hc_ffn_fn;                            // [hc_dim x hc_mix]: hyper-connection FFN function
+    const float* hc_ffn_scale = nullptr;              // [3]: FFN scale factors
+    QuantWeight attn_wo_a, attn_wo_b;                 // output LoRA: [n_head*HD/n_out_groups, n_out_groups*o_lora_rank] / [n_out_groups*o_lora_rank, n_embd]
+    QuantWeight attn_kv;                              // attn_kv: [n_embd, n_embd_head_k] (KV projection)
+    const float* attn_sinks = nullptr;                // [n_head] F32, attention sinks
+    const float* attn_q_a_norm_ds = nullptr;          // [n_embd_head_k] F32, KV projection norm (DS variant)
+    bool fable_half_width = false;                    // half-width experts: gate/up [n_embd/2, ...], down [n_ff_exp/2, ...]
+    bool is_nextn = false;                            // nextn prediction layer (MTP draft head)
+    // Nextn prediction tensors (MTP draft head)
+    QuantWeight nextn_e_proj;                         // [n_embd x n_embd]: embedding projection
+    QuantWeight nextn_h_proj;                         // [n_embd x n_embd]: hyper-connection projection
+    const float* nextn_enorm = nullptr;               // [n_embd]
+    const float* nextn_hnorm = nullptr;               // [n_hc * n_embd]
+    const float* nextn_shared_head_norm = nullptr;    // [n_embd]
+    QuantWeight nextn_hc_head_base;                   // [n_hc]
+    QuantWeight nextn_hc_head_fn;                     // [n_hc * n_embd x n_hc]
+    const float* nextn_hc_head_scale = nullptr;       // [1]
+    // Compressed attention tensors (ratio > 0)
+    QuantWeight attn_compressor_ape;                  // [coff*head_size, ratio]
+    QuantWeight attn_compressor_kv;                   // [n_embd, coff*head_size]
+    QuantWeight attn_compressor_gate;                 // [n_embd, coff*head_size]
+    const float* attn_compressor_norm = nullptr;      // [head_size]
+    // DSA indexer tensors (ratio == 4)
+    QuantWeight indexer_attn_q_b;                     // [q_lora_rank, indexer_n_head*indexer_head_size]
+    QuantWeight indexer_proj;                         // [n_embd, indexer_n_head]
+    QuantWeight indexer_compressor_ape;               // [coff*indexer_head_size, ratio]
+    QuantWeight indexer_compressor_kv;                // [n_embd, coff*indexer_head_size]
+    QuantWeight indexer_compressor_gate;              // [n_embd, coff*indexer_head_size]
+    const float* indexer_compressor_norm = nullptr;   // [indexer_head_size]
+    // Hash layer routing (ffn_gate_tid2eid)
+    QuantWeight ffn_gate_tid2eid;                     // [n_expert_used, n_vocab]: token ID to expert ID map
 };
 
 // MTP draft head (a qwen4exp nextn sidecar GGUF, inference_set_draft_model): one more full-attention MoE block
@@ -201,7 +248,11 @@ struct inference_model {
     // qwen4exp (Qwen3.8-Flash-Next). n_hc == 0: a plain residual stream (qwen35 / qwen35moe).
     int n_hc = 0;                                       // hyper_connection.count: parallel residual streams
     int hc_rank = 0;                                    // hyper_connection.low_rank
-    HcMix hc_head;                                      // output_hc_*: the final mixer, in place of output_norm
+    HcMix hc_head;                                      // output_hc_*: the final mixer, in place of output_norm (qwen4exp low-rank)
+    // DeepSeek V4 / GLM-5.3-Flash full-rank output hyper-connection (Sinkhorn normalization)
+    QuantWeight hc_out_base;                            // [n_hc]: output hyper-connection base bias
+    QuantWeight hc_out_fn;                              // [hc_dim x n_hc]: output hyper-connection function matrix
+    const float* hc_out_scale = nullptr;                // [1]: output hyper-connection scale factor
     bool gdn_sigmoid_gate = false;                      // DeltaNet output gate sigmoid(z) instead of SiLU(z)
     // PLE n-gram hash embeddings: a token's row of head h is (t0*m0 ^ t1*m1 ^ .. ^ t_{n-1}*m_{n-1}) % vocab[h] +
     // offset[h] for its n-gram of the n - 1 previous tokens (n = 2 .. ple_ngram, ple_per_ngram heads each); the
@@ -283,6 +334,41 @@ struct inference_model {
     // output-normed rows pooled into the embedding instead of an LM head. pooling_type: 1 mean, 2 first (CLS),
     // 3 last; -1: not an embedding model
     int embed_pooling = -1;
+    // GLM-5.3-Flash (glm5_next): MLA with DSA indexer, KDA linear attention, hyper-connections with Sinkhorn.
+    // The release is 320B/18B, 45 layers (34 KDA + 11 MLA), 288 experts + 1 shared, top-8.
+    bool glm5_next = false;
+    int n_lora_q = 0;                                   // q_lora_rank (1536 in release)
+    int n_lora_kv = 0;                                  // kv_lora_rank (512 in release)
+    int indexer_top_k = 0;                              // DSA: top-k selection (2048 in release)
+    int indexer_kpool = 4;                              // key pooling factor (4 in release)
+    int indexer_head_count = 0;                         // DSA indexer heads
+    int indexer_key_length = 0;                         // DSA indexer key length
+    QuantWeight indexer_k_norm;                         // DSA: indexer key normalization [indexer_head_size]
+    QuantWeight indexer_proj;                           // DSA: projection to indexer space
+    QuantWeight indexer_attn_k;                         // DSA: attention key projection
+    QuantWeight indexer_attn_q_b;                       // DSA: attention query projection (low-rank)
+    int hc_sinkhorn_iters = 0;                          // Sinkhorn normalization iterations
+    float hc_eps = 0.0f;                                // Sinkhorn convergence threshold
+    float swiglu_limit = 0.0f;                          // SwiGLU clamp value (10.0 in release)
+    int first_dense_layers = 0;                         // First N layers are dense FFN, rest are MoE
+    float e_score_correction_bias = 0.0f;              // MoE router sigmoid bias
+    // DeepSeek V4 (deepseek2): MLA + compressed attention, full-rank hyper-connections.
+    bool deepseek2 = false;
+    int n_mla_head_q = 0;                               // MLA: query heads (per-head Q)
+    int n_mla_head_k = 0;                               // MLA: key heads (MQA-style)
+    int n_mla_head_v = 0;                               // MLA: value heads (MQA-style)
+    int compress_ratio = 0;                             // Compressed attention ratio (0, 4 in release)
+    int n_lora_o = 0;                                   // output LoRA rank
+    int n_attn_out_groups = 0;                          // attention output groups
+    int expert_gating_func = 0;                         // MoE: gating function type
+    int n_hash_layers = 0;                              // first N layers use hash routing
+    int n_swa = 0;                                      // sliding window attention length
+    float compress_rope_freq_base = 0.0f;               // compressor RoPE base
+    int indexer_n_head = 0;                             // DSA indexer heads
+    int indexer_head_size = 0;                          // DSA indexer key length
+    int nextn_predict_layers = 0;                       // MTP prediction layers
+    std::vector<uint64_t> compress_ratios;              // per-layer compression ratios
+    std::vector<uint64_t> swiglu_clamp_exp;             // per-layer SwiGLU clamp exponents
 };
 
 // A sequence's context while another is current (inference_seq_select swaps it with the model's fields)

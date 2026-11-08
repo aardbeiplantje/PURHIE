@@ -831,6 +831,562 @@ static bool load_layer_nemotron(inference_model* m, int i, LayerWeights& L, cons
            check_shape("ffn_down_shexp", i, L.W_down, E, FS);
 }
 
+
+// GLM-5.3-Flash layer loading (glm5_next): MLA with DSA indexer, KDA linear attention.
+// First 3 layers: dense FFN (not MoE). Rest: MoE with sigmoid routing + e_score_correction_bias.
+// 34 KDA layers (linear attention with per-channel decay) + 11 MLA layers (sparse attention via DSA).
+static bool load_layer_glm5_next(inference_model* m, int i, LayerWeights& L, const std::vector<int>& ple_layers) {
+    const int E = m->n_embd, FF = m->n_ff;
+    char name[128];
+    auto nm = [&](int idx, const char* t) { snprintf(name, sizeof(name), "blk.%d.%s", idx, t); return name; };
+    (void)ple_layers;  // not used by glm5_next
+
+    // Classify layer: KDA has ssm_beta_alpha/attn_qkv (DeltaNet-like), MLA has attn_q_a (MLA projections)
+    bool is_kda = find_tensor_index(m->gguf, nm(i, "attn_qkv.weight")) >= 0 ||
+                  find_tensor_index(m->gguf, nm(i, "ssm_beta_alpha.weight")) >= 0;
+    bool is_mla = find_tensor_index(m->gguf, nm(i, "attn_q_a.weight")) >= 0;
+    
+    if (!is_kda && !is_mla) {
+        set_error("glm5_next: blk.%d cannot classify (attn_qkv=%d ssm_beta_alpha=%d attn_q_a=%d)", i,
+                  find_tensor_index(m->gguf, nm(i, "attn_qkv.weight")),
+                  find_tensor_index(m->gguf, nm(i, "ssm_beta_alpha.weight")),
+                  find_tensor_index(m->gguf, nm(i, "attn_q_a.weight")));
+        return false;
+    }
+    
+    L.kind = is_kda ? LAYER_KDA : LAYER_MLA_ATTN;
+    if (is_mla) L.kv_slot = m->n_kv_layers++;  // only attention layers get KV cache space
+
+    // Common: attention normalization
+    if (!bind_norm(m->gguf, nm(i, "attn_norm.weight"), E, L.attn_norm, true)) return false;
+    
+    // Determine if this is a dense FFN layer (first N layers) or MoE
+    bool is_dense = i < m->first_dense_layers;
+    L.moe = !is_dense;
+    
+    if (is_mla) {
+        // MLA tensors: low-rank Q/K/V projections
+        // attn_q_a: [n_embd, q_lora_rank]
+        // attn_q_b: [q_lora_rank, HQ*HD]
+        // attn_kv_a_mqa: [n_embd, kv_lora_rank + qk_rope_head_dim]
+        // attn_k_b: [n_embd_head_qk_nope, kv_lora_rank, n_head]
+        // attn_v_b: [kv_lora_rank, n_embd_head_v_mla, n_head]
+        // attn_out: [n_head * n_embd_head_v_mla, n_embd]
+        
+        const int q_lora = m->n_lora_q;
+        const int kv_lora = m->n_lora_kv;
+        
+        // Q projection (low-rank, two stages)
+        if (!bind_weight(m->gguf, nm(i, "attn_q_a.weight"), L.W_q_a, true) ||
+            !bind_weight(m->gguf, nm(i, "attn_q_b.weight"), L.W_q_b, true)) return false;
+        
+        // Q/K/V norms
+        if (!bind_norm(m->gguf, nm(i, "attn_q_a_norm.weight"), q_lora, L.attn_q_a_norm, true) ||
+            !bind_norm(m->gguf, nm(i, "attn_kv_a_norm.weight"), kv_lora, L.attn_kv_a_norm, true)) return false;
+        
+        // K/V projections
+        if (!bind_weight(m->gguf, nm(i, "attn_kv_a_mqa.weight"), L.W_kv_a, true) ||
+            !bind_weight(m->gguf, nm(i, "attn_k_b.weight"), L.W_k_b, true) ||
+            !bind_weight(m->gguf, nm(i, "attn_v_b.weight"), L.W_v_b, true)) return false;
+        
+        // Attention output
+        if (!bind_weight(m->gguf, nm(i, "attn_out.weight"), L.W_attn_out, true)) return false;
+    }
+    
+    if (is_kda) {
+        // KDA tensors: Kimi Delta Attention with per-channel decay
+        // attn_qkv: fused [Q | KV] projection (can be split)
+        // ssm_beta_alpha: fused [ssm_beta | ssm_alpha] (can be split)
+        // ssm_out: output projection [n_embd x d_inner]
+        // ssm_conv1d: conv1d weights [d_conv x conv_dim] F32
+        // ssm_dt: delta time bias [dt_rank] F32
+        // ssm_a: decay [-exp(A_log)] [dt_rank] F32
+        // ssm_norm: RMSNorm gamma [d_state] F32
+        
+        const int DS = m->ssm_d_state, NG = m->ssm_n_group, NV = m->ssm_dt_rank, DI = m->ssm_d_inner;
+        const int conv_dim = 2 * NG * DS + DI;
+        
+        // Check for fused QKV (split) or separate Q/KV
+        if (find_tensor_index(m->gguf, nm(i, "attn_qkv_gate.weight")) >= 0) {
+            // Fused layout: [attn_qkv | attn_gate]
+            // Note: GLM-5.3 uses separate QKV, not fused with gate
+            set_error("glm5_next: blk.%d: fused QKV+gate not supported", i);
+            return false;
+        } else if (!bind_weight(m->gguf, nm(i, "attn_qkv.weight"), L.W_qkv, true)) {
+            return false;
+        }
+        
+        // Check for fused beta/alpha or separate
+        if (find_tensor_index(m->gguf, nm(i, "ssm_beta_alpha.weight")) >= 0) {
+            if (!bind_split(m->gguf, nm(i, "ssm_beta_alpha.weight"), NV, L.W_beta, L.W_alpha)) return false;
+        } else if (!bind_weight(m->gguf, nm(i, "ssm_alpha.weight"), L.W_alpha, true) ||
+                   !bind_weight(m->gguf, nm(i, "ssm_beta.weight"), L.W_beta, true)) {
+            return false;
+        }
+        
+        if (!bind_weight(m->gguf, nm(i, "ssm_out.weight"), L.W_ssm_out, true)) return false;
+        if (!bind_f32(m->gguf, nm(i, "ssm_conv1d.weight"), m->ssm_d_conv, conv_dim, L.ssm_conv1d)) return false;
+        if (!bind_norm(m->gguf, nm(i, "ssm_dt.bias"), NV, L.ssm_dt, true)) return false;
+        if (!bind_norm(m->gguf, nm(i, "ssm_a"), NV, L.ssm_a, true)) return false;
+        if (!bind_norm(m->gguf, nm(i, "ssm_norm.weight"), DS, L.ssm_norm, true)) return false;
+        
+        if (!check_shape("attn_qkv", i, L.W_qkv, conv_dim, E) ||
+            !check_shape("ssm_alpha", i, L.W_alpha, NV, E) ||
+            !check_shape("ssm_beta", i, L.W_beta, NV, E) ||
+            !check_shape("ssm_out", i, L.W_ssm_out, E, DI)) return false;
+    }
+    
+    // FFN: dense (first 3 layers) or MoE (rest)
+    if (L.moe) {
+        // MoE with sigmoid routing + e_score_correction_bias
+        const int NE = m->n_expert, FE = m->n_ff_exp, FS = m->n_ff_shexp;
+        L.shexp = find_tensor_index(m->gguf, nm(i, "ffn_gate_shexp.weight")) >= 0;
+        
+        if (NE <= 0 || m->n_expert_used <= 0 || m->n_expert_used > NE || 
+            FE <= 0 || (L.shexp ? FS <= 0 : FS != 0)) {
+            set_error("glm5_next: blk.%d: bad MoE hparams (experts %d used %d ff_exp %d ff_shexp %d)", i,
+                     NE, m->n_expert_used, FE, FS);
+            return false;
+        }
+        
+        if (!bind_weight(m->gguf, nm(i, "ffn_gate_inp.weight"), L.W_router, true)) return false;
+        if (!bind_weight(m->gguf, nm(i, "ffn_gate_exps.weight"), L.We_gate, true) ||
+            !bind_weight(m->gguf, nm(i, "ffn_up_exps.weight"), L.We_up, true) ||
+            !bind_weight(m->gguf, nm(i, "ffn_down_exps.weight"), L.We_down, true)) return false;
+        
+        if (L.shexp &&
+            (!bind_weight(m->gguf, nm(i, "ffn_gate_shexp.weight"), L.W_gate, true) ||
+             !bind_weight(m->gguf, nm(i, "ffn_up_shexp.weight"), L.W_up, true) ||
+             !bind_weight(m->gguf, nm(i, "ffn_down_shexp.weight"), L.W_down, true) ||
+             !bind_norm(m->gguf, nm(i, "ffn_gate_inp_shexp.weight"), E, L.shexp_gate, true))) {
+            return false;
+        }
+    } else {
+        // Dense FFN (first 3 layers)
+        if (!bind_weight(m->gguf, nm(i, "ffn_gate.weight"), L.W_gate, true) ||
+            !bind_weight(m->gguf, nm(i, "ffn_up.weight"), L.W_up, true) ||
+            !bind_weight(m->gguf, nm(i, "ffn_down.weight"), L.W_down, true)) return false;
+        if (!check_shape("ffn_gate", i, L.W_gate, FF, E) ||
+            !check_shape("ffn_up", i, L.W_up, FF, E) ||
+            !check_shape("ffn_down", i, L.W_down, E, FF)) return false;
+    }
+    
+    // Hyper-connections (full-rank Sinkhorn, when n_hc > 0)
+    // These replace the plain attn_norm / ffn_norm with multi-stream Sinkhorn normalization
+    if (m->n_hc > 0) {
+        const int hc_dim = m->n_hc * E;
+        const int hc_mix = (2 + m->n_hc) * m->n_hc;
+        
+        // Layer hyper-connections: base [hc_mix], fn [hc_dim x hc_mix], scale [3]
+        if (!bind_weight(m->gguf, nm(i, "hc_attn_base.weight"), L.hc_attn_base, true) ||
+            !bind_weight(m->gguf, nm(i, "hc_attn_fn.weight"), L.hc_attn_fn, true) ||
+            !bind_norm(m->gguf, nm(i, "hc_attn_scale.weight"), 3, L.hc_attn_scale, true) ||
+            !bind_weight(m->gguf, nm(i, "hc_ffn_base.weight"), L.hc_ffn_base, true) ||
+            !bind_weight(m->gguf, nm(i, "hc_ffn_fn.weight"), L.hc_ffn_fn, true) ||
+            !bind_norm(m->gguf, nm(i, "hc_ffn_scale.weight"), 3, L.hc_ffn_scale, true))
+            return false;
+    }
+    
+    return true;
+}
+
+// DeepSeek V4 layer loading (deepseek2): MLA with output LoRA, compressed attention, hyper-connections, DSA indexer.
+// Hyper-connections use full-rank Sinkhorn normalization (different from qwen4exp's low-rank).
+// MoE with sigmoid/sqrtsoftplus routing + e_score_correction_bias + hash layer routing.
+static bool load_layer_deepseek2(inference_model* m, int i, LayerWeights& L, const std::vector<int>& ple_layers) {
+    (void)ple_layers;
+    const int E = m->n_embd, HQ = m->n_head, HD = m->head_dim;
+    const int FE = m->n_ff_exp, FS = m->n_ff_shexp;
+    const int NE = m->n_expert, UE = m->n_expert_used;
+    const int o_lora_rank = m->n_lora_o;
+    const int n_out_groups = m->n_attn_out_groups;
+    const int HC = m->n_hc;
+    const int hc_dim = HC > 0 ? HC * E : 0;
+    const int hc_mix = HC > 0 ? (2 + HC) * HC : 0;
+    char name[128];
+    auto nm = [&](int idx, const char* t) { snprintf(name, sizeof(name), "blk.%d.%s", idx, t); return name; };
+
+    L.kind = LAYER_FULL_ATTN;
+    L.kv_slot = m->n_kv_layers++;
+
+    // Hyper-connections (full-rank Sinkhorn, different from qwen4exp low-rank)
+    if (HC > 0) {
+        // hc_attn: base [hc_mix], fn [hc_dim x hc_mix], scale [3]
+        if (!bind_weight(m->gguf, nm(i, "hc_attn_base.weight"), L.hc_attn_base, true) ||
+            !bind_weight(m->gguf, nm(i, "hc_attn_fn.weight"), L.hc_attn_fn, true) ||
+            !bind_norm(m->gguf, nm(i, "hc_attn_scale.weight"), 3, L.hc_attn_scale, true) ||
+            !bind_weight(m->gguf, nm(i, "hc_ffn_base.weight"), L.hc_ffn_base, true) ||
+            !bind_weight(m->gguf, nm(i, "hc_ffn_fn.weight"), L.hc_ffn_fn, true) ||
+            !bind_norm(m->gguf, nm(i, "hc_ffn_scale.weight"), 3, L.hc_ffn_scale, true))
+            return false;
+        if (!check_shape("hc_attn_base", i, L.hc_attn_base, hc_mix, E) ||
+            !check_shape("hc_attn_fn", i, L.hc_attn_fn, hc_mix, hc_dim) ||
+            !check_shape("hc_ffn_base", i, L.hc_ffn_base, hc_mix, E) ||
+            !check_shape("hc_ffn_fn", i, L.hc_ffn_fn, hc_mix, hc_dim))
+            return false;
+    } else {
+        // Standard norms when no hyper-connections
+        if (!bind_norm(m->gguf, nm(i, "attn_norm.weight"), E, L.attn_norm, true) ||
+            !bind_norm(m->gguf, nm(i, "ffn_norm.weight"), E, L.ffn_norm, true))
+            return false;
+    }
+
+    // Attention tensors: sinks, norms, projections
+    if (!bind_norm(m->gguf, nm(i, "attn_sinks.weight"), HQ, L.attn_sinks, false)) return false;
+    if (!bind_norm(m->gguf, nm(i, "attn_q_a_norm.weight"), m->n_lora_q, L.attn_q_a_norm, true)) return false;
+    if (!bind_norm(m->gguf, nm(i, "attn_kv_a_norm.weight"), m->n_lora_kv, L.attn_kv_a_norm, true)) return false;
+
+    // MLA: low-rank Q projections
+    if (!bind_weight(m->gguf, nm(i, "attn_q_a.weight"), L.W_q_a, true) ||
+        !bind_weight(m->gguf, nm(i, "attn_q_b.weight"), L.W_q_b, true)) return false;
+
+    // MLA: KV projection (separate from Q in V4)
+    if (!bind_weight(m->gguf, nm(i, "attn_kv.weight"), L.attn_kv, true)) return false;
+
+    // Output LoRA (wo_a, wo_b): replaces the single Wo in standard attention
+    if (!bind_weight(m->gguf, nm(i, "attn_wo_a.weight"), L.attn_wo_a, true) ||
+        !bind_weight(m->gguf, nm(i, "attn_wo_b.weight"), L.attn_wo_b, true)) return false;
+
+    // Check attention shapes
+    const int q_lora = m->n_lora_q;
+    if (!check_shape("attn_q_a", i, L.W_q_a, q_lora, E) ||
+        !check_shape("attn_q_b", i, L.W_q_b, HQ * HD, q_lora) ||
+        !check_shape("attn_kv", i, L.attn_kv, HD, E)) return false;
+    if (!check_shape("attn_wo_a", i, L.attn_wo_a, (HQ * HD) / n_out_groups, n_out_groups * o_lora_rank) ||
+        !check_shape("attn_wo_b", i, L.attn_wo_b, E, n_out_groups * o_lora_rank))
+        return false;
+
+    // Compressed attention tensors (ratio > 0)
+    int ratio = 0;
+    if (!m->compress_ratios.empty() && i < (int)m->compress_ratios.size()) {
+        ratio = (int)m->compress_ratios[i];
+    }
+    if (ratio > 0) {
+        const int coff = ratio == 4 ? 2 : 1;
+        if (!bind_weight(m->gguf, nm(i, "attn_compressor_ape.weight"), L.attn_compressor_ape, true) ||
+            !bind_weight(m->gguf, nm(i, "attn_compressor_kv.weight"), L.attn_compressor_kv, true) ||
+            !bind_weight(m->gguf, nm(i, "attn_compressor_gate.weight"), L.attn_compressor_gate, true) ||
+            !bind_norm(m->gguf, nm(i, "attn_compressor_norm.weight"), HD, L.attn_compressor_norm, true))
+            return false;
+        if (!check_shape("attn_compressor_ape", i, L.attn_compressor_ape, coff * HD, ratio) ||
+            !check_shape("attn_compressor_kv", i, L.attn_compressor_kv, E, coff * HD) ||
+            !check_shape("attn_compressor_gate", i, L.attn_compressor_gate, E, coff * HD))
+            return false;
+    }
+
+    // DSA indexer tensors (ratio == 4)
+    if (ratio == 4 && m->indexer_n_head > 0 && m->indexer_head_size > 0) {
+        const int coff = 2;  // ratio == 4 => coff = 2
+        if (!bind_weight(m->gguf, nm(i, "indexer_attn_q_b.weight"), L.indexer_attn_q_b, true) ||
+            !bind_weight(m->gguf, nm(i, "indexer_proj.weight"), L.indexer_proj, true) ||
+            !bind_weight(m->gguf, nm(i, "indexer_compressor_ape.weight"), L.indexer_compressor_ape, true) ||
+            !bind_weight(m->gguf, nm(i, "indexer_compressor_kv.weight"), L.indexer_compressor_kv, true) ||
+            !bind_weight(m->gguf, nm(i, "indexer_compressor_gate.weight"), L.indexer_compressor_gate, true) ||
+            !bind_norm(m->gguf, nm(i, "indexer_compressor_norm.weight"), m->indexer_head_size, L.indexer_compressor_norm, true))
+            return false;
+        if (!check_shape("indexer_attn_q_b", i, L.indexer_attn_q_b, m->indexer_n_head * m->indexer_head_size, q_lora) ||
+            !check_shape("indexer_proj", i, L.indexer_proj, m->indexer_n_head, E) ||
+            !check_shape("indexer_compressor_ape", i, L.indexer_compressor_ape, coff * m->indexer_head_size, ratio) ||
+            !check_shape("indexer_compressor_kv", i, L.indexer_compressor_kv, E, coff * m->indexer_head_size) ||
+            !check_shape("indexer_compressor_gate", i, L.indexer_compressor_gate, E, coff * m->indexer_head_size))
+            return false;
+    }
+
+    // FFN: MoE with router + expert tensors + shared expert
+    L.moe = true;  // DeepSeek V4 always uses MoE
+    L.shexp = FS > 0;
+    if (NE <= 0 || UE <= 0 || UE > NE || FE <= 0) {
+        set_error("deepseek2: blk.%d: bad MoE hparams (experts %d used %d ff_exp %d)", i, NE, UE, FE);
+        return false;
+    }
+
+    // Router
+    if (!bind_weight(m->gguf, nm(i, "ffn_gate_inp.weight"), L.W_router, true)) return false;
+
+    // Expert probabilities bias (optional for hash layers)
+    if (!bind_norm(m->gguf, nm(i, "ffn_exp_probs_b.bias"), NE, L.exp_probs_b, false)) return false;
+
+    // Check for fable half-width experts
+    int gate_type = -1, up_type = -1, down_type = -1;
+    int64_t gate_ne[3] = {0}, up_ne[3] = {0}, down_ne[3] = {0};
+    {
+        const char* gname = nm(i, "ffn_gate_exps.weight");
+        const char* uname = nm(i, "ffn_up_exps.weight");
+        const char* dname = nm(i, "ffn_down_exps.weight");
+        int gi = find_tensor_index(m->gguf, gname);
+        int ui = find_tensor_index(m->gguf, uname);
+        int di = find_tensor_index(m->gguf, dname);
+        if (gi >= 0 && ui >= 0 && di >= 0) {
+            const int64_t* gne = gguf_tensor_ne(m->gguf, gi);
+            const int64_t* une = gguf_tensor_ne(m->gguf, ui);
+            const int64_t* dne = gguf_tensor_ne(m->gguf, di);
+            if (gne && une && dne) {
+                gate_type = gguf_tensor_type(m->gguf, gi);
+                up_type = gguf_tensor_type(m->gguf, ui);
+                down_type = gguf_tensor_type(m->gguf, di);
+                gate_ne[0] = gne[0]; gate_ne[1] = gne[1]; gate_ne[2] = gne[2];
+                up_ne[0] = une[0]; up_ne[1] = une[1]; up_ne[2] = une[2];
+                down_ne[0] = dne[0]; down_ne[1] = dne[1]; down_ne[2] = dne[2];
+            }
+        }
+    }
+
+    // Fable half-width: gate/up [n_embd/2, n_ff_exp, n_expert], down [n_ff_exp/2, n_embd, n_expert]
+    L.fable_half_width = gate_type >= 0 && up_type >= 0 && down_type >= 0 &&
+        gate_ne[0] == E / 2 && gate_ne[1] == FE && gate_ne[2] == NE &&
+        up_ne[0] == E / 2 && up_ne[1] == FE && up_ne[2] == NE &&
+        down_ne[0] == FE / 2 && down_ne[1] == E && down_ne[2] == NE;
+
+    if (L.fable_half_width) {
+        if (!bind_weight(m->gguf, nm(i, "ffn_gate_exps.weight"), L.We_gate, true) ||
+            !bind_weight(m->gguf, nm(i, "ffn_up_exps.weight"), L.We_up, true) ||
+            !bind_weight(m->gguf, nm(i, "ffn_down_exps.weight"), L.We_down, true)) return false;
+        if (!check_shape("ffn_gate_exps", i, L.We_gate, NE * FE / 2, E / 2) ||
+            !check_shape("ffn_up_exps", i, L.We_up, NE * FE / 2, E / 2) ||
+            !check_shape("ffn_down_exps", i, L.We_down, NE * E, FE / 2))
+            return false;
+    } else {
+        if (!bind_weight(m->gguf, nm(i, "ffn_gate_exps.weight"), L.We_gate, true) ||
+            !bind_weight(m->gguf, nm(i, "ffn_up_exps.weight"), L.We_up, true) ||
+            !bind_weight(m->gguf, nm(i, "ffn_down_exps.weight"), L.We_down, true)) return false;
+        if (!check_shape("ffn_gate_exps", i, L.We_gate, NE * FE, E) ||
+            !check_shape("ffn_up_exps", i, L.We_up, NE * FE, E) ||
+            !check_shape("ffn_down_exps", i, L.We_down, NE * E, FE))
+            return false;
+    }
+
+    // Shared expert
+    if (L.shexp) {
+        if (!bind_weight(m->gguf, nm(i, "ffn_gate_shexp.weight"), L.W_gate, true) ||
+            !bind_weight(m->gguf, nm(i, "ffn_up_shexp.weight"), L.W_up, true) ||
+            !bind_weight(m->gguf, nm(i, "ffn_down_shexp.weight"), L.W_down, true)) return false;
+        if (!check_shape("ffn_gate_shexp", i, L.W_gate, FS * UE, E) ||
+            !check_shape("ffn_up_shexp", i, L.W_up, FS * UE, E) ||
+            !check_shape("ffn_down_shexp", i, L.W_down, E, FS * UE))
+            return false;
+    }
+
+    // Hash layer routing (ffn_gate_tid2eid) - optional, for first n_hash_layers
+    int tid2eid_idx = find_tensor_index(m->gguf, nm(i, "ffn_gate_tid2eid.weight"));
+    if (tid2eid_idx >= 0) {
+        const int64_t* tne = gguf_tensor_ne(m->gguf, tid2eid_idx);
+        size_t tbytes = 0;
+        const void* tp = gguf_get_tensor_ptr(m->gguf, nm(i, "ffn_gate_tid2eid.weight"), &tbytes);
+        if (tne && tp && tbytes == (size_t)(UE * m->vocab_size) * 4) {  // F32
+            L.ffn_gate_tid2eid.type = gguf_tensor_type(m->gguf, tid2eid_idx);
+            L.ffn_gate_tid2eid.N = UE * m->vocab_size;
+            L.ffn_gate_tid2eid.K = tne[0];
+            L.ffn_gate_tid2eid.row_bytes = tbytes / (size_t)L.ffn_gate_tid2eid.N;
+            L.ffn_gate_tid2eid.data = tp;
+        }
+    }
+
+    // Nextn prediction tensors (MTP draft head) - loaded when i >= n_layer - nextn_predict_layers
+    const int nextn_start = m->n_layer - m->nextn_predict_layers;
+    L.is_nextn = m->nextn_predict_layers > 0 && i >= nextn_start;
+    if (L.is_nextn) {
+        if (!bind_weight(m->gguf, nm(i, "nextn.e_proj.weight"), L.nextn_e_proj, true) ||
+            !bind_weight(m->gguf, nm(i, "nextn.h_proj.weight"), L.nextn_h_proj, true) ||
+            !bind_norm(m->gguf, nm(i, "nextn.enorm.weight"), E, L.nextn_enorm, true) ||
+            !bind_norm(m->gguf, nm(i, "nextn.hnorm.weight"), HC > 0 ? HC * E : E, L.nextn_hnorm, HC > 0) ||
+            !bind_norm(m->gguf, nm(i, "nextn.shared_head_norm.weight"), E, L.nextn_shared_head_norm, true) ||
+            !bind_weight(m->gguf, nm(i, "nextn.hc_head_base.weight"), L.nextn_hc_head_base, HC > 0) ||
+            !bind_weight(m->gguf, nm(i, "nextn.hc_head_fn.weight"), L.nextn_hc_head_fn, HC > 0) ||
+            !bind_norm(m->gguf, nm(i, "nextn.hc_head_scale.weight"), 1, L.nextn_hc_head_scale, HC > 0))
+            return false;
+        if (!check_shape("nextn.e_proj", i, L.nextn_e_proj, E, E) ||
+            !check_shape("nextn.h_proj", i, L.nextn_h_proj, E, E))
+            return false;
+    }
+
+    return true;
+}
+
+// GLM-5.3-Flash (glm5_next): MLA + DSA indexer, KDA linear attention, hyper-connections with Sinkhorn.
+// The first 3 layers are dense FFN, rest are MoE with sigmoid routing + e_score_correction_bias.
+// 34 KDA layers (linear attention) + 11 MLA layers (sparse attention via DSA indexer).
+// This loader reads the architecture hparams; layer loading is classified by tensor presence.
+static bool load_glm5_next(inference_model* m) {
+    m->glm5_next = true;
+
+    // MLA parameters
+    m->n_lora_q = (int)gguf_arch_int(m->gguf, "attention.q_lora_rank", 0);
+    m->n_lora_kv = (int)gguf_arch_int(m->gguf, "attention.kv_lora_rank", 0);
+    if (m->n_lora_q <= 0 || m->n_lora_kv <= 0) {
+        set_error("glm5_next: missing q_lora_rank / kv_lora_rank");
+        return false;
+    }
+
+    // DSA indexer parameters
+    m->indexer_head_count = (int)gguf_arch_int(m->gguf, "attention.indexer.head_count", 0);
+    m->indexer_key_length = (int)gguf_arch_int(m->gguf, "attention.indexer.key_length", 0);
+    m->indexer_top_k = (int)gguf_arch_int(m->gguf, "attention.indexer.top_k", 0);
+    if (m->indexer_head_count <= 0 || m->indexer_key_length <= 0 || m->indexer_top_k <= 0) {
+        set_error("glm5_next: missing DSA indexer params");
+        return false;
+    }
+
+    // DSA indexer tensors (model-level, shared across all MLA layers)
+    // Note: These are loaded once and used by all MLA layers
+    if (find_tensor_index(m->gguf, "mla.indexer_k_norm.weight") >= 0 &&
+        !bind_weight(m->gguf, "mla.indexer_k_norm.weight", m->indexer_k_norm, true)) {
+        set_error("glm5_next: cannot load indexer_k_norm.weight");
+        return false;
+    }
+    if (find_tensor_index(m->gguf, "mla.indexer_proj.weight") >= 0 &&
+        !bind_weight(m->gguf, "mla.indexer_proj.weight", m->indexer_proj, true)) {
+        set_error("glm5_next: cannot load indexer_proj.weight");
+        return false;
+    }
+    if (find_tensor_index(m->gguf, "mla.indexer_attn_k.weight") >= 0 &&
+        !bind_weight(m->gguf, "mla.indexer_attn_k.weight", m->indexer_attn_k, true)) {
+        set_error("glm5_next: cannot load indexer_attn_k.weight");
+        return false;
+    }
+    if (find_tensor_index(m->gguf, "mla.indexer_attn_q_b.weight") >= 0 &&
+        !bind_weight(m->gguf, "mla.indexer_attn_q_b.weight", m->indexer_attn_q_b, true)) {
+        set_error("glm5_next: cannot load indexer_attn_q_b.weight");
+        return false;
+    }
+
+    // Optional: key pooling
+    m->indexer_kpool = (int)gguf_arch_int(m->gguf, "attention.index_kpool", 4);
+
+    // MoE routing
+    m->e_score_correction_bias = gguf_arch_float(m->gguf, "mlp.gate.e_score_correction_bias", 0.0f);
+
+    // Hyper-connections
+    int hc_mult = (int)gguf_arch_int(m->gguf, "hyper_connection.count", 0);
+    if (hc_mult > 0) {
+        m->n_hc = hc_mult;
+        m->hc_rank = (int)gguf_arch_int(m->gguf, "hyper_connection.low_rank", 0);
+        m->hc_sinkhorn_iters = (int)gguf_arch_int(m->gguf, "hyper_connection.sinkhorn_iters", 20);
+        m->hc_eps = gguf_arch_float(m->gguf, "hyper_connection.epsilon", 0.01f);
+        
+        // Output hyper-connection (final mixer before LM head) - full-rank with Sinkhorn
+        const int hc_dim = hc_mult * m->n_embd;
+        const int n_hc = hc_mult;
+        
+        // Bind output_hc tensors for full-rank Sinkhorn normalization
+        char name[160];
+        
+        // output_hc_base: [n_hc]
+        snprintf(name, sizeof(name), "output_hc_base.weight");
+        if (!bind_weight(m->gguf, name, m->hc_out_base, true)) {
+            set_error("glm5_next: cannot load %s", name);
+            return false;
+        }
+        
+        // output_hc_fn: [hc_dim x n_hc]
+        snprintf(name, sizeof(name), "output_hc_fn.weight");
+        if (!bind_weight(m->gguf, name, m->hc_out_fn, true)) {
+            set_error("glm5_next: cannot load %s", name);
+            return false;
+        }
+        
+        // output_hc_scale: [1]
+        snprintf(name, sizeof(name), "output_hc_scale.weight");
+        if (!bind_norm(m->gguf, name, 1, m->hc_out_scale, true)) {
+            set_error("glm5_next: cannot load %s", name);
+            return false;
+        }
+    }
+
+    // Model-specific
+    m->swiglu_limit = gguf_arch_float(m->gguf, "swiglu_limit", 0.0f);
+    m->first_dense_layers = (int)gguf_arch_int(m->gguf, "first_dense_layers", 0);
+    m->n_nextn = (int)gguf_arch_int(m->gguf, "nextn_predict_layers", 0);
+
+    // KV cache layout: stores kv_lora_rank values per position (not per-head)
+    // This is a big win: much smaller than per-head K/V
+    return true;
+}
+
+// DeepSeek V4 (deepseek2): MLA + compressed attention, full-rank hyper-connections.
+// MoE with sigmoid/sqrtsoftplus routing. Similar to qwen4exp but with different attention structure.
+static bool load_deepseek2(inference_model* m) {
+    m->deepseek2 = true;
+
+    // MLA parameters
+    m->n_lora_q = (int)gguf_arch_int(m->gguf, "attention.q_lora_rank", 0);
+    m->n_lora_kv = (int)gguf_arch_int(m->gguf, "attention.kv_lora_rank", 0);
+    m->n_lora_o = (int)gguf_arch_int(m->gguf, "attention.output_lora_rank", 0);
+    m->n_attn_out_groups = (int)gguf_arch_int(m->gguf, "attention.output_group_count", 0);
+    if (m->n_lora_q <= 0 || m->n_lora_kv <= 0) {
+        set_error("deepseek2: missing q_lora_rank / kv_lora_rank");
+        return false;
+    }
+    if (m->n_attn_out_groups <= 0) {
+        set_error("deepseek2: requires attention.output_group_count > 0");
+        return false;
+    }
+
+    // Expert parameters
+    m->n_ff_exp = (int)gguf_arch_int(m->gguf, "expert.feed_forward_length", 0);
+    m->n_ff_shexp = (int)gguf_arch_int(m->gguf, "expert.shared_count", 0);
+    m->expert_weights_scale = gguf_arch_float(m->gguf, "expert.weights_scale", 1.0f);
+    m->expert_weights_norm = gguf_arch_int(m->gguf, "expert.weights_norm", 1) != 0;
+    m->expert_gating_func = (int)gguf_arch_int(m->gguf, "expert.gating_func", 0);
+    if (m->expert_gating_func == 0) {
+        m->expert_gating_func = 2;  // LLAMA_EXPERT_GATING_FUNC_TYPE_SQRTSOFTPLUS
+    }
+
+    // Compressed attention ratios (0 = no compression, 4 = full compression)
+    std::vector<uint64_t> ratios;
+    if (kv_u64_array(m->gguf, "attention.compress_ratios", ratios)) {
+        if ((int)ratios.size() < m->n_layer) {
+            set_error("deepseek2: compress_ratios count %zu != n_layer %d", ratios.size(), m->n_layer);
+            return false;
+        }
+        m->compress_ratios = ratios;
+        for (size_t l = 0; l < ratios.size() && l < (size_t)m->n_layer; ++l)
+            if (ratios[l] != 0) {
+                set_error("deepseek2: compressed attention (layer %zu, ratio %llu) is not supported",
+                         l, (unsigned long long)ratios[l]);
+                return false;
+            }
+    }
+
+    // DSA indexer parameters
+    m->indexer_n_head = (int)gguf_arch_int(m->gguf, "attention.indexer.head_count", 0);
+    m->indexer_head_size = (int)gguf_arch_int(m->gguf, "attention.indexer.key_length", 0);
+    m->indexer_top_k = (int)gguf_arch_int(m->gguf, "attention.indexer.top_k", 0);
+
+    // Sliding window attention
+    m->n_swa = (int)gguf_arch_int(m->gguf, "attention.sliding_window", 0);
+    if (m->n_swa > 0) {
+        m->compress_rope_freq_base = gguf_arch_float(m->gguf, "attention.compress_rope_freq_base", 0.0f);
+    }
+
+    // Hash layers and MTP
+    m->n_hash_layers = (int)gguf_arch_int(m->gguf, "hash_layer_count", 0);
+    m->nextn_predict_layers = (int)gguf_arch_int(m->gguf, "nextn_predict_layers", 0);
+    if (m->nextn_predict_layers > 0 && m->nextn_predict_layers >= m->n_layer) {
+        set_error("deepseek2: nextn_predict_layers %d >= n_layer %d", m->nextn_predict_layers, m->n_layer);
+        return false;
+    }
+
+    // Hyper-connections (full-rank, different from qwen4exp's low-rank)
+    m->n_hc = (int)gguf_arch_int(m->gguf, "hyper_connection.count", 0);
+    if (m->n_hc > 0) {
+        m->hc_sinkhorn_iters = (int)gguf_arch_int(m->gguf, "hyper_connection.sinkhorn_iters", 20);
+        m->hc_eps = gguf_arch_float(m->gguf, "hyper_connection.epsilon", 0.01f);
+        m->hc_rank = (int)gguf_arch_int(m->gguf, "hyper_connection.low_rank", 0);
+        if (m->hc_rank <= 0) {
+            set_error("deepseek2: hyper_connection.low_rank must be > 0 when count > 0");
+            return false;
+        }
+    }
+
+    // SwiGLU clamp exponents (per-layer, optional)
+    kv_u64_array(m->gguf, "swiglu_clamp_exp", m->swiglu_clamp_exp);
+
+    // MoE routing bias
+    m->e_score_correction_bias = gguf_arch_float(m->gguf, "mlp.gate.e_score_correction_bias", 0.0f);
+
+    return true;
+}
+
 static bool load_model_weights(inference_model* m, const std::vector<int>& ple_layers) {
     m->layers.resize(m->n_layer);
     Gemma4Shape g4;
@@ -838,9 +1394,13 @@ static bool load_model_weights(inference_model* m, const std::vector<int>& ple_l
     if (m->model_name == "gemma4" && !load_gemma4(m, g4)) return false;
     if (m->model_name == "gemma-embedding" && !load_gemma_embedding(m, g4)) return false;
     if (m->model_name == "nemotron_h_moe" && !load_nemotron(m, gn)) return false;
+    if (m->model_name == "glm5_next" && !load_glm5_next(m)) return false;
+    if (m->model_name == "deepseek2" && !load_deepseek2(m)) return false;
     for (int i = 0; i < m->n_layer; ++i)
         if (!(m->gemma4     ? load_layer_gemma4(m, i, m->layers[i], g4)
               : m->nemotron ? load_layer_nemotron(m, i, m->layers[i], gn)
+              : m->glm5_next  ? load_layer_glm5_next(m, i, m->layers[i], ple_layers)
+              : m->deepseek2  ? load_layer_deepseek2(m, i, m->layers[i], ple_layers)
                             : load_layer(m, m->gguf, i, m->layers[i], ple_layers)))
             return false;
     return true;
@@ -870,7 +1430,8 @@ int inference_model_info(const char* path, inference_model_info_t* out) {
     out->n_ctx_train = gguf_context_length(g) > 0 ? gguf_context_length(g) : 0;
     // the architectures the loader runs (ARCHITECTURE.md, models)
     static const char* const archs[] = {"qwen2",  "qwen3",  "qwen3moe", "qwen35",          "qwen35moe",
-                                        "qwen4exp", "gemma4", "llama",  "nemotron_h_moe", "gemma-embedding"};
+                                        "qwen4exp", "gemma4", "llama",  "nemotron_h_moe", "gemma-embedding",
+                                        "glm5_next", "deepseek2"};
     bool known = false;
     for (const char* a : archs) known = known || (arch && !strcmp(arch, a));
     const int64_t ty = gguf_find_kv(g, "general.type");

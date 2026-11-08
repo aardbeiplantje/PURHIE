@@ -14,7 +14,9 @@ static hipFunction_t g_hc_norm = nullptr, g_hc_lowrank = nullptr, g_hc_mix = nul
 static hipFunction_t g_add_normed = nullptr, g_geglu = nullptr, g_softcap = nullptr;
 static hipFunction_t g_attn_post = nullptr, g_ffn_post = nullptr;
 static hipFunction_t g_mconv = nullptr, g_mconv_state = nullptr, g_mscan = nullptr, g_mgnorm = nullptr,
-                     g_router_sig = nullptr, g_relu2 = nullptr;
+                     g_router_sig = nullptr, g_router_sqrtsoftplus = nullptr, g_relu2 = nullptr, g_dsa_mask = nullptr;
+static hipFunction_t g_dsv4_hc_pre = nullptr, g_dsv4_hc_post = nullptr, g_dsv4_hc_head = nullptr;
+static hipFunction_t g_dsv4_compress = nullptr;
 
 int gpu_ops_init(const char* co_path) {
     if (g_mod) return 0;
@@ -43,9 +45,15 @@ int gpu_ops_init(const char* co_path) {
         hipModuleGetFunction(&g_mscan, g_mod, "mamba_scan") != hipSuccess ||
         hipModuleGetFunction(&g_mgnorm, g_mod, "mamba_gnorm") != hipSuccess ||
         hipModuleGetFunction(&g_router_sig, g_mod, "moe_router_sigmoid") != hipSuccess ||
+        hipModuleGetFunction(&g_router_sqrtsoftplus, g_mod, "moe_router_sqrtsoftplus") != hipSuccess ||
         hipModuleGetFunction(&g_relu2, g_mod, "relu2") != hipSuccess ||
         hipModuleGetFunction(&g_geglu, g_mod, "geglu") != hipSuccess ||
-        hipModuleGetFunction(&g_softcap, g_mod, "softcap") != hipSuccess) {
+        hipModuleGetFunction(&g_softcap, g_mod, "softcap") != hipSuccess ||
+        hipModuleGetFunction(&g_dsa_mask, g_mod, "dsa_attention_mask") != hipSuccess ||
+        hipModuleGetFunction(&g_dsv4_hc_pre, g_mod, "dsv4_hc_pre") != hipSuccess ||
+        hipModuleGetFunction(&g_dsv4_hc_post, g_mod, "dsv4_hc_post") != hipSuccess ||
+        hipModuleGetFunction(&g_dsv4_hc_head, g_mod, "dsv4_hc_head") != hipSuccess ||
+        hipModuleGetFunction(&g_dsv4_compress, g_mod, "dsv4_compress") != hipSuccess) {
         INFER_LOG("[gpu_ops] kernels missing in %s\n", co_path);
         gpu_ops_free();
         return -1;
@@ -60,7 +68,9 @@ void gpu_ops_free(void) {
     g_hc_norm = g_hc_lowrank = g_hc_mix = g_ple_gate = g_ple_conv = g_mtp_concat = nullptr;
     g_add_normed = g_geglu = g_softcap = nullptr;
     g_attn_post = g_ffn_post = nullptr;
-    g_mconv = g_mconv_state = g_mscan = g_mgnorm = g_router_sig = g_relu2 = nullptr;
+    g_mconv = g_mconv_state = g_mscan = g_mgnorm = g_router_sig = g_router_sqrtsoftplus = g_relu2 = g_dsa_mask = nullptr;
+    g_dsv4_hc_pre = g_dsv4_hc_post = g_dsv4_hc_head = nullptr;
+    g_dsv4_compress = nullptr;
 }
 
 hipError_t gpu_add_rmsnorm(const float* x_in, const float* add, float* x_out, const float* w, float* y, int n, int T,
@@ -278,6 +288,29 @@ hipError_t gpu_moe_router_sigmoid(const float* logits, const float* bias, int* i
     return hipModuleLaunchKernel(g_router_sig, (unsigned)T, 1, 1, 256, 1, 1, 0, stream, args, nullptr);
 }
 
+// DeepSeek V4: sqrtsoftplus routing with bias, top-k, renormalized weights * scale
+// Uses softplus(x) = log(1 + exp(x)) instead of sigmoid
+hipError_t gpu_moe_router_sqrtsoftplus(const float* logits, const float* bias, int* ids, float* wts, int n_expert,
+                                       int n_used, int norm, float scale, int T, hipStream_t stream) {
+    if (!g_router_sqrtsoftplus) return hipErrorInvalidDeviceFunction;
+    if (T <= 0 || n_expert <= 0 || n_expert > 1024 || n_used <= 0 || n_used > 64 || n_used > n_expert)
+        return hipErrorInvalidValue;
+    void* args[] = {(void*)&logits, (void*)&bias, &ids, &wts, &n_expert, &n_used, &norm, &scale};
+    return hipModuleLaunchKernel(g_router_sqrtsoftplus, (unsigned)T, 1, 1, 256, 1, 1, 0, stream, args, nullptr);
+}
+
+// DeepSeek V4: DSA sparse attention mask application
+// Apply top-k selection from DSA indexer to weight attention output
+// attn [n_heads_head_dim, T], ids [T][top_k], sel_w [T][top_k], out [n_heads_head_dim, T]
+hipError_t gpu_dsa_attention_mask(const float* attn, const int* ids, const float* sel_w, float* out,
+                                  int n_heads_head_dim, int n_pooled, int top_k, int T, hipStream_t stream) {
+    if (!g_dsa_mask) return hipErrorInvalidDeviceFunction;
+    if (T <= 0 || n_heads_head_dim <= 0 || n_pooled <= 0 || top_k <= 0 || top_k > 64)
+        return hipErrorInvalidValue;
+    void* args[] = {(void*)&attn, (void*)&ids, (void*)&sel_w, &out, &n_heads_head_dim, &n_pooled, &top_k, &T};
+    return hipModuleLaunchKernel(g_dsa_mask, (unsigned)((n_heads_head_dim + 255) / 256), (unsigned)T, 1, 256, 1, 1, 0, stream, args, nullptr);
+}
+
 hipError_t gpu_relu2(const float* in, float* out, int rows, int h, int stride, const qmatvec_q8* q8,
                      hipStream_t stream) {
     if (!g_relu2) return hipErrorInvalidDeviceFunction;
@@ -286,4 +319,72 @@ hipError_t gpu_relu2(const float* in, float* out, int rows, int h, int stride, c
     qmatvec_q8_out o = qmatvec_q8_outputs(q8);
     void* args[] = {(void*)&in, &out, &n, &h, &stride, &o};
     return hipModuleLaunchKernel(g_relu2, (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, args, nullptr);
+}
+
+// DeepSeek V4 / GLM-5.3-Flash: full-rank hyper-connections with Sinkhorn normalization
+// dsv4_hc_pre: before a token mixer. rms_norm(res) -> hc_fn matmul -> split into pre/post/comb via Sinkhorn
+// -> weighted_sum(pre, res) = mixed input to the mixer.
+// dst[out]: [n_hc * n_hc * 2][T] (sinkhorn split result: pre[n_hc], post[n_hc], comb[n_hc*n_hc])
+// pre[out]: [n_hc][T], post[out]: [n_hc][T], comb[out]: [n_hc][n_hc][T]
+hipError_t gpu_dsv4_hc_pre(const float* res_in, float* dst, float* pre, float* post, float* comb,
+                           const float* w_fn, const float* w_base, const float* w_scale, int n, int hc, int T,
+                           float eps, int sinkhorn_iters, hipStream_t stream) {
+    if (!g_dsv4_hc_pre) return hipErrorInvalidDeviceFunction;
+    if (T <= 0 || hc <= 0 || n <= 0 || sinkhorn_iters <= 0) return hipErrorInvalidValue;
+    const int64_t hc_dim = (int64_t)hc * n;
+    const int64_t mix_dim = (int64_t)((2 + hc) * hc) * T;
+    const int64_t dst_dim = (int64_t)(2 + 2 * hc) * hc * T;
+    void* args[] = {(void*)&res_in, (void*)&dst, (void*)&pre, (void*)&post, (void*)&comb,
+                     (void*)&w_fn, (void*)&w_base, (void*)&w_scale,
+                     &n, &hc, &T, &eps, &sinkhorn_iters,
+                     (void*)&hc_dim, (void*)&mix_dim, (void*)&dst_dim};
+    unsigned grid = (unsigned)((hc_dim + 255) / 256);
+    return hipModuleLaunchKernel(g_dsv4_hc_pre, grid, 1, 1, 256, 1, 1, 0, stream, args, nullptr);
+}
+
+// dsv4_hc_post: after a token mixer. Expand block_out (single stream) back to multi-stream residual.
+// output[hc*n][T] = block_out[n][T] * post[hc][T] + sum_src(comb[hc][hc][T] * residual[hc*n][T])
+hipError_t gpu_dsv4_hc_post(const float* block_out, const float* residual, const float* post, const float* comb,
+                            float* out, int n, int hc, int T, hipStream_t stream) {
+    if (!g_dsv4_hc_post) return hipErrorInvalidDeviceFunction;
+    if (T <= 0 || hc <= 0 || n <= 0) return hipErrorInvalidValue;
+    const int64_t hc_dim = (int64_t)hc * n;
+    void* args[] = {(void*)&block_out, (void*)&residual, (void*)&post, (void*)&comb, (void*)&out,
+                     &n, &hc, &T, (void*)&hc_dim, (void*)&n, (void*)&hc, (void*)&T};
+    unsigned grid = (unsigned)((hc_dim + 255) / 256);
+    return hipModuleLaunchKernel(g_dsv4_hc_post, grid, 1, 1, 256, 1, 1, 0, stream, args, nullptr);
+}
+
+// dsv4_hc_head: final mixer before LM head. No Sinkhorn, just sigmoid weighting.
+// rms_norm(res) -> output_hc_fn matmul [n_hc x hc_dim] -> [n_hc][T]
+// sigmoid(pre * scale[0] + base) + eps -> per-stream weights
+// weighted_sum(weights, res) = mixed output [n_embd][T]
+hipError_t gpu_dsv4_hc_head(const float* res_in, const float* w_fn, const float* w_base, const float* w_scale,
+                            float* out, int n, int hc, int T, float eps, hipStream_t stream) {
+    if (!g_dsv4_hc_head) return hipErrorInvalidDeviceFunction;
+    if (T <= 0 || hc <= 0 || n <= 0) return hipErrorInvalidValue;
+    const int64_t hc_dim = (int64_t)hc * n;
+    void* args[] = {(void*)&res_in, (void*)&w_fn, (void*)&w_base, (void*)&w_scale, (void*)&out,
+                     &n, &hc, &T, &eps, (void*)&hc_dim};
+    unsigned grid = (unsigned)((hc_dim + 255) / 256);
+    return hipModuleLaunchKernel(g_dsv4_hc_head, grid, 1, 1, 256, 1, 1, 0, stream, args, nullptr);
+}
+
+// DeepSeek V4: compressed attention kernel launcher
+// Projects K through compressor matrices and manages ring buffer state
+hipError_t gpu_dsv4_compress(const float* x, const float* wkv, const float* wgate, const float* ape,
+                             const float* norm, const float* kv_state_in, const float* score_state_in,
+                             float* kv_proj, float* sc_proj, float* kv_state_out, float* score_state_out,
+                             int* should_compress, int n_embd, int head_dim, int ratio, int T, int coff,
+                             int pos0, hipStream_t stream) {
+    if (!g_dsv4_compress) return hipErrorInvalidDeviceFunction;
+    if (T <= 0 || ratio <= 0 || head_dim <= 0 || n_embd <= 0 || coff <= 0 || pos0 < 0)
+        return hipErrorInvalidValue;
+    void* args[] = {(void*)&x, (void*)&wkv, (void*)&wgate, (void*)&ape, (void*)&norm,
+                     (void*)&kv_state_in, (void*)&score_state_in, (void*)&kv_proj,
+                     (void*)&sc_proj, (void*)&kv_state_out, (void*)&score_state_out,
+                     (void*)&should_compress, &n_embd, &head_dim, &ratio, &T,
+                     &coff, &pos0};
+    unsigned grid = (unsigned)((coff * head_dim + 255) / 256);
+    return hipModuleLaunchKernel(g_dsv4_compress, grid, (unsigned)T, 1, 256, 1, 1, 0, stream, args, nullptr);
 }
