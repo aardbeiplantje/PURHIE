@@ -69,39 +69,22 @@ __device__ __forceinline__ float conv_channel(const float* hist, const float* wc
     return y;
 }
 
-// The decay gate and beta of token rows [k0, k1) * n_v, by one workgroup.
-// Per-head (qwen35 / qwen3.5): g_out [k0..k1), beta_out [k0..k1).
-// Per-channel (glm5_next): g_out [k0..k1) * DS (one scale per channel), beta_out [k0..k1).
+// The decay gate and beta of token rows [k0, k1) * n_v, by one workgroup
 __device__ __forceinline__ void gates(const float* alpha, const float* beta_in, const float* dt_bias,
-                                       const float* ssm_a, float* g_out, float* beta_out, int n_v, int k0, int k1,
-                                       bool per_channel) {
-    if (!per_channel) {
-        for (int k = k0 + threadIdx.x; k < k1; k += DS) {
-            const int h = k % n_v;
-            const float a = alpha[k] + dt_bias[h];
-            const float sp = a > 20.0f ? a : logf(1.0f + expf(a));
-            g_out[k] = sp * ssm_a[h];
-            beta_out[k] = 1.0f / (1.0f + expf(-beta_in[k]));
-        }
-    } else {
-        // Per-channel: alpha [k0..k1), dt_bias [n_v], ssm_a [n_v * DS]
-        // g_out: [k0..k1) * DS values, one scale per channel
-        for (int k = k0 + threadIdx.x; k < k1; k += DS) {
-            const int h = k % n_v;
-            for (int d = 0; d < DS; ++d) {
-                const float a = alpha[k * DS + d] + dt_bias[h];
-                const float sp = a > 20.0f ? a : logf(1.0f + expf(a));
-                g_out[(k - k0) * DS + d] = sp * ssm_a[h * DS + d];
-            }
-            beta_out[k] = 1.0f / (1.0f + expf(-beta_in[k]));
-        }
+                                      const float* ssm_a, float* g_out, float* beta_out, int n_v, int k0, int k1) {
+    for (int k = k0 + threadIdx.x; k < k1; k += DS) {
+        const int h = k % n_v;
+        const float a = alpha[k] + dt_bias[h];
+        const float sp = a > 20.0f ? a : logf(1.0f + expf(a));
+        g_out[k] = sp * ssm_a[h];
+        beta_out[k] = 1.0f / (1.0f + expf(-beta_in[k]));
     }
 }
 
 extern "C" __global__ void __launch_bounds__(DS)
 deltanet_pre(const float* qkv, float* conv_state, const float* conv_w, int d_conv, float* conv_out, int n_qk,
-              const float* alpha, const float* beta_in, const float* dt_bias, const float* ssm_a, float* g_out,
-              float* beta_out, int n_v, float eps, int T, int per_channel) {
+             const float* alpha, const float* beta_in, const float* dt_bias, const float* ssm_a, float* g_out,
+             float* beta_out, int n_v, float eps, int T) {
     const int conv_dim = gridDim.x * DS;
     const int c = blockIdx.x * DS + threadIdx.x;
     const int ns = d_conv - 1;
@@ -119,13 +102,13 @@ deltanet_pre(const float* qkv, float* conv_state, const float* conv_w, int d_con
     }
     for (int i = 0; i < ns; ++i) st[i] = hist[i];
 
-    if (blockIdx.x == 0) gates(alpha, beta_in, dt_bias, ssm_a, g_out, beta_out, n_v, 0, T * n_v, per_channel != 0);
+    if (blockIdx.x == 0) gates(alpha, beta_in, dt_bias, ssm_a, g_out, beta_out, n_v, 0, T * n_v);
 }
 
 extern "C" __global__ void __launch_bounds__(DS)
 deltanet_conv(const float* qkv, const float* conv_state, const float* conv_w, int d_conv, float* conv_out,
-               int n_qk, const float* alpha, const float* beta_in, const float* dt_bias, const float* ssm_a,
-               float* g_out, float* beta_out, int n_v, float eps, int per_channel) {
+              int n_qk, const float* alpha, const float* beta_in, const float* dt_bias, const float* ssm_a,
+              float* g_out, float* beta_out, int n_v, float eps) {
     const int conv_dim = gridDim.x * DS, t = blockIdx.y;
     const int c = blockIdx.x * DS + threadIdx.x;
     const int ns = d_conv - 1;
@@ -139,7 +122,7 @@ deltanet_conv(const float* qkv, const float* conv_state, const float* conv_w, in
     const float x = qkv[(size_t)t * conv_dim + c];
     conv_out[(size_t)t * conv_dim + c] = conv_channel(hist, wc, ns, x, (int)blockIdx.x < n_qk, eps);
 
-    if (blockIdx.x == 0) gates(alpha, beta_in, dt_bias, ssm_a, g_out, beta_out, n_v, t * n_v, (t + 1) * n_v, per_channel != 0);
+    if (blockIdx.x == 0) gates(alpha, beta_in, dt_bias, ssm_a, g_out, beta_out, n_v, t * n_v, (t + 1) * n_v);
 }
 
 // The states after the first tokens of a verify pass (speculative decoding's rollback points): p[m] (when set)
@@ -172,13 +155,9 @@ deltanet_conv_state(const float* qkv, float* conv_state, int d_conv, int T, MidS
     for (int i = 0; i < ns; ++i) st[i] = h[i];
 }
 
-// Per-channel decay (glm5_next / KDA): g has shape [T][n_v * DS] (one scale per channel, not per V head).
-// The state update becomes S[:, j] *= exp(g[:, j]) per channel, not a per-head scalar.
-// Current (qwen35): g [T][n_v], one decay per V head, applied to all rows of that head's state.
-// Per-channel: g [T][n_v * 128], each of the R rows of column j gets its own decay factor.
 extern "C" __global__ void __launch_bounds__(128)
 deltanet_rule(float* state, const float* conv_out, const float* g, const float* beta, float* out, int n_k, int T,
-               MidStates mid, int per_channel) {
+              MidStates mid) {
     constexpr int R = DS / RULE_RP;
     const int h = blockIdx.x, n_v = gridDim.x, hk = h % n_k;
     const int p = threadIdx.x % RULE_RP, j = blockIdx.y * RULE_CW + threadIdx.x / RULE_RP;
@@ -203,52 +182,26 @@ deltanet_rule(float* state, const float* conv_out, const float* g, const float* 
             k[4 * r] = b.x, k[4 * r + 1] = b.y, k[4 * r + 2] = b.z, k[4 * r + 3] = b.w;
         }
         const float v = co[2 * n_k * DS + h * DS + j];
-        const float bt = beta[t * n_v + h];
+        const float decay = expf(g[t * n_v + h]), bt = beta[t * n_v + h];
 
-        if (!per_channel) {
-            // Original per-head scalar decay (qwen35 path)
-            const float decay = expf(g[t * n_v + h]);
-            float kv = 0.0f;
+        float kv = 0.0f;
 #pragma unroll
-            for (int r = 0; r < R; ++r) {
-                col[r] *= decay;
-                kv += col[r] * k[r];
-            }
-#pragma unroll
-            for (int off = 1; off < RULE_RP; off <<= 1) kv += __shfl_xor(kv, off, 32);
-            const float delta = (v - kv) * bt;
-            float o = 0.0f;
-#pragma unroll
-            for (int r = 0; r < R; ++r) {
-                col[r] += k[r] * delta;
-                o += col[r] * q[r];
-            }
-#pragma unroll
-            for (int off = 1; off < RULE_RP; off <<= 1) o += __shfl_xor(o, off, 32);
-            if (p == 0) out[(size_t)t * n_v * DS + h * DS + j] = o * scale;
-        } else {
-            // Per-channel decay (glm5_next / KDA path): g [(t * n_v + h) * DS + j * R + r]
-            const int g_base = (t * n_v + h) * DS;
-            float kv = 0.0f;
-#pragma unroll
-            for (int r = 0; r < R; ++r) {
-                const float decay = expf(g[g_base + j * R + r]);
-                col[r] *= decay;
-                kv += col[r] * k[r];
-            }
-#pragma unroll
-            for (int off = 1; off < RULE_RP; off <<= 1) kv += __shfl_xor(kv, off, 32);
-            const float delta = (v - kv) * bt;
-            float o = 0.0f;
-#pragma unroll
-            for (int r = 0; r < R; ++r) {
-                col[r] += k[r] * delta;
-                o += col[r] * q[r];
-            }
-#pragma unroll
-            for (int off = 1; off < RULE_RP; off <<= 1) o += __shfl_xor(o, off, 32);
-            if (p == 0) out[(size_t)t * n_v * DS + h * DS + j] = o * scale;
+        for (int r = 0; r < R; ++r) {
+            col[r] *= decay;
+            kv += col[r] * k[r];
         }
+#pragma unroll
+        for (int off = 1; off < RULE_RP; off <<= 1) kv += __shfl_xor(kv, off, 32);
+        const float delta = (v - kv) * bt;
+        float o = 0.0f;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            col[r] += k[r] * delta;
+            o += col[r] * q[r];
+        }
+#pragma unroll
+        for (int off = 1; off < RULE_RP; off <<= 1) o += __shfl_xor(o, off, 32);
+        if (p == 0) out[(size_t)t * n_v * DS + h * DS + j] = o * scale;
         if (t < 3 && t < T - 1 && mid.p[t]) {  // the state after token t: a rollback point of a verify pass
             float* Sm = mid.p[t] + ((size_t)h * (DS / RULE_CW) + blockIdx.y) * R * 128 + threadIdx.x;
 #pragma unroll

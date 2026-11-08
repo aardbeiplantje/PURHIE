@@ -8,7 +8,6 @@
 
 #include "qmatvec.h"
 #include "deltanet.h"  // deltanet_mid_states
-#include "inference_internal.h"  // QuantWeight for DSV4 hash routing
 
 #ifdef __cplusplus
 extern "C" {
@@ -122,45 +121,8 @@ hipError_t gpu_mamba_gnorm(const float* y, const float* zx, long long ld, const 
 // quantized into q8 if set.
 hipError_t gpu_moe_router_sigmoid(const float* logits, const float* bias, int* ids, float* wts, int n_expert,
                                   int n_used, int norm, float scale, int T, hipStream_t stream);
-// DeepSeek V4: sqrtsoftplus routing with bias, top-k, renormalized weights * scale
-hipError_t gpu_moe_router_sqrtsoftplus(const float* logits, const float* bias, int* ids, float* wts, int n_expert,
-                                       int n_used, int norm, float scale, int T, hipStream_t stream);
-// DeepSeek V4: DSA sparse attention mask application
-// Apply top-k selection from DSA indexer to weight attention output
-// attn [n_head * head_dim, T], ids [T][top_k], sel_w [T][top_k], out [n_head * head_dim, T]
-hipError_t gpu_dsa_attention_mask(const float* attn, const int* ids, const float* sel_w, float* out,
-                                   int n_heads_head_dim, int n_pooled, int top_k, int T, hipStream_t stream);
-// DeepSeek V4 / GLM-5.3-Flash: full-rank hyper-connections with Sinkhorn normalization
-// dsv4_hc_pre: before a token mixer. rms_norm(res) -> hc_fn matmul -> split into pre/post/comb via Sinkhorn
-// -> weighted_sum(pre, res) = mixed input to the mixer. res[res_in], res_out, w_fn, w_base, w_scale[out]
-// n: n_embd, hc: n_hc, T: tokens. dst[hc_dim][T], pre[n_hc][T], post[n_hc][T], comb[n_hc][n_hc][T]
-hipError_t gpu_dsv4_hc_pre(const float* res_in, float* dst, float* pre, float* post, float* comb,
-                           const float* w_fn, const float* w_base, const float* w_scale, int n, int hc, int T,
-                           float eps, int sinkhorn_iters, hipStream_t stream);
-// dsv4_hc_post: after a token mixer. block_out[n][T] (single stream), residual[hc*n][T] (multi-stream),
-// post[hc][T], comb[hc][hc][T]. output[hc*n][T] = block_out * post + sum_src(comb * residual[src])
-hipError_t gpu_dsv4_hc_post(const float* block_out, const float* residual, const float* post, const float* comb,
-                            float* out, int n, int hc, int T, hipStream_t stream);
-// dsv4_hc_head: final mixer before LM head. rms_norm(res) -> output_hc_fn matmul -> sigmoid(pre) + eps
-// -> weighted_sum(pre, res) = mixed output [n_embd][T]. No Sinkhorn, just per-stream weights.
-hipError_t gpu_dsv4_hc_head(const float* res_in, const float* w_fn, const float* w_base, const float* w_scale,
-                            float* out, int n, int hc, int T, float eps, hipStream_t stream);
-// DeepSeek V4: compressed attention (ratio > 0)
-// Projects K through compressor matrices, manages ring buffer, pools when should_compress
-hipError_t gpu_dsv4_compress(const float* x, const float* wkv, const float* wgate, const float* ape,
-                             const float* norm, const float* kv_state_in, const float* score_state_in,
-                             float* kv_proj, float* sc_proj, float* kv_state_out, float* score_state_out,
-                             int* should_compress, int n_embd, int head_dim, int ratio, int T, int coff,
-                             int pos0, hipStream_t stream);
 hipError_t gpu_relu2(const float* in, float* out, int rows, int h, int stride, const qmatvec_q8* q8,
                      hipStream_t stream);
-
-// DeepSeek V4: hash layer routing (token-ID to expert-ID lookup)
-// ffn_gate_tid2eid: [n_expert_used, n_vocab] F32; for each token t, tid2eid[e][tokens[t]] = expert_id
-// ids: [T][n_used] output expert assignments; wts: [T][n_used] output weights (all 1.0f)
-// tokens: [T] input token IDs; returns true on success
-extern "C" bool matvec_hash_routing(const QuantWeight& tid2eid, const int* tokens, int* ids, float* wts,
-                                    int n_expert, int n_used, int n_vocab, int T);
 
 #ifdef __cplusplus
 }

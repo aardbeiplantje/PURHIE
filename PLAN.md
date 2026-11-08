@@ -8,7 +8,7 @@
 1. **Qwen3.8-Flash-Next from BF16** (section below): the model's own MTP layer as its draft head; a batch's PLE rows
    read from disk in parallel.
 2. **Concurrent runs** in rocm-inference-server (section below).
-3. **Server logging** (section below): implemented and verified end-to-end.
+3. **Server logging** (section below): implemented; the server test and the Flash soak run are open.
 4. **GLM-5.3-Flash (`glm5_next`) as an architecture** (section below): the gate is memory capacity, not kernels -
    95% of its 320B params are expert weights, and none of FP8 / FP4 / Q4_0 fits 128 GB, so nothing runs until the
    expert pin / unpin decision below is made. Start with the tiny GGUF generator, not the kernels.
@@ -165,11 +165,19 @@ each per round; GPU sharing); long prefills in chunks between other requests' to
 off the request path (between rounds, or in a second process); fairness and queue limits per user (with the
 logging's user and conversation id); llama-server on the same GPU.
 
-## Server logging
+## Server logging (implemented, not yet run end to end)
 
-Implemented and verified end-to-end. The engine's event hook (C), its Perl binding (`set_event_handler`), the formatter `ROCm::Inference::Log`, the server's lines (start, done, prefill progress, loads, access) and the options `--log-level`, `--log-format`, `--log-color` are in. Unit tests: `t/05-log.t` (formatter), `t/15-events.t` (GPU, a real generate). Server test (`t/60-server.t`) and Flash soak run completed.
-
-Identity: the user (nginx X-Remote-User; a Keycloak JWT later), the client address (X-Real-IP), and the conversation id (the X-LLamaCPP-Id-slot header of the opencode fixups). The docker repo's nginx needs `proxy_set_header X-Remote-User` on /rocm/ (not done here).
+The engine's event hook (C), its Perl binding (`set_event_handler`), the formatter `ROCm::Inference::Log`, the server's
+lines (start, done, prefill progress, loads, access) and the options `--log-level`, `--log-format`, `--log-color` are
+in. Unit tests: `t/05-log.t` (formatter), `t/15-events.t` (GPU, a real generate). Not yet run:
+- **Server test** (`t/60-server.t`, to extend): the server on a tiny model with `--log-level debug --log-format json`,
+  one chat request; the captured lines parsed as JSON, in order: prefill_begin, prefill_progress (up to the total),
+  prefill_end, the first token, done. The first token has no line yet: the done line carries the first-token time.
+- **Soak on the Flash model**: one request with a long prompt; the prefill ticks visible in real time, no per-token
+  lines. Needs a model location that pins (see the draft-head item under Open leads).
+Identity: the user (nginx X-Remote-User; a Keycloak JWT later), the client address (X-Real-IP), and the conversation
+id (the X-LLamaCPP-Id-slot header of the opencode fixups). The docker repo's nginx needs `proxy_set_header
+X-Remote-User` on /rocm/ (not done here).
 
 ## Later
 
@@ -192,21 +200,6 @@ Identity: the user (nginx X-Remote-User; a Keycloak JWT later), the client addre
   engine has no YaRN. To do: YaRN frequencies and the attention scale in the RoPE, a `--rope-factor` option, and a
   quality check at long context (not only that it runs). The 16 GB KV budget caps it at about 600k positions at F16
   even then. Keep in mind; not started.
-
-## Future architectures
-
-- **gpt-oss** (user, 2026-11-04).
-- **deepseek2** (user, 2026-11-04).
-- **glm4** (user, 2026-11-04).
-- **phi3** (user, 2026-11-04).
-- **gemma2 / gemma3** (user, 2026-11-04).
-- **Mistral** (user, 2026-11-04): llama architecture, SentencePiece tokenizer.
-
-## Future infrastructure
-
-- **ROCmFP4_FAST WMMA kernel work** (user, 2026-11-04: "move on, table this for now"). Tabled because Phase 1 profiling on Qwen3.8-27B (14 GB, `matvec_q8_q4_0_rocmfp4_fast` at 81.8% of GPU time) shows generation is bandwidth-bound (202 GB/s of weights, near UMA peak of 256 GB/s), not compute-bound. WMMA kernels (`matmul_wmma_q4_0_rocmfp4_fast`) account for only 12.2% of GPU time and are used only for prefill (T â¥ 32 tokens). For T=1 generation, forcing WMMA would waste compute on padding, add LDS staging traffic, and increase epilogue overhead â ~5-10% more power for the same output. WMMA is the right choice for prefill (amortizes weight reads across 64+ tokens); the bottleneck for generation is `matvec_q8_q4_0_rocmfp4_fast` (single-token int8 path), and optimization must target model-level changes (smaller footprint, already at 4.25 bpw) or caching, not kernel-level tweaks.
-- **CPAN release of ROCm::Inference, Minijinja and Web::Route** (user, 2026-11-05: the Docker image builds them
-  from source).
 
 ## Open leads
 
@@ -248,6 +241,13 @@ Tests and API:
   tools (<|python_tag|> brave_search.call(...)) not parsed; Nemotron's reply format (check against its template).
 - The XS module lacks inference_prefill_logits, model_name and set_seed (add when a Perl user needs them); a C
   API channel flag for reply kinds only if a non-Perl user needs it.
+
+## Tabled
+
+- Older architectures: gpt-oss, deepseek2, glm4, phi3, gemma2 / gemma3, Mistral (user, 2026-11-04).
+- The ROCmFP4_FAST WMMA kernel work (user, 2026-11-04: "move on, table this for now").
+- A CPAN release of ROCm::Inference, Minijinja and Web::Route (user, 2026-11-05: the Docker image builds them
+  from source).
 
 ## Tried and rejected (measured; do not repeat without a new idea)
 
