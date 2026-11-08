@@ -7,7 +7,7 @@ use JSON::PP ();
 use POSIX ();
 use Time::HiRes ();
 
-# The server's log lines (WORKLOG logging plan, Phase 3): one line per event, with the PID, the user, the client
+# The server's log lines: one line per event, with the PID, the user, the client
 # address, the conversation, the request, the model and the event; text (fixed columns, so docker logs stays
 # greppable) or JSON lines. Colours by kind, off unless the output is a terminal (or color => 'always').
 

@@ -245,7 +245,7 @@ struct inference_model {
     int lm_head_q8 = 0;                                 // inference_set_lm_head_q8: use an int8 copy of the LM head
     uint64_t seed = 0;                                  // inference_generate sampler seed
 
-    // Engine event hook (WORKLOG logging plan, Phase 1): a per-model observer (inference_set_event_cb). Null until
+    // Engine event hook: a per-model observer (inference_set_event_cb). Null until
     // a host registers one (the default). Events fire synchronously on the caller's thread; the callback must do no
     // I/O. A null callback costs one pointer check per fire site. See inference.h for the event types.
     inference_event_cb event_cb = nullptr;

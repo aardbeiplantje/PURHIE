@@ -11,7 +11,9 @@
 3. **Server logging** (section below): implemented and tested (`t/62-server-log.t`); the Flash soak run is open.
 4. **GLM-5.3-Flash (`glm5_next`) as an architecture** (section below): the gate is memory capacity, not kernels -
    95% of its 320B params are expert weights, and none of FP8 / FP4 / Q4_0 fits 128 GB, so nothing runs until the
-   expert pin / unpin decision below is made. Start with the tiny GGUF generator, not the kernels.
+   expert pin / unpin decision below is made. Start with the tiny GGUF generator, not the kernels. A first attempt
+   (4fe7dae, another agent; reverted in d4a45fa) skipped the gate and the oracle: tensor names unlike `glm-dsa`'s, a
+   tiny GGUF its own loader refused, and a DSA path that reweighted dense attention output instead of selecting keys.
 
 Later: a conversion / quantization tool in this project; expert pin / unpin for MoE models larger than memory.
 
@@ -66,7 +68,7 @@ tensor shapes before sizing anything.
 2. **The converter and the loader, no kernels.** `llama.cpp/conversion/` has base, command_r, deepseek,
    diffusion_gemma, laguna, llama, mellum, muse_glimmer, qwen4exp and zaya - **no `glm5_next` mapping** - so the
    HF -> GGUF conversion is itself a deliverable. The loader dispatches on `general.architecture` against a
-   hardcoded list at `src/inference.cpp:856`, so an unknown arch fails with "architecture %s is not supported"
+   hardcoded list (`archs` in `inference_model_info`, `src/inference.cpp`), so an unknown arch fails with "architecture %s is not supported"
    before anything runs. Tensor name -> slot map from the checkpoint's own `modules_to_not_convert` (a literal
    tensor-name list): `self_attn.{q,k,v,qkv_proj,o,f_a,f_b,g_a,g_b,b}_proj*`, `{q,k,v}_conv1d`, `A_log`, `dt_bias`,
    `o_norm`, `fused_qkvbfg_a_proj`, `indexer.{wq_b,wk,k_norm,weights_proj,index_kpool_compress_ape,
@@ -150,16 +152,22 @@ sequences are dropped (the engine does not have them; tried for llama.cpp withou
   Qwen3-0.6B (on /dev/shm). The server uses it only with `--store`; the Docker repo passes it only when ROCM_STORE
   is set (run.sh, llama.sh; empty by default).
 - **Switching reads the prefix back** instead of prefilling it: a sequence resumes from any stored prefix.
-- **Not done:** the store on by default; eviction and a disk tier in the server (`ROCm::Inference::Store` has the
-  policy, the server does not call it); a measured switch on the 27B model. Estimate: its KV is 69,632 bytes per
-  token (F16), so a 12k prefix is 0.84 GB and /data reads at 6.5 GB/s; a switch should take seconds against the 227 s
-  re-prefill in the logs. Unmeasured.
-Next: measure a 27B switch with `--store` on /dev/shm, then decide the default (run.sh), then wire eviction in.
+- **Eviction: in.** The server trims the store to `--store-max` GB (default 16) after each request, least recently
+  used first, and logs what each request mapped and published (`kv` and `evict` lines).
+- **Not done:** the store on by default; a disk tier; a measured switch on the 27B model. Estimate: its KV is 69,632
+  bytes per token (F16), so a 12k prefix is 0.84 GB and /data reads at 6.5 GB/s; a switch should take seconds
+  against the 227 s re-prefill in the logs. Unmeasured.
+- **Open (user, 2026-11-08):** with Qwen3.6-35B, opencode runs more agents, and an agent that continues after another
+  one ran seems to lose its prefill cache. Needs the user's request list and the `kv` / `evict` / done lines of the
+  affected request: whether its prefix was evicted, or its recurrent snapshot (every 4 blocks and at the prompt's
+  end) does not cover where the re-rendered prompt diverges, or opencode reorders / rewrites the earlier messages.
+Next: that question; then measure a 27B switch with `--store` on /dev/shm and decide the default (run.sh).
 
 The server serves one request at a time unless `--parallel N`, which batches N conversations of one model (not
 with a draft head); with `--models-dir` each loaded model has its own sequences and the loop steps them in turn. A
 request that arrives during another, or during a model load (2 s from the page cache, minutes from a cold disk),
-waits: a test request waited 7 min 22 s, then ran at 38 tok/s. To look at: `--parallel` by default, and with
+waits: a test request waited 7 min 22 s, then ran at 38 tok/s. `--parallel 2` passes the server tests on
+Qwen3.5-4B but has not run on the 27B / 35B deployments. To look at: `--parallel` by default, and with
 speculative decoding (a draft per sequence, or verify batches); several models generating at once (one forward pass
 each per round; GPU sharing); long prefills in chunks between other requests' tokens (prefill_chunk exists); loads
 off the request path (between rounds, or in a second process); fairness and queue limits per user (with the
@@ -238,7 +246,8 @@ Quality / correctness:
 
 Tests and API:
 - Fold the remaining verifiers into the regression suite: generate_verify, store_verify.sh, mtp_verify (needs
-  the draft head), the Perl t/ suite (Minijinja and Web::Route on PERL5LIB).
+  the draft head), the Perl t/ suite (Minijinja and Web::Route on PERL5LIB; `t/60-server.t` wants Qwen3.5-4B:
+  on Qwen3-0.6B its "is 91 prime" answer checks fail).
 - Untested: Mistral (llama architecture, SentencePiece tokenizer), Llama-3.1-8B (no files); Llama 3.1's built-in
   tools (<|python_tag|> brave_search.call(...)) not parsed; Nemotron's reply format (check against its template).
 - The XS module lacks inference_prefill_logits, model_name and set_seed (add when a Perl user needs them); a C

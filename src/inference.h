@@ -297,7 +297,7 @@ int inference_embed(inference_model_t* model, const int32_t* tokens, int n, floa
 // How the last inference_generate_stream prompt was handled: tokens reused from the sequence, tokens prefilled.
 int inference_last_prompt_stats(const inference_model_t* model, int* reused, int* prefilled);
 
-// ---- Engine event hook (WORKLOG logging plan, Phase 1): a per-model observer the host registers to watch the
+// ---- Engine event hook: a per-model observer the host registers to watch the
 // engine's prefill / store / draft activity without INFERENCE_VERBOSE's raw stderr spam. The engine calls the
 // callback synchronously, on the caller's thread, with a pointer to a small struct that is valid only for the
 // duration of the call (copy it out if you keep it). The callback must do no I/O and never block: it hands the

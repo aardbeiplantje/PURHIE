@@ -53,7 +53,7 @@ static double ms_since(const std::chrono::steady_clock::time_point& t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-// Fire one engine event (WORKLOG logging plan, Phase 1). Does nothing when no handler is registered (one null
+// Fire one engine event. Does nothing when no handler is registered (one null
 // check per fire site, the whole cost when logging is off). Fires synchronously on the caller's thread with a
 // stack event struct; the callback must not do I/O. Returns the callback's return value (0 with no handler).
 static int fire_event(inference_model* m, int type, int n0, int n1, double ms) {
@@ -2157,7 +2157,7 @@ int inference_last_prompt_stats(const inference_model_t* m, int* reused, int* pr
     return 0;
 }
 
-// WORKLOG logging plan, Phase 1: register (cb != NULL) or clear (cb == NULL) the per-model event hook. Fires
+// Register (cb != NULL) or clear (cb == NULL) the per-model event hook. Fires
 // synchronously on the caller's thread; the callback must not do I/O (it hands the event struct to its host).
 int inference_set_event_cb(inference_model_t* model, inference_event_cb cb, void* user) {
     if (!model) return INFERENCE_ERR_INVALID_ARG;

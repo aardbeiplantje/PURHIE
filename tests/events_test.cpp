@@ -1,4 +1,4 @@
-// events_test -- the engine event hook (inference_set_event_cb, WORKLOG logging plan Phase 1) on a real model:
+// events_test -- the engine event hook (inference_set_event_cb) on a real model:
 // the events' order and counts, and that the hook changes no output. Usage (from build/co, for the kernels):
 //   events_test MODEL.gguf [DRAFT_HEAD.gguf]
 // With a draft head, the draft events are checked on MODEL too.
