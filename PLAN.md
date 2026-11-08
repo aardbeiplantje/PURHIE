@@ -10,12 +10,12 @@
 2. **Concurrent runs** in rocm-inference-server (section below).
 3. **Server logging** (section below): implemented and tested (`t/62-server-log.t`); the Flash soak run is open.
 4. **GLM-5.3-Flash (`glm5_next`) as an architecture** (section below): the gate is memory capacity, not kernels -
-   95% of its 320B params are expert weights, and none of FP8 / FP4 / Q4_0 fits 128 GB, so nothing runs until the
-   expert pin / unpin decision below is made. Start with the tiny GGUF generator, not the kernels. A first attempt
+   95% of its 320B params are expert weights, and none of FP8 / FP4 / Q4_0 fits 128 GB, so it would page experts in from disk
+   (the deployment maps models from disk; expert pin / unpin is tabled) - measure that first. Start with the tiny GGUF generator, not the kernels. A first attempt
    (4fe7dae, another agent; reverted in d4a45fa) skipped the gate and the oracle: tensor names unlike `glm-dsa`'s, a
    tiny GGUF its own loader refused, and a DSA path that reweighted dense attention output instead of selecting keys.
 
-Later: a conversion / quantization tool in this project; expert pin / unpin for MoE models larger than memory.
+Later: a conversion / quantization tool in this project.
 
 ## Status in brief
 
@@ -63,8 +63,8 @@ tensor shapes before sizing anything.
    12-14 / 23-27 were estimates with no stated efficiency; measure them before quoting. So "can we run it" is a routing-trace question, not a kernel question:
    route ~10k tokens through the router alone (small enough to run on CPU from a quantized copy), count the
    distinct experts hit per layer, and settle the target bpw + the pinned fraction **before** writing a kernel.
-   This is the "expert pin / unpin" item under **Later** below, and for this model it is a prerequisite, not a
-   later nicety.
+   With expert pin / unpin tabled (2026-11-08) the cold part pages in from disk through the mapping: the routing
+   trace says how much of it a token touches.
 2. **The converter and the loader, no kernels.** `llama.cpp/conversion/` has base, command_r, deepseek,
    diffusion_gemma, laguna, llama, mellum, muse_glimmer, qwen4exp and zaya - **no `glm5_next` mapping** - so the
    HF -> GGUF conversion is itself a deliverable. The loader dispatches on `general.architecture` against a
@@ -195,7 +195,7 @@ stream prompt reports as one prefill). A client that leaves cancels its prefill 
 (Web::Route's `client_gone`). Tests: `t/05-log.t`, `t/15-events.t`, `tests/events_test` (chunked streams too), and
 `t/62-server-log.t` (Qwen3.5-4B: the lines in order, `--debug-stream`, cancels mid-prefill; both modes). Open:
 - **Soak on the Flash model**: one request with a long prompt; the prefill ticks visible in real time, no per-token
-  lines. Needs a model location that pins (see the draft-head item under Open leads).
+  lines. Needs a window with the deployment stopped (see the draft-events item under Open leads).
 - With `--parallel`, the done line's store counters (`kv` line) are the model's over the request, so another job's
   blocks can show in them.
 Identity: the user (nginx X-Remote-User; a Keycloak JWT later), the client address (X-Real-IP), and the conversation
@@ -212,11 +212,6 @@ X-Remote-User` on /rocm/ (not done here).
   full-model RAM: the BF16 Flash is 359 GB); an importance matrix collected on the GPU by the engine from an FP4
   model; checks with dequant_verify / forward_verify against ggml's quantizers. C/C++ next to quant_types.cpp, a
   Perl front end.
-- **Expert pin / unpin for MoE models larger than memory** (user: "for MoE models with a limited set of activated
-  weights, dense will always be too small"). Each GGUF file is one mapping, pinned (hipHostRegister) in ranges
-  around the CPU-only tensors; registration works on any range, so: after the router, make the chosen experts'
-  ranges resident and registered, with a cache of recently used experts; dense layers stay pinned. Only for MoE
-  models that do not fit even at FP4.
 - **Qwen3.8-Flash-Next beyond 262,144 tokens (YaRN)** (HF card, 2026-11-06). The checkpoint is 262,144 natively
   (`max_position_embeddings`, `rope_type` default); the card reaches 1M by a YaRN override (`factor` 4.0, original
   262144, with an attention scale). Nothing is dropped by the converter: the GGUF has no rope-scaling keys, and the
@@ -246,9 +241,10 @@ Quality / correctness:
 - Chunked prefill is not split-invariant on the WMMA path: a split at any point other than the engine's micro-batch
   changes logits by up to ~0.7 (0.6B, one 1128-token prompt); exact with `QMATVEC_NO_WMMA=1`. Streaming with
   `prefill_chunk`, and a store's block splits, inherit it. Decide whether the WMMA path should be exact.
-- Draft events are not verified: `events_test MODEL DRAFT` is written but not run. The Flash model does not pin on
-  the work host (ext4 /models, a 67.7 GB range: invalid argument), and there is no small model with a draft head
-  (tools/gen_qwen4exp_tiny.py writes none). Needs a huge-page location for the Flash model, or a generator for a tiny head.
+- Draft events are not verified: `events_test MODEL DRAFT` is written but not run. The Flash model (122.8 GB file) shares
+  the work host's 124 GB with the user's deployment: a load from /models paged in 48 GB in 11 min (~70 MB/s,
+  2026-11-08) and was stopped so as not to evict the deployment's model. Flash work needs a window with the
+  deployment stopped, or a generator for a tiny model with a draft head (tools/gen_qwen4exp_tiny.py writes none).
 - K-quants dot Q8_K activations (one scale per 256), as ggml's CPU backend; ggml's GPU backend uses q8_1 (per 32):
   ~1% better perplexity at Q2_K. An option for the K-quant kernels.
 - A quantized KV cache needs n_kv * D % 256 == 0 (Qwen2.5-0.5B, 2 x 64, cannot have one).
@@ -260,7 +256,7 @@ Quality / correctness:
 Tests and API:
 - In `make regress` (2026-11-08): kv_verify, generate_verify, events_test, seq_verify (0.6B, 4B), store_verify.sh,
   and the Perl suites (Web::Route, Minijinja, ROCm::Inference with the server tests on Qwen3.5-4B). Still out:
-  mtp_verify and `events_test MODEL DRAFT` (the Flash model and its draft head; the model does not pin here).
+  mtp_verify and `events_test MODEL DRAFT` (the Flash model and its draft head: a window with the deployment stopped).
 - Untested: Mistral (llama architecture, SentencePiece tokenizer), Llama-3.1-8B (no files); Llama 3.1's built-in
   tools (<|python_tag|> brave_search.call(...)) not parsed; Nemotron's reply format (check against its template).
 - The XS module lacks inference_prefill_logits, model_name and set_seed (add when a Perl user needs them); a C
@@ -270,6 +266,8 @@ Tests and API:
 
 - Older architectures: gpt-oss, deepseek2, glm4, phi3, gemma2 / gemma3, Mistral (user, 2026-11-04).
 - The ROCmFP4_FAST WMMA kernel work (user, 2026-11-04: "move on, table this for now").
+- Expert pin / unpin for MoE models larger than memory (user, 2026-11-08: "we dont do that now, we just mmap()
+  from disk"): the deployment maps the models from disk; a model larger than memory pages in from there.
 - A CPAN release of ROCm::Inference, Minijinja and Web::Route (user, 2026-11-05: the Docker image builds them
   from source).
 
