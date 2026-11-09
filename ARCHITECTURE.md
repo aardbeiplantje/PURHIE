@@ -154,7 +154,8 @@ renames, experts stacked into one 3-D tensor, MLA's `kv_b_proj` split into a tra
 `attn_v_b`, KDA's conv1d reshape and `ssm_a = -exp(A_log)`; for DeepSeek-V4 its own layout, FP8 with E8M0
 (power-of-two) block scales, routed experts as packed FP4 moved bit for bit into MXFP4 (`repack_mxfp4`) and kept
 so, hash-routing tables as I32. A checkpoint tensor neither converted nor skipped on purpose (vision, DeepSeek's
-MTP layer) stops the conversion. Rows stream from the shards through the encoders; FP8
+MTP layer) stops the conversion. A clone with LFS whose working tree holds only pointer files (no checkout) is read in place: every file
+the converter opens goes through `lfs_path`, which turns a pointer into its object under `.git/lfs/objects`. Rows stream from the shards through the encoders; FP8
 weights with 128x128 block scales (`inference_quantize_fp8_blocks`) are decoded and encoded in one step, so an FP8
 release goes to ROCmFP4 rounded once, with the same policy as for a GGUF in (one command, one writer). `tests/convert_verify.sh`: as BF16
 the output is byte for byte `convert_hf_to_gguf.py`'s (model-card keys aside) on Qwen3-0.6B and on tiny random

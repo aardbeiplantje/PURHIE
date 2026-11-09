@@ -5,7 +5,7 @@
 #    tiny random DeepSeek-V4-Flash (tools/gen_dsv4_ckpt.py: DeepSeek's layout, FP8 with E8M0 scales, packed FP4
 #    experts, hash routing, KV compressors), converted as BF16 by both: the same tensors (names, types, shapes,
 #    bytes) and metadata (model-card keys aside).
-# 2. The tiny GLM to FAST directly = to F32, then re-encoded from that GGUF: FP8 decoded and encoded in one step, rounded once.
+# 2. The tiny GLM to FAST directly (and 3, below: from a clone with LFS pointers) = to F32, then re-encoded from that GGUF: FP8 decoded and encoded in one step, rounded once.
 # Needs: CONVERT_UPSTREAM (a llama.cpp checkout with convert_hf_to_gguf.py and gguf-py; default
 # /data/conv/upstream), CONVERT_PYTHON (a Python with torch, transformers >= 5 and safetensors; default
 # /data/hf/venv/bin/python), CONVERT_PYTHONPATH (modules ahead of it: a transformers that knows glm5_next and
@@ -33,6 +33,14 @@ for m in "$DATA/qwen3-0.6b:qwen3" "$DIR/glm-tiny:glm" "$DIR/ds-tiny:deepseek4"; 
     printf '%s, BF16: ' "$tag"
     $PL "$HERE/gguf_compare.pl" --ignore-card "$DIR/$tag-ours.gguf" "$DIR/$tag-ref.gguf" || rc=1
 done
+# 3. A git clone with LFS whose working tree has only pointer files (no checkout): read from .git/lfs/objects
+( cd "$DIR" && git init -q lfs-src && cd lfs-src && git lfs install --local > /dev/null &&
+  git lfs track '*.safetensors' '*.json' > /dev/null && cp "$DIR"/glm-tiny/* . && git add -A &&
+  git -c user.name=t -c user.email=t@t commit -qm tiny && cd .. &&
+  GIT_LFS_SKIP_SMUDGE=1 git clone -q lfs-src lfs-clone && cd lfs-clone && git lfs fetch > /dev/null ) || rc=1
+$PL "$ROOT/perl/ROCm-Inference/bin/rocm-convert" -q -f --name 'Glm Tiny' "$DIR/lfs-clone" "$DIR/glm-lfs.gguf" bf16-ref || rc=1
+printf 'glm, from LFS pointers vs from the files: '
+$PL "$HERE/gguf_compare.pl" "$DIR/glm-lfs.gguf" "$DIR/glm-ours.gguf" || rc=1
 $PL "$ROOT/perl/ROCm-Inference/bin/rocm-convert" -q -f "$DIR/glm-tiny" "$DIR/glm-f32.gguf" f32 || rc=1
 $PL "$ROOT/perl/ROCm-Inference/bin/rocm-convert" -q -f "$DIR/glm-f32.gguf" "$DIR/glm-f32-fast.gguf" fast || rc=1
 $PL "$ROOT/perl/ROCm-Inference/bin/rocm-convert" -q -f "$DIR/glm-tiny" "$DIR/glm-fast.gguf" fast || rc=1

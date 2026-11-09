@@ -37,6 +37,7 @@ sub architectures { return sort keys %ARCH }
 
 sub _slurp {
     my ($path) = @_;
+    $path = ROCm::Inference::SafeTensors::lfs_path($path);
     open my $f, '<:raw', $path or croak "$path: $!";
     local $/;
     my $s = <$f>;

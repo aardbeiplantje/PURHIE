@@ -82,7 +82,8 @@ rocm-convert - a Hugging Face checkpoint or a GGUF to a GGUF the engine runs, in
 =head1 DESCRIPTION
 
 IN is either a checkpoint directory as Hugging Face publishes it (a git clone with LFS: F<config.json>,
-F<tokenizer.json>, F<tokenizer_config.json>, F<model*.safetensors> and their index) or a GGUF (a split one by its
+F<tokenizer.json>, F<tokenizer_config.json>, F<model*.safetensors> and their index; a clone without a checkout,
+its files git-lfs pointers, is read from F<.git/lfs/objects> in place) or a GGUF (a split one by its
 first file). The output is one GGUF, written on the CPU tensor by tensor: no model is loaded whole and the GPU is
 not used.
 

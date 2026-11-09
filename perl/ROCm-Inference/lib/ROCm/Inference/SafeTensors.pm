@@ -9,10 +9,11 @@ use warnings;
 use Carp qw(croak);
 use Exporter 'import';
 use File::Spec;
+use Cwd ();
 use JSON::PP ();
 
 our $VERSION = '0.01';
-our @EXPORT_OK = qw(st_open st_read_rows st_rows st_row_bytes);
+our @EXPORT_OK = qw(st_open st_read_rows st_rows st_row_bytes lfs_path);
 # 1: each range read is dropped from the page cache after (ROCm::Inference::drop_cache), for a converter streaming
 # a checkpoint once
 our $DROP_CACHE = 0;
@@ -21,8 +22,55 @@ our $DROP_CACHE = 0;
 my %SIZE = (F64 => 8, F32 => 4, F16 => 2, BF16 => 2, F8_E4M3 => 1, F8_E5M2 => 1, F8_E8M0 => 1, I64 => 8, I32 => 4,
             I16 => 2, I8 => 1, U8 => 1, BOOL => 1);
 
+# A file of a git clone with LFS whose working tree holds pointer files (no checkout: the content is only in
+# .git/lfs/objects): the object's path for a pointer, the path itself for any other file. A pointer is
+# "version https://git-lfs.github.com/spec/v1", "oid sha256:<hex>", "size <n>"; the object is
+# <git dir>/lfs/objects/<hex 0-1>/<hex 2-3>/<hex>, the git dir the nearest .git above the file (a directory, or a
+# file with "gitdir: <path>" for a worktree or submodule).
+sub lfs_path {
+    my ($path) = @_;
+    my $size = -s $path;
+    return $path unless defined $size && $size < 1024;
+    open my $f, '<:raw', $path or return $path;
+    local $/;
+    my $s = <$f> // '';
+    close $f;
+    return $path unless $s =~ m{\Aversion https://git-lfs\.github\.com/spec/v1\n}
+                     && $s =~ /^oid sha256:([0-9a-f]{64})$/m;
+    my $oid = $1;
+    my ($want) = $s =~ /^size (\d+)$/m;
+    my $dir = File::Spec->rel2abs((File::Spec->splitpath(File::Spec->rel2abs($path)))[1]);
+    my $git;
+    while (1) {
+        my $g = File::Spec->catfile($dir, '.git');
+        if (-d $g) { $git = $g; last }
+        if (-f $g) {
+            open my $h, '<', $g or croak "$g: $!";
+            my ($gd) = <$h> =~ /^gitdir:\s*(.+?)\s*$/;
+            croak "$g: no gitdir line" unless defined $gd;
+            $git = File::Spec->rel2abs($gd, $dir);
+            my $common = File::Spec->catfile($git, 'commondir');  # a worktree: the objects are the main repo's
+            if (-f $common && open my $c, '<', $common) {
+                my $cd = <$c> // '';
+                chomp $cd;
+                $git = File::Spec->rel2abs($cd, $git) if length $cd;
+            }
+            last;
+        }
+        my $up = File::Spec->catdir($dir, File::Spec->updir);
+        last if File::Spec->rel2abs($up) eq $dir || $dir eq File::Spec->rootdir;
+        $dir = Cwd::abs_path($up) // last;
+    }
+    croak "$path is a git-lfs pointer, but no .git above it holds the object" unless $git;
+    my $obj = File::Spec->catfile($git, 'lfs', 'objects', substr($oid, 0, 2), substr($oid, 2, 2), $oid);
+    croak "$path is a git-lfs pointer to $oid, not fetched (git lfs fetch)" unless -f $obj;
+    croak "$obj: " . (-s $obj) . " bytes, the pointer says $want" if defined $want && -s $obj != $want;
+    return $obj;
+}
+
 sub _slurp {
     my ($path) = @_;
+    $path = lfs_path($path);
     open my $f, '<:raw', $path or croak "$path: $!";
     local $/;
     my $s = <$f>;
@@ -47,7 +95,7 @@ sub st_open {
     }
     my %st = (dir => $dir, tensors => {}, order => []);
     for my $file (@files) {
-        my $path = File::Spec->catfile($dir, $file);
+        my $path = lfs_path(File::Spec->catfile($dir, $file));
         open my $f, '<:raw', $path or croak "$path: $!";
         read($f, my $n8, 8) == 8 or croak "$path: not a safetensors file";
         my $n = unpack 'Q<', $n8;
@@ -133,6 +181,12 @@ C<name>, C<dtype>, C<shape>, C<file>, C<start>, C<bytes>, C<esize>) and C<order>
 =item st_read_rows(\%handles, $tensor, $first_row, $n_rows)
 
 Those rows (all dimensions but the last flattened) as a byte string.
+
+=item lfs_path($path)
+
+The file's content path: for a git-lfs pointer file (a clone without a checkout), the object under the nearest
+F<.git/lfs/objects> (dies when it was not fetched or its size is not the pointer's); C<$path> otherwise.
+st_open and the converter read every file through it.
 
 =item st_rows($tensor), st_row_bytes($tensor)
 
