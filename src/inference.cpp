@@ -899,6 +899,17 @@ int inference_quantize(int dst_type, void* dst, int src_type, const void* src, l
     return 0;
 }
 
+int inference_quantize_fp8_blocks(int dst_type, void* dst, const void* src, const float* scale, long long nrows,
+                                  long long ncols, int block_rows, int block_cols, long long scale_cols, int n_threads) {
+    char err[256];
+    if (qz_quantize_fp8_blocks(dst_type, dst, (const uint8_t*)src, scale, nrows, ncols, block_rows, block_cols,
+                               scale_cols, n_threads, err, sizeof err) != 0) {
+        set_error("%s", err);
+        return INFERENCE_ERR_INVALID_ARG;
+    }
+    return 0;
+}
+
 int inference_model_info(const char* path, inference_model_info_t* out) {
     clear_error();
     if (!path || !out) { set_error("NULL argument"); return -1; }

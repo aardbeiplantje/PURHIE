@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-# gguf_compare.pl A.gguf B.gguf: the same metadata (keys, types, values; order ignored) and the same tensors (by
+# gguf_compare.pl [--ignore-card] A.gguf B.gguf: the same metadata (keys, types, values; order ignored) and the same tensors (by
 # name: type, shape and data bytes; order ignored). Exit 0 when they are, 1 with the differences listed otherwise.
 use strict;
 use warnings;
@@ -7,7 +7,11 @@ use warnings;
 use Digest::SHA;
 use ROCm::Inference::GGUF qw(gguf_read gguf_read_rows gguf_type_info);
 
-die "usage: $0 A.gguf B.gguf\n" unless @ARGV == 2;
+# --ignore-card: the model-card keys convert_hf_to_gguf.py derives from README.md / the parameter count
+# (general.license*, base_model*, tags, size_label, basename, ...) are not compared
+my $ignore_card = @ARGV && $ARGV[0] eq '--ignore-card' ? shift : 0;
+my $CARD = qr/^general\.(?:license|base_model|tags|size_label|basename|finetune|version|organization|author|url|repo_url|doi|uuid|description|languages|datasets|quantized_by|source)/;
+die "usage: $0 [--ignore-card] A.gguf B.gguf\n" unless @ARGV == 2;
 my ($A, $B) = map { gguf_read($_) } @ARGV;
 my $bad = 0;
 sub diff { print "  $_[0]\n"; ++$bad }
@@ -19,6 +23,7 @@ sub kv_str {
 my %ka = map { $_->[0] => kv_str($_->[1], $_->[2]) } @{$A->{kv}};
 my %kb = map { $_->[0] => kv_str($_->[1], $_->[2]) } @{$B->{kv}};
 for my $k (sort keys %{{%ka, %kb}}) {
+    next if $ignore_card && $k =~ $CARD;
     if (!exists $ka{$k} || !exists $kb{$k}) { diff("metadata $k only in " . (exists $ka{$k} ? 'A' : 'B')) }
     elsif ($ka{$k} ne $kb{$k}) { diff("metadata $k: $ka{$k} / $kb{$k}") }
 }

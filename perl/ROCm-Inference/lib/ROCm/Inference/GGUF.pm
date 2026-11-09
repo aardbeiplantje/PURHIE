@@ -1,7 +1,7 @@
 package ROCm::Inference::GGUF;
 
 # GGUF files in plain Perl: the header (metadata and tensor table) read and written, tensor data read in row ranges.
-# No model is loaded and no GPU is touched; bin/rocm-quantize builds on it.
+# No model is loaded and no GPU is touched; bin/rocm-convert builds on it.
 
 use strict;
 use warnings;
@@ -11,6 +11,8 @@ use Exporter 'import';
 
 our $VERSION = '0.01';
 our @EXPORT_OK = qw(gguf_read gguf_write_header gguf_type_info gguf_type_id gguf_tensor_bytes gguf_read_rows);
+# 1: each range gguf_read_rows reads is dropped from the page cache after (ROCm::Inference::drop_cache)
+our $DROP_CACHE = 0;
 
 # Metadata value types (gguf.h)
 use constant {
@@ -160,12 +162,16 @@ sub gguf_read_rows {
         croak "$t->{path}: $!" unless defined $got;
         croak "$t->{path}: tensor $t->{name} is cut short" unless $got;
     }
+    ROCm::Inference::drop_cache(fileno($fh), $at, $want) if $DROP_CACHE;
     return $buf;
 }
 
 sub _enc_value {
     my ($type, $v) = @_;
-    return pack('Q<', length $v) . $v if $type == T_STRING;
+    if ($type == T_STRING) {  # character strings (decoded JSON) as UTF-8 bytes
+        utf8::encode($v) if utf8::is_utf8($v);
+        return pack('Q<', length $v) . $v;
+    }
     if ($type == T_ARRAY) {
         my ($et, $vals) = @$v;
         my $s = pack 'VQ<', $et, scalar @$vals;

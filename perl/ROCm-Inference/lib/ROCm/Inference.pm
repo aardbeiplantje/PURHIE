@@ -625,7 +625,23 @@ string, re-encoded as C<$dst_type> on the CPU: F32 (0), F16 (1), BF16 (30), Q8_0
 Q4_0_ROCMFP4_FAST (101), the same bytes as the reference quantizers write without an importance matrix. Returns
 the encoded rows as a byte string. C<$n_threads> (default 0: one a core) encoder threads. No model is needed and
 the GPU is not used. Dies on a type it cannot decode or encode, on rows that are not whole blocks, or on short
-input. ROCm::Inference::GGUF and bin/rocm-quantize build a whole-file quantizer on it.
+input. ROCm::Inference::Convert and bin/rocm-convert build whole-file conversion on it.
+
+=item quantize_fp8_blocks($dst_type, $fp8_bytes, $scale_bytes, $n_rows, $n_cols, $block_rows, $block_cols, $scale_cols, $n_threads)
+
+The same from FP8 e4m3fn weights (one byte a value) with a float32 scale per C<$block_rows> x C<$block_cols>
+block (a Hugging Face checkpoint's C<weight_scale_inv>, C<$scale_cols> a row): each value is fp8 times its
+block's scale, then encoded. The rows start at a row that starts a block. bin/rocm-convert reads FP8 releases
+with it.
+
+=item json_decode($bytes)
+
+JSON (UTF-8 bytes) as Perl data, for the converter's F<config.json> and F<tokenizer.json> (which take JSON::PP
+minutes): objects as hash references, arrays as array references, booleans as Perl's true and false.
+
+=item exp_neg_f32($bytes)
+
+C<-expf(x)> for each float32 of a byte string (the converter's C<ssm_a = -exp(A_log)>, rounded as float32).
 
 =item quant_row_size($type, $n_cols)
 

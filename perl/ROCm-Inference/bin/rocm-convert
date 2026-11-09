@@ -1,0 +1,164 @@
+#!/usr/bin/env perl
+# rocm-convert: a Hugging Face checkpoint or a GGUF to one GGUF in the engine's types (ROCmFP4, FAST, Q8_0, ...).
+use strict;
+use warnings;
+
+use File::Basename qw(basename);
+use Getopt::Long qw(GetOptions);
+use Pod::Usage qw(pod2usage);
+use Time::HiRes qw(time);
+
+use ROCm::Inference::Convert ();
+use ROCm::Inference::GGUF qw(gguf_type_info);
+use ROCm::Inference::Quant ();
+
+my %o = (threads => 0, type => [], recipe => 'strix');
+GetOptions(\%o, 'type|t=s@', 'recipe|r=s', 'threads|j=i', 'arch=s', 'pre=s', 'name=s', 'dry-run|n', 'force|f',
+           'quiet|q', 'keep-cache', 'list', 'help|h')
+    or pod2usage(2);
+pod2usage(-verbose => 2, -exitval => 0) if $o{help};
+if ($o{list}) { print "$_\n" for ROCm::Inference::Convert::architectures(); exit 0 }
+pod2usage(2) unless @ARGV == 2 || @ARGV == 3;
+my ($in, $out, $target) = @ARGV;
+$target //= 'q4_0_rocmfp4_fast';
+die "rocm-convert: $out exists (--force overwrites it)\n" if -e $out && !$o{force} && !$o{'dry-run'};
+sub fail { die 'rocm-convert: ' . ($_[0] =~ s/ at \S+ line \d+\.\n//r) . "\n" }
+
+my $q;
+if (lc $target ne 'bf16-ref') {
+    $q = eval { ROCm::Inference::Quant->new(target => $target, recipe => $o{recipe}, rules => $o{type}) } or fail($@);
+}
+my %a = (quant => $q, threads => $o{threads}, dry_run => $o{'dry-run'}, keep_cache => $o{'keep-cache'},
+         progress => sub { report(@_) unless $o{quiet} });
+my $t0 = time;
+my $res;
+if (-d $in) {
+    my $m = eval { ROCm::Inference::Convert->open_model($in, map { $o{$_} ? ($_ => $o{$_}) : () } qw(arch pre name)) }
+        or fail($@);
+    printf "%s: %s (%s), %d checkpoint tensors -> %s as %s\n", basename($in), $m->arch, $m->{hf_arch},
+        scalar @{$m->st->{order}}, $out, $q ? $q->target : 'bf16 (as convert_hf_to_gguf.py --outtype bf16)'
+        unless $o{quiet};
+    $res = eval { $m->convert($out, %a) } or fail($@);
+} else {
+    fail("bf16-ref is for a checkpoint directory, $in is a file") unless $q;
+    printf "%s -> %s as %s\n", basename($in), $out, $q->target unless $o{quiet};
+    $res = eval { ROCm::Inference::Convert->requantize($in, $out, %a) } or fail($@);
+}
+if ($o{'dry-run'} && !$o{quiet}) { report($_) for @{$res->{tensors}} }
+unless ($o{quiet}) {
+    my ($vals, $ib) = (0, 0);
+    for my $s (@{$res->{tensors}}) { my $n = 1; $n *= $_ for @{$s->{ne}}; $vals += $n; $ib += $s->{in_bytes} }
+    my $s = time - $t0;
+    printf "%.2f GB (%.2f bits a value) -> %.2f GB (%.2f bits a value)%s\n", $ib / 1e9, 8 * $ib / $vals,
+        $res->{bytes} / 1e9, 8 * $res->{bytes} / $vals,
+        $o{'dry-run'} ? ' (dry run: nothing written)' : sprintf(' in %.0f s (%.0f MB/s read)', $s, $ib / 1e6 / ($s || 1));
+}
+
+sub report {
+    my ($s, $i, $n) = @_;
+    my ($to) = gguf_type_info($s->{type});
+    printf "[%4s/%4d] %-44s [%s] %s%s %.2f -> %.2f MB%s\n", $i // '-', $n // scalar @{$res->{tensors}}, $s->{name},
+        join(', ', @{$s->{ne}}), $s->{from}, $to eq $s->{from} ? '' : " -> $to", $s->{in_bytes} / 1048576,
+        $s->{bytes} / 1048576, $s->{why} ? " ($s->{why})" : '';
+}
+
+__END__
+
+=head1 NAME
+
+rocm-convert - a Hugging Face checkpoint or a GGUF to a GGUF the engine runs, in its types
+
+=head1 SYNOPSIS
+
+  rocm-convert [options] IN OUT.gguf [TYPE]
+
+  rocm-convert /data/hf/GLM-5.3-Flash GLM-5.3-Flash-FAST.gguf          # a checkpoint: FAST, recipe strix
+  rocm-convert Model-BF16.gguf Model-FAST.gguf                         # a GGUF re-encoded
+  rocm-convert -r plain Model-BF16.gguf Model-FAST-pure.gguf           # every matrix FAST, as llama-quantize
+  rocm-convert -t 'ffn_down_exps=rocmfp4' GLM-Q8_0.gguf GLM-FAST.gguf
+  rocm-convert /data/hf/Qwen3-0.6B Qwen3-0.6B-BF16.gguf bf16-ref       # as convert_hf_to_gguf.py --outtype bf16
+  rocm-convert --list
+
+=head1 DESCRIPTION
+
+IN is either a checkpoint directory as Hugging Face publishes it (a git clone with LFS: F<config.json>,
+F<tokenizer.json>, F<tokenizer_config.json>, F<model*.safetensors> and their index) or a GGUF (a split one by its
+first file). The output is one GGUF, written on the CPU tensor by tensor: no model is loaded whole and the GPU is
+not used.
+
+From a checkpoint: the metadata, vocabulary and tensor names of llama.cpp's F<convert_hf_to_gguf.py> (so
+llama.cpp and the engine read the file alike), the tensors streamed from the shards and encoded as TYPE. FP8
+weights with block scales (C<weight_scale_inv>) are decoded and encoded in one step, so an FP8 release goes to
+ROCmFP4 rounded once, with no BF16 or Q8_0 file in between. C<--list> gives the architectures.
+
+From a GGUF: its metadata (with C<general.file_type> and C<general.quantization_version> set and the split keys
+removed) and its tensors re-encoded as TYPE. With C<-r plain> the output is byte for byte llama.cpp's
+llama-quantize's (ROCmFPX's, for ROCmFP4 / FAST without C<--pure>'s mixing; C<tests/quantize_verify.sh>).
+
+The encoders are the engine's (libinference: C<inference_quantize>), the same bytes as the reference quantizers
+(llama.cpp's Q8_0 / F16 / BF16, ROCmFPX's ROCmFP4) without an importance matrix.
+
+TYPE (default C<q4_0_rocmfp4_fast>; C<fast> and C<rocmfp4_fast> are the same): C<q4_0_rocmfp4_fast> (4.25 bits a
+value), C<q4_0_rocmfp4> (4.5), C<q8_0> (8.5), C<f16>, C<bf16>, C<f32>; or, from a checkpoint, C<bf16-ref>: BF16
+with F32 where convert_hf_to_gguf.py keeps F32 (for comparing with it; C<tests/convert_verify.sh>).
+
+Which tensors: the matrices (2 or more dimensions, names ending in C<weight>) except norms, routers
+(C<ffn_gate_inp>), convolutions, position embeddings and vision-encoder parts (the set llama.cpp's llama-quantize
+leaves alone), and only from F32, F16, BF16, Q8_0 or FP8; the recipe gives some of them Q8_0 instead of TYPE. A
+tensor that is already 4-bit or a K-quant (DeepSeek V4's MXFP4 experts, say) is copied as it is unless a
+C<--type> rule names it. Rows that are not whole blocks of the target are written as F16. The output is written to
+F<OUT.gguf.part> and renamed when complete.
+
+What is read and written is dropped from the page cache as it goes (C<posix_fadvise>), so converting a few hundred
+GB leaves the cache to the models being served; C<--keep-cache> keeps it.
+
+=head1 OPTIONS
+
+=over
+
+=item B<-t>, B<--type> REGEX=TYPE
+
+Tensors whose GGUF name matches REGEX (a Perl regex, unanchored) are written as TYPE, or as they are with
+C<keep>. Repeatable; the first matching rule wins. Rules apply only to the tensors described above.
+
+=item B<-r>, B<--recipe> NAME
+
+Per-tensor types for a 4-bit TYPE, after the C<--type> rules. C<strix> (the default) writes as Q8_0 the
+tensors where bits cost little bandwidth: the token embeddings and the PLE table (a token reads one row), the LM
+head (one matrix; on Qwen3-30B-A3B it closed 60% of FAST's perplexity gap to Q8_0 for 1% of the file, at the same
+tok/s), the DSA indexer and the mHC mixers (small). Everything else, experts and attention included, takes TYPE.
+C<plain>: every tensor TYPE, as llama-quantize writes it.
+
+=item B<-j>, B<--threads> N
+
+Encoder threads (default: one a core). Give fewer on a host that is serving a model.
+
+=item B<--arch> NAME, B<--pre> NAME, B<--name> NAME
+
+From a checkpoint: the Hugging Face architecture to convert as (default: F<config.json>'s), the tokenizer's
+pre-tokenizer name (C<tokenizer.ggml.pre>; default: the architecture's), C<general.name> (default: from the
+directory's name).
+
+=item B<-n>, B<--dry-run>
+
+Print each tensor's plan and the size; write nothing.
+
+=item B<-f>, B<--force>
+
+Overwrite OUT.gguf.
+
+=item B<-q>, B<--quiet>
+
+No progress output.
+
+=item B<--keep-cache>
+
+Leave what is read and written in the page cache.
+
+=item B<--list>
+
+The checkpoint architectures supported.
+
+=back
+
+=cut

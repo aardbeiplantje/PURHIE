@@ -26,6 +26,13 @@ int qz_supported(int dst_type);
 int qz_quantize(int dst_type, void *dst, int src_type, const void *src, int64_t nrows, int64_t ncols,
                 int n_threads, char *err, size_t err_len);
 
+// FP8 e4m3fn rows with a float32 scale per block_rows x block_cols block (Hugging Face's weight_scale_inv): value =
+// fp8 * scale, as transformers / llama.cpp's converter dequantize, then encoded as dst_type. Row r of src uses scale
+// row r / block_rows (scale_cols columns a row): give src and scale from a row that starts a block.
+int qz_quantize_fp8_blocks(int dst_type, void *dst, const uint8_t *src, const float *scale, int64_t nrows, int64_t ncols,
+                           int block_rows, int block_cols, int64_t scale_cols, int n_threads, char *err, size_t err_len);
+float qz_fp8_e4m3_to_fp32(uint8_t v);
+
 // One block / row encoders (the reference's semantics; exposed for the tests)
 void qz_row_q8_0(const float *x, void *y, int64_t n);
 void qz_row_rocmfp4(const float *x, void *y, int64_t n);

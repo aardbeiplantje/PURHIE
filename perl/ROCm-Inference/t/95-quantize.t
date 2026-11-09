@@ -8,7 +8,7 @@ use ROCm::Inference ();
 use ROCm::Inference::GGUF qw(gguf_read gguf_read_rows gguf_write_header gguf_type_id gguf_type_info);
 
 # The quantizer without a model or a GPU: ROCm::Inference::quantize (the engine's encoders), ROCm::Inference::GGUF
-# (a header written and read back) and bin/rocm-quantize on a GGUF made here. That the encoders write the
+# (a header written and read back) and bin/rocm-convert on a GGUF made here. That the encoders write the
 # reference's bytes is tests/quantize_verify.sh's (it needs the llama.cpp oracle).
 
 my ($F32, $F16, $BF16, $Q8_0, $FP4, $FAST) = map { gguf_type_id($_) } qw(f32 f16 bf16 q8_0 q4_0_rocmfp4 q4_0_rocmfp4_fast);
@@ -69,14 +69,14 @@ open my $fh, '<:raw', $in or die $!;
 is(gguf_read_rows($fh, $g->{tensors}[0], 1, 2), substr($tensors[0]{data}, 256, 512), 'rows 1 .. 2 of a tensor');
 is(join('', map { $_->{offset} % 32 } @{$g->{tensors}}), '00000', 'tensor offsets aligned');
 
-# rocm-quantize: the matrix encoded, the norm and the convolution kept, rows of 48 values (not blocks of 32) as F16,
+# rocm-convert (a GGUF in): the matrix encoded, the norm and the convolution kept, rows of 48 values (not blocks of 32) as F16,
 # the LM head Q8_0 (recipe strix, the default)
 my $out = File::Spec->catfile($dir, 'out.gguf');
-my $script = File::Spec->catfile('bin', 'rocm-quantize');
+my $script = File::Spec->catfile('bin', 'rocm-convert');
 my $rc = system($^X, (map { "-I$_" } @INC), $script, '-q', '-r', 'plain', $in, "$out.plain", 'fast');
 is((gguf_type_info(gguf_read("$out.plain")->{tensors}[4]{type}))[0], 'q4_0_rocmfp4_fast', 'recipe plain: the LM head FAST');
 $rc = system($^X, (map { "-I$_" } @INC), $script, '-q', $in, $out, 'fast');
-is($rc, 0, 'rocm-quantize ran');
+is($rc, 0, 'rocm-convert ran');
 my $q = gguf_read($out);
 is_deeply([map { (gguf_type_info($_->{type}))[0] } @{$q->{tensors}}], [qw(q4_0_rocmfp4_fast f32 f32 f16 q8_0)],
           'types: the matrix FAST, the norm and conv1d kept, 48-value rows F16, the LM head Q8_0');

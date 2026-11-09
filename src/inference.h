@@ -86,6 +86,11 @@ size_t inference_quant_row_size(int type, long long ncols);  // 0: unknown type,
 int inference_quant_can_encode(int dst_type);                // 1 when dst_type is one of the six above
 int inference_quantize(int dst_type, void* dst, int src_type, const void* src, long long nrows, long long ncols,
                        int n_threads);
+// The same from FP8 e4m3fn weights with a float32 scale per block_rows x block_cols block (a Hugging Face FP8
+// checkpoint's weight / weight_scale_inv pair): value = fp8 * scale, then encoded. Row r uses scale row
+// r / block_rows of scale_cols columns: src and scale start at a row that starts a block.
+int inference_quantize_fp8_blocks(int dst_type, void* dst, const void* src, const float* scale, long long nrows,
+                                  long long ncols, int block_rows, int block_cols, long long scale_cols, int n_threads);
 
 // Reference counting for shared ownership
 void inference_model_retain(inference_model_t* model);

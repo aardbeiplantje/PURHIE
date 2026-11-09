@@ -16,15 +16,17 @@
    tiny GGUF its own loader refused, and a DSA path that reweighted dense attention output instead of selecting keys.
 
 5. **Independent of llama.cpp: a quantizer and a converter here** (user, 2026-11-09: "i want to be independent of
-   llama.cpp"). The quantizer is in (`bin/rocm-quantize`, `inference_quantize`; with `-r plain` byte for byte
+   llama.cpp"). One command, `bin/rocm-convert`, takes a checkpoint or a GGUF. Quantizing (`inference_quantize`; with `-r plain` byte for byte
    llama-quantize's on FAST / ROCmFP4 / Q8_0, `tests/quantize_verify.sh`; default recipe `strix`: Q8_0 lookup
    tables, LM head, indexer and mHC, measured in ARCHITECTURE.md s4). Open on it: a better quality measure than
    perplexity for small per-tensor choices (K / V moved perplexity by +-2% without following precision): the KL
    divergence of the logits against the Q8_0 / BF16 model; and the recipe on Flash in the deployment (its Q8_0 LM
-   head and hc mixers are untested on the real model). Next, the converter (section "Later"): HF safetensors ->
-   GGUF, reading FP8 e4m3 with its block scales and writing the target type directly, so a 320B model needs no
-   640 GB BF16 (or 340 GB Q8_0) intermediate on a 361 GB disk. Until then GLM-5.3 / DeepSeek V4 go through
-   upstream's convert_hf_to_gguf.py (`--fp8-as-q8`; it knows `glm5-next` and `deepseek4`) and then rocm-quantize.
+   head and hc mixers are untested on the real model). The converter is in too (`bin/rocm-convert`; byte for byte
+   convert_hf_to_gguf.py's on Qwen3 and a tiny GLM-5.3-Flash, `tests/convert_verify.sh`): `rocm-convert
+   /data/hf/GLM-5.3-Flash GLM-5.3-Flash-FAST.gguf` reads the FP8 release and writes FAST, no intermediate file.
+   Open: DeepSeek V4 (which release: V4-Flash, 160 GB FP8 + MXFP4 experts, is the one that fits; the MXFP4 experts
+   copied as they are), the model-card `general.*` keys (license, base model, size label), more architectures as
+   needed (each a package in `ROCm::Inference::Convert` checked against convert_hf_to_gguf.py).
 
 ## Status in brief
 
@@ -94,9 +96,9 @@ tensor shapes before sizing anything.
    distinct experts hit per layer, and settle the target bpw + the pinned fraction **before** writing a kernel.
    With expert pin / unpin tabled (2026-11-08) the cold part pages in from disk through the mapping: the routing
    trace says how much of it a token touches.
-2. **The converter and the loader, no kernels.** `llama.cpp/conversion/` has base, command_r, deepseek,
-   diffusion_gemma, laguna, llama, mellum, muse_glimmer, qwen4exp and zaya - **no `glm5_next` mapping** - so the
-   HF -> GGUF conversion is itself a deliverable. The loader dispatches on `general.architecture` against a
+2. **The converter and the loader, no kernels.** The converter is done (`rocm-convert`, the GGUF names of upstream
+   llama.cpp's `glm5-next`: `ssm_*` / `attn_q_a` / `attn_k_b` / `indexer.*` / `hc_*` / `blk.45.nextn.*`; see ▶ Next
+   item 5); the GGUF's tensor table is what the loader binds. The loader dispatches on `general.architecture` against a
    hardcoded list (`archs` in `inference_model_info`, `src/inference.cpp`), so an unknown arch fails with "architecture %s is not supported"
    before anything runs. Tensor name -> slot map from the checkpoint's own `modules_to_not_convert` (a literal
    tensor-name list): `self_attn.{q,k,v,qkv_proj,o,f_a,f_b,g_a,g_b,b}_proj*`, `{q,k,v}_conv1d`, `A_log`, `dt_bias`,
@@ -237,14 +239,9 @@ X-Remote-User` on /rocm/ (not done here).
 
 ## Later
 
-- **The converter: HF safetensors -> GGUF in this project** (user: "the conversion belongs with this project sort
-  of"; the quantizer it feeds is done, ▶ Next item 5). In Perl next to `ROCm::Inference::GGUF` (a safetensors
-  header is JSON plus offsets), the rows through `inference_quantize`; per architecture a tensor-name and metadata
-  map that matches upstream llama.cpp's GGUF names, so the oracle keeps reading what it writes. Sources: BF16 and
-  FP8 e4m3 with 128x128 block scales (a decoder in quant_types.cpp); targets straight to the engine's types, tensor
-  by tensor. Check: its GGUF against upstream convert_hf_to_gguf.py's on a small model, tensor for tensor. Open
-  after it: an importance matrix (the weighted ROCmFP4 search; collected on the GPU by the engine), and a faster
-  encoder (AVX-512 across 16 blocks keeps each block's summation order, so the bytes stay the reference's).
+- **Converter follow-ups**: an importance matrix (the weighted ROCmFP4 search; collected on the GPU by the
+  engine), and a faster encoder (AVX-512 across 16 blocks keeps each block's summation order, so the bytes stay the
+  reference's).
 - **Qwen3.8-Flash-Next beyond 262,144 tokens (YaRN)** (HF card, 2026-11-06). The checkpoint is 262,144 natively
   (`max_position_embeddings`, `rope_type` default); the card reaches 1M by a YaRN override (`factor` 4.0, original
   262144, with an attention scale). Nothing is dropped by the converter: the GGUF has no rope-scaling keys, and the

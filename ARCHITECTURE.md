@@ -129,9 +129,11 @@ to 6-bit codes. No model used here needs them.
 reference encoders without an importance matrix (ggml's `quantize_row_q8_0_ref` and fp16 / bf16 rounding,
 ROCmFPX's `rocmfp4.c`: Codebook10 indices, each block's UE4M3 scale by an exhaustive least-squares search outward
 from max|x| / 10). The file is compiled with `-ffp-contract=off`, because a fused multiply-add rounds the search's
-sums of squares differently and picks another scale on a tie. `bin/rocm-quantize` (Perl: `ROCm::Inference::GGUF`
-reads and writes the header, the C encoders do the rows, 64M values at a time) writes a GGUF tensor by tensor
-without loading a model or using the GPU. It quantizes the tensors llama-quantize does (matrices, without norms,
+sums of squares differently and picks another scale on a tie. `bin/rocm-convert` with a GGUF in (Perl:
+`ROCm::Inference::GGUF` reads and writes the header, the C encoders do the rows, 64M values at a time, 233 MB
+resident on a 32 GB model, all 16 cores) writes a GGUF tensor by tensor without loading a model or using the GPU,
+dropping what it reads and writes from the page cache as it goes (`posix_fadvise`), so the served models keep it.
+It quantizes the tensors llama-quantize does (matrices, without norms,
 routers, convolutions and position embeddings), takes `-t REGEX=TYPE` rules, falls back to F16 for rows that are not
 whole blocks, and copies tensors that are already 4-bit (MXFP4 experts) or K-quants unless a rule names them.
 With `-r plain` its output is byte for byte llama-quantize's on Qwen3-0.6B and Qwen3.5-0.8B
@@ -142,6 +144,19 @@ Qwen3-30B-A3B from its Q8_0 (wikitext-2 perplexity, 320 chunks of 512; 2026-11-0
 matrix FAST 8.980 (16.27 GB), FAST with a Q8_0 LM head 8.838 (16.44 GB; decode 83-88 tok/s either way), every
 matrix ROCmFP4 8.936 (17.22 GB). Attention K / V as ROCmFP4 (9.157) or kept at Q8_0 (9.013) did not beat FAST,
 although ROCmFP4 has ~10% less weight error there (the matvecs are exact: `matvec_verify`), so they take the target.
+
+**Converting** (`bin/rocm-convert`, `ROCm::Inference::Convert`): a Hugging Face checkpoint directory (a git clone
+with LFS) to one GGUF without llama.cpp and without an intermediate file. `ROCm::Inference::SafeTensors` reads the
+shards' headers and rows; `json_decode` (XS) reads `config.json` / `tokenizer.json` in a fraction of a second.
+The metadata, vocabulary (byte-level BPE, special tokens, chat template) and tensor names are ports of
+`convert_hf_to_gguf.py`'s, per architecture a package (`Qwen3`, `Glm5Next`) with its parameters and tensor map:
+renames, experts stacked into one 3-D tensor, MLA's `kv_b_proj` split into a transposed `attn_k_b` and
+`attn_v_b`, KDA's conv1d reshape and `ssm_a = -exp(A_log)`. Rows stream from the shards through the encoders; FP8
+weights with 128x128 block scales (`inference_quantize_fp8_blocks`) are decoded and encoded in one step, so an FP8
+release goes to ROCmFP4 rounded once, with the same policy as for a GGUF in (one command, one writer). `tests/convert_verify.sh`: as BF16
+the output is byte for byte `convert_hf_to_gguf.py`'s (model-card keys aside) on Qwen3-0.6B and on a tiny random
+GLM-5.3-Flash (`tools/gen_glm5next_ckpt.py`: the release's names, dtypes and layer pattern, FP8 included); FP8 ->
+FAST directly is byte for byte F32, then that GGUF re-encoded.
 
 ## 5. Exactness and WMMA
 
@@ -284,7 +299,8 @@ less well and 2 is best; the adaptive default is within ~1% of the best fixed co
 | `mtp_verify` | draft acceptance, speculative = plain (greedy, sampled, library) |
 | `mtp_own_verify.sh` | a model's own MTP block drafts what the same block as a sidecar drafts; generation with it = without (tiny models) |
 | `store_verify.sh` | the KV block store across processes (optionally with a draft head) |
-| `quantize_verify.sh` | the encoders vs the reference's on synthetic rows and real tensors; `rocm-quantize` vs ROCmFPX's `llama-quantize` on a whole model (FAST, ROCmFP4, Q8_0): the same bytes |
+| `convert_verify.sh` | `rocm-convert` vs llama.cpp's `convert_hf_to_gguf.py` (BF16, byte for byte) on Qwen3-0.6B and a tiny GLM-5.3-Flash; FP8 -> FAST directly = F32 then re-encoded (needs torch and an upstream checkout) |
+| `quantize_verify.sh` | the encoders vs the reference's on synthetic rows and real tensors; `rocm-convert -r plain` (a GGUF in) vs ROCmFPX's `llama-quantize` on a whole model (FAST, ROCmFP4, Q8_0): the same bytes |
 | `matvec_verify`, `dequant_verify`, `attn_decode_verify`, `kv_verify`, `tokenizer_*`, `sampler_verify`, `capi_smoke` | kernels, decoders, tokenizer, C API |
 | `perl/ROCm-Inference/t/*.t` | the Perl binding (GPU tests with `ROCM_INFERENCE_TEST_*`) |
 | `perplexity` | wikitext-2 perplexity as llama.cpp's `llama-perplexity` computes it (logits of every position: `inference_prefill_logits`) |

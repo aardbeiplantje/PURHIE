@@ -6,9 +6,12 @@ MANIFEST.SKIP
 Makefile.PL
 README
 bin/rocm-inference-server
-bin/rocm-quantize
+bin/rocm-convert
 lib/ROCm/Inference.pm
+lib/ROCm/Inference/Convert.pm
 lib/ROCm/Inference/GGUF.pm
+lib/ROCm/Inference/Quant.pm
+lib/ROCm/Inference/SafeTensors.pm
 lib/ROCm/Inference/Log.pm
 lib/ROCm/Inference/Store.pm
 t/00-load.t

@@ -12,6 +12,9 @@
 #include "EXTERN.h"
 #include "perl.h"
 #include "XSUB.h"
+#include <math.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "inference.h"
 
@@ -190,6 +193,162 @@ static void drop_event_handler(pTHX_ inference_model_t* m) {
     hv_delete(g_events, key, (I32)strlen(key), G_DISCARD);
 }
 
+/* ---------------------------------------------------------------- JSON (for the converter: config / tokenizer files)
+   A strict RFC 8259 decoder to Perl data: objects -> hash refs, arrays -> array refs, strings -> UTF-8 strings,
+   integers -> IV (NV past 64 bits), other numbers -> NV, true / false -> copies of PL_sv_yes / PL_sv_no (booleans to
+   builtin::is_bool), null -> undef. JSON::PP takes minutes on a 20 MB tokenizer.json. */
+typedef struct { const char* p; const char* end; const char* err; } jsn_t;
+
+static void jsn_ws(jsn_t* j) {
+    while (j->p < j->end && (*j->p == ' ' || *j->p == '\t' || *j->p == '\n' || *j->p == '\r')) ++j->p;
+}
+
+static int jsn_hex4(jsn_t* j, unsigned* out) {
+    unsigned v = 0;
+    if (j->end - j->p < 4) return 0;
+    for (int i = 0; i < 4; ++i) {
+        const char c = *j->p++;
+        v <<= 4;
+        if (c >= '0' && c <= '9') v |= (unsigned)(c - '0');
+        else if (c >= 'a' && c <= 'f') v |= (unsigned)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v |= (unsigned)(c - 'A' + 10);
+        else return 0;
+    }
+    *out = v;
+    return 1;
+}
+
+static SV* jsn_string(pTHX_ jsn_t* j) {
+    ++j->p; /* the opening quote */
+    const char* q = j->p;
+    while (q < j->end && *q != '"' && *q != '\\') ++q;
+    SV* sv = newSVpvn(j->p, (STRLEN)(q - j->p));
+    j->p = q;
+    while (j->p < j->end && *j->p != '"') {
+        if (*j->p != '\\') {
+            const char* r = j->p;
+            while (r < j->end && *r != '"' && *r != '\\') ++r;
+            sv_catpvn(sv, j->p, (STRLEN)(r - j->p));
+            j->p = r;
+            continue;
+        }
+        if (++j->p >= j->end) break;
+        char c = *j->p++, buf[4];
+        switch (c) {
+        case '"': case '\\': case '/': sv_catpvn(sv, &c, 1); break;
+        case 'b': sv_catpvn(sv, "\b", 1); break;
+        case 'f': sv_catpvn(sv, "\f", 1); break;
+        case 'n': sv_catpvn(sv, "\n", 1); break;
+        case 'r': sv_catpvn(sv, "\r", 1); break;
+        case 't': sv_catpvn(sv, "\t", 1); break;
+        case 'u': {
+            unsigned u, lo;
+            if (!jsn_hex4(j, &u)) { j->err = "bad \\u escape"; SvREFCNT_dec(sv); return NULL; }
+            if (u >= 0xD800 && u < 0xDC00 && j->end - j->p >= 6 && j->p[0] == '\\' && j->p[1] == 'u') {
+                const char* save = j->p;
+                j->p += 2;
+                if (jsn_hex4(j, &lo) && lo >= 0xDC00 && lo < 0xE000) u = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
+                else j->p = save;
+            }
+            int n;
+            if (u < 0x80) { buf[0] = (char)u; n = 1; }
+            else if (u < 0x800) { buf[0] = (char)(0xC0 | (u >> 6)); buf[1] = (char)(0x80 | (u & 63)); n = 2; }
+            else if (u < 0x10000) {
+                buf[0] = (char)(0xE0 | (u >> 12)); buf[1] = (char)(0x80 | ((u >> 6) & 63));
+                buf[2] = (char)(0x80 | (u & 63)); n = 3;
+            } else {
+                buf[0] = (char)(0xF0 | (u >> 18)); buf[1] = (char)(0x80 | ((u >> 12) & 63));
+                buf[2] = (char)(0x80 | ((u >> 6) & 63)); buf[3] = (char)(0x80 | (u & 63)); n = 4;
+            }
+            sv_catpvn(sv, buf, (STRLEN)n);
+            break;
+        }
+        default: j->err = "bad escape"; SvREFCNT_dec(sv); return NULL;
+        }
+    }
+    if (j->p >= j->end) { j->err = "unterminated string"; SvREFCNT_dec(sv); return NULL; }
+    ++j->p; /* the closing quote */
+    SvUTF8_on(sv);
+    return sv;
+}
+
+static SV* jsn_value(pTHX_ jsn_t* j, int depth) {
+    jsn_ws(j);
+    if (j->p >= j->end) { j->err = "unexpected end"; return NULL; }
+    if (depth > 512) { j->err = "nested too deeply"; return NULL; }
+    const char c = *j->p;
+    if (c == '"') return jsn_string(aTHX_ j);
+    if (c == '{') {
+        HV* hv = newHV();
+        ++j->p;
+        jsn_ws(j);
+        if (j->p < j->end && *j->p == '}') { ++j->p; return newRV_noinc((SV*)hv); }
+        for (;;) {
+            jsn_ws(j);
+            if (j->p >= j->end || *j->p != '"') { j->err = "expected a key"; break; }
+            SV* k = jsn_string(aTHX_ j);
+            if (!k) break;
+            jsn_ws(j);
+            if (j->p >= j->end || *j->p != ':') { j->err = "expected ':'"; SvREFCNT_dec(k); break; }
+            ++j->p;
+            SV* v = jsn_value(aTHX_ j, depth + 1);
+            if (!v) { SvREFCNT_dec(k); break; }
+            (void)hv_store_ent(hv, k, v, 0);
+            SvREFCNT_dec(k);
+            jsn_ws(j);
+            if (j->p < j->end && *j->p == ',') { ++j->p; continue; }
+            if (j->p < j->end && *j->p == '}') { ++j->p; return newRV_noinc((SV*)hv); }
+            j->err = "expected ',' or '}'";
+            break;
+        }
+        SvREFCNT_dec((SV*)hv);
+        return NULL;
+    }
+    if (c == '[') {
+        AV* av = newAV();
+        ++j->p;
+        jsn_ws(j);
+        if (j->p < j->end && *j->p == ']') { ++j->p; return newRV_noinc((SV*)av); }
+        for (;;) {
+            SV* v = jsn_value(aTHX_ j, depth + 1);
+            if (!v) break;
+            av_push(av, v);
+            jsn_ws(j);
+            if (j->p < j->end && *j->p == ',') { ++j->p; continue; }
+            if (j->p < j->end && *j->p == ']') { ++j->p; return newRV_noinc((SV*)av); }
+            j->err = "expected ',' or ']'";
+            break;
+        }
+        SvREFCNT_dec((SV*)av);
+        return NULL;
+    }
+    if (j->end - j->p >= 4 && !memcmp(j->p, "true", 4)) { j->p += 4; return newSVsv(&PL_sv_yes); }
+    if (j->end - j->p >= 5 && !memcmp(j->p, "false", 5)) { j->p += 5; return newSVsv(&PL_sv_no); }
+    if (j->end - j->p >= 4 && !memcmp(j->p, "null", 4)) { j->p += 4; return newSV(0); }
+    if (c == '-' || (c >= '0' && c <= '9')) {
+        const char* s = j->p;
+        int is_int = 1;
+        if (*j->p == '-') ++j->p;
+        while (j->p < j->end && *j->p >= '0' && *j->p <= '9') ++j->p;
+        if (j->p < j->end && *j->p == '.') { is_int = 0; ++j->p; while (j->p < j->end && *j->p >= '0' && *j->p <= '9') ++j->p; }
+        if (j->p < j->end && (*j->p == 'e' || *j->p == 'E')) {
+            is_int = 0;
+            ++j->p;
+            if (j->p < j->end && (*j->p == '+' || *j->p == '-')) ++j->p;
+            while (j->p < j->end && *j->p >= '0' && *j->p <= '9') ++j->p;
+        }
+        char tmp[64];
+        const size_t n = (size_t)(j->p - s);
+        if (n == 0 || n >= sizeof tmp) { j->err = "bad number"; return NULL; }
+        memcpy(tmp, s, n);
+        tmp[n] = 0;
+        if (is_int && n < 19) return newSViv((IV)strtoll(tmp, NULL, 10));
+        return newSVnv(strtod(tmp, NULL));
+    }
+    j->err = "unexpected character";
+    return NULL;
+}
+
 MODULE = ROCm::Inference    PACKAGE = ROCm::Inference
 
 PROTOTYPES: DISABLE
@@ -255,6 +414,92 @@ quantize(dst_type, src_type, src, nrows, ncols, n_threads = 0)
         croak_last(aTHX_ "quantize", INFERENCE_ERR_INVALID_ARG);
     }
     SvCUR_set(RETVAL, drs * (size_t)nrows);
+  OUTPUT:
+    RETVAL
+
+SV*
+quantize_fp8_blocks(dst_type, src, scale, nrows, ncols, block_rows, block_cols, scale_cols, n_threads = 0)
+    int dst_type
+    SV* src
+    SV* scale
+    IV nrows
+    IV ncols
+    int block_rows
+    int block_cols
+    IV scale_cols
+    int n_threads
+  CODE:
+    /* FP8 e4m3fn rows (a byte string) with float32 block scales (a byte string, scale_cols a row) re-encoded as
+       dst_type (inference_quantize_fp8_blocks) */
+    const size_t drs = inference_quant_row_size(dst_type, ncols);
+    if (!drs) croak("quantize_fp8_blocks: type %d cannot hold rows of %ld values", dst_type, (long)ncols);
+    STRLEN len, slen;
+    const char* p = SvPVbyte(src, len);
+    const char* sp = SvPVbyte(scale, slen);
+    const size_t srows = block_rows > 0 ? (size_t)((nrows + block_rows - 1) / block_rows) : 0;
+    if (nrows < 0 || len < (size_t)ncols * (size_t)nrows || slen < 4 * srows * (size_t)scale_cols)
+        croak("quantize_fp8_blocks: %lu bytes of rows and %lu of scales for %ld rows of %ld", (unsigned long)len,
+              (unsigned long)slen, (long)nrows, (long)ncols);
+    RETVAL = newSV(drs * (size_t)nrows + 1);
+    SvPOK_only(RETVAL);
+    if (inference_quantize_fp8_blocks(dst_type, SvPVX(RETVAL), p, (const float*)sp, nrows, ncols, block_rows,
+                                      block_cols, scale_cols, n_threads) != 0) {
+        SvREFCNT_dec(RETVAL);
+        croak_last(aTHX_ "quantize_fp8_blocks", INFERENCE_ERR_INVALID_ARG);
+    }
+    SvCUR_set(RETVAL, drs * (size_t)nrows);
+  OUTPUT:
+    RETVAL
+
+SV*
+json_decode(text)
+    SV* text
+  CODE:
+    /* JSON (UTF-8 bytes) to Perl data, for the converter's config and tokenizer files */
+    STRLEN len;
+    const char* p = SvPVbyte(text, len);
+    jsn_t j = {p, p + len, NULL};
+    RETVAL = jsn_value(aTHX_ &j, 0);
+    if (RETVAL) {
+        jsn_ws(&j);
+        if (j.p != j.end) { SvREFCNT_dec(RETVAL); RETVAL = NULL; j.err = "trailing characters"; }
+    }
+    if (!RETVAL) croak("json_decode: %s at byte %ld", j.err ? j.err : "?", (long)(j.p - p));
+  OUTPUT:
+    RETVAL
+
+SV*
+exp_neg_f32(src)
+    SV* src
+  CODE:
+    /* -expf(x) for each float32 of a byte string (the converter's ssm_a = -exp(A_log), in float32 as torch) */
+    STRLEN len;
+    const char* p = SvPVbyte(src, len);
+    const size_t n = len / 4;
+    RETVAL = newSV(len + 1);
+    SvPOK_only(RETVAL);
+    float* o = (float*)SvPVX(RETVAL);
+    for (size_t i = 0; i < n; ++i) {
+        float x;
+        memcpy(&x, p + 4 * i, 4);
+        o[i] = -expf(x);
+    }
+    SvCUR_set(RETVAL, n * 4);
+  OUTPUT:
+    RETVAL
+
+int
+drop_cache(fd, offset, len, sync = 0)
+    int fd
+    IV offset
+    IV len
+    int sync
+  CODE:
+    /* The page cache's copy of [offset, offset + len) of an open file dropped (written back first with sync): a
+       converter streaming hundreds of GB leaves the cache to the models being served. Pages other processes map
+       stay. Returns posix_fadvise's result. */
+    if (sync) (void)fdatasync(fd);
+    RETVAL = posix_fadvise(fd, (off_t)offset, (off_t)len, POSIX_FADV_DONTNEED);
   OUTPUT:
     RETVAL
 

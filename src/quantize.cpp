@@ -216,29 +216,10 @@ static void encode_row(int t, const float *x, void *y, int64_t n) {
     }
 }
 
-int qz_quantize(int dst_type, void *dst, int src_type, const void *src, int64_t nrows, int64_t ncols, int n_threads,
-                char *err, size_t err_len) {
-    const size_t src_row = qt_row_size(src_type, ncols), dst_row = qt_row_size(dst_type, ncols);
-    if (nrows < 0 || ncols <= 0 || !dst || !src) {
-        snprintf(err, err_len, "quantize: bad arguments (%lld rows of %lld)", (long long)nrows, (long long)ncols);
-        return -1;
-    }
-    if (!src_row) {
-        const qt_traits *tr = qt_get_traits(src_type);
-        snprintf(err, err_len, "quantize: cannot decode type %d%s%s rows of %lld", src_type, tr ? " " : "",
-                 tr ? tr->name : "", (long long)ncols);
-        return -1;
-    }
-    if (src_type == dst_type) {
-        memcpy(dst, src, src_row * (size_t)nrows);
-        return 0;
-    }
-    if (!qz_supported(dst_type) || !dst_row) {
-        const qt_traits *tr = qt_get_traits(dst_type);
-        snprintf(err, err_len, "quantize: cannot encode type %d%s%s rows of %lld", dst_type, tr ? " " : "",
-                 tr ? tr->name : "", (long long)ncols);
-        return -1;
-    }
+// Rows 0 .. nrows of ncols values decoded by dec(row, floats) and encoded as dst_type, rows on n_threads threads
+template <typename Dec>
+static bool run_rows(int dst_type, void *dst, int64_t nrows, int64_t ncols, int n_threads, const Dec &dec) {
+    const size_t dst_row = qt_row_size(dst_type, ncols);
     if (n_threads <= 0) n_threads = (int)std::max(1u, std::thread::hardware_concurrency());
     n_threads = (int)std::min<int64_t>(n_threads, std::max<int64_t>(1, nrows));
     // Rows in chunks of ~64K values a thread takes at a time
@@ -252,7 +233,7 @@ int qz_quantize(int dst_type, void *dst, int src_type, const void *src, int64_t 
             if (r0 >= nrows) break;
             const int64_t r1 = std::min(nrows, r0 + chunk);
             for (int64_t r = r0; r < r1; ++r) {
-                if (qt_to_float(src_type, (const uint8_t *)src + (size_t)r * src_row, f.data(), ncols) != 0) {
+                if (!dec(r, f.data())) {
                     bad = 1;
                     return;
                 }
@@ -267,9 +248,77 @@ int qz_quantize(int dst_type, void *dst, int src_type, const void *src, int64_t 
         for (int i = 0; i < n_threads; ++i) th.emplace_back(work);
         for (auto &t : th) t.join();
     }
-    if (bad) {
+    return !bad;
+}
+
+static bool check_dst(int dst_type, int64_t ncols, char *err, size_t err_len) {
+    if (qz_supported(dst_type) && qt_row_size(dst_type, ncols)) return true;
+    const qt_traits *tr = qt_get_traits(dst_type);
+    snprintf(err, err_len, "quantize: cannot encode type %d%s%s rows of %lld", dst_type, tr ? " " : "", tr ? tr->name : "",
+             (long long)ncols);
+    return false;
+}
+
+int qz_quantize(int dst_type, void *dst, int src_type, const void *src, int64_t nrows, int64_t ncols, int n_threads,
+                char *err, size_t err_len) {
+    const size_t src_row = qt_row_size(src_type, ncols);
+    if (nrows < 0 || ncols <= 0 || !dst || !src) {
+        snprintf(err, err_len, "quantize: bad arguments (%lld rows of %lld)", (long long)nrows, (long long)ncols);
+        return -1;
+    }
+    if (!src_row) {
+        const qt_traits *tr = qt_get_traits(src_type);
+        snprintf(err, err_len, "quantize: cannot decode type %d%s%s rows of %lld", src_type, tr ? " " : "",
+                 tr ? tr->name : "", (long long)ncols);
+        return -1;
+    }
+    if (src_type == dst_type) {
+        memcpy(dst, src, src_row * (size_t)nrows);
+        return 0;
+    }
+    if (!check_dst(dst_type, ncols, err, err_len)) return -1;
+    const uint8_t *s = (const uint8_t *)src;
+    if (!run_rows(dst_type, dst, nrows, ncols, n_threads,
+                  [&](int64_t r, float *f) { return qt_to_float(src_type, s + (size_t)r * src_row, f, ncols) == 0; })) {
         snprintf(err, err_len, "quantize: decoding type %d failed", src_type);
         return -1;
     }
+    return 0;
+}
+
+// ---------------------------------------------------------------- FP8 (OCP e4m3fn) with block scales
+
+// e4m3fn: sign, 4 exponent bits (bias 7), 3 mantissa bits; no infinities, S.1111.111 is NaN
+float qz_fp8_e4m3_to_fp32(uint8_t v) {
+    const int e = (v >> 3) & 15, m = v & 7;
+    float f;
+    if ((v & 0x7f) == 0x7f) f = NAN;
+    else if (e == 0) f = ldexpf((float)m, -9);
+    else f = ldexpf((float)(8 + m), e - 10);
+    return (v & 0x80) ? -f : f;
+}
+
+static float g_fp8[256];
+static const bool g_fp8_init = [] {
+    for (int i = 0; i < 256; ++i) g_fp8[i] = qz_fp8_e4m3_to_fp32((uint8_t)i);
+    return true;
+}();
+
+int qz_quantize_fp8_blocks(int dst_type, void *dst, const uint8_t *src, const float *scale, int64_t nrows, int64_t ncols,
+                           int block_rows, int block_cols, int64_t scale_cols, int n_threads, char *err, size_t err_len) {
+    if (nrows < 0 || ncols <= 0 || !dst || !src || !scale || block_rows <= 0 || block_cols <= 0 ||
+        scale_cols < (ncols + block_cols - 1) / block_cols) {
+        snprintf(err, err_len, "quantize fp8: bad arguments (%lld rows of %lld, blocks %d x %d, %lld scale columns)",
+                 (long long)nrows, (long long)ncols, block_rows, block_cols, (long long)scale_cols);
+        return -1;
+    }
+    if (!check_dst(dst_type, ncols, err, err_len)) return -1;
+    (void)g_fp8_init;
+    run_rows(dst_type, dst, nrows, ncols, n_threads, [&](int64_t r, float *f) {
+        const uint8_t *w = src + (size_t)r * (size_t)ncols;
+        const float *sc = scale + (size_t)(r / block_rows) * (size_t)scale_cols;
+        for (int64_t j = 0; j < ncols; ++j) f[j] = g_fp8[w[j]] * sc[j / block_cols];  // one rounding, as torch's
+        return true;
+    });
     return 0;
 }
