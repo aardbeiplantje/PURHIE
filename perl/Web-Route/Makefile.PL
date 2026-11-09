@@ -22,10 +22,10 @@ WriteMakefile(
             license    => ['https://unlicense.org/'],
             repository => {
                 type => 'git',
-                url  => 'https://github.com/CowboyTim/rocm-hip.git',
-                web  => 'https://github.com/CowboyTim/rocm-hip/tree/main/perl/Web-Route',
+                url  => 'https://github.com/aardbeiplantje/purhie.git',
+                web  => 'https://github.com/aardbeiplantje/purhie/tree/main/perl/Web-Route',
             },
-            bugtracker => { web => 'https://github.com/CowboyTim/rocm-hip/issues' },
+            bugtracker => { web => 'https://github.com/aardbeiplantje/purhie/issues' },
         },
     },
     clean              => { FILES => 'Web-Route-*' },

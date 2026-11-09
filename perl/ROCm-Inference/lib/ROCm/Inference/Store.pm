@@ -177,7 +177,7 @@ Copy files back (with their snapshots), atomically.
 =head1 SEE ALSO
 
 L<ROCm::Inference>; the C API (F<inference.h>) and the engine:
-L<https://github.com/CowboyTim/rocm-hip>.
+L<https://github.com/aardbeiplantje/purhie>.
 
 =head1 AUTHOR
 

@@ -775,7 +775,7 @@ C<STOP_NONE STOP_EOG STOP_MAX_TOKENS STOP_STRING STOP_CALLBACK STOP_CONTEXT_FULL
 
 L<ROCm::Inference::Store>, L<Minijinja>, L<rocm-inference-server> (an OpenAI-compatible server, with
 L<Web::Route>); the C API (F<inference.h>) and the engine:
-L<https://github.com/CowboyTim/rocm-hip>.
+L<https://github.com/aardbeiplantje/purhie>.
 
 =head1 AUTHOR
 

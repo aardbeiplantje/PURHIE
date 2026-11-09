@@ -46,9 +46,9 @@ my $missing = !$inc                          ? "libinference not found"
 if ($missing) {
     print STDERR <<"EOT";
 $missing.
-ROCm::Inference needs libinference, the C library of https://github.com/CowboyTim/rocm-hip (ROCm, an AMD gfx1151
+ROCm::Inference needs libinference, the C library of https://github.com/aardbeiplantje/purhie (ROCm, an AMD gfx1151
 GPU): build and install it there (make && make install PREFIX=<dir>), then set ROCM_INFERENCE_PREFIX=<dir> or put
-<dir>/lib/pkgconfig on PKG_CONFIG_PATH, or build this module inside a rocm-hip checkout (perl/ROCm-Inference).
+<dir>/lib/pkgconfig on PKG_CONFIG_PATH, or build this module inside a purhie checkout (perl/ROCm-Inference).
 EOT
     exit 0;
 }
@@ -87,10 +87,10 @@ WriteMakefile(
             license    => ['https://unlicense.org/'],
             repository => {
                 type => 'git',
-                url  => 'https://github.com/CowboyTim/rocm-hip.git',
-                web  => 'https://github.com/CowboyTim/rocm-hip/tree/main/perl/ROCm-Inference',
+                url  => 'https://github.com/aardbeiplantje/purhie.git',
+                web  => 'https://github.com/aardbeiplantje/purhie/tree/main/perl/ROCm-Inference',
             },
-            bugtracker => { web => 'https://github.com/CowboyTim/rocm-hip/issues' },
+            bugtracker => { web => 'https://github.com/aardbeiplantje/purhie/issues' },
         },
     },
     clean              => { FILES => 'ROCm-Inference-*' },
