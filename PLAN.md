@@ -33,9 +33,19 @@ Quantized: /models/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST-PLE_Q8_0.gguf (PLE table
   compress ratio 4); the release came with a separate head file (/data/mtp, set_draft_model: ~38 -> ~50 tok/s).
   Load the nextn block of the same file as the draft, dense attention there (exact below top_k 2048 x ratio 4
   positions; above, only which drafts are accepted can differ). The server then needs no separate draft file.
-- **PLE rows in parallel.** A text whose rows are not cached prefills at 391 tok/s: ~32k random 4 KB reads of the
-  table one at a time (~85 us each). Fetch a batch's rows concurrently (madvise WILLNEED / readahead, or a few
-  threads: NVMe serves deep queues) so the table can stay on disk at prefill speed.
+- **PLE rows in parallel** (the deployment's prefill bottleneck now). A text whose rows are not cached prefills at
+  391 tok/s: ~32k random 4 KB reads of the table one at a time (~85 us each). Fetch a batch's rows concurrently
+  (madvise WILLNEED / readahead, or a few threads: NVMe serves deep queues) so the table can stay on disk at prefill
+  speed. In the deployment (2026-11-09, `--parallel 1`, a 4 GB store in /dev/shm, 30k-token opencode prompts):
+  400-480 tok/s on the new tokens, the GPU mostly idle, as here.
+- **Memory budget on 124 GB** (2026-11-09). Resident: ~65 GB (all the GPU reads, experts included, pinned); the
+  rest of the 122.8 GB file (PLE table 35.8 GiB, token embeddings) is read by the CPU through the page cache, and
+  slows prefill to a crawl when that cache is squeezed. What squeezed it: a 19 GB block store in /dev/shm (tmpfs,
+  not evictable without swap), two 262k-token KV caches (`--parallel 2`), and the user's downloads (dirty pages
+  waiting for a slow disk). The server now warns at a load when the models, their KV caches and a store in memory
+  leave too little page cache for the CPU-read parts (`memory_check`), and a store on a disk works (the KV cache
+  stays in /dev/shm; blocks are copied in, 2970612). Not the cause: split-invariant prefill
+  (`QMATVEC_PREFILL_SPLIT_VARIANT=1`, set in the docker repo's run.sh on 2026-11-09, can go again).
 - The fork's qwen4exp is behind upstream's (recurrent_layers as indices vs upstream's bool flags; llama-server
   rejects these files): worth porting in the fork (the user's).
 

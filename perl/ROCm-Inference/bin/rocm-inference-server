@@ -128,8 +128,15 @@ sub settings {
 sub footprint {
     my ($r) = @_;
     my ($ctx, $kvt) = settings($r);
-    my $seqs = $r->{info}{kind} eq 'chat' ? $parallel : 1;
-    return $r->{info}{bytes} + $r->{info}{kv_bytes_per_token} * $ctx * $seqs * $kv_factor{$kvt};
+    return $r->{info}{bytes} + $r->{info}{kv_bytes_per_token} * $ctx * seqs($r) * $kv_factor{$kvt};
+}
+
+sub seqs { my ($r) = @_; $r->{info}{kind} eq 'chat' ? $parallel : 1 }
+
+# A loaded model's KV caches (every sequence's)
+sub kv_bytes {
+    my ($r) = @_;
+    return $r->{ctx} ? $r->{info}{kv_bytes_per_token} * $r->{ctx} * seqs($r) * $kv_factor{ $r->{kvt} } : 0;
 }
 
 sub idle { my ($r) = @_; !@{ $r->{queue} } && !@{ $r->{running} } && !$r->{busy} }
@@ -178,6 +185,7 @@ sub load {
     $m or die "cannot load $r->{path}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r || last_error()) . "\n";
     my $pages = stage_info($m);
     my $mem = $pages =~ /(\d+) of (\d+) MB on 2 MB pages/ ? "$1 of $2 MB on 2 MB pages" : '';
+    $r->{resident} = $pages =~ /(\d+) of (\d+) MB/ ? $2 * 2**20 : undef;  # (what is pinned: resident)
     my $emb = $r->{info}{kind} eq 'embedding';
     # a block store needs every layer's history: no sliding-window ring unless asked for
     set_swa_ring($m, $o{'swa-ring'} // ($o{store} ? 0 : -1)) unless $emb;
@@ -220,7 +228,57 @@ sub load {
     # --parallel N: N sequences (conversations at once), each a KV cache of the context; sequence 0 and N - 1 more
     $r->{pool} = [ map { { seq => $_, job => undef, prompt => [] } } 0, $emb ? () : map { seq_new($m) } 2 .. $parallel ];
     @$r{qw(m ctx kvt)} = ($m, $ctx, $kvt);
+    memory_check($r, $m);
     return $r;
+}
+
+sub mem_total {
+    open my $fh, '<', '/proc/meminfo' or return;
+    while (<$fh>) { return $1 * 1024 if /^MemTotal:\s+(\d+)/ }
+    return;
+}
+
+# After a load: a warning when the loaded models do not fit the RAM. What the GPU reads is held in memory (pinned:
+# the size stage_info reports at the load); what only the CPU reads (the token embeddings, Qwen3.8-Flash's 35.8 GiB
+# PLE table) stays in the file and is read through the page cache, so it is fast only while the page cache can keep
+# it: else a prefill reads its rows from the disk (the GPU idle, waiting for them). Counted against the RAM: each
+# loaded model's resident part and KV caches, and a block store in memory (tmpfs: --store-max, or its size without
+# a cap), which nothing evicts without swap; what is left is the page cache for the CPU-read parts
+sub memory_check {
+    my ($r, $m) = @_;
+    my $total = mem_total() or return;
+    my @loaded = grep { $_->{m} } values %M;
+    my ($held, $cpu) = (0, 0);
+    for my $x (@loaded) {
+        my $res = $x->{resident} // $x->{info}{bytes};
+        $held += $res + kv_bytes($x);
+        $cpu += $x->{info}{bytes} - $res if $x->{info}{bytes} > $res;
+    }
+    my $store = 0;
+    if ($o{store} && !store_stats($m)->{on_disk}) {
+        my ($bytes) = store_usage($o{store});
+        $store = $o{'store-max'} > 0 ? $o{'store-max'} * 2**30 : $bytes // 0;
+    }
+    my $need = $held + $store;
+    return if $need + $cpu <= $total;
+    my $gb = sub { sprintf '%.1f', $_[0] / 2**30 };
+    my $what = sprintf('%d loaded model%s: %s GB in memory with their KV caches (this one %s GB + %s GB KV for %d x %d '
+                     . 'positions)%s', scalar @loaded, @loaded == 1 ? '' : 's', $gb->($held),
+                       $gb->($r->{resident} // $r->{info}{bytes}), $gb->(kv_bytes($r)), seqs($r), $r->{ctx},
+                       $store ? ', the KV store in memory ' . $gb->($store) . ' GB' : '');
+    my $fix = 'a smaller --ctx or --parallel' . ($store ? ', the store on a disk or a smaller --store-max' : '')
+            . ', or fewer models loaded';
+    if ($need > $total) {
+        $LOG->warn_(model => $r->{id}, event => 'memory',
+                    msg => sprintf('%s GB of RAM, %s: %s GB more than there is. Memory runs out (the kernel reclaims '
+                                 . 'what it can, a prefill can stall): %s', $gb->($total), $what, $gb->($need - $total), $fix));
+    } else {
+        $LOG->warn_(model => $r->{id}, event => 'memory',
+                    msg => sprintf('%s GB of RAM, %s: %s GB left for the page cache, which the %s GB the CPU reads from '
+                                 . 'the model files (token embeddings, PLE tables) do not fit. A prefill then reads '
+                                 . 'those rows from the disk (slow, the GPU idle): %s', $gb->($total), $what,
+                                   $gb->($total - $need), $gb->($cpu), $fix));
+    }
 }
 
 # An OpenAI-style error, as a response to die with
@@ -1130,7 +1188,11 @@ An MTP draft head for speculative decoding (Qwen3.8-Flash-Next).
 
 =item --store F<dir>
 
-A KV block store (e.g. under F</dev/shm>): prompt prefixes are reused across conversations and restarts.
+A KV block store (e.g. under F</dev/shm>): prompt prefixes are reused across conversations and restarts. On tmpfs a
+block is published by a link (no copy), but the store is RAM that nothing evicts without swap: with a large model,
+keep C<--store-max> small. On a disk the KV cache stays in F</dev/shm> and each block is copied in (a warning at the
+start says so). After each load the server warns when the loaded models, their KV caches and a store in memory leave
+too little RAM for the page cache (see the C<memory> log line).
 
 =item --store-max GB
 
