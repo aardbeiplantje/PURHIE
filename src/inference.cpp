@@ -6,6 +6,7 @@
 #include "inference_internal.h"
 #include "gguf_mmap.h"
 #include "quant_types.h"
+#include "quantize.h"
 #include "qmatvec.h"
 #include "kv_cache.h"
 #include "tokenizer.h"
@@ -883,6 +884,20 @@ static bool load_model_weights(inference_model* m, const std::vector<int>& ple_l
 inference_model_t* inference_load_model(const char* gguf_path) { return inference_load_model_ex(gguf_path, nullptr); }
 
 const char* inference_stage_info(const inference_model_t* m) { return m ? m->stage_info.c_str() : ""; }
+
+size_t inference_quant_row_size(int type, long long ncols) { return qt_row_size(type, ncols); }
+
+int inference_quant_can_encode(int dst_type) { return qz_supported(dst_type); }
+
+int inference_quantize(int dst_type, void* dst, int src_type, const void* src, long long nrows, long long ncols,
+                       int n_threads) {
+    char err[256];
+    if (qz_quantize(dst_type, dst, src_type, src, nrows, ncols, n_threads, err, sizeof err) != 0) {
+        set_error("%s", err);
+        return INFERENCE_ERR_INVALID_ARG;
+    }
+    return 0;
+}
 
 int inference_model_info(const char* path, inference_model_info_t* out) {
     clear_error();

@@ -6,7 +6,9 @@ MANIFEST.SKIP
 Makefile.PL
 README
 bin/rocm-inference-server
+bin/rocm-quantize
 lib/ROCm/Inference.pm
+lib/ROCm/Inference/GGUF.pm
 lib/ROCm/Inference/Log.pm
 lib/ROCm/Inference/Store.pm
 t/00-load.t
@@ -26,5 +28,6 @@ t/65-models-dir.t
 t/70-stage.t
 t/80-seq.t
 t/90-embed.t
+t/95-quantize.t
 xt/pod-coverage.t
 xt/pod.t

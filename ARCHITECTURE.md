@@ -124,6 +124,25 @@ gfx1250; FP4 / FP6 scaled conversions only on CDNA 4 (gfx950) and gfx1250. So OC
 need software decodes here; `v_perm` takes 3-bit indices, so the table lookup used for ROCmFP4 does not extend
 to 6-bit codes. No model used here needs them.
 
+**Quantizing** (`src/quantize.cpp`, `inference_quantize`): the engine writes its own weight files. Rows of any type
+`quant_types.h` decodes are re-encoded on the CPU as F32, F16, BF16, Q8_0, ROCmFP4 or FAST, the same bytes as the
+reference encoders without an importance matrix (ggml's `quantize_row_q8_0_ref` and fp16 / bf16 rounding,
+ROCmFPX's `rocmfp4.c`: Codebook10 indices, each block's UE4M3 scale by an exhaustive least-squares search outward
+from max|x| / 10). The file is compiled with `-ffp-contract=off`, because a fused multiply-add rounds the search's
+sums of squares differently and picks another scale on a tie. `bin/rocm-quantize` (Perl: `ROCm::Inference::GGUF`
+reads and writes the header, the C encoders do the rows, 64M values at a time) writes a GGUF tensor by tensor
+without loading a model or using the GPU. It quantizes the tensors llama-quantize does (matrices, without norms,
+routers, convolutions and position embeddings), takes `-t REGEX=TYPE` rules, falls back to F16 for rows that are not
+whole blocks, and copies tensors that are already 4-bit (MXFP4 experts) or K-quants unless a rule names them.
+With `-r plain` its output is byte for byte llama-quantize's on Qwen3-0.6B and Qwen3.5-0.8B
+(`tests/quantize_verify.sh`), at the same speed: CPU-bound at about 75M values a second on 16 cores.
+The default recipe, `strix`, writes the token embeddings, the PLE table, the LM head, the DSA indexer and the mHC
+mixers as Q8_0: a token reads one row of a lookup table, and the others are single or small matrices. Measured on
+Qwen3-30B-A3B from its Q8_0 (wikitext-2 perplexity, 320 chunks of 512; 2026-11-09): Q8_0 8.743 (32.5 GB), every
+matrix FAST 8.980 (16.27 GB), FAST with a Q8_0 LM head 8.838 (16.44 GB; decode 83-88 tok/s either way), every
+matrix ROCmFP4 8.936 (17.22 GB). Attention K / V as ROCmFP4 (9.157) or kept at Q8_0 (9.013) did not beat FAST,
+although ROCmFP4 has ~10% less weight error there (the matvecs are exact: `matvec_verify`), so they take the target.
+
 ## 5. Exactness and WMMA
 
 The batched kernels (`matmul_q8_*`, `matvec_q8t_*`, attention below 16 tokens, the per-token MoE path below 8
@@ -265,6 +284,7 @@ less well and 2 is best; the adaptive default is within ~1% of the best fixed co
 | `mtp_verify` | draft acceptance, speculative = plain (greedy, sampled, library) |
 | `mtp_own_verify.sh` | a model's own MTP block drafts what the same block as a sidecar drafts; generation with it = without (tiny models) |
 | `store_verify.sh` | the KV block store across processes (optionally with a draft head) |
+| `quantize_verify.sh` | the encoders vs the reference's on synthetic rows and real tensors; `rocm-quantize` vs ROCmFPX's `llama-quantize` on a whole model (FAST, ROCmFP4, Q8_0): the same bytes |
 | `matvec_verify`, `dequant_verify`, `attn_decode_verify`, `kv_verify`, `tokenizer_*`, `sampler_verify`, `capi_smoke` | kernels, decoders, tokenizer, C API |
 | `perl/ROCm-Inference/t/*.t` | the Perl binding (GPU tests with `ROCM_INFERENCE_TEST_*`) |
 | `perplexity` | wikitext-2 perplexity as llama.cpp's `llama-perplexity` computes it (logits of every position: `inference_prefill_logits`) |

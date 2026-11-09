@@ -16,7 +16,7 @@ BEGIN {  # at compile time: the constants below call into the XS
 
 # The C library (libinference.so) mapped one function per C call; plus the plain-Perl chat helpers below
 our @EXPORT_OK = qw(
-    model_info load_model free_model kv_cache_init set_lm_head_q8 set_draft_model set_draft_tokens set_prefill_batch set_event_handler
+    model_info quantize quant_row_size quant_can_encode load_model free_model kv_cache_init set_lm_head_q8 set_draft_model set_draft_tokens set_prefill_batch set_event_handler
     set_swa_ring swa_ring stage_info set_kv_type
     seq_new seq_select seq_current seq_free stream_begin chat_start step_streams step_chats
     embedding_dim embed
@@ -617,6 +617,24 @@ C<set_draft_model>; or C<unsupported>, with C<why>: not a model, an architecture
 not run), C<arch>, C<n_ctx_train> (0 if not given), C<files> and C<bytes> (a split model is given by its
 F<-00001-of-0000N> file: all its files), C<kv_bytes_per_token> (K and V of one position as F16 over the attention
 layers: an estimate of the KV cache, Q8_0 about half, Q4_0 a quarter). Dies if the file is not a GGUF.
+
+=item quantize($dst_type, $src_type, $bytes, $n_rows, $n_cols, $n_threads)
+
+C<$n_rows> rows of C<$n_cols> values of ggml type C<$src_type> (any type the engine decodes), given as a byte
+string, re-encoded as C<$dst_type> on the CPU: F32 (0), F16 (1), BF16 (30), Q8_0 (8), Q4_0_ROCMFP4 (100) or
+Q4_0_ROCMFP4_FAST (101), the same bytes as the reference quantizers write without an importance matrix. Returns
+the encoded rows as a byte string. C<$n_threads> (default 0: one a core) encoder threads. No model is needed and
+the GPU is not used. Dies on a type it cannot decode or encode, on rows that are not whole blocks, or on short
+input. ROCm::Inference::GGUF and bin/rocm-quantize build a whole-file quantizer on it.
+
+=item quant_row_size($type, $n_cols)
+
+Bytes of one row of C<$n_cols> values of a ggml type; 0 if the engine does not know the type or the row is not
+whole blocks of it.
+
+=item quant_can_encode($type)
+
+1 when C<quantize> can write C<$type>.
 
 =item kv_cache_init($m, $n_ctx)
 

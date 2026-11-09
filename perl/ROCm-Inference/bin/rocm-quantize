@@ -1,0 +1,263 @@
+#!/usr/bin/env perl
+# rocm-quantize: a GGUF re-encoded tensor by tensor (ROCmFP4, ROCmFP4_FAST, Q8_0, F16, BF16) on the CPU.
+use strict;
+use warnings;
+
+use File::Basename qw(basename);
+use Getopt::Long qw(GetOptions);
+use Pod::Usage qw(pod2usage);
+use Time::HiRes qw(time);
+
+use ROCm::Inference ();
+use ROCm::Inference::GGUF qw(gguf_read gguf_read_rows gguf_write_header gguf_type_info gguf_type_id);
+
+my %ALIAS = (fast => 'q4_0_rocmfp4_fast', rocmfp4_fast => 'q4_0_rocmfp4_fast', rocmfp4 => 'q4_0_rocmfp4');
+# general.file_type (llama_ftype) of a file whose tensors are mostly this type
+my %FTYPE = (f32 => 0, f16 => 1, q8_0 => 7, bf16 => 32, q4_0_rocmfp4 => 100, q4_0_rocmfp4_fast => 103);
+# Sources re-encoded by default: the ones a 4-bit or 8-bit encoding loses nothing new from. Anything else (K-quants,
+# MXFP4 / NVFP4 experts, ...) is already quantized and is kept unless a --type rule names it.
+my %HIGH = map { $_ => 1 } qw(f32 f16 bf16 q8_0);
+
+my %o = (threads => 0, type => [], recipe => 'strix');
+GetOptions(\%o, 'type|t=s@', 'recipe|r=s', 'threads|j=i', 'dry-run|n', 'force|f', 'quiet|q', 'help|h')
+    or pod2usage(2);
+pod2usage(-verbose => 2, -exitval => 0) if $o{help};
+pod2usage(2) unless @ARGV == 2 || @ARGV == 3;
+my ($in, $out, $target) = @ARGV;
+$target = type_name($target // 'q4_0_rocmfp4_fast');
+die "rocm-quantize: $target is not a file type (one of: " . join(', ', sort keys %FTYPE) . ")\n"
+    unless exists $FTYPE{$target};
+die "rocm-quantize: $out exists (--force overwrites it)\n" if -e $out && !$o{force} && !$o{'dry-run'};
+
+sub type_name {
+    my ($n) = @_;
+    $n = lc $n;
+    $n = $ALIAS{$n} // $n;
+    return $n if $n eq 'keep';
+    die "rocm-quantize: unknown tensor type '$_[0]'\n" unless defined gguf_type_id($n);
+    die "rocm-quantize: cannot encode $n\n" unless ROCm::Inference::quant_can_encode(gguf_type_id($n));
+    return $n;
+}
+
+# --type REGEX=TYPE: the first rule whose regex matches a tensor's name decides its type (keep: as it is)
+my @rules = map {
+    my ($re, $t) = /^(.+)=([^=]+)$/ or die "rocm-quantize: --type wants REGEX=TYPE, not '$_'\n";
+    [qr/$re/, type_name($t), $_];
+} @{$o{type}};
+
+# Recipes: rules after the --type ones, for a 4-bit target. strix spends bits where a token reads little of the
+# tensor or it is small: Q8_0 for the lookup tables (a token reads one row of token_embd / the PLE table), the LM
+# head (read whole every token, but one matrix: on Qwen3-30B-A3B it closes 60% of FAST's perplexity gap to Q8_0 for
+# 1% of the file and no measurable tok/s), the DSA indexer and the mHC mixers (small; they select keys and mix the
+# streams). Attention K / V stay at the target: neither ROCmFP4 nor Q8_0 there improved perplexity (2026-11-09).
+my %RECIPE = (
+    plain => [],
+    strix => [
+        ['^(?:per_layer_)?token_embd\.weight$' => 'q8_0'],
+        ['^output\.weight$' => 'q8_0'],
+        ['\.indexer\.' => 'q8_0'],
+        ['(?:^|\.)hc_|^output_hc_' => 'q8_0'],
+    ],
+);
+die "rocm-quantize: unknown recipe '$o{recipe}' (" . join(', ', sort keys %RECIPE) . ")\n" unless $RECIPE{$o{recipe}};
+my @recipe = $target =~ /^q4_0_rocmfp4/ ? map { [qr/$_->[0]/, $_->[1], "recipe $o{recipe}"] } @{$RECIPE{$o{recipe}}} : ();
+
+# Tensors a quantization leaves alone whatever the target (the same set as llama.cpp's llama-quantize): 1-D
+# tensors, names not ending in "weight", norms, routers (expert gating), convolutions, position / token-type
+# embeddings and vision-encoder parts
+my @NEVER = (qr/_norm\.weight$/, qr/ffn_gate_inp\.weight/, qr/ffn_gate_tid2eid\.weight/, qr/ssm_conv1d/,
+             qr/shortconv\.conv\.weight/, qr/altup/, qr/laurel/, qr/per_layer_model_proj/, qr/^position_embd\./,
+             qr/^token_types\./, qr/time_mix_(?:first|w[012]|[av][012]|a[012]|g[12]|decay_w[12]|lerp_fused)\.weight/,
+             qr/attn_rel_b\.weight/, qr/\.position_embd/, qr/sam\.(?:pos_embd|neck\.|net_)/, qr/\.rel_pos/,
+             qr/\.patch_embd/, qr/\.patch_merger/);
+
+# The type a tensor is written as, and why when it is not the target
+sub plan {
+    my ($t) = @_;
+    my $src = (gguf_type_info($t->{type}))[0];
+    my $eligible = @{$t->{ne}} >= 2 && $t->{name} =~ /weight$/ && !grep { $t->{name} =~ $_ } @NEVER;
+    my ($want, $why);
+    if (!$eligible) {
+        ($want, $why) = ($src, 'kept');
+    } elsif (my ($r) = grep { $t->{name} =~ $_->[0] } @rules) {
+        ($want, $why) = $r->[1] eq 'keep' ? ($src, "kept by $r->[2]") : ($r->[1], "by $r->[2]");
+    } elsif (!$HIGH{$src}) {
+        ($want, $why) = ($src, "kept ($src is already quantized)");
+    } elsif (my ($rr) = grep { $t->{name} =~ $_->[0] } @recipe) {
+        ($want, $why) = ($rr->[1], "by $rr->[2]");
+    } else {
+        $want = $target;
+    }
+    return ($src, undef) if $want eq $src;
+    die "rocm-quantize: $t->{name}: the engine cannot decode $src to re-encode it\n"
+        unless ROCm::Inference::quant_row_size($t->{type}, $t->{ne}[0]);
+    my (undef, $blk) = gguf_type_info(gguf_type_id($want));
+    if ($t->{ne}[0] % $blk) {  # rows that are not whole blocks of the target: F16 (as llama-quantize falls back)
+        $why = "$t->{ne}[0] values a row are not whole blocks of $blk for $want";
+        $want = 'f16';
+        return ($src, $why) if $want eq $src;
+    }
+    return ($want, $why);
+}
+
+my $g = gguf_read($in);
+my $arch = do { my $i = $g->{kv_index}{'general.architecture'}; defined $i ? $g->{kv}[$i][2] : '?' };
+printf "%s: %s, %d tensors, %d metadata keys -> %s as %s\n", basename($in), $arch, scalar @{$g->{tensors}},
+    scalar @{$g->{kv}}, $out, $target unless $o{quiet};
+
+# Metadata: the input's, then general.quantization_version and general.file_type (moved to the end, as llama.cpp
+# does), and without the split keys (the output is one file)
+my @kv = grep { $_->[0] !~ /^(?:general\.quantization_version|general\.file_type|split\.(?:no|count|tensors\.count))$/ }
+    @{$g->{kv}};
+push @kv, ['general.quantization_version', 4, 2], ['general.file_type', 4, $FTYPE{$target}];
+
+my (@outt, $in_bytes, $out_bytes);
+for my $t (@{$g->{tensors}}) {
+    my ($want, $why) = plan($t);
+    my $o = {%$t, src => $t};
+    if (defined $want) {
+        $o->{type} = gguf_type_id($want);
+        $o->{bytes} = ROCm::Inference::quant_row_size($o->{type}, $t->{ne}[0]) * rows($t);
+    }
+    $o->{why} = $why;
+    push @outt, $o;
+    $in_bytes += $t->{bytes};
+    $out_bytes += $o->{bytes};
+}
+sub rows { my $n = 1; $n *= $_ for @{$_[0]{ne}}[1 .. $#{$_[0]{ne}}]; return $n }
+
+my ($header, $data) = gguf_write_header(\@kv, \@outt, $g->{alignment});
+if ($o{'dry-run'}) {
+    report($_) for @outt;
+    summary(0);
+    exit 0;
+}
+
+my $part = "$out.part";
+open my $fo, '>:raw', $part or die "rocm-quantize: $part: $!\n";
+wr($fo, $header);
+my %fh;
+my $t0 = time;
+my $i = 0;
+for my $o (@outt) {
+    my $t = $o->{src};
+    my $fi = $fh{$t->{path}} //= do { open my $f, '<:raw', $t->{path} or die "rocm-quantize: $t->{path}: $!\n"; $f };
+    my $nrows = rows($t);
+    my $copy = $o->{type} == $t->{type};
+    # About 64M values a pass (a 256 MB BF16 read, the threads' share each)
+    my $chunk = $copy ? $nrows : int((64 << 20) / $t->{ne}[0]) || 1;
+    my $written = 0;
+    for (my $r = 0; $r < $nrows; $r += $chunk) {
+        my $n = $r + $chunk > $nrows ? $nrows - $r : $chunk;
+        my $s = gguf_read_rows($fi, $t, $r, $n);
+        $s = ROCm::Inference::quantize($o->{type}, $t->{type}, $s, $n, $t->{ne}[0], $o{threads}) unless $copy;
+        wr($fo, $s);
+        $written += length $s;
+    }
+    die "rocm-quantize: $t->{name}: wrote $written bytes, $o->{bytes} planned\n" unless $written == $o->{bytes};
+    wr($fo, "\0" x ((-$written) % $g->{alignment}));
+    report($o, ++$i);
+}
+close $fo or die "rocm-quantize: $part: $!\n";
+rename $part, $out or die "rocm-quantize: rename $part -> $out: $!\n";
+summary(time - $t0);
+
+sub wr {
+    my ($f, $s) = @_;
+    my $off = 0;
+    while ($off < length $s) {
+        my $w = syswrite($f, $s, length($s) - $off, $off);
+        die "rocm-quantize: $part: $!\n" unless defined $w;
+        $off += $w;
+    }
+}
+
+sub report {
+    my ($o, $n) = @_;
+    return if $o{quiet};
+    my $t = $o->{src};
+    my ($from) = gguf_type_info($t->{type});
+    my ($to) = gguf_type_info($o->{type});
+    printf "[%4s/%4d] %-44s [%s] %s%s %.2f -> %.2f MB%s\n", $n // '-', scalar @outt, $t->{name},
+        join(', ', @{$t->{ne}}), $from, $to eq $from ? '' : " -> $to", $t->{bytes} / 1048576, $o->{bytes} / 1048576,
+        $o->{why} ? " ($o->{why})" : '';
+}
+
+sub summary {
+    my ($s) = @_;
+    return if $o{quiet};
+    my $vals = 0;
+    for my $t (@{$g->{tensors}}) { my $n = 1; $n *= $_ for @{$t->{ne}}; $vals += $n }
+    printf "%.2f GB (%.2f bits a value) -> %.2f GB (%.2f bits a value)%s\n", $in_bytes / 1e9, 8 * $in_bytes / $vals,
+        (length($header) + $data) / 1e9, 8 * $out_bytes / $vals,
+        $s ? sprintf(' in %.0f s (%.0f MB/s read)', $s, $in_bytes / 1e6 / $s) : ' (dry run: nothing written)';
+}
+
+__END__
+
+=head1 NAME
+
+rocm-quantize - re-encode a GGUF model's weights (ROCmFP4, ROCmFP4_FAST, Q8_0, F16, BF16)
+
+=head1 SYNOPSIS
+
+  rocm-quantize [options] IN.gguf OUT.gguf [TYPE]
+
+  rocm-quantize Model-BF16.gguf Model-FAST.gguf               # FAST, recipe strix
+  rocm-quantize -r plain Model-BF16.gguf Model-FAST-pure.gguf  # every matrix FAST
+  rocm-quantize -t 'ffn_down_exps=rocmfp4' GLM-Q8_0.gguf GLM-FAST.gguf
+
+=head1 DESCRIPTION
+
+Writes IN.gguf (or every file of a split model, given its first file) as one GGUF with its weight matrices
+re-encoded as TYPE, on the CPU: no model is loaded and the GPU is not used. The encoders are the engine's
+(libinference: C<inference_quantize>), which write the same bytes as the reference quantizers (llama.cpp's
+Q8_0 / F16 / BF16, ROCmFPX's ROCmFP4) without an importance matrix; C<tests/quantize_verify> checks that.
+
+TYPE (default C<q4_0_rocmfp4_fast>; C<fast> and C<rocmfp4_fast> are the same): C<q4_0_rocmfp4_fast> (4.25 bits a
+value), C<q4_0_rocmfp4> (4.5), C<q8_0> (8.5), C<f16>, C<bf16>, C<f32>.
+
+Which tensors: the matrices (2 or more dimensions, names ending in C<weight>) except norms, routers
+(C<ffn_gate_inp>), convolutions, position embeddings and vision-encoder parts (the set llama.cpp's llama-quantize
+leaves alone), and only from F32, F16, BF16 or Q8_0; the recipe (C<--recipe>, default C<strix>) gives some of them
+Q8_0 instead of TYPE. A tensor that is already 4-bit or a K-quant (DeepSeek V4's
+MXFP4 experts, say) is copied as it is unless a C<--type> rule names it. Rows that are not whole blocks of the
+target are written as F16. The metadata is copied, with C<general.file_type> and C<general.quantization_version>
+set and the split keys removed. The output is written to F<OUT.gguf.part> and renamed when complete.
+
+=head1 OPTIONS
+
+=over
+
+=item B<-t>, B<--type> REGEX=TYPE
+
+Tensors whose name matches REGEX (a Perl regex, unanchored) are written as TYPE, or as they are with
+C<keep>. Repeatable; the first matching rule wins. Rules apply only to the tensors described above.
+
+=item B<-r>, B<--recipe> NAME
+
+Per-tensor types for a 4-bit TYPE, after the C<--type> rules. C<strix> (the default) writes as Q8_0 the
+tensors where bits cost little bandwidth: the token embeddings and the PLE table (a token reads one row), the LM
+head (one matrix; on Qwen3-30B-A3B it closed 60% of FAST's perplexity gap to Q8_0 for 1% of the file, at the same
+tok/s), the DSA indexer and the mHC mixers (small). Everything else, experts and attention included, takes TYPE.
+C<plain>: every tensor TYPE, as llama-quantize writes it. Applies only to tensors from F32, F16, BF16 or Q8_0.
+
+=item B<-j>, B<--threads> N
+
+Encoder threads (default: one a core). Give fewer on a host that is serving a model.
+
+=item B<-n>, B<--dry-run>
+
+Print each tensor's plan and the output size; write nothing.
+
+=item B<-f>, B<--force>
+
+Overwrite OUT.gguf.
+
+=item B<-q>, B<--quiet>
+
+No progress output.
+
+=back
+
+=cut

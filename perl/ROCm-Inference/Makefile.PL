@@ -75,7 +75,7 @@ WriteMakefile(
     dynamic_lib        => { OTHERLDFLAGS => "-Wl,-rpath,$lib" },
     CONFIGURE_REQUIRES => { 'ExtUtils::MakeMaker' => '6.64' },
     PREREQ_PM          => { 'Carp' => 0, 'Exporter' => 0, 'XSLoader' => 0 },
-    EXE_FILES          => ['bin/rocm-inference-server'],
+    EXE_FILES          => ['bin/rocm-inference-server', 'bin/rocm-quantize'],
     TEST_REQUIRES      => { 'Test::More' => '0.88', 'File::Temp' => 0 },
     META_MERGE         => {
         'meta-spec' => { version => 2 },

@@ -205,17 +205,18 @@ $(ATTN_VERIFY): $(TESTSDIR)/attn_verify.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/attn_verify.cpp $(SRCDIR)/kv_cache.cpp $(LDFLAGS) -o $@
 
 # Phase 4: Inference engine static library
-$(INFERENCE_LIB): $(SRCDIR)/inference.cpp $(SRCDIR)/inference.h $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/gguf_mmap.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/quant_types.h $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_cache.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/tokenizer.h $(SRCDIR)/unicode_flags.inc $(SRCDIR)/sampler.cpp $(SRCDIR)/sampler.h $(SRCDIR)/qwen_model.h $(SRCDIR)/sha256.cpp $(SRCDIR)/sha256.h $(SRCDIR)/inference_internal.h $(SRCDIR)/model_stage.cpp $(SRCDIR)/model_stage.h
+$(INFERENCE_LIB): $(SRCDIR)/inference.cpp $(SRCDIR)/inference.h $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/gguf_mmap.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/quant_types.h $(SRCDIR)/quantize.cpp $(SRCDIR)/quantize.h $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_cache.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/tokenizer.h $(SRCDIR)/unicode_flags.inc $(SRCDIR)/sampler.cpp $(SRCDIR)/sampler.h $(SRCDIR)/qwen_model.h $(SRCDIR)/sha256.cpp $(SRCDIR)/sha256.h $(SRCDIR)/inference_internal.h $(SRCDIR)/model_stage.cpp $(SRCDIR)/model_stage.h
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/inference.cpp -o $(OBJDIR)/inference.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/gguf_mmap.cpp -o $(OBJDIR)/gguf_mmap.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/quant_types.cpp -o $(OBJDIR)/quant_types.o
+	$(CLANG) $(CXXFLAGS) -ffp-contract=off -I. -fPIC -c $(SRCDIR)/quantize.cpp -o $(OBJDIR)/quantize.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/kv_cache.cpp -o $(OBJDIR)/kv_cache.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/tokenizer.cpp -o $(OBJDIR)/tokenizer.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/sampler.cpp -o $(OBJDIR)/sampler.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/sha256.cpp -o $(OBJDIR)/sha256.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/model_stage.cpp -o $(OBJDIR)/model_stage.o
 	rm -f $@
-	ar rcs $@ $(OBJDIR)/inference.o $(OBJDIR)/gguf_mmap.o $(OBJDIR)/quant_types.o $(OBJDIR)/kv_cache.o $(OBJDIR)/tokenizer.o $(OBJDIR)/sampler.o $(OBJDIR)/sha256.o $(OBJDIR)/model_stage.o
+	ar rcs $@ $(OBJDIR)/inference.o $(OBJDIR)/gguf_mmap.o $(OBJDIR)/quant_types.o $(OBJDIR)/quantize.o $(OBJDIR)/kv_cache.o $(OBJDIR)/tokenizer.o $(OBJDIR)/sampler.o $(OBJDIR)/sha256.o $(OBJDIR)/model_stage.o
 
 # Inference engine shared library (versioned): the whole engine (both archives, kernels embedded), exporting only
 # the public C API (src/libinference.map: inference_*, tokenizer_*, sampler_*)
@@ -364,6 +365,14 @@ REF_LLAMA_B  ?= $(REF_LLAMA)/build-cpu
 REF_DUMP     = $(BINDIR)/ref_dump
 
 ref_dump: $(REF_DUMP)
+
+# The weight encoders (src/quantize.cpp) against the reference's, byte for byte (tests/quantize_verify.cpp)
+QUANTIZE_VERIFY = $(BINDIR)/quantize_verify
+quantize_verify: $(QUANTIZE_VERIFY)
+$(QUANTIZE_VERIFY): $(TESTSDIR)/quantize_verify.cpp $(SRCDIR)/quantize.cpp $(SRCDIR)/quantize.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
+	c++ -O2 -std=c++17 -ffp-contract=off -I$(SRCDIR) -I$(REF_LLAMA)/ggml/include $(TESTSDIR)/quantize_verify.cpp \
+		$(SRCDIR)/quantize.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp \
+		$(REF_LLAMA_B)/ggml/src/libggml-base.a -lpthread -lm -o $@
 
 $(REF_DUMP): tools/ref_oracle/ref_dump.cpp
 	@mkdir -p $(BINDIR)

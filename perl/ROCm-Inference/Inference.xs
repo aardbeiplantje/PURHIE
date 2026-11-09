@@ -232,6 +232,49 @@ model_info(path)
   OUTPUT:
     RETVAL
 
+SV*
+quantize(dst_type, src_type, src, nrows, ncols, n_threads = 0)
+    int dst_type
+    int src_type
+    SV* src
+    IV nrows
+    IV ncols
+    int n_threads
+  CODE:
+    /* nrows x ncols values of src_type (a byte string) re-encoded as dst_type: a byte string (inference_quantize) */
+    const size_t srs = inference_quant_row_size(src_type, ncols), drs = inference_quant_row_size(dst_type, ncols);
+    if (!srs || !drs) croak("quantize: type %d or %d cannot hold rows of %ld values", src_type, dst_type, (long)ncols);
+    STRLEN len;
+    const char* p = SvPVbyte(src, len);
+    if (nrows < 0 || len < srs * (size_t)nrows)
+        croak("quantize: %lu bytes of input, %lu needed", (unsigned long)len, (unsigned long)(srs * (size_t)nrows));
+    RETVAL = newSV(drs * (size_t)nrows + 1);
+    SvPOK_only(RETVAL);
+    if (inference_quantize(dst_type, SvPVX(RETVAL), src_type, p, nrows, ncols, n_threads) != 0) {
+        SvREFCNT_dec(RETVAL);
+        croak_last(aTHX_ "quantize", INFERENCE_ERR_INVALID_ARG);
+    }
+    SvCUR_set(RETVAL, drs * (size_t)nrows);
+  OUTPUT:
+    RETVAL
+
+UV
+quant_row_size(type, ncols)
+    int type
+    IV ncols
+  CODE:
+    RETVAL = inference_quant_row_size(type, ncols);
+  OUTPUT:
+    RETVAL
+
+int
+quant_can_encode(type)
+    int type
+  CODE:
+    RETVAL = inference_quant_can_encode(type);
+  OUTPUT:
+    RETVAL
+
 const char*
 stage_info(h)
     SV* h

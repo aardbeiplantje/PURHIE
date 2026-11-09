@@ -15,7 +15,16 @@
    (4fe7dae, another agent; reverted in d4a45fa) skipped the gate and the oracle: tensor names unlike `glm-dsa`'s, a
    tiny GGUF its own loader refused, and a DSA path that reweighted dense attention output instead of selecting keys.
 
-Later: a conversion / quantization tool in this project.
+5. **Independent of llama.cpp: a quantizer and a converter here** (user, 2026-11-09: "i want to be independent of
+   llama.cpp"). The quantizer is in (`bin/rocm-quantize`, `inference_quantize`; with `-r plain` byte for byte
+   llama-quantize's on FAST / ROCmFP4 / Q8_0, `tests/quantize_verify.sh`; default recipe `strix`: Q8_0 lookup
+   tables, LM head, indexer and mHC, measured in ARCHITECTURE.md s4). Open on it: a better quality measure than
+   perplexity for small per-tensor choices (K / V moved perplexity by +-2% without following precision): the KL
+   divergence of the logits against the Q8_0 / BF16 model; and the recipe on Flash in the deployment (its Q8_0 LM
+   head and hc mixers are untested on the real model). Next, the converter (section "Later"): HF safetensors ->
+   GGUF, reading FP8 e4m3 with its block scales and writing the target type directly, so a 320B model needs no
+   640 GB BF16 (or 340 GB Q8_0) intermediate on a 361 GB disk. Until then GLM-5.3 / DeepSeek V4 go through
+   upstream's convert_hf_to_gguf.py (`--fp8-as-q8`; it knows `glm5-next` and `deepseek4`) and then rocm-quantize.
 
 ## Status in brief
 
@@ -228,14 +237,14 @@ X-Remote-User` on /rocm/ (not done here).
 
 ## Later
 
-- **A conversion / quantization tool in this project** (user: "the conversion belongs with this project sort of").
-  What the engine runs is specialized (ROCmFP4 FAST, the PLE table on disk, per-tensor recipes) and depends on the
-  fork's converter and quantizer, whose conventions can disagree with upstream's. Scope: HF safetensors -> GGUF
-  for the architectures here, metadata both the engine and llama.cpp read; quantization to the engine's types
-  with per-tensor recipes (PLE / token embeddings / output, attention K/V), streamed tensor by tensor (no
-  full-model RAM: the BF16 Flash is 359 GB); an importance matrix collected on the GPU by the engine from an FP4
-  model; checks with dequant_verify / forward_verify against ggml's quantizers. C/C++ next to quant_types.cpp, a
-  Perl front end.
+- **The converter: HF safetensors -> GGUF in this project** (user: "the conversion belongs with this project sort
+  of"; the quantizer it feeds is done, ▶ Next item 5). In Perl next to `ROCm::Inference::GGUF` (a safetensors
+  header is JSON plus offsets), the rows through `inference_quantize`; per architecture a tensor-name and metadata
+  map that matches upstream llama.cpp's GGUF names, so the oracle keeps reading what it writes. Sources: BF16 and
+  FP8 e4m3 with 128x128 block scales (a decoder in quant_types.cpp); targets straight to the engine's types, tensor
+  by tensor. Check: its GGUF against upstream convert_hf_to_gguf.py's on a small model, tensor for tensor. Open
+  after it: an importance matrix (the weighted ROCmFP4 search; collected on the GPU by the engine), and a faster
+  encoder (AVX-512 across 16 blocks keeps each block's summation order, so the bytes stay the reference's).
 - **Qwen3.8-Flash-Next beyond 262,144 tokens (YaRN)** (HF card, 2026-11-06). The checkpoint is 262,144 natively
   (`max_position_embeddings`, `rope_type` default); the card reaches 1M by a YaRN override (`factor` 4.0, original
   262144, with an attention scale). Nothing is dropped by the converter: the GGUF has no rope-scaling keys, and the

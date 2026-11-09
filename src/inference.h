@@ -77,6 +77,16 @@ typedef struct inference_model_info_t {
 } inference_model_info_t;
 int inference_model_info(const char* gguf_path, inference_model_info_t* out);
 
+// Weight quantization on the CPU (no GPU, no model loaded): nrows rows of ncols values of src_type (a ggml type id
+// the engine decodes) re-encoded as dst_type: 0 F32, 1 F16, 30 BF16, 8 Q8_0, 100 Q4_0_ROCMFP4, 101
+// Q4_0_ROCMFP4_FAST (the same bytes as the reference quantizers, without an importance matrix). Rows are back to
+// back in src and dst; dst holds nrows * inference_quant_row_size(dst_type, ncols) bytes. src_type == dst_type
+// copies. n_threads <= 0: one a core. Returns 0, negative on error (inference_get_last_error says why).
+size_t inference_quant_row_size(int type, long long ncols);  // 0: unknown type, or ncols not a multiple of its block
+int inference_quant_can_encode(int dst_type);                // 1 when dst_type is one of the six above
+int inference_quantize(int dst_type, void* dst, int src_type, const void* src, long long nrows, long long ncols,
+                       int n_threads);
+
 // Reference counting for shared ownership
 void inference_model_retain(inference_model_t* model);
 void inference_model_release(inference_model_t* model);
