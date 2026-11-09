@@ -97,8 +97,11 @@ int  kv_cache_slot_attach(inference_kv_cache_t *c, int slot, int fd);
 int  kv_cache_slot_make_private(inference_kv_cache_t *c, int slot, int copy);
 int  kv_cache_slot_publish(inference_kv_cache_t *c, int slot, const char *path);
 /* Move the private slots' files to dir (contents kept): publishing links a slot's file into the store directory,
-   which must be on the same filesystem. Returns 0, -1 on error. */
+   which must be on the same filesystem. Returns 0, -1 on error. A dir not in memory (a disk, not tmpfs / ramfs /
+   hugetlbfs) keeps the slots where they are (kv_cache_create also puts them in /dev/shm then): every write to the
+   cache would go to the disk. Publishing then writes a copy of the block (kv_cache_copy_publish: 1). */
 int  kv_cache_set_dir(inference_kv_cache_t *c, const char *dir);
+int  kv_cache_copy_publish(const inference_kv_cache_t *c);
 
 /* Wipe every byte of the mapping (fresh context / full reset of stored data). */
 void kv_cache_zero(inference_kv_cache_t *c);

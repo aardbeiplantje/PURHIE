@@ -2144,7 +2144,7 @@ int inference_store_open(inference_model_t* m, const char* dir, int snapshot_eve
     }
     close(probe);
     // Blocks are published by linking a slot's own file, so the slots must live on the store's filesystem: every
-    // sequence's
+    // sequence's. A store on a disk keeps them in /dev/shm and publishes copies (kv_cache_set_dir)
     for (inference_model::SeqCtx* q : m->seqs)
         if (q && q->kvc && kv_cache_set_dir(q->kvc, dir) != 0) {
             set_error("store: cannot move the KV slots to %s", dir);
@@ -2257,6 +2257,7 @@ int inference_store_get_stats(const inference_model_t* m, inference_store_stats*
     st->block_tokens = m->kvc ? kv_cache_block_tokens(m->kvc) : 0;
     st->block_bytes = m->kvc ? (long long)kv_cache_block_bytes(m->kvc) : 0;
     st->snapshot_bytes = m->qwen ? (long long)state_bytes(m) : 0;
+    st->on_disk = m->kvc ? kv_cache_copy_publish(m->kvc) : 0;
     return 0;
 }
 

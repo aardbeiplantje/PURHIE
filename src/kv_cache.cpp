@@ -13,6 +13,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <errno.h>
 #include <unistd.h>
 
@@ -40,6 +41,9 @@ struct inference_kv_cache {
     std::string dir;
     std::vector<int> slot_fd;
     std::vector<char> slot_shared;  // 1: a store file (immutable: never written)
+    // The store directory is not in memory (a disk): the slots stay in dir (/dev/shm) and a published block is a
+    // copy written there (kv_cache_set_dir)
+    bool copy_publish = false;
 };
 
 namespace {
@@ -72,6 +76,15 @@ int new_slot_file(inference_kv_cache_t* c, bool* publishable) {
         fd = -1;
     }
     return fd;
+}
+
+// Whether dir is in memory (tmpfs, ramfs, hugetlbfs): the slots' files may live there. On a disk filesystem every
+// write to the cache would be written back to the disk (and pinning the slots at the start writes all of them)
+bool in_memory_dir(const char* dir) {
+    struct statfs fs;
+    if (statfs(dir, &fs) != 0) return true;  // (not known: as before)
+    const unsigned long t = (unsigned long)fs.f_type;
+    return t == 0x01021994UL /* tmpfs */ || t == 0x858458f6UL /* ramfs */ || t == 0x958458f6UL /* hugetlbfs */;
 }
 
 char* slot_addr(const inference_kv_cache_t* c, int slot) { return (char*)c->base + (size_t)slot * c->block_bytes; }
@@ -141,6 +154,10 @@ inference_kv_cache_t *kv_cache_create(const char *shm_path, const kv_cache_confi
         c->dir = shm_path;
         const size_t slash = c->dir.rfind('/');
         c->dir = slash == std::string::npos ? "." : slash == 0 ? "/" : c->dir.substr(0, slash);
+    }
+    if (!in_memory_dir(c->dir.c_str())) {  // (a block store on a disk: see kv_cache_set_dir)
+        c->dir = "/dev/shm";
+        c->copy_publish = true;
     }
     const int n_slots = c->cfg.n_ctx / B;
     // Each slot keeps its file open: raise the soft open-file limit to what the slots need (the hard limit permitting)
@@ -239,6 +256,8 @@ int kv_cache_slot_make_private(inference_kv_cache_t *c, int slot, int copy) {
 
 int kv_cache_set_dir(inference_kv_cache_t *c, const char *dir) {
     if (!c || !dir) return -1;
+    c->copy_publish = !in_memory_dir(dir);
+    if (c->copy_publish) return 0;  // the slots stay where they are; a published block is a copy
     c->dir = dir;
     for (size_t i = 0; i < c->slot_fd.size(); ++i)
         if (!c->slot_shared[i] && kv_cache_slot_make_private(c, (int)i, 1) != 0) return -1;
@@ -248,6 +267,30 @@ int kv_cache_set_dir(inference_kv_cache_t *c, const char *dir) {
 int kv_cache_slot_publish(inference_kv_cache_t *c, int slot, const char *path) {
     if (!c || slot < 0 || slot >= (int)c->slot_fd.size() || !path) return -1;
     char proc[64];
+    if (c->copy_publish) {  // a copy in an anonymous file of the store's directory, linked once complete
+        if (access(path, F_OK) == 0) return 1;
+        std::string sdir = path;
+        const size_t slash = sdir.rfind('/');
+        sdir = slash == std::string::npos ? "." : slash == 0 ? "/" : sdir.substr(0, slash);
+        const int fd = open(sdir.c_str(), O_TMPFILE | O_RDWR | O_CLOEXEC, 0644);
+        if (fd < 0) { INFER_LOG("kv_cache: publish slot %d in %s: %s\n", slot, sdir.c_str(), strerror(errno)); return -1; }
+        size_t done = 0;
+        while (done < c->block_bytes) {
+            const ssize_t w = pwrite(fd, slot_addr(c, slot) + done, c->block_bytes - done, (off_t)done);
+            if (w <= 0) break;
+            done += (size_t)w;
+        }
+        snprintf(proc, sizeof(proc), "/proc/self/fd/%d", fd);
+        const int rc = done < c->block_bytes ? -1 : linkat(AT_FDCWD, proc, AT_FDCWD, path, AT_SYMLINK_FOLLOW);
+        const int err = errno;
+        close(fd);
+        if (rc != 0) {
+            if (done == c->block_bytes && err == EEXIST) return 1;
+            INFER_LOG("kv_cache: publish slot %d as %s: %s\n", slot, path, strerror(done < c->block_bytes ? errno : err));
+            return -1;
+        }
+        return 0;  // (the slot stays private: the store has its own copy)
+    }
     snprintf(proc, sizeof(proc), "/proc/self/fd/%d", c->slot_fd[slot]);
     if (linkat(AT_FDCWD, proc, AT_FDCWD, path, AT_SYMLINK_FOLLOW) != 0) {
         if (errno == EEXIST) return 1;  // already published (by another session or process)
@@ -257,6 +300,8 @@ int kv_cache_slot_publish(inference_kv_cache_t *c, int slot, const char *path) {
     c->slot_shared[slot] = 1;  // now visible to others: never written again
     return 0;
 }
+
+int kv_cache_copy_publish(const inference_kv_cache_t *c) { return c && c->copy_publish ? 1 : 0; }
 
 int kv_cache_n_layers(const inference_kv_cache_t *c) { return c ? c->cfg.n_layers : 0; }
 int kv_cache_n_ctx(const inference_kv_cache_t *c)    { return c ? c->cfg.n_ctx : 0; }

@@ -371,6 +371,8 @@ typedef struct inference_store_stats {
     long long snapshot_bytes;      // size of a .rst file (0: no recurrent layers)
     long long snapshots_dropped;   // superseded prompt-end snapshots this model deleted
     long long snapshots_held;      // prompt-end snapshots held in memory instead of written (inference_store_set_lazy)
+    int on_disk;                   // 1: the store is not in memory (not tmpfs): the KV cache stays in /dev/shm and a
+                                   // block is published as a copy (a write per block) instead of a link
 } inference_store_stats;
 
 int inference_store_get_stats(const inference_model_t* model, inference_store_stats* stats);

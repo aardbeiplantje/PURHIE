@@ -158,6 +158,9 @@ def main():
     NG, NV, DS, DCONV = 2, 4, 128, 4          # DeltaNet: q/k heads, v heads, head size, conv width
     DI = NV * DS
     NE, NU, FE, FS = 16, 4, 256, 256          # experts, used, expert width, shared expert width
+    # (TINY_EXPERTS=512,10,640: the release's routing and expert width)
+    if os.environ.get("TINY_EXPERTS"):
+        NE, NU, FE = (int(x) for x in os.environ["TINY_EXPERTS"].split(","))
     IH, IK = 4, 128                           # indexer (unused: compress ratios are 0)
     PLE_L, NGRAM, PER, PCONV = 1, 3, 8, 4     # PLE layer, n-gram size, heads per n-gram, conv width
     PH = (NGRAM - 1) * PER                    # 16 PLE heads

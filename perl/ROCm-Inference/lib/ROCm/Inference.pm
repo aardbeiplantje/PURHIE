@@ -653,6 +653,7 @@ conversation that goes on writes none. False (the default) writes one at every p
 
 A hash ref: C<blocks_published>, C<blocks_attached>, C<snapshots_saved>, C<snapshots_restored>,
 C<snapshots_dropped> (superseded prompt ends deleted), C<snapshots_held> (prompt ends held instead of written: lazy),
+C<on_disk> (1: the store is not on tmpfs, so the KV cache stays in /dev/shm and blocks are published as copies),
 C<tokens_from_store>, C<block_tokens>, C<block_bytes>, C<snapshot_bytes>.
 
 =item store_block_names($m, \@ids)

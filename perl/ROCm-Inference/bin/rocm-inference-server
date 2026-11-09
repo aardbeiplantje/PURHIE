@@ -210,6 +210,11 @@ sub load {
                        msg => sprintf('KV store %s: %d files, %.2f GB, %d tokens a block; snapshots %s, every %d blocks',
                                       $o{store}, $files, $bytes / 2**30, store_stats($m)->{block_tokens},
                                       $o{'store-snapshots'}, $o{'store-snapshot-every'} // 4));
+            # (a store on a disk: the KV cache stays in /dev/shm, a block is published as a copy, not a link)
+            $LOG->warn_(model => $r->{id}, event => 'open',
+                        msg => "KV store $o{store} is not in memory (not tmpfs): the KV cache stays in /dev/shm and "
+                             . 'each block is copied to the store (a disk write per block, slower than on tmpfs)')
+                if store_stats($m)->{on_disk};
         }
     }
     # --parallel N: N sequences (conversations at once), each a KV cache of the context; sequence 0 and N - 1 more
