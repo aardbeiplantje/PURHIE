@@ -503,6 +503,39 @@ drop_cache(fd, offset, len, sync = 0)
   OUTPUT:
     RETVAL
 
+SV*
+repack_mxfp4(packed, scale, rows, cols)
+    SV* packed
+    SV* scale
+    IV rows
+    IV cols
+  CODE:
+    /* FP4 weights as DeepSeek / compressed-tensors store them (rows x cols/2 bytes: value 2i in the low nibble, 2i+1
+       in the high; an E8M0 scale byte per 32 values) as ggml's MXFP4 blocks (a scale byte, then 16 bytes: value j
+       low, j+16 high). Bits are moved, not changed: both index ggml's kvalues_mxfp4. */
+    STRLEN lp, ls;
+    const unsigned char* p = (const unsigned char*)SvPVbyte(packed, lp);
+    const unsigned char* sc = (const unsigned char*)SvPVbyte(scale, ls);
+    if (cols % 32 || rows < 0 || lp < (STRLEN)(rows * cols / 2) || ls < (STRLEN)(rows * cols / 32))
+        croak("repack_mxfp4: %lu packed and %lu scale bytes for %ld x %ld", (unsigned long)lp, (unsigned long)ls,
+              (long)rows, (long)cols);
+    const IV nb = cols / 32;
+    RETVAL = newSV((STRLEN)(rows * nb * 17) + 1);
+    SvPOK_only(RETVAL);
+    unsigned char* o = (unsigned char*)SvPVX(RETVAL);
+    for (IV r = 0; r < rows; ++r) {
+        for (IV b = 0; b < nb; ++b) {
+            const unsigned char* src = p + r * (cols / 2) + b * 16;
+            unsigned char v[32];
+            for (int i = 0; i < 16; ++i) { v[2 * i] = src[i] & 15; v[2 * i + 1] = src[i] >> 4; }
+            *o++ = sc[r * nb + b];
+            for (int j = 0; j < 16; ++j) *o++ = (unsigned char)(v[j] | (v[j + 16] << 4));
+        }
+    }
+    SvCUR_set(RETVAL, (STRLEN)(rows * nb * 17));
+  OUTPUT:
+    RETVAL
+
 UV
 quant_row_size(type, ncols)
     int type

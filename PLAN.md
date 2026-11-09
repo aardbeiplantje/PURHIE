@@ -24,9 +24,11 @@
    head and hc mixers are untested on the real model). The converter is in too (`bin/rocm-convert`; byte for byte
    convert_hf_to_gguf.py's on Qwen3 and a tiny GLM-5.3-Flash, `tests/convert_verify.sh`): `rocm-convert
    /data/hf/GLM-5.3-Flash GLM-5.3-Flash-FAST.gguf` reads the FP8 release and writes FAST, no intermediate file.
-   Open: DeepSeek V4 (which release: V4-Flash, 160 GB FP8 + MXFP4 experts, is the one that fits; the MXFP4 experts
-   copied as they are), the model-card `general.*` keys (license, base model, size label), more architectures as
-   needed (each a package in `ROCm::Inference::Convert` checked against convert_hf_to_gguf.py).
+   DeepSeek-V4-Flash (the user's choice, 2026-11-09) converts too (`DeepSeek4`, MXFP4 experts kept: 152 GB FAST);
+   its MTP layer is left out, as upstream does (a separate draft file: to do with the MTP work). Open: the
+   model-card `general.*` keys (license, base model, size label), more architectures as needed (each a package in
+   `ROCm::Inference::Convert` checked against convert_hf_to_gguf.py), DeepSeek-V4 in the engine (`deepseek4`:
+   KV compressors, hash routing, grouped output projection; like GLM-5.3 it does not fit 128 GB resident).
 
 ## Status in brief
 

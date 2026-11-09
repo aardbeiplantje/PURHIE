@@ -213,7 +213,7 @@ sub text_params {
     $self->u32('expert_group_used_count', $hp->{topk_group}) if defined $hp->{topk_group};
     if (defined(my $sf = $self->find(qw(score_function scoring_func score_func moe_router_activation
                                         moe_router_activation_func expert_selection_fn router_score_func router_score_function)))) {
-        my %g = (softmax => 1, sigmoid => 2, sqrtsoftplus => 3);
+        my %g = (softmax => 1, sigmoid => 2, sqrtsoftplus => 4);
         croak "unsupported expert gating function $sf" unless $g{$sf};
         $self->u32('expert_gating_func', $g{$sf});
     }
@@ -445,8 +445,17 @@ sub stack {
 sub fp8_scale {
     my ($self, $t) = @_;
     return undef unless $t->{dtype} eq 'F8_E4M3';
-    (my $sn = $t->{name}) =~ s/\.weight$/.weight_scale_inv/;
-    return $self->{st}{tensors}{$sn} // croak "$t->{name}: FP8 without $sn";
+    (my $base = $t->{name}) =~ s/\.weight$//;
+    return $self->{st}{tensors}{"$base.weight_scale_inv"} // $self->{st}{tensors}{"$base.scale"}
+        // croak "$t->{name}: FP8 without $base.weight_scale_inv or $base.scale";
+}
+
+# Block scales as float32 bytes: F32 as they are, E8M0 (a power-of-two exponent, bias 127) expanded
+sub _scale_f32 {
+    my ($sc, $bytes) = @_;
+    return $bytes if $sc->{dtype} eq 'F32';
+    return pack 'f<*', map { 2 ** ($_ - 127) } unpack 'C*', $bytes if $sc->{dtype} eq 'F8_E8M0';
+    croak "$sc->{name}: block scales of $sc->{dtype}";
 }
 
 # convert_hf_to_gguf.py's output type for a tensor in a BF16 file: F32 for 1-D tensors, norms, routers,
@@ -472,19 +481,37 @@ sub convert {
     $self->general;
     $self->text_params;
     $self->params;
-    $self->kv('general.file_type', U32, $q ? $q->ftype : 32);
+    $self->kv('general.file_type', U32, $q ? $q->ftype : $self->ref_ftype);
     $self->kv('general.quantization_version', U32, 2);
     $self->vocab;
     my @specs = $self->tensors;
+    # Every checkpoint tensor is used, or skipped on purpose (the architecture's skipped(): vision, a separate MTP)
+    my %used;
     for my $s (@specs) {
-        my $base = $self->base_type($s);
+        for my $t ((map { $_->[0] } @{$s->{parts} // []}), (map { @$_ } @{$s->{mxfp4} // []}), @{$s->{uses} // []}) {
+            $used{$t->{name}} = 1;
+            my $sc = $self->fp8_scale($t);
+            $used{$sc->{name}} = 1 if $sc;
+        }
+    }
+    my $skip = $self->skipped;
+    my @unused = grep { !$used{$_} && !($skip && /$skip/) } @{$self->st->{order}};
+    croak scalar(@unused) . " checkpoint tensors not converted: @unused[0 .. ($#unused < 9 ? $#unused : 9)]" if @unused;
+    for my $s (@specs) {
+        if ($s->{type_fixed}) {  # not the policy's (an I32 table)
+            $s->{type} = gguf_type_id($s->{type_fixed});
+            $s->{in_bytes} = 0;
+            next;
+        }
+        my $base = $s->{base} // $self->base_type($s);
         my ($want, $why) = $q ? $q->plan($s->{name}, $s->{ne}, $base) : ($base);
         $s->{why} = $why;
         $s->{type} = gguf_type_id($want);
         my $t0 = $s->{parts} && $s->{parts}[0][0];
-        $s->{from} = $t0 ? lc $t0->{dtype} : 'f32';
+        $s->{from} //= $t0 ? lc $t0->{dtype} : 'f32';
         $s->{in_bytes} = 0;
         $s->{in_bytes} += $_->[2] * ROCm::Inference::SafeTensors::st_row_bytes($_->[0]) for @{$s->{parts} // []};
+        $s->{in_bytes} += $_->[0]{bytes} + $_->[1]{bytes} for @{$s->{mxfp4} // []};
     }
     return write_file($out, $self->{kv}, \@specs, 32, %a, reader => $self);
 }
@@ -502,8 +529,9 @@ sub write_file {
         my $rows = 1;
         $rows *= $_ for @{$s->{ne}}[1 .. $#{$s->{ne}}];
         $s->{rows} = $rows;
-        $s->{bytes} = ROCm::Inference::quant_row_size($s->{type}, $s->{ne}[0]) * $rows
-            or croak "$s->{name}: " . (gguf_type_info($s->{type}))[0] . " cannot hold rows of $s->{ne}[0]";
+        my ($tn, $blk, $tsz) = gguf_type_info($s->{type});
+        croak "$s->{name}: $tn cannot hold rows of $s->{ne}[0]" unless $blk && $s->{ne}[0] % $blk == 0;
+        $s->{bytes} = $s->{ne}[0] / $blk * $tsz * $rows;
     }
     my ($header, $data) = gguf_write_header($kv, $specs, $align);
     my $res = {kv => $kv, tensors => $specs, bytes => length($header) + $data};
@@ -534,6 +562,28 @@ sub write_file {
             my $b = ROCm::Inference::quantize($s->{type}, 0, $f, $s->{rows}, $s->{ne}[0], $th);
             $wr->($b);
             $written += length $b;
+        }
+        if ($s->{raw}) {  # computed bytes already in the tensor's type (an I32 table)
+            my $b = $s->{raw}->();
+            $wr->($b);
+            $written += length $b;
+        }
+        for my $e (@{$s->{mxfp4} // []}) {  # packed FP4 + E8M0 scales: MXFP4 blocks (re-encoded if asked)
+            my ($w, $sc) = @$e;
+            my $rows = ROCm::Inference::SafeTensors::st_rows($w);
+            my $cols = 2 * $w->{shape}[-1];
+            croak "$s->{name}: rows of $cols from $w->{name}, $s->{ne}[0] wanted" unless $cols == $s->{ne}[0];
+            my $chunk = int((64 << 20) / $cols) || 1;
+            for (my $r = 0; $r < $rows; $r += $chunk) {
+                my $n = $r + $chunk > $rows ? $rows - $r : $chunk;
+                my $b = ROCm::Inference::repack_mxfp4(ROCm::Inference::SafeTensors::st_read_rows(\%fh, $w, $r, $n),
+                                                      ROCm::Inference::SafeTensors::st_read_rows(\%fh, $sc, $r, $n),
+                                                      $n, $cols);
+                $b = ROCm::Inference::quantize($s->{type}, gguf_type_id('mxfp4'), $b, $n, $cols, $th)
+                    unless $s->{type} == gguf_type_id('mxfp4');
+                $wr->($b);
+                $written += length $b;
+            }
         }
         if (my $t = $s->{gguf}) {  # a GGUF's tensor, re-encoded (or copied) ~64M values a pass
             my $fi = $fh{$t->{path}} //= do { open my $f, '<:raw', $t->{path} or croak "$t->{path}: $!"; $f };
@@ -603,11 +653,10 @@ sub _write_part {
                                                 && $ss[1] == int(($ws[1] + $bs->[1] - 1) / $bs->[1]);
         croak "$t->{name}: a part from row $r0 does not start a block of $br rows" if $r0 % $br;
         my $chunk = $br * (int((64 << 20) / ($cols * $br)) || 1);
-        croak "$sc->{name}: F32 scales wanted, $sc->{dtype}" unless $sc->{dtype} eq 'F32';
         for (my $r = $r0; $r < $r0 + $n; $r += $chunk) {
             my $m = $r + $chunk > $r0 + $n ? $r0 + $n - $r : $chunk;
             my $w = st_read_rows($fh, $t, $r, $m);
-            my $sr = st_read_rows($fh, $sc, $r / $br, int(($m + $br - 1) / $br));
+            my $sr = _scale_f32($sc, st_read_rows($fh, $sc, $r / $br, int(($m + $br - 1) / $br)));
             my $b = ROCm::Inference::quantize_fp8_blocks($s->{type}, $w, $sr, $m, $cols, $br, $bc, $ss[1], $threads);
             $wr->($b);
             $written += length $b;
@@ -647,6 +696,8 @@ sub floats {
 }
 
 sub vocab { $_[0]->vocab_gpt2 }
+sub skipped { undef }  # a regex of checkpoint tensors the architecture leaves out on purpose
+sub ref_ftype { 32 }  # convert_hf_to_gguf.py --outtype bf16's general.file_type
 sub params { }
 
 # ---------------------------------------------------------------- architectures
@@ -683,6 +734,7 @@ use Carp qw(croak);
 our @ISA = ('ROCm::Inference::Convert');
 __PACKAGE__->register(qw(Glm5NextForConditionalGeneration));
 sub arch { 'glm5-next' }
+sub skipped { qr/^model\.visual\./ }  # the vision encoder: a separate (mmproj) file
 sub tokenizer_pre { 'glm4' }
 
 # convert_hf_to_gguf.py's Glm5NextModel: the MTP layer after the decoder layers counts as a block; head_dim is not
@@ -795,7 +847,7 @@ sub tensors {
             }
             my $al = $t->("$a.A_log");
             my $nh = $hp->{num_attention_heads};
-            push @s, {name => "$b.ssm_a", ne => [$nh], f32 => 1, data => sub {
+            push @s, {name => "$b.ssm_a", ne => [$nh], f32 => 1, uses => [$al], data => sub {
                 my @v = ($self->floats($al))[0 .. $nh - 1];
                 return ROCm::Inference::exp_neg_f32(pack 'f<*', @v);
             }};
@@ -831,7 +883,7 @@ sub _kv_b {
     my ($nh, $nope, $vd) = ($hp->{num_attention_heads}, $hp->{qk_nope_head_dim}, $hp->{v_head_dim});
     my $kvl = $kv->{shape}[1];
     croak "$kv->{name}: [@{$kv->{shape}}], $nh heads of $nope + $vd rows wanted" unless $kv->{shape}[0] == $nh * ($nope + $vd);
-    my $k = {name => "$b.attn_k_b.weight", ne => [$nope, $kvl, $nh], data => sub {
+    my $k = {name => "$b.attn_k_b.weight", ne => [$nope, $kvl, $nh], uses => [$kv], data => sub {
         my @f = $self->floats($kv);
         my @o;
         for my $h (0 .. $nh - 1) {
@@ -843,6 +895,145 @@ sub _kv_b {
     my $v = {name => "$b.attn_v_b.weight", ne => [$kvl, $vd, $nh],
              parts => [map { [$kv, $_ * ($nope + $vd) + $nope, $vd] } 0 .. $nh - 1]};
     return ($k, $v);
+}
+
+package ROCm::Inference::Convert::DeepSeek4;
+use Carp qw(croak);
+use File::Basename qw(dirname);
+use File::Spec;
+our @ISA = ('ROCm::Inference::Convert');
+__PACKAGE__->register(qw(DeepseekV4ForCausalLM));
+sub arch { 'deepseek4' }
+sub skipped { qr/^(?:mtp\.|aligner\.|image_)/ }  # the MTP layer (a separate draft file upstream) and vision
+sub tokenizer_pre { 'joyai-llm' }
+sub ref_ftype { 38 }  # MOSTLY_MXFP4_MOE
+
+# DeepSeek's own checkpoint layout (layers.N.attn.wq_a, ffn.experts.E.w1, mtp.0.*), as convert_hf_to_gguf.py's
+# DeepseekV4Model converts it: FP8 weights with E8M0 block scales, routed experts packed FP4 with E8M0 scales
+# (MXFP4, moved bit for bit), hash-routing tables as I32. The MTP layer is not converted (upstream's "conversion
+# v0" leaves it to a separate draft file).
+sub init {
+    my ($self) = @_;
+    my $rs = $self->{config}{rope_scaling};
+    if (ref $rs eq 'HASH' && !defined(($self->{rope}{full_attention} // $self->{rope})->{rope_type})) {
+        my %r = %$rs;
+        $r{rope_type} //= $r{type} if defined $r{type};
+        $self->{rope} = {%{$self->{rope}}, %r};
+    }
+}
+
+sub vocab {
+    my ($self) = @_;
+    $self->vocab_gpt2;
+    return if defined $self->{kv_at}{'tokenizer.chat_template'};
+    # the release has no template: convert_hf_to_gguf.py adds its own (models/templates), as we do ours
+    my $name = basename_($self->{dir}) =~ /0731/ ? 'deepseek-v4-flash-0731.jinja' : 'deepseek-v4.jinja';
+    my $path = File::Spec->catfile(dirname(__FILE__), 'Convert', 'templates', $name);
+    if (-f $path) {
+        my $tpl = ROCm::Inference::Convert::_slurp($path);
+        utf8::decode($tpl);
+        $self->kv('tokenizer.chat_template', ROCm::Inference::Convert::STR, $tpl);
+    }
+}
+sub basename_ { my ($d) = @_; $d =~ s{/+$}{}; return (File::Spec->splitdir($d))[-1] }
+
+sub params {
+    my ($self) = @_;
+    my $hp = $self->hp;
+    $self->u32('rope.dimension_count', $hp->{qk_rope_head_dim});
+    $self->u32('attention.q_lora_rank', $hp->{q_lora_rank});
+    $self->u32('attention.sliding_window', $hp->{sliding_window});
+    $self->u32('expert_feed_forward_length', $hp->{moe_intermediate_size});
+    $self->u32('expert_shared_count', $hp->{n_shared_experts});
+    $self->f32('expert_weights_scale', $hp->{routed_scaling_factor});
+    $self->bool('expert_weights_norm', $hp->{norm_topk_prob});
+    $self->arr('swiglu_clamp_exp', [($hp->{swiglu_limit}) x $self->{block_count}], ROCm::Inference::Convert::F32);
+    $self->arr('swiglu_clamp_shexp', [($hp->{swiglu_limit}) x $self->{block_count}], ROCm::Inference::Convert::F32);
+    $self->u32('attention.indexer.head_count', $hp->{index_n_heads});
+    $self->u32('attention.indexer.key_length', $hp->{index_head_dim});
+    $self->u32('attention.indexer.top_k', $hp->{index_topk});
+    $self->u32('attention.output_group_count', $hp->{o_groups});
+    $self->u32('attention.output_lora_rank', $hp->{o_lora_rank});
+    $self->arr('attention.compress_ratios', $hp->{compress_ratios}, ROCm::Inference::Convert::I32);
+    $self->f32('attention.compress_rope_freq_base', $hp->{compress_rope_theta});
+    $self->u32('hyper_connection.count', $hp->{hc_mult});
+    $self->u32('hyper_connection.sinkhorn_iterations', $hp->{hc_sinkhorn_iters});
+    $self->f32('hyper_connection.epsilon', $hp->{hc_eps});
+    $self->u32('hash_layer_count', $hp->{num_hash_layers});
+    $self->u32('embedding_length_out', $hp->{hidden_size} * $hp->{hc_mult});
+}
+
+# convert_hf_to_gguf.py's types for this architecture: FP8 matrices Q8_0, F32 sources F32, BF16 matrices BF16;
+# 1-D tensors and norms F32
+sub base_type {
+    my ($self, $s) = @_;
+    return 'f32' if @{$s->{ne}} <= 1 || $s->{name} =~ /_norm\.weight$/;
+    my $t = $s->{parts} && $s->{parts}[0][0];
+    return 'q8_0' if $t && $t->{dtype} eq 'F8_E4M3';
+    return 'f32' if $t && $t->{dtype} eq 'F32';
+    return 'bf16';
+}
+
+sub tensors {
+    my ($self) = @_;
+    my $hp = $self->hp;
+    my $T = $self->st->{tensors};
+    my @s = ($self->same('token_embd.weight', $self->t('embed.weight')),
+             $self->same('output.weight', $self->t('head.weight')),
+             $self->same('output_norm.weight', $self->t('norm.weight')),
+             map { $self->same("output_hc_$_.weight", $self->t("hc_head_$_")) } qw(base fn scale));
+    my %map = ('attn.attn_sink' => 'attn_sinks.weight', 'attn.wq_a.weight' => 'attn_q_a.weight',
+               'attn.wq_b.weight' => 'attn_q_b.weight', 'attn.q_norm.weight' => 'attn_q_a_norm.weight',
+               'attn.wkv.weight' => 'attn_kv.weight', 'attn.kv_norm.weight' => 'attn_kv_a_norm.weight',
+               'attn.wo_a.weight' => 'attn_output_a.weight', 'attn.wo_b.weight' => 'attn_output_b.weight',
+               'attn.compressor.ape' => 'attn_compressor_ape.weight',
+               'attn.compressor.wkv.weight' => 'attn_compressor_kv.weight',
+               'attn.compressor.wgate.weight' => 'attn_compressor_gate.weight',
+               'attn.compressor.norm.weight' => 'attn_compressor_norm.weight',
+               'attn.indexer.wq_b.weight' => 'indexer.attn_q_b.weight',
+               'attn.indexer.weights_proj.weight' => 'indexer.proj.weight',
+               'attn.indexer.compressor.ape' => 'indexer_compressor_ape.weight',
+               'attn.indexer.compressor.wkv.weight' => 'indexer_compressor_kv.weight',
+               'attn.indexer.compressor.wgate.weight' => 'indexer_compressor_gate.weight',
+               'attn.indexer.compressor.norm.weight' => 'indexer_compressor_norm.weight',
+               'attn_norm.weight' => 'attn_norm.weight', 'ffn_norm.weight' => 'ffn_norm.weight',
+               'ffn.gate.weight' => 'ffn_gate_inp.weight', 'ffn.gate.bias' => 'exp_probs_b.bias',
+               'ffn.gate.bias_vl' => 'exp_probs_b_vl.bias',
+               'ffn.shared_experts.w1.weight' => 'ffn_gate_shexp.weight',
+               'ffn.shared_experts.w2.weight' => 'ffn_down_shexp.weight',
+               'ffn.shared_experts.w3.weight' => 'ffn_up_shexp.weight',
+               map { ("hc_${_}", "hc_$_.weight") } map { ("attn_$_", "ffn_$_") } qw(fn base scale));
+    my $ne = $hp->{n_routed_experts};
+    for my $l (0 .. $self->{block_count} - 1) {
+        my $p = "layers.$l";
+        my $hash = $l < $hp->{num_hash_layers};
+        for my $k (sort grep { !/\.(?:scale)$/ || /hc_/ } map { s/^\Q$p.\E//r } grep { /^\Q$p.\E/ } keys %$T) {
+            next if $k =~ /^ffn\.experts\./ || $k eq 'ffn.gate.tid2eid';
+            next if $k =~ /\.scale$/ && $k !~ /^hc_/;
+            next if $hash && $k eq 'ffn.gate.bias';  # hash layers route by tid2eid; the bias is unused
+            my $g = $map{$k} // croak "$p.$k: no GGUF name";
+            push @s, $self->same("blk.$l.$g", $T->{"$p.$k"});
+        }
+        if ($hash) {
+            my $tt = $self->t("$p.ffn.gate.tid2eid");
+            croak "$tt->{name}: I64 wanted" unless $tt->{dtype} eq 'I64';
+            push @s, {name => "blk.$l.ffn_gate_tid2eid.weight", ne => [reverse @{$tt->{shape}}], type_fixed => 'i32',
+                      uses => [$tt],
+                      from => 'i64', raw => sub {
+                my %fh;
+                my $b = ROCm::Inference::SafeTensors::st_read_rows(\%fh, $tt, 0, ROCm::Inference::SafeTensors::st_rows($tt));
+                return pack 'l<*', unpack 'q<*', $b;
+            }};
+        }
+        for my $w ([w1 => 'gate'], [w2 => 'down'], [w3 => 'up']) {
+            my @pairs = map { [$self->t("$p.ffn.experts.$_.$w->[0].weight"), $self->t("$p.ffn.experts.$_.$w->[0].scale")] }
+                0 .. $ne - 1;
+            my @sh = @{$pairs[0][0]{shape}};
+            push @s, {name => "blk.$l.ffn_$w->[1]_exps.weight", ne => [2 * $sh[1], $sh[0], $ne], base => 'mxfp4',
+                      from => 'fp4', mxfp4 => \@pairs};
+        }
+    }
+    return @s;
 }
 
 1;

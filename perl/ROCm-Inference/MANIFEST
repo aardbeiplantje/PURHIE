@@ -34,3 +34,5 @@ t/90-embed.t
 t/95-quantize.t
 xt/pod-coverage.t
 xt/pod.t
+lib/ROCm/Inference/Convert/templates/deepseek-v4.jinja
+lib/ROCm/Inference/Convert/templates/deepseek-v4-flash-0731.jinja

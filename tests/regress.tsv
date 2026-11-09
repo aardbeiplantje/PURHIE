@@ -15,7 +15,7 @@ quick	test	seq_qwen35_4b	/models/Qwen3.5-4B-ROCMFP4.gguf	seq_verify	-	-
 quick	sh	store_qwen3_06b	/models/Qwen3-0.6B-Q8_0.gguf	store_verify.sh	-	-
 quick	sh	mtp_own_qwen4exp_tiny	/models/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST-PLE_Q8_0.gguf	mtp_own_verify.sh	-	-
 quick	sh	quantize_qwen3_06b	/models/Qwen3-0.6B-Q8_0.gguf	quantize_verify.sh	-	-
-full	sh	convert_qwen3_glm5next	-	convert_verify.sh	-	-
+full	sh	convert_qwen3_glm5next_dsv4	-	convert_verify.sh	-	-
 quick	test	attn_split	-	attn_split_verify 300	-	-
 quick	test	split_qwen3_06b	/models/Qwen3-0.6B-Q8_0.gguf	split_verify	-	-
 quick	test	split_qwen35_4b	/models/Qwen3.5-4B-ROCMFP4.gguf	split_verify	-	-
