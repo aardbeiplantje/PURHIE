@@ -34,6 +34,8 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <atomic>
+#include <thread>
 #include <unistd.h>
 #include <initializer_list>
 #include <unordered_map>
@@ -1704,13 +1706,16 @@ struct QwenModel {
         return ple_rows(tokens, T, pos0, 0);
     }
 
-    // ple_rows for T tokens into rows row0 .. of s.ple_emb
+    // ple_rows for T tokens into rows row0 .. of s.ple_emb. Two passes: the rows' indices (the n-gram hashes), then
+    // the rows decoded (a 512-token prefill chunk of Qwen3.8-Flash reads 8192 of its 50.7 GiB table)
     bool ple_rows(const int* tokens, int T, int pos0, int row0) {
         const int NG = eng->ple_ngram, PER = eng->ple_per_ngram, PD = eng->ple_dim, E = eng->n_embd;
         const int64_t eos = eng->ple_eos;
         int32_t* hist = rs.ple_hist;  // NG - 1 tokens before this batch, most recent last
         if (pos0 == 0)
             for (int i = 0; i < NG - 1; ++i) hist[i] = (int32_t)eos;
+        const int H = (NG - 1) * PER;
+        ple_idx.resize((size_t)T * H);
         for (int t = 0; t < T; ++t) {
             int64_t ctx[8];
             ctx[0] = tokens[t];
@@ -1725,15 +1730,36 @@ struct QwenModel {
                 for (int k = 1; k < n; ++k) mixed ^= (uint64_t)ctx[k] * eng->ple_mult[k];
                 for (int g = 0; g < PER; ++g) {
                     const int h = (n - 2) * PER + g;
-                    const uint64_t row = mixed % eng->ple_vocab[h] + eng->ple_offset[h];
-                    if (qt_to_float(eng->ple_table.type, eng->ple_table.row((int)row),
-                                    s.ple_emb + (size_t)(row0 + t) * E + h * PD,
-                                    PD) != 0) {
-                        qwen_set_error("cannot decode per_layer_token_embd type %d", eng->ple_table.type);
-                        return false;
-                    }
+                    ple_idx[(size_t)t * H + h] = mixed % eng->ple_vocab[h] + eng->ple_offset[h];
                 }
             }
+        }
+        // decoded on up to ple_threads threads: a cold row's read blocks only its thread, so the NVMe gets a queue
+        // of them (Qwen3.8-Flash, cold rows: 77 us a row one at a time, 6.5 us on 16 threads), and a cached
+        // table's decode runs in parallel too. Few rows (a decode step's 16): this thread
+        const size_t nrow = ple_idx.size();
+        std::atomic<bool> bad{false};
+        auto decode = [&](size_t i0, size_t i1) {
+            for (size_t i = i0; i < i1; ++i) {
+                const size_t t = i / H, h = i % H;
+                if (qt_to_float(eng->ple_table.type, eng->ple_table.row((int)ple_idx[i]),
+                                s.ple_emb + (size_t)(row0 + t) * E + h * PD, PD) != 0)
+                    bad = true;
+            }
+        };
+        const int nt = nrow >= 256 ? std::min<int>(ple_threads, (int)(nrow / 64)) : 1;
+        if (nt <= 1) {
+            decode(0, nrow);
+        } else {
+            std::vector<std::thread> th;
+            th.reserve(nt - 1);
+            for (int k = 1; k < nt; ++k) th.emplace_back(decode, nrow * k / nt, nrow * (k + 1) / nt);
+            decode(0, nrow / nt);
+            for (std::thread& x : th) x.join();
+        }
+        if (bad) {
+            qwen_set_error("cannot decode per_layer_token_embd type %d", eng->ple_table.type);
+            return false;
         }
         // the last NG - 1 tokens of (history, batch); a verify pass also keeps them after its first token
         std::vector<int32_t> all(hist, hist + NG - 1);
@@ -1843,7 +1869,12 @@ struct QwenModel {
     float *mtp_h = nullptr, *mtp_carry = nullptr, *mtp_cat = nullptr, *mtp_logits = nullptr, *spec_logits = nullptr;
     float* mtp_chain = nullptr;                 // the head's output streams, the input of its next chained draft
     bool spec_mid = false;                      // a verify pass: keep the states after its first tokens in rs_mid
-    int spec_n = 0;                             // tokens of the last verify pass (0: none)
+    std::vector<uint64_t> ple_idx;              // ple_rows: the batch's table rows, [token][head]
+    // ple_rows' threads (PLE_THREADS; 1: one at a time, as before). More than the cores: a thread waiting for the
+    // disk takes none (a table on the disk, tools/gen_qwen4exp_tiny.py TINY_PLE_HEAD_ROWS=5500000, 64 wikitext
+    // chunks cold: 2,140 tok/s on 1 thread, 6,170 on 16, 6,890 on 32; cached 7,980 / 8,380 / 8,000)
+    const int ple_threads = getenv("PLE_THREADS") ? std::max(1, atoi(getenv("PLE_THREADS"))) : 32;
+    int spec_n = 0;                            // tokens of the last verify pass (0: none)
     RecurrentState rs_mid[SPEC_MAX_DRAFTS];     // rs_mid[j]: the state after token j of a verify pass
 
     // The rollback points of layer l's state array `a` for a pass of T tokens (none outside a verify pass)

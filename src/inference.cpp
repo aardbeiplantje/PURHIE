@@ -124,8 +124,14 @@ static bool pin_gguf(gguf_model_t* gguf, std::vector<const QuantWeight*> cpu_onl
         if (e > b) skip.push_back({(const char*)b, (const char*)e});
     }
     std::sort(skip.begin(), skip.end());
-    // CPU-only tensors are read a row at a time, some from disk (the PLE table): 4 KB folios, not 2 MB reads
-    for (const auto& r : skip) (void)madvise((void*)r.first, (size_t)(r.second - r.first), MADV_NOHUGEPAGE);
+    // CPU-only tensors are read a row at a time, some from disk (the PLE table): 4 KB folios, not 2 MB reads, and no
+    // readahead around a row (a cold Qwen3.8-Flash PLE row: 995 us with the file's MADV_HUGEPAGE, 232 us in 4 KB
+    // folios with the default readahead, 77 us MADV_RANDOM; the rows of a batch are prefetched together:
+    // qwen_model.cpp ple_rows)
+    for (const auto& r : skip) {
+        (void)madvise((void*)r.first, (size_t)(r.second - r.first), MADV_NOHUGEPAGE);
+        (void)madvise((void*)r.first, (size_t)(r.second - r.first), MADV_RANDOM);
+    }
     pinned_bytes = unpinned_bytes = 0;
     for (int i = 0; i < gguf_n_maps(gguf); ++i) {
         size_t size = 0;

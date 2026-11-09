@@ -193,7 +193,8 @@ def main():
     w.add(a + "ple.layers", ARR, [PLE_L], U32)
     w.add(a + "ple.layer_multipliers", ARR, kv[a + "ple.layer_multipliers"][1], kv[a + "ple.layer_multipliers"][2])
     # small prime-ish head vocabularies, so the table stays small but hashing still spreads
-    hv = [997 + 6 * h for h in range(PH)]
+    # (TINY_PLE_HEAD_ROWS=N: N rows a head, a table of GBs that cannot stay cached, for timing reads from the disk)
+    hv = [int(os.environ.get("TINY_PLE_HEAD_ROWS", 997)) + 6 * h for h in range(PH)]
     offs = [sum(hv[:h]) for h in range(PH)]
     w.add(a + "ple.head_offsets", ARR, offs, U64)
     w.add(a + "ple.head_vocab_sizes", ARR, hv, U64)
@@ -212,7 +213,12 @@ def main():
     w.tensor("output_hc_up.weight", [LR, HCD], T_FP4F, quant(T_FP4F, LR * HCD, 2 * s(LR)))
     ple_rows = (sum(hv) + 255) // 256 * 256
     pt = {"q5_1": T_Q5_1, "q8_0": T_Q8_0, "q4_0": T_Q4_0, "bf16": T_BF16, "f16": T_F16}[os.environ.get("PLE_TYPE", "q5_1")]
-    w.tensor("per_layer_token_embd.weight", [PD, ple_rows], pt, quant(pt, PD * ple_rows, 1.0))
+    if ple_rows > 65536:  # (a large table: one random chunk of rows, repeated)
+        chunk = quant(pt, PD * 65536, 1.0)
+        table = chunk * (ple_rows // 65536) + chunk[: len(chunk) * (ple_rows % 65536) // 65536]
+    else:
+        table = quant(pt, PD * ple_rows, 1.0)
+    w.tensor("per_layer_token_embd.weight", [PD, ple_rows], pt, table)
 
     for l in range(NL):
         b = f"blk.{l}."

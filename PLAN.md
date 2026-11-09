@@ -33,11 +33,15 @@ Quantized: /models/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST-PLE_Q8_0.gguf (PLE table
   compress ratio 4); the release came with a separate head file (/data/mtp, set_draft_model: ~38 -> ~50 tok/s).
   Load the nextn block of the same file as the draft, dense attention there (exact below top_k 2048 x ratio 4
   positions; above, only which drafts are accepted can differ). The server then needs no separate draft file.
-- **PLE rows in parallel** (the deployment's prefill bottleneck now). A text whose rows are not cached prefills at
-  391 tok/s: ~32k random 4 KB reads of the table one at a time (~85 us each). Fetch a batch's rows concurrently
-  (madvise WILLNEED / readahead, or a few threads: NVMe serves deep queues) so the table can stay on disk at prefill
-  speed. In the deployment (2026-11-09, `--parallel 1`, a 4 GB store in /dev/shm, 30k-token opencode prompts):
-  400-480 tok/s on the new tokens, the GPU mostly idle, as here.
+- **PLE rows in parallel: implemented, to be measured in the deployment.** It saw 400-480 tok/s on 30k-token
+  opencode prompts (2026-11-09), the GPU mostly idle: cold rows of the 50.7 GiB table read one at a time.
+  Measured on the real table (a scratch benchmark, only uncached pages): 995 us a cold row through the file's
+  MADV_HUGEPAGE mapping, 232 us in 4 KB folios with readahead (what the engine had), 77 us with MADV_RANDOM, 6.5 us
+  on 16 threads, 4.6 us with MADV_WILLNEED on the batch. Now: MADV_RANDOM on the CPU-only tensors, and ple_rows
+  decodes a batch's rows on 32 threads (PLE_THREADS; WILLNEED cost 7% on a cached table, threads gain 5%). On a
+  tiny model with a 3 GB table on the disk (gen_qwen4exp_tiny.py TINY_PLE_HEAD_ROWS=5500000), 64 wikitext chunks
+  cold: 2,140 -> 6,890 tok/s, the same perplexity. In the deployment: a 512-token chunk's 8192 rows ~0.05 s instead
+  of ~1.9 s cold.
 - **Memory budget on 124 GB** (2026-11-09). Resident: ~65 GB (all the GPU reads, experts included, pinned); the
   rest of the 122.8 GB file (PLE table 35.8 GiB, token embeddings) is read by the CPU through the page cache, and
   slows prefill to a crawl when that cache is squeezed. What squeezed it: a 19 GB block store in /dev/shm (tmpfs,
