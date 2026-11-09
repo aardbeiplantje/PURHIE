@@ -140,8 +140,11 @@ struct LayerWeights {
 // p - 1 (before the final mixer): RMSNorm(embedding) * enorm and per-stream RMSNorm(streams) * hnorm,
 // concatenated per stream and projected by eh_proj to the block's residual streams. Its own final mixer and LM
 // head give the draft for p + 1; its own KV cache (one layer). llama.cpp qwen4exp graph_mtp.
+// The base model's own MTP block (the model's file, blk.<n_layer>) is the same head: its final mixer is
+// blk.N.nextn.hc_head_* (a sidecar's output_hc_*), the embeddings and LM head are the model's, gguf the model's.
 struct MtpHead {
     gguf_model_t* gguf = nullptr;
+    bool own = false;                                  // the model's own MTP block: gguf is the model's (not closed)
     std::vector<std::pair<void*, size_t>> pinned;      // registered ranges of its mapping
     QuantWeight token_embd;                            // rows decoded on the CPU
     QuantWeight output;                                // its LM head

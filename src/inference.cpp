@@ -169,6 +169,31 @@ static void unpin(std::vector<std::pair<void*, size_t>>& pinned) {
     pinned.clear();
 }
 
+// Register the pages of block il's tensors (the MTP block of a staged model: the stage holds only the decoder's)
+static bool pin_tensors(gguf_model_t* g, int il, std::vector<std::pair<void*, size_t>>& pinned) {
+    const uintptr_t page = (uintptr_t)sysconf(_SC_PAGESIZE);
+    char pre[32];
+    const int np = snprintf(pre, sizeof pre, "blk.%d.", il);
+    std::vector<std::pair<uintptr_t, uintptr_t>> r;
+    for (int64_t i = 0; i < gguf_n_tensors(g); ++i) {
+        const char* n = gguf_tensor_name(g, i);
+        size_t bytes = 0;
+        const void* p = n && !strncmp(n, pre, np) ? gguf_get_tensor_ptr(g, n, &bytes) : nullptr;
+        if (p && bytes) r.push_back({(uintptr_t)p / page * page, ((uintptr_t)p + bytes + page - 1) / page * page});
+    }
+    std::sort(r.begin(), r.end());
+    for (size_t i = 0; i < r.size();) {  // merged: a page may hold the ends of two tensors
+        uintptr_t b = r[i].first, e = r[i].second;
+        for (++i; i < r.size() && r[i].first <= e; ++i) e = std::max(e, r[i].second);
+        if (hipHostRegister((void*)b, (size_t)(e - b), hipHostRegisterReadOnly) != hipSuccess) {
+            unpin(pinned);
+            return false;
+        }
+        pinned.push_back({(void*)b, (size_t)(e - b)});
+    }
+    return true;
+}
+
 static bool pin_model_memory(inference_model* m) {
     if (m->stage.base) {  // every tensor the GPU reads is in the stage: pin it, leave the GGUF mapping to the CPU
         const hipError_t e = hipHostRegister(m->stage.base, m->stage.bytes, hipHostRegisterReadOnly);
@@ -1056,7 +1081,7 @@ static void free_mtp(inference_model* m) {
     if (!m->mtp) return;
     unpin(m->mtp->pinned);
     if (m->mtp->kvc) kv_cache_free(m->mtp->kvc);
-    if (m->mtp->gguf) close_gguf(m->mtp->gguf);
+    if (m->mtp->gguf && !m->mtp->own) close_gguf(m->mtp->gguf);
     delete m->mtp;
     m->mtp = nullptr;
 }
@@ -1093,34 +1118,53 @@ int inference_set_draft_model(inference_model_t* m, const char* path) {
     if (m->n_hc <= 0) { set_error("draft heads are supported for qwen4exp models only"); return -1; }
     MtpHead* h = new MtpHead();
     m->mtp = h;
-    h->gguf = gguf_mmap_open(path);
-    if (!h->gguf) { set_error("cannot open draft model %s", path); free_mtp(m); return -1; }
-    const char* arch = gguf_arch(h->gguf);
-    const int blocks = (int)gguf_block_count(h->gguf), nextn = (int)gguf_arch_int(h->gguf, "nextn_predict_layers", 0);
-    if (!arch || m->model_name != arch || nextn != 1 || gguf_embedding_length(h->gguf) != m->n_embd ||
-        gguf_arch_int(h->gguf, "hyper_connection.count", 0) != m->n_hc ||
-        gguf_arch_int(h->gguf, "hyper_connection.low_rank", 0) != m->hc_rank ||
-        gguf_head_count(h->gguf) != m->n_head || gguf_head_count_kv(h->gguf) != m->n_head_kv ||
-        gguf_arch_int(h->gguf, "expert_count", 0) != m->n_expert ||
-        gguf_arch_int(h->gguf, "expert_used_count", 0) != m->n_expert_used) {
-        set_error("%s is not an MTP head for this model (arch %s, %d nextn layers)", path, arch ? arch : "?", nextn);
-        free_mtp(m);
-        return -1;
+    // the model's own file (the same inode): its MTP block, from the model's mapping
+    struct stat sp, so;
+    const char* own_path = gguf_file_path(m->gguf, 0);
+    h->own = own_path && stat(path, &sp) == 0 && stat(own_path, &so) == 0 && sp.st_dev == so.st_dev &&
+             sp.st_ino == so.st_ino;
+    int il = m->n_layer;
+    if (h->own) {
+        if (m->n_nextn != 1) {
+            set_error("%s has no MTP block to draft with (%d nextn layers)", path, m->n_nextn);
+            free_mtp(m);
+            return -1;
+        }
+        h->gguf = m->gguf;
+    } else {
+        h->gguf = gguf_mmap_open(path);
+        if (!h->gguf) { set_error("cannot open draft model %s", path); free_mtp(m); return -1; }
+        const char* arch = gguf_arch(h->gguf);
+        const int blocks = (int)gguf_block_count(h->gguf), nextn = (int)gguf_arch_int(h->gguf, "nextn_predict_layers", 0);
+        if (!arch || m->model_name != arch || nextn != 1 || gguf_embedding_length(h->gguf) != m->n_embd ||
+            gguf_arch_int(h->gguf, "hyper_connection.count", 0) != m->n_hc ||
+            gguf_arch_int(h->gguf, "hyper_connection.low_rank", 0) != m->hc_rank ||
+            gguf_head_count(h->gguf) != m->n_head || gguf_head_count_kv(h->gguf) != m->n_head_kv ||
+            gguf_arch_int(h->gguf, "expert_count", 0) != m->n_expert ||
+            gguf_arch_int(h->gguf, "expert_used_count", 0) != m->n_expert_used) {
+            set_error("%s is not an MTP head for this model (arch %s, %d nextn layers)", path, arch ? arch : "?", nextn);
+            free_mtp(m);
+            return -1;
+        }
+        il = blocks - 1;
     }
-    const int il = blocks - 1, HCD = m->n_hc * m->n_embd;
+    const int HCD = m->n_hc * m->n_embd;
     char name[128];
     auto nm = [&](const char* t) { snprintf(name, sizeof(name), "blk.%d.%s", il, t); return name; };
+    char mix[64];
+    snprintf(mix, sizeof mix, "blk.%d.nextn.hc_head", il);  // the base model's: the head's own final mixer
     const int n_kv = m->n_kv_layers;
     const bool ok = load_layer(m, h->gguf, il, h->L, {});
     m->n_kv_layers = n_kv;  // the head's attention has its own cache
     h->L.kv_slot = 0;
+    if (h->own) h->token_embd = m->token_embd, h->output = m->output;
     if (!ok || h->L.kind != LAYER_FULL_ATTN || !h->L.moe ||
-        !bind_weight(h->gguf, "token_embd.weight", h->token_embd, true) ||
-        !bind_weight(h->gguf, "output.weight", h->output, true) ||
+        (!h->own && (!bind_weight(h->gguf, "token_embd.weight", h->token_embd, true) ||
+                     !bind_weight(h->gguf, "output.weight", h->output, true))) ||
         !bind_weight(h->gguf, nm("nextn.eh_proj.weight"), h->eh_proj, true) ||
         !bind_norm(h->gguf, nm("nextn.enorm.weight"), m->n_embd, h->enorm, true) ||
         !bind_norm(h->gguf, nm("nextn.hnorm.weight"), HCD, h->hnorm, true) ||
-        !bind_hc_mix(m, h->gguf, "output_hc", h->hc_head, false)) {
+        !bind_hc_mix(m, h->gguf, h->own ? mix : "output_hc", h->hc_head, false)) {
         free_mtp(m);  // the binding that failed set the error
         return -1;
     }
@@ -1130,11 +1174,21 @@ int inference_set_draft_model(inference_model_t* m, const char* path) {
         free_mtp(m);
         return -1;
     }
-    size_t pb = 0, ub = 0;
-    if (!pin_gguf(h->gguf, {&h->token_embd}, h->pinned, pb, ub)) {
-        set_error("draft model: hipHostRegister failed");
-        free_mtp(m);
-        return -1;
+    if (h->own) {
+        // The model's mapping is pinned already, the MTP block with it - unless the model is staged: then the
+        // GPU reads the stage, and the block's tensors (not staged) are registered here
+        if (m->stage.base && !pin_tensors(h->gguf, il, h->pinned)) {
+            set_error("draft model: hipHostRegister failed");
+            free_mtp(m);
+            return -1;
+        }
+    } else {
+        size_t pb = 0, ub = 0;
+        if (!pin_gguf(h->gguf, {&h->token_embd}, h->pinned, pb, ub)) {
+            set_error("draft model: hipHostRegister failed");
+            free_mtp(m);
+            return -1;
+        }
     }
     if (m->kvc) {
         const kv_cache_config_t cfg = mtp_kv_config(m, kv_cache_n_ctx(m->kvc));

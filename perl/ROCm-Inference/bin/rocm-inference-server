@@ -34,6 +34,8 @@ pod2usage(-verbose => 2, -exitval => 0) if $o{help};
 pod2usage("--model or --models-dir is required\n") unless $o{model} || $o{'models-dir'};
 ROCm::Inference::_require_minijinja()
     or die "rocm-inference-server needs the Minijinja module $ROCm::Inference::MINIJINJA_VERSION\n";
+my $no_draft = ($o{draft} // '') eq 'none';  # (no draft head, not even a model's own MTP block)
+delete $o{draft} if $no_draft;
 die "--draft goes with --model\n" if $o{draft} && !$o{model};
 die "--models-dir: no directory $o{'models-dir'}\n" if $o{'models-dir'} && !-d $o{'models-dir'};
 my $parallel = $o{parallel} // 1;
@@ -201,10 +203,13 @@ sub load {
     if (!$emb) {
         if ($r->{draft}) {
             set_draft_model($m, $r->{draft});
-        } elsif ($r->{dir} && $parallel == 1) {  # a draft head of the directory that fits this model
-            for my $d (@{ $dir_drafts{ $r->{info}{arch} } // [] }) {
+        } elsif (!$no_draft && $parallel == 1) {
+            # the model's own MTP block (Qwen3.8-Flash-Next from the BF16: nothing more to load), else a draft head
+            # of the directory that fits this model
+            for my $d ($r->{path}, $r->{dir} ? @{ $dir_drafts{ $r->{info}{arch} } // [] } : ()) {
                 next unless eval { set_draft_model($m, $d); 1 };
-                $LOG->info('model', model => $r->{id}, event => 'draft', msg => "draft head $d");
+                $LOG->info('model', model => $r->{id}, event => 'draft',
+                           msg => $d eq $r->{path} ? 'draft head: the model\'s own MTP block' : "draft head $d");
                 last;
             }
         }
@@ -1099,8 +1104,9 @@ F<-00001-of-0000N> file; not other files, shards, mmproj or imatrix files), list
 file name without F<.gguf> as id. None is loaded at start: a request loads the model its C<model> names (a load from
 the page cache or a tmpfs takes a few seconds; from a cold disk what the disk gives), and a model is unloaded when
 another needs the room (C<--models-max>, C<--models-margin>), least recently used first, never one that serves a
-request. The directory is read again when the list is asked for, so files added or removed show. A draft (MTP) head
-in the directory is used for the model it fits (Qwen3.8-Flash-Next; not with C<--parallel>). Each model gets the
+request. The directory is read again when the list is asked for, so files added or removed show. A model's own MTP
+block, else a draft (MTP) head in the directory, is used for the model it fits (Qwen3.8-Flash-Next; not with
+C<--parallel>). Each model gets the
 context and KV cache type C<--ctx> / C<--kv-type> give, by default from its own trained context (C<--kv-budget>).
 
 =item --models-max N
@@ -1182,9 +1188,11 @@ needs it). At 128k context about 3 GB instead of 31 GB for Gemma-4 26B-A4B.
 
 The model id in the API (default: the file name without F<.gguf>).
 
-=item --draft F<file.gguf>
+=item --draft F<file.gguf> | none
 
-An MTP draft head for speculative decoding (Qwen3.8-Flash-Next).
+An MTP draft head for speculative decoding (Qwen3.8-Flash-Next). Without it (and without C<--parallel>), a model
+whose file carries its own MTP block (converted from the BF16 release with it, C<blk.N.nextn.*>) drafts with that
+block, which costs no memory but its one-layer KV cache; C<none>: no draft head.
 
 =item --store F<dir>
 

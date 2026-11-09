@@ -5,6 +5,9 @@
 #
 # PLE_TYPE (environment): the per_layer_token_embd table's type, q5_1 (the release's, default), q8_0, q4_0, bf16 or
 # f16: the CPU decodes its rows, whatever the type (qt_to_float), from disk.
+# TINY_MTP=<head.gguf> (environment): the model carries an MTP block after its layers, as converted from the BF16
+# release (blk.N.nextn.*, its own final mixer nextn.hc_head_*, fused hc_*_down_inject), and <head.gguf> is the same
+# block as a sidecar head (the release's: hc_* apart, the final mixer as output_hc_*, its own token_embd / output).
 #
 # The real model (98.5 GiB) does not fit here, so the architecture is verified on this file instead: the same
 # tensor names, layer pattern, quant types per tensor and tokenizer as the release GGUF, with small widths. The
@@ -168,11 +171,12 @@ def main():
     V = len(kv["tokenizer.ggml.tokens"][1])
     HCD = HC * E
 
+    mtp = os.environ.get("TINY_MTP")
     w = Writer()
     a = "qwen4exp."
     w.add("general.architecture", STR, "qwen4exp")
     w.add("general.name", STR, "qwen4exp-tiny-random")
-    for k, t, v in [("block_count", U32, NL), ("context_length", U32, 262144), ("embedding_length", U32, E),
+    for k, t, v in [("block_count", U32, NL + (1 if mtp else 0)), ("context_length", U32, 262144), ("embedding_length", U32, E),
                     ("attention.head_count", U32, HQ), ("attention.head_count_kv", U32, HKV),
                     ("rope.freq_base", F32, 10000000.0), ("attention.layer_norm_rms_epsilon", F32, 1e-6),
                     ("expert_count", U32, NE), ("expert_used_count", U32, NU), ("attention.key_length", U32, HD),
@@ -189,7 +193,9 @@ def main():
                     ("embedding_length_per_layer_input", U32, PD)]:
         w.add(a + k, t, v)
     w.add(a + "rope.dimension_sections", ARR, [11, 11, 10, 0], I32)
-    w.add(a + "attention.compress_ratios", ARR, [0] * NL, U32)
+    w.add(a + "attention.compress_ratios", ARR, [0] * NL + ([4] if mtp else []), U32)
+    if mtp:
+        w.add(a + "nextn_predict_layers", U32, 1)
     w.add(a + "ple.layers", ARR, [PLE_L], U32)
     w.add(a + "ple.layer_multipliers", ARR, kv[a + "ple.layer_multipliers"][1], kv[a + "ple.layer_multipliers"][2])
     # small prime-ish head vocabularies, so the table stays small but hashing still spreads
@@ -263,6 +269,54 @@ def main():
         w.tensor(b + "ffn_gate_shexp.weight", [E, FS], T_FP4F, quant(T_FP4F, E * FS, s(E)))
         w.tensor(b + "ffn_up_shexp.weight", [E, FS], T_FP4F, quant(T_FP4F, E * FS, s(E)))
         w.tensor(b + "ffn_down_shexp.weight", [FS, E], T_FP4F, quant(T_FP4F, FS * E, s(FS)))
+    if mtp:  # the MTP block, blk.NL: a full-attention MoE block with its nextn projection, norms and final mixer
+        hw = Writer()
+        hw.kv = list(w.kv)
+        hw.kv[[k for k, *_ in hw.kv].index("general.name")] = ("general.name", STR, "qwen4exp-tiny-random-mtp", None)
+        for name in ("token_embd.weight", "output.weight"):
+            hw.tensors.append(next(t for t in w.tensors if t[0] == name))
+        b = f"blk.{NL}."
+
+        def both(name, dims, gtype, data):
+            w.tensor(b + name, dims, gtype, data)
+            hw.tensor(b + name, dims, gtype, data)
+        for m in ("attn", "ffn"):
+            both(f"hc_{m}_norm.weight", [HCD], T_F32, ones(HCD))
+            dn = quant(T_FP4F, HCD * LR, s(HCD))
+            ij = quant(T_FP4F, HCD * HC, 2 * s(HCD))
+            w.tensor(b + f"hc_{m}_down_inject.weight", [HCD, LR + HC], T_FP4F, dn + ij)  # rows: down, then inject
+            hw.tensor(b + f"hc_{m}_down.weight", [HCD, LR], T_FP4F, dn)
+            hw.tensor(b + f"hc_{m}_inject.weight", [HCD, HC], T_FP4F, ij)
+            both(f"hc_{m}_up.weight", [LR, HCD], T_FP4F, quant(T_FP4F, LR * HCD, 2 * s(LR)))
+        both("attn_q.weight", [E, 2 * HQ * HD], T_FP4F, quant(T_FP4F, E * 2 * HQ * HD, s(E)))
+        both("attn_k.weight", [E, HKV * HD], T_FP4F, quant(T_FP4F, E * HKV * HD, s(E)))
+        both("attn_v.weight", [E, HKV * HD], T_FP4F, quant(T_FP4F, E * HKV * HD, s(E)))
+        both("attn_output.weight", [HQ * HD, E], T_FP4F, quant(T_FP4F, HQ * HD * E, s(HQ * HD)))
+        both("attn_q_norm.weight", [HD], T_F32, ones(HD))
+        both("attn_k_norm.weight", [HD], T_F32, ones(HD))
+        both("indexer.k_norm.weight", [IK], T_F32, ones(IK))
+        both("indexer.k_proj.weight", [E, IK], T_FP4F, quant(T_FP4F, E * IK, s(E)))
+        both("indexer.q_norm.weight", [IK], T_F32, ones(IK))
+        both("indexer.q_proj.weight", [E, IH * IK], T_FP4F, quant(T_FP4F, E * IH * IK, s(E)))
+        both("ffn_gate_inp.weight", [E, NE], T_F32, quant(T_F32, E * NE, s(E)))
+        both("ffn_gate_inp_shexp.weight", [E], T_F32, quant(T_F32, E, s(E)))
+        both("ffn_gate_exps.weight", [E, FE, NE], T_FP4F, quant(T_FP4F, E * FE * NE, s(E)))
+        both("ffn_up_exps.weight", [E, FE, NE], T_FP4F, quant(T_FP4F, E * FE * NE, s(E)))
+        both("ffn_down_exps.weight", [FE, E, NE], T_FP4F, quant(T_FP4F, FE * E * NE, s(FE)))
+        both("ffn_gate_shexp.weight", [E, FS], T_FP4F, quant(T_FP4F, E * FS, s(E)))
+        both("ffn_up_shexp.weight", [E, FS], T_FP4F, quant(T_FP4F, E * FS, s(E)))
+        both("ffn_down_shexp.weight", [FS, E], T_FP4F, quant(T_FP4F, FS * E, s(FS)))
+        both("nextn.eh_proj.weight", [2 * E, E], T_Q8_0, quant(T_Q8_0, 2 * E * E, s(2 * E)))
+        both("nextn.enorm.weight", [E], T_F32, ones(E))
+        both("nextn.hnorm.weight", [HCD], T_F32, ones(HCD))
+        for t, dims, data in (("norm", [HCD], ones(HCD)), ("down", [HCD, LR], quant(T_FP4F, HCD * LR, s(HCD))),
+                              ("up", [LR, HCD], quant(T_FP4F, LR * HCD, 2 * s(LR)))):
+            gt = T_F32 if t == "norm" else T_FP4F
+            w.tensor(b + f"nextn.hc_head_{t}.weight", dims, gt, data)
+            hw.tensor(f"output_hc_{t}.weight", dims, gt, data)
+        hw.tensor(b + "nextn.shared_head_norm.weight", [HCD], T_F32, ones(HCD))  # (the release's; not read)
+        hw.write(mtp)
+        print(f"{mtp}: {len(hw.tensors)} tensors, the MTP block blk.{NL} as a sidecar")
     w.write(path)
     print(f"{path}: {len(w.tensors)} tensors, vocab {V}, PLE table {ple_rows} rows")
 

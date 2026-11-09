@@ -57,7 +57,7 @@ All GPU-visible memory is host memory registered with HIP; there are no device a
 | Scratch (activations) | one unlinked `/dev/shm` file | coarse-grained | Carved into per-micro-batch arrays (up to 1,024 tokens); the GPU caches it, coherent at kernel boundaries |
 | Recurrent state | `/dev/shm` file | coarse-grained | DeltaNet conv + delta-rule state per linear layer (thread-ordered for coalescing), PLE conv state and token history; checkpoints are GPU copies of the whole region; `rs_mid` holds the state after the first token of a verify pass |
 | KV cache | one `O_TMPFILE` per 256-position block | per slot | Block-major `[K_0 V_0 ... K_L V_L]` per block; a slot is replaced by `MAP_FIXED` remapping (store attach), published by `linkat` |
-| Draft head | its own GGUF mapping + one-layer KV cache | as above | Loaded on demand |
+| Draft head | its own GGUF mapping (a sidecar) or the model's (its own MTP block) + one-layer KV cache | as above | Loaded on demand |
 
 ## 4. Weights and matmuls
 
@@ -208,7 +208,9 @@ scratch per token on Qwen3.8).
 ## 7. Speculative decoding (MTP)
 
 A nextn sidecar GGUF (`inference_set_draft_model`) holds one more full-attention MoE block with its own
-embeddings, final mixer and LM head. Its row at position p combines the token at p and the main model's residual
+embeddings, final mixer and LM head; a model converted with its MTP block carries the same block after its decoder
+layers (`blk.N.nextn.*`, its final mixer `nextn.hc_head_*`), drafted with from the model's own mapping and with the
+model's embeddings and LM head (the server's default). Its row at position p combines the token at p and the main model's residual
 streams at p − 1 (`eh_proj` per stream); every main forward runs it on its rows, so its one-layer KV cache
 follows the sequence. The head drafts k tokens (`inference_set_draft_tokens`: 1–3, or by default 2 or 3 per
 pass, whichever gives the most tokens per second by the recent acceptance of each draft position and the
@@ -261,6 +263,7 @@ less well and 2 is best; the adaptive default is within ~1% of the best fixed co
 | `qwen4exp_verify` | per-layer streams, single layers by teacher forcing, logits; token-by-token / split / restored = prefill |
 | `generate_verify` | streaming, stop strings, chat turns with prefix reuse, LM-head option |
 | `mtp_verify` | draft acceptance, speculative = plain (greedy, sampled, library) |
+| `mtp_own_verify.sh` | a model's own MTP block drafts what the same block as a sidecar drafts; generation with it = without (tiny models) |
 | `store_verify.sh` | the KV block store across processes (optionally with a draft head) |
 | `matvec_verify`, `dequant_verify`, `attn_decode_verify`, `kv_verify`, `tokenizer_*`, `sampler_verify`, `capi_smoke` | kernels, decoders, tokenizer, C API |
 | `perl/ROCm-Inference/t/*.t` | the Perl binding (GPU tests with `ROCM_INFERENCE_TEST_*`) |

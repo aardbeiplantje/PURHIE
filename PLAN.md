@@ -5,8 +5,8 @@
 
 ## ▶ Next (week of 2026-11-09; user, 2026-11-05: "we will work on it next week")
 
-1. **Qwen3.8-Flash-Next from BF16** (section below): the model's own MTP layer as its draft head; a batch's PLE rows
-   read from disk in parallel.
+1. **Qwen3.8-Flash-Next from BF16** (section below): the own MTP block as draft head and the parallel PLE reads are
+   in; both to be measured in the deployment (the user).
 2. **Concurrent runs** in rocm-inference-server (section below).
 3. **Server logging** (section below): implemented and tested (`t/62-server-log.t`); the Flash soak run is open.
 4. **GLM-5.3-Flash (`glm5_next`) as an architecture** (section below): the gate is memory capacity, not kernels -
@@ -28,11 +28,17 @@ rocm-inference), which builds rocm-hip from GitHub `main`. Design: ARCHITECTURE.
 ## Qwen3.8-Flash-Next from BF16
 
 Quantized: /models/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST-PLE_Q8_0.gguf (PLE table Q8_0 on disk). Open:
-- **The model's own MTP layer as its draft head.** The base-model GGUF carries it (blk.48: nextn.eh_proj / enorm /
-  hnorm, nextn.hc_head_down / norm / up — the head's own hyper-connection mix, new — and attention with QSA
-  compress ratio 4); the release came with a separate head file (/data/mtp, set_draft_model: ~38 -> ~50 tok/s).
-  Load the nextn block of the same file as the draft, dense attention there (exact below top_k 2048 x ratio 4
-  positions; above, only which drafts are accepted can differ). The server then needs no separate draft file.
+- **The model's own MTP block as its draft head: implemented, to be measured on Flash.** `set_draft_model` with the
+  model's own file takes blk.48 from the model's mapping (pinned with it; a staged model pins the block's pages on
+  their own), with the model's embeddings and LM head and the block's final mixer nextn.hc_head_*; the server
+  drafts with it by default (`--parallel 1`, no `--draft`; `--draft none` turns it off). Attention there is dense
+  (compress ratio 4: exact below top_k 2048 x 4 positions; above, only which drafts are accepted can differ). On
+  tiny models (`tests/mtp_own_verify.sh`, regress row mtp_own_qwen4exp_tiny) it drafts exactly what the same block
+  as a sidecar drafts. Open: acceptance and tok/s on Flash (`build/mtp_verify F F 128` with F the model; the sidecar
+  measured ~38 -> ~50 tok/s). One difference to watch: the base file's nextn.hc_head_norm is the sidecar's
+  output_hc_norm + 1.0 (all its other tensors are byte-identical); every other norm in both files has the
+  converter's +1 (zero-centred gammas), so the base file is likely right and the sidecar off - if the own block's
+  acceptance is worse than the sidecar's, that is the first suspect.
 - **PLE rows in parallel: implemented, to be measured in the deployment.** It saw 400-480 tok/s on 30k-token
   opencode prompts (2026-11-09), the GPU mostly idle: cold rows of the 50.7 GiB table read one at a time.
   Measured on the real table (a scratch benchmark, only uncached pages): 995 us a cold row through the file's

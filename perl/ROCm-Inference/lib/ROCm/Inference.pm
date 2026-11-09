@@ -663,10 +663,12 @@ The store file names of the token list's full blocks, in order (e.g. to keep a s
 =item set_draft_model($m, $path) / set_draft_model($m, undef)
 
 Load an MTP draft head for speculative decoding (Qwen3.8-Flash-Next: a nextn sidecar GGUF such as
-F<mtp-Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST.gguf>), or unload it. C<generate> then decodes each token
+F<mtp-Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST.gguf>, or the model's own file when it carries its MTP block: nothing more
+is loaded or pinned), or unload it. C<generate> then decodes each token
 together with the head's guesses of the next ones and keeps each guess that is the token sampled anyway: the
 same tokens as without the head, for any sampling options, up to three times as many per pass when the head
-guesses well. Dies when the file is not a head for this model. Before or after C<kv_cache_init>.
+guesses well. Dies when the file is not a head for this model (or is the model's own, without an MTP block). Before or after
+C<kv_cache_init>.
 
 =item set_prefill_batch($m, $n_tokens)
 
