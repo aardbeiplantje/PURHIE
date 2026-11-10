@@ -880,7 +880,8 @@ sub requantize {
     my @specs;
     for my $t (@{$g->{tensors}}) {
         my ($src) = gguf_type_info($t->{type});
-        my ($want, $why) = $q->plan($t->{name}, $t->{ne}, $src);
+        # a float target decodes the quantized tensors too (a reference copy of a quantized file)
+        my ($want, $why) = $q->plan($t->{name}, $t->{ne}, $src, decode => 1);
         $why = undef if $want eq $src;
         croak "$t->{name}: the engine cannot decode $src to re-encode it"
             unless $want eq $src || ROCm::Inference::quant_row_size($t->{type}, $t->{ne}[0]);

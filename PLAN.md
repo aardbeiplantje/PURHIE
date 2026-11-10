@@ -79,7 +79,28 @@ Quantized: /models/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST-PLE_Q8_0.gguf (PLE table
 - The fork's qwen4exp is behind upstream's (recurrent_layers as indices vs upstream's bool flags; llama-server
   rejects these files): worth porting in the fork (the user's).
 
-## GLM-5.3-Flash (`glm5_next`): what has to change, and in what order (planned, not started; user, 2026-11-06)
+## GLM-5.3-Flash (`glm5_next`): what has to change, and in what order (started 2026-11-10; planned 2026-11-06)
+
+**Where it stands (2026-11-10).** The release is converted (`/models/GLM-5.3-Flash-FAST.gguf`, 171 GB FAST; its
+`indexer_compressor_ape` / `_gate` came out 4-bit: the strix rule missed the underscore names, fixed since, tiny
+tensors, not worth the 19 h to redo). The oracle: upstream llama.cpp has `src/models/glm5-next.cpp` (KDA, the
+k-pool DSA indexer, NoPE MLA over the latent, DeepSeek-V4-style mHC with Sinkhorn, sigmoid MoE with the SwiGLU
+clamp); its CPU build at /data/conv/upstream-build, `make ref_dump_stock REF_STOCK=/data/conv/upstream
+REF_STOCK_B=/data/conv/upstream-build`. The test model is `tools/gen_glm5next_ckpt.py`'s tiny checkpoint
+(8 layers: 6 KDA + 2 DSA, 3 dense + 5 MoE, MTP) as FAST, the engine's input, and that file decoded to F32
+(`rocm-convert tiny-fast.gguf tiny-f32.gguf f32`), the oracle's: the same weight values on both sides, so the
+comparison is of the forward pass alone (`ref_dump_stock acts`: 935 named activations, hc_* / kda_* / indexer_* /
+ffn_moe_* per layer). User, 2026-11-10: the reference is for numbers only, the engine keeps its UMA way (the
+GGUF mapped and pinned in place, GPU-first with the CPU alongside), and FP4-sized weights (ROCmFP4 / FAST) are the
+target. Work order: (a) the loader - `glm5-next` in `archs`, `load_glm5next` binding every tensor above into new
+LayerWeights fields (kinds LAYER_KDA / LAYER_MLA_DSA, the mHC `hc_*_fn/base/scale`, MLA `attn_q_a` .. `attn_v_b`,
+indexer `indexer.*` / `indexer_compressor_*`, `swiglu_clamp_*`), the MLA latent cache size in
+`inference_model_info` (kv_lora_rank + the indexer's key | gate | pooled rows per position instead of attn_k /
+attn_v widths); (b) a `glm5next_verify` like `qwen4exp_verify` (teacher-forced per-layer cosines against the
+acts, then whole-model logits); (c) the forward pass, GPU kernels on FAST weights: mHC pre / post (the Sinkhorn
+on a 4x4 per token), KDA (per-channel decay in `deltanet`), the indexer (pool, score, top-k by the `moe_router`
+machinery, ties to the lower index), sparse MLA decode over the selected latents; (d) the routing trace of item 1
+on the real file, once the deployment can spare the memory.
 
 Config read from huggingface.co/zai-org/GLM-5.3-Flash/raw/main/config.json on 2026-11-06; the numbers below are
 computed from it, not copied from its model card. 320B total / 18B active, 45 decoder layers, hidden 4096, vocab

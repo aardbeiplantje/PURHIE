@@ -17,6 +17,7 @@ our %FTYPE = (f32 => 0, f16 => 1, q8_0 => 7, bf16 => 32, q4_0_rocmfp4 => 100, q4
 # Sources re-encoded by default: the ones a 4-bit or 8-bit encoding loses nothing new from. Anything else (K-quants,
 # MXFP4 / NVFP4 experts, ...) is already quantized and is kept unless a rule names it.
 my %HIGH = map { $_ => 1 } qw(f32 f16 bf16 q8_0);
+my %FLOAT = map { $_ => 1 } qw(f32 f16 bf16);
 
 # Recipes: rules after the user's, for a 4-bit target. strix spends bits where a token reads little of the tensor or
 # it is small: Q8_0 for the lookup tables (a token reads one row of token_embd / the PLE table), the LM head (read
@@ -28,7 +29,7 @@ our %RECIPE = (
     strix => [
         ['^(?:per_layer_)?token_embd\.weight$' => 'q8_0'],
         ['^output\.weight$' => 'q8_0'],
-        ['\.indexer\.' => 'q8_0'],
+        ['\.indexer[._]' => 'q8_0'],
         ['(?:^|\.)hc_|^output_hc_' => 'q8_0'],
     ],
 );
@@ -84,7 +85,7 @@ sub plan {
         ($want, $why) = ($src, 'kept');
     } elsif (my ($r) = grep { $name =~ $_->[0] } @{$self->{rules}}) {
         ($want, $why) = $r->[1] eq 'keep' ? ($src, "kept by $r->[2]") : ($r->[1], "by $r->[2]");
-    } elsif (!$HIGH{$src}) {
+    } elsif (!$HIGH{$src} && !($opt{decode} && $FLOAT{$self->{target}})) {
         ($want, $why) = ($src, "kept ($src is already quantized)");
     } elsif (my ($rr) = grep { $name =~ $_->[0] } @{$self->{recipe}}) {
         ($want, $why) = ($rr->[1], "by $rr->[2]");

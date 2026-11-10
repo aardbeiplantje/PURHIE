@@ -107,7 +107,9 @@ Which tensors: the matrices (2 or more dimensions, names ending in C<weight>) ex
 (C<ffn_gate_inp>), convolutions, position embeddings and vision-encoder parts (the set llama.cpp's llama-quantize
 leaves alone), and only from F32, F16, BF16, Q8_0 or FP8; the recipe gives some of them Q8_0 instead of TYPE. A
 tensor that is already 4-bit or a K-quant (DeepSeek V4's MXFP4 experts, say) is copied as it is unless a
-C<--type> rule names it. Rows that are not whole blocks of the target are written as F16. The output is written to
+C<--type> rule names it; from a GGUF to C<f32>, C<f16> or C<bf16> they are decoded (a full-precision copy of a
+quantized file, for a reference that cannot read its types). Rows that are not whole blocks of the target are
+written as F16. The output is written to
 F<OUT.gguf.part> and renamed when complete.
 
 What is read and written is dropped from the page cache as it goes (C<posix_fadvise>), so converting a few hundred
