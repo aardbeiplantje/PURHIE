@@ -148,10 +148,16 @@ sub general {
     $self->kv('general.architecture', STR, $self->arch);
     $self->kv('general.type', STR, 'model');
     if (my $gc = json_file(File::Spec->catfile($self->{dir}, 'generation_config.json'))) {
-        $self->kv('general.sampling.top_k', I32, int $gc->{top_k}) if defined $gc->{top_k} && !ref $gc->{top_k};
-        $self->kv('general.sampling.top_p', F32, 0 + $gc->{top_p}) if defined $gc->{top_p} && !ref $gc->{top_p};
-        $self->kv('general.sampling.temp', F32, 0 + $gc->{temperature})
-            if defined $gc->{temperature} && !ref $gc->{temperature};
+        # gguf-py's Metadata: [key, its type, generation_config.json's names]
+        $gc->{penalty_repeat} //= $gc->{repetition_penalty};
+        for (['sequence', STR], ['top_k', I32], ['top_p', F32], ['min_p', F32], ['xtc_probability', F32],
+             ['xtc_threshold', F32], ['temp', F32, 'temperature'], ['penalty_last_n', I32], ['penalty_repeat', F32],
+             ['mirostat', I32], ['mirostat_tau', F32], ['mirostat_eta', F32]) {
+            my ($k, $ty, $src) = @$_;
+            my $v = $gc->{$src // $k};
+            next unless defined $v && !ref $v;
+            $self->kv("general.sampling.$k", $ty, $ty == STR ? $v : $ty == I32 ? int $v : 0 + $v);
+        }
     }
     $self->kv('general.name', STR, $self->{opt}{name} // _model_name(basename($self->{dir})));
 }
@@ -176,7 +182,8 @@ sub text_params {
     $self->u32_or_arr('attention.head_count_kv', $v) if defined($v = $self->find(qw(num_key_value_heads n_kv_heads)));
     my $hp = $self->{hp};
     $self->bool('attention.causal', 0)
-        if (exists $hp->{is_causal} && is_bool($hp->{is_causal}) && !$hp->{is_causal}) || $hp->{use_bidirectional_attention};
+        if (exists $hp->{is_causal} && is_bool($hp->{is_causal}) && !$hp->{is_causal})
+           || (is_bool($hp->{use_bidirectional_attention}) && $hp->{use_bidirectional_attention});
     my $rp = $self->{rope}{full_attention} // $self->{rope};
     if (defined(my $rt = $rp->{rope_type})) {
         my $fac = $rp->{factor};
@@ -236,7 +243,7 @@ sub vocab_gpt2 {
     my $vocab = $tj->{model}{vocab} or croak "tokenizer.json: no model.vocab";
     $rev{$vocab->{$_}} = $_ for keys %$vocab;
     my %added;
-    for my $a (@{$tj->{added_tokens} // []}) {
+    for my $a ($self->added_tokens) {
         $rev{$a->{id}} = $a->{content};
         $added{$a->{id}} = $a;
     }
@@ -269,6 +276,164 @@ sub vocab_gpt2 {
     $self->kv('tokenizer.ggml.tokens', ARR, [STR, \@tok]);
     $self->kv('tokenizer.ggml.token_type', ARR, [I32, \@type]);
     $self->special_vocab($n, merges => 1, extra => $opt{special});
+}
+
+# The added tokens as transformers loads them: tokenizer.json's, and tokenizer_config.json's added_tokens_decoder
+# for ids tokenizer.json lacks
+sub added_tokens {
+    my ($self) = @_;
+    return @{$self->{added} //= do {
+        my $tj = $self->{tokenizer} //= json_file(File::Spec->catfile($self->{dir}, 'tokenizer.json'));
+        my @a = @{$tj->{added_tokens} // []};
+        my %have = map { $_->{id} => 1 } @a;
+        my $tc = json_file(File::Spec->catfile($self->{dir}, 'tokenizer_config.json')) // {};
+        my $d = $tc->{added_tokens_decoder} // {};
+        push @a, map { {%{$d->{$_}}, id => 0 + $_} } sort { $a <=> $b } grep { !$have{$_} } keys %$d;
+        \@a;
+    }};
+}
+
+# A byte-fallback BPE vocabulary as gguf-py's LlamaHfVocab reads it (through transformers): the model's tokens by
+# id, then added tokens past them; score -1000; BYTE for <0xNN>, CONTROL for special tokens, NORMAL otherwise;
+# %opt: model (tokenizer.ggml.model), visible => [tokens written USER_DEFINED though special]
+sub vocab_llama_hf {
+    my ($self, %opt) = @_;
+    my $tj = $self->{tokenizer} //= json_file(File::Spec->catfile($self->{dir}, 'tokenizer.json'))
+        or croak "$self->{dir}: no tokenizer.json";
+    my $m = $tj->{model};
+    croak 'tokenizer.json: not a byte-fallback BPE' unless ($m->{type} // '') eq 'BPE' && $m->{byte_fallback};
+    my %rev;
+    $rev{$m->{vocab}{$_}} = $_ for keys %{$m->{vocab}};
+    my $base = keys %rev;
+    my @added = $self->added_tokens;
+    $rev{$_->{id}} = $_->{content} for @added;
+    my $tc = json_file(File::Spec->catfile($self->{dir}, 'tokenizer_config.json')) // {};
+    # transformers' all_special_tokens: the special added tokens, the config's named tokens
+    my %special = map { $_->{content} => 1 } grep { $_->{special} } @added;
+    for my $k (grep { /_token$/ } keys %$tc) {
+        my $v = ref $tc->{$k} eq 'HASH' ? $tc->{$k}{content} : $tc->{$k};
+        $special{$v} = 1 if defined $v && !ref $v && !is_bool($v);
+    }
+    $special{$_} = 1 for map { ref $_ eq 'HASH' ? $_->{content} : $_ }
+        @{ref $tc->{extra_special_tokens} eq 'ARRAY' ? $tc->{extra_special_tokens} : []},
+        @{$tc->{additional_special_tokens} // []};
+    my %visible = map { $_ => 1 } @{$opt{visible} // []};
+    my (@tok, @type);
+    my @extra = sort { $a <=> $b } grep { $_ >= $base } map { $_->{id} } @added;
+    for my $i (0 .. $base - 1, @extra) {
+        my $t = $rev{$i} // croak "tokenizer.json: no token $i";
+        push @tok, $t;
+        push @type, $visible{$t} ? TOK_USER_DEFINED : $i < $base && $t =~ /^<0x[0-9A-Fa-f]{2}>\z/ ? TOK_BYTE
+            : $special{$t} ? TOK_CONTROL : $i < $base ? TOK_NORMAL : TOK_USER_DEFINED;
+    }
+    $self->kv('tokenizer.ggml.model', STR, $opt{model} // 'llama');
+    $self->kv('tokenizer.ggml.tokens', ARR, [STR, \@tok]);
+    $self->kv('tokenizer.ggml.scores', ARR, [F32, [(-1000) x @tok]]);
+    $self->kv('tokenizer.ggml.token_type', ARR, [I32, \@type]);
+    $self->special_vocab(scalar @tok, merges => 1);
+    return scalar @tok;
+}
+
+# A SentencePiece tokenizer.model's pieces: [piece, score, type] by id (the protobuf ModelProto: field 1 the
+# pieces, each piece 1 / score 2 / type 3, type NORMAL when absent)
+sub spm_pieces {
+    my ($path) = @_;
+    my $b = _slurp($path);
+    my $pos = 0;
+    my $varint = sub {
+        my ($s, $p) = @_;
+        my ($v, $sh) = (0, 0);
+        while (1) {
+            my $c = ord substr $$s, $$p++, 1;
+            $v |= ($c & 0x7f) << $sh;
+            last unless $c & 0x80;
+            $sh += 7;
+        }
+        return $v;
+    };
+    my $skip = sub {
+        my ($s, $p, $wt) = @_;
+        if ($wt == 0) { $varint->($s, $p) }
+        elsif ($wt == 1) { $$p += 8 }
+        elsif ($wt == 2) { $$p += $varint->($s, $p) }
+        elsif ($wt == 5) { $$p += 4 }
+        else { croak "$path: protobuf wire type $wt" }
+    };
+    my @pieces;
+    while ($pos < length $b) {
+        my $key = $varint->(\$b, \$pos);
+        my ($f, $wt) = ($key >> 3, $key & 7);
+        if ($f == 1 && $wt == 2) {
+            my $len = $varint->(\$b, \$pos);
+            my $m = substr $b, $pos, $len;
+            $pos += $len;
+            my ($q, $piece, $score, $type) = (0, '', 0, 1);
+            while ($q < length $m) {
+                my $k = $varint->(\$m, \$q);
+                my ($g, $w) = ($k >> 3, $k & 7);
+                if ($g == 1 && $w == 2) { my $l = $varint->(\$m, \$q); $piece = substr $m, $q, $l; $q += $l }
+                elsif ($g == 2 && $w == 5) { $score = unpack 'f<', substr $m, $q, 4; $q += 4 }
+                elsif ($g == 3 && $w == 0) { $type = $varint->(\$m, \$q) }
+                else { $skip->(\$m, \$q, $w) }
+            }
+            utf8::decode($piece);
+            push @pieces, [$piece, $score, $type];
+        } else {
+            $skip->(\$b, \$pos, $wt);
+        }
+    }
+    return @pieces;
+}
+
+# convert_hf_to_gguf.py's _set_vocab_sentencepiece: tokenizer.model's pieces (types as SentencePiece reports them:
+# UNKNOWN, CONTROL, UNUSED, BYTE, NORMAL otherwise), added_tokens.json's and tokenizer_config.json's added tokens
+# over them; tokenizer.ggml.model "llama", pre "default"
+sub vocab_sentencepiece {
+    my ($self) = @_;
+    my @p = spm_pieces(File::Spec->catfile($self->{dir}, 'tokenizer.model'));
+    my $n = $self->find(qw(vocab_size_per_layer_input vocab_size)) || scalar @p;
+    my @tok = map { "[PAD$_]" } 0 .. $n - 1;
+    my @score = (-10000) x $n;
+    my @type = (TOK_UNUSED) x $n;
+    my %t = (2 => TOK_UNKNOWN, 3 => TOK_CONTROL, 5 => TOK_UNUSED, 6 => TOK_BYTE);
+    for my $i (0 .. $#p) {
+        last if $i >= $n;
+        ($tok[$i], $score[$i], $type[$i]) = ($p[$i][0], $p[$i][1], $t{$p[$i][2]} // TOK_NORMAL);
+    }
+    if (my $at = json_file(File::Spec->catfile($self->{dir}, 'added_tokens.json'))) {
+        for my $k (keys %$at) {
+            next if $at->{$k} >= $n;
+            ($tok[$at->{$k}], $score[$at->{$k}], $type[$at->{$k}]) = ($k, -1000, TOK_USER_DEFINED);
+        }
+    }
+    my $tc = json_file(File::Spec->catfile($self->{dir}, 'tokenizer_config.json')) // {};
+    for my $id (keys %{$tc->{added_tokens_decoder} // {}}) {
+        next if $id >= $n;
+        my $d = $tc->{added_tokens_decoder}{$id};
+        my $c = $d->{content};
+        if ($d->{special} || looks_special($c)) { $type[$id] = TOK_CONTROL }
+        else { $c =~ s/\x{2581}/ /g; $type[$id] = TOK_USER_DEFINED }
+        ($tok[$id], $score[$id]) = ($c, -1000);
+    }
+    $self->kv('tokenizer.ggml.model', STR, 'llama');
+    $self->kv('tokenizer.ggml.pre', STR, 'default');
+    $self->kv('tokenizer.ggml.tokens', ARR, [STR, \@tok]);
+    $self->kv('tokenizer.ggml.scores', ARR, [F32, \@score]);
+    $self->kv('tokenizer.ggml.token_type', ARR, [I32, \@type]);
+    $self->special_vocab(scalar @tok);
+    return scalar @tok;
+}
+
+# general pooling of a sentence-transformers model (modules.json's Pooling module): pooling_type
+sub pooling_type {
+    my ($self) = @_;
+    my $mods = json_file(File::Spec->catfile($self->{dir}, 'modules.json')) or return;
+    my ($m) = grep { $_->{type} =~ /Pooling$/ } @$mods or return;
+    my $c = json_file(File::Spec->catfile($self->{dir}, $m->{path}, 'config.json')) or return;
+    my %mode = (mean => 1, cls => 2, lasttoken => 3);
+    my $t = $c->{pooling_mode_mean_tokens} ? 1 : $c->{pooling_mode_cls_token} ? 2 : $c->{pooling_mode_lasttoken} ? 3
+          : $mode{$c->{pooling_mode} // ''} // croak "$m->{path}: pooling type not supported";
+    $self->u32('pooling_type', $t);
 }
 
 # Added tokens that are control tokens though not marked special (convert_hf_to_gguf.py's does_token_look_special)
@@ -307,7 +472,7 @@ sub special_vocab {
         }
         _normalizer($tj->{normalizer}, \%norm) if ref $tj->{normalizer} eq 'HASH';
         _pre_tokenizer($tj->{pre_tokenizer}, \%norm) if ref $tj->{pre_tokenizer} eq 'HASH';
-        my $added = $tj->{added_tokens} // [];
+        my $added = [$self->added_tokens];
         my ($bos, $cls, $eos, $sep) = map { $tc ? $tc->{"${_}_token"} : undef } qw(bos cls eos sep);
         if ($tc) {
             $tc->{bos_token} = $bos = $cls if !$bos && $cls;
@@ -323,6 +488,8 @@ sub special_vocab {
                     @add{qw(bos eos sep)} = (1, 1, 1);
                 } elsif ($pt eq 'TemplateProcessing') {
                     my @single = @{$p->{single} // []};
+                    my ($sfirst, $slast) = @single > 1
+                        ? ($single[0]{SpecialToken}{id}, $single[-1]{SpecialToken}{id}) : (undef, undef);
                     if (@single > 1) {
                         my $first = $single[0]{SpecialToken}{id};
                         if (defined $first) {
@@ -342,6 +509,22 @@ sub special_vocab {
                                 $tc->{eos_token} = $eos = $last;
                             }
                             $add{eos} = $last eq ($eos // '') ? 1 : 0;
+                        }
+                    }
+                    if (my @pair = @{$p->{pair} // []}) {  # A [sep] [eos] B: add_sep_token
+                        shift @pair if defined $sfirst && ($pair[0]{SpecialToken}{id} // '') eq $sfirst;
+                        pop @pair if defined $slast && @pair && ($pair[-1]{SpecialToken}{id} // '') eq $slast;
+                        if (@pair && ($pair[0]{Sequence}{id} // '') eq 'A' && ($pair[-1]{Sequence}{id} // '') eq 'B'
+                            && (@pair = @pair[1 .. $#pair - 1])) {
+                            my $sepc = $tc ? (ref $tc->{sep_token} eq 'HASH' ? $tc->{sep_token}{content} : $tc->{sep_token}) : undef;
+                            my $eosc = ref $eos eq 'HASH' ? $eos->{content} : $eos;
+                            my $is = sub { my $e = shift; defined $e && grep { defined $_ && $_ eq $e } $sepc, $eosc };
+                            my $add_sep = 0;
+                            my $e0 = $pair[0]{SpecialToken}{id};
+                            $add_sep = 1 if $is->($e0) && !defined $slast;
+                            $add_sep = 1 if @pair == 2 && $is->($pair[1]{SpecialToken}{id});
+                            $add{sep} = $add_sep;
+                            $tc->{sep_token} = $eosc if $add_sep && !defined $sepc && $tc;
                         }
                     }
                 }
@@ -381,7 +564,7 @@ sub special_vocab {
     for my $e (@{$opt{extra} // []}) {
         my ($typ, $text) = @$e;
         push @types, $typ unless grep { $_ eq $typ } @types;
-        my ($id) = map { $_->{id} } grep { $_->{content} eq $text } @{$tj->{added_tokens} // []};
+        my ($id) = map { $_->{id} } grep { $_->{content} eq $text } $self->added_tokens;
         croak "special token $text is not an added token" unless defined $id;
         $set->($typ, $id);
     }
@@ -442,6 +625,63 @@ sub stack {
     return {name => $gname, ne => [reverse(@s), scalar @$ts], parts => [map { [$_, 0, st_rows($_)] } @$ts], %o};
 }
 
+# Every checkpoint tensor under "$prefix." through a table of [regex on the rest, GGUF name (with $1.. from the
+# match), options]: the GGUF tensors, in checkpoint order; a tensor no row matches dies (an unknown tensor is a new
+# variant of the architecture, not something to drop). Rows with an undefined name are skipped (used elsewhere).
+sub map_prefix {
+    my ($self, $prefix, $gp, $table) = @_;
+    my @s;
+    my $T = $self->st->{tensors};
+    for my $name (grep { index($_, "$prefix.") == 0 } @{$self->st->{order}}) {
+        my $rest = substr $name, length($prefix) + 1;
+        my $hit;
+        for my $row (@$table) {
+            my ($re, $g, %o) = @$row;
+            my @m = $rest =~ /^$re\z/ or next;
+            $hit = 1;
+            last unless defined $g;
+            my $n = ref $g eq 'CODE' ? $g->(@m) : $g =~ s/\$(\d)/$m[$1 - 1]/gr;
+            push @s, $self->same("$gp$n", $T->{$name}, %o);
+            last;
+        }
+        croak "$name: no GGUF name" unless $hit;
+    }
+    return @s;
+}
+
+# The common decoder-layer names (convert_hf_to_gguf.py's TensorNameMap for the Llama family)
+our @LAYER = (
+    [qr/input_layernorm\.weight/, 'attn_norm.weight'], [qr/post_attention_layernorm\.weight/, 'ffn_norm.weight'],
+    [qr/self_attn\.([qkv])_proj\.(weight|bias)/, 'attn_$1.$2'], [qr/self_attn\.o_proj\.(weight|bias)/, 'attn_output.$1'],
+    [qr/self_attn\.([qk])_norm\.weight/, 'attn_$1_norm.weight'],
+    [qr/mlp\.(gate|up|down)_proj\.weight/, 'ffn_$1.weight'], [qr/mlp\.gate\.weight/, 'ffn_gate_inp.weight'],
+    [qr/mlp\.shared_experts?\.(gate|up|down)_proj\.weight/, 'ffn_$1_shexp.weight'],
+    [qr/mlp\.shared_expert_gate\.weight/, 'ffn_gate_inp_shexp.weight'],
+    [qr/mlp\.experts\.\d+\.\w+\.weight/, undef], [qr/mlp\.experts\.(?:gate_up_proj|down_proj)/, undef],
+);
+
+# The routed experts of a layer as ffn_{gate,up,down}_exps: from one tensor an expert ("$p.E.gate_proj.weight") or
+# fused ones ("$p.gate_up_proj" [E, 2 * ff, n] split in halves, "$p.down_proj" [E, n, ff])
+sub experts {
+    my ($self, $p, $b, $n, %o) = @_;
+    my $T = $self->st->{tensors};
+    my $w = $o{suffix} // '.weight';
+    if (my $gu = $T->{"$p.gate_up_proj"} // $T->{"$p.gate_up_proj.weight"}) {
+        my ($e, $ff2, $h) = @{$gu->{shape}};
+        my $ff = $ff2 / 2;
+        my $dn = $T->{"$p.down_proj"} // $self->t("$p.down_proj.weight");
+        return ({name => "$b.ffn_gate_exps.weight", ne => [$h, $ff, $e], parts => [map { [$gu, $_ * $ff2, $ff] } 0 .. $e - 1]},
+                {name => "$b.ffn_up_exps.weight", ne => [$h, $ff, $e], parts => [map { [$gu, $_ * $ff2 + $ff, $ff] } 0 .. $e - 1]},
+                $self->same("$b.ffn_down_exps.weight", $dn));
+    }
+    my %gg = (gate => $o{gate} // 'gate_proj', up => $o{up} // 'up_proj', down => $o{down} // 'down_proj');
+    my @s;
+    for my $k (qw(gate up down)) {
+        push @s, $self->stack("$b.ffn_${k}_exps.weight", [map { $self->t("$p.$_.$gg{$k}$w") } 0 .. $n - 1]);
+    }
+    return @s;
+}
+
 # The weight_scale_inv of an FP8 tensor, if it has one
 sub fp8_scale {
     my ($self, $t) = @_;
@@ -489,7 +729,8 @@ sub convert {
     # Every checkpoint tensor is used, or skipped on purpose (the architecture's skipped(): vision, a separate MTP)
     my %used;
     for my $s (@specs) {
-        for my $t ((map { $_->[0] } @{$s->{parts} // []}), (map { @$_ } @{$s->{mxfp4} // []}), @{$s->{uses} // []}) {
+        for my $t ((map { $_->[0] } @{$s->{parts} // []}), (map { @$_ } @{$s->{mxfp4} // []}), @{$s->{uses} // []},
+                   @{$s->{hcat} // []}) {
             $used{$t->{name}} = 1;
             my $sc = $self->fp8_scale($t);
             $used{$sc->{name}} = 1 if $sc;
@@ -508,11 +749,12 @@ sub convert {
         my ($want, $why) = $q ? $q->plan($s->{name}, $s->{ne}, $base) : ($base);
         $s->{why} = $why;
         $s->{type} = gguf_type_id($want);
-        my $t0 = $s->{parts} && $s->{parts}[0][0];
+        my $t0 = $s->{parts} && $s->{parts}[0][0] || $s->{hcat} && $s->{hcat}[0];
         $s->{from} //= $t0 ? lc $t0->{dtype} : 'f32';
         $s->{in_bytes} = 0;
         $s->{in_bytes} += $_->[2] * ROCm::Inference::SafeTensors::st_row_bytes($_->[0]) for @{$s->{parts} // []};
         $s->{in_bytes} += $_->[0]{bytes} + $_->[1]{bytes} for @{$s->{mxfp4} // []};
+        $s->{in_bytes} += $_->{bytes} for @{$s->{hcat} // []};
     }
     return write_file($out, $self->{kv}, \@specs, 32, %a, reader => $self);
 }
@@ -601,6 +843,20 @@ sub write_file {
         for my $p (@{$s->{parts} // []}) {
             $written += $a{reader}->_write_part($wr, \%fh, $s, @$p, $th);
         }
+        if (my $hc = $s->{hcat}) {  # rows of several tensors side by side: row r = each one's row r in turn
+            my $src = $DT{$hc->[0]{dtype}} // croak "$s->{name}: dtype $hc->[0]{dtype}";
+            croak "$s->{name}: tensors of different dtypes" if grep { $_->{dtype} ne $hc->[0]{dtype} } @$hc;
+            my @rb = map { ROCm::Inference::SafeTensors::st_row_bytes($_) } @$hc;
+            my $chunk = int((64 << 20) / $s->{ne}[0]) || 1;
+            for (my $r = 0; $r < $s->{rows}; $r += $chunk) {
+                my $n = $r + $chunk > $s->{rows} ? $s->{rows} - $r : $chunk;
+                my @b = map { ROCm::Inference::SafeTensors::st_read_rows(\%fh, $_, $r, $n) } @$hc;
+                my $rows = join '', map { my $i = $_; map { substr $b[$_], $i * $rb[$_], $rb[$_] } 0 .. $#b } 0 .. $n - 1;
+                my $q = ROCm::Inference::quantize($s->{type}, gguf_type_id($src), $rows, $n, $s->{ne}[0], $th);
+                $wr->($q);
+                $written += length $q;
+            }
+        }
         croak "$s->{name}: wrote $written bytes, $s->{bytes} planned" unless $written == $s->{bytes};
         $wr->("\0" x ((-$written) % $align));
         $a{progress}->($s, ++$i, scalar @$specs) if $a{progress};
@@ -667,9 +923,17 @@ sub _write_part {
     my $src = $DT{$t->{dtype}} // croak "$t->{name}: dtype $t->{dtype} is not read";
     my $sid = gguf_type_id($src);
     my $chunk = int((64 << 20) / $cols) || 1;
+    # col_blocks => [w, [source block of each output block]]: each row's columns moved w at a time
+    my ($cw, $order) = @{$s->{col_blocks} // []};
+    croak "$s->{name}: column blocks of $cw do not cover $cols" if $cw && $cw * @$order != $cols;
     for (my $r = $r0; $r < $r0 + $n; $r += $chunk) {
         my $m = $r + $chunk > $r0 + $n ? $r0 + $n - $r : $chunk;
-        my $b = ROCm::Inference::quantize($s->{type}, $sid, st_read_rows($fh, $t, $r, $m), $m, $cols, $threads);
+        my $rows = st_read_rows($fh, $t, $r, $m);
+        if ($cw) {
+            my ($eb, $rb) = ($t->{esize} * $cw, $t->{esize} * $cols);
+            $rows = join '', map { my $o = $_ * $rb; map { substr $rows, $o + $_ * $eb, $eb } @$order } 0 .. $m - 1;
+        }
+        my $b = ROCm::Inference::quantize($s->{type}, $sid, $rows, $m, $cols, $threads);
         $wr->($b);
         $written += length $b;
     }
@@ -696,6 +960,25 @@ sub floats {
     return unpack 'f<*', $f;
 }
 
+# Float values rounded to BF16 (to nearest, ties to even) and back, as a torch BF16 tensor holds the result of an
+# operation on it
+sub bf16_round {
+    return map {
+        my $u = unpack 'L<', pack 'f<', $_;
+        $u = ($u & 0x7fffffff) > 0x7f800000 ? ($u | 0x00400000) & 0xffff0000 : ($u + 0x7fff + (($u >> 16) & 1)) & 0xffff0000;
+        unpack 'f<', pack 'L<', $u;
+    } @_;
+}
+
+# A small tensor computed from a checkpoint tensor's values: the GGUF tensor $gname of shape @ne, F32 values
+# $fn->(@values) (convert_hf_to_gguf.py computes in F32: a BF16 tensor is widened first)
+sub computed {
+    my ($self, $gname, $t, $ne, $fn, %o) = @_;
+    return {name => $gname, ne => $ne, uses => [$t], from => lc $t->{dtype}, %o, data => sub {
+        return pack 'f<*', $fn->($self->floats($t));
+    }};
+}
+
 sub vocab { $_[0]->vocab_gpt2 }
 sub skipped { undef }  # a regex of checkpoint tensors the architecture leaves out on purpose
 sub ref_ftype { 32 }  # convert_hf_to_gguf.py --outtype bf16's general.file_type
@@ -703,32 +986,698 @@ sub params { }
 
 # ---------------------------------------------------------------- architectures
 
-package ROCm::Inference::Convert::Qwen3;
+# A Llama-family decoder (model.embed_tokens, model.layers.N.{self_attn,mlp}, model.norm, lm_head) with the common
+# names; routed experts stacked. The base of the Qwen and Llama packages.
+package ROCm::Inference::Convert::Decoder;
 use Carp qw(croak);
 our @ISA = ('ROCm::Inference::Convert');
+
+sub prefix { 'model' }  # where embed_tokens / layers / norm are
+sub layer_table { \@ROCm::Inference::Convert::LAYER }
+sub layer_extra { () }  # an architecture's own tensors of layer $l (after the table's)
+sub n_experts { $_[0]->find(qw(num_local_experts num_experts n_routed_experts)) }
+
+sub tensors {
+    my ($self) = @_;
+    my $T = $self->st->{tensors};
+    my $P = $self->prefix;
+    my @s = ($self->same('token_embd.weight', $self->t("$P.embed_tokens.weight")));
+    for my $l (0 .. $self->{block_count} - 1) {
+        my $p = "$P.layers.$l";
+        push @s, $self->map_prefix($p, "blk.$l.", $self->layer_table);
+        push @s, $self->experts("$p.mlp.experts", "blk.$l", $self->n_experts)
+            if grep { /^\Q$p.mlp.experts.\E/ } keys %$T;
+        push @s, $self->layer_extra($l, $p);
+    }
+    push @s, $self->same('output_norm.weight', $T->{"$P.norm.weight"}) if $T->{"$P.norm.weight"};
+    push @s, $self->same('output.weight', $T->{'lm_head.weight'}) if $T->{'lm_head.weight'};
+    return @s;
+}
+
+package ROCm::Inference::Convert::Qwen2;
+our @ISA = ('ROCm::Inference::Convert::Decoder');
+__PACKAGE__->register(qw(Qwen2ForCausalLM));
+sub arch { 'qwen2' }
+sub tokenizer_pre { 'qwen2' }
+
+package ROCm::Inference::Convert::Qwen3;
+our @ISA = ('ROCm::Inference::Convert::Decoder');
 __PACKAGE__->register(qw(Qwen3ForCausalLM));
 sub arch { 'qwen3' }
 sub tokenizer_pre { 'qwen2' }
 
-sub tensors {
+# Llama 3.x (convert_hf_to_gguf.py's LlamaModel): Q and K rows reordered from HF's rotate-half RoPE layout to the
+# interleaved one llama.cpp's "llama" uses; the llama3 RoPE frequency factors as rope_freqs.
+package ROCm::Inference::Convert::Llama;
+use Carp qw(croak);
+our @ISA = ('ROCm::Inference::Convert::Decoder');
+__PACKAGE__->register(qw(LlamaForCausalLM));
+sub arch { 'llama' }
+sub tokenizer_pre { 'llama-bpe' }
+
+sub vocab {
     my ($self) = @_;
-    my $st = $self->st;
-    my @s = ($self->same('token_embd.weight', $self->t('model.embed_tokens.weight')));
-    for my $l (0 .. $self->{block_count} - 1) {
-        my $p = "model.layers.$l";
-        push @s, map { $self->same("blk.$l.$_->[0]", $self->t("$p.$_->[1]")) } (
-            ['attn_norm.weight', 'input_layernorm.weight'], ['attn_q.weight', 'self_attn.q_proj.weight'],
-            ['attn_k.weight', 'self_attn.k_proj.weight'], ['attn_v.weight', 'self_attn.v_proj.weight'],
-            ['attn_output.weight', 'self_attn.o_proj.weight'], ['attn_q_norm.weight', 'self_attn.q_norm.weight'],
-            ['attn_k_norm.weight', 'self_attn.k_norm.weight'], ['ffn_norm.weight', 'post_attention_layernorm.weight'],
-            ['ffn_gate.weight', 'mlp.gate_proj.weight'], ['ffn_up.weight', 'mlp.up_proj.weight'],
-            ['ffn_down.weight', 'mlp.down_proj.weight']);
+    croak 'a SentencePiece Llama (tokenizer.model) is not supported yet' if -f File::Spec->catfile($self->{dir}, 'tokenizer.model');
+    my $tc = ROCm::Inference::Convert::json_file(File::Spec->catfile($self->{dir}, 'tokenizer_config.json')) // {};
+    $self->kv('tokenizer.ggml.add_space_prefix', ROCm::Inference::Convert::BOOL, $tc->{add_prefix_space} ? 1 : 0)
+        if defined $tc->{add_prefix_space};
+    $self->vocab_gpt2;
+}
+
+sub params {
+    my ($self) = @_;
+    my $hp = $self->hp;
+    $self->u32('vocab_size', $hp->{vocab_size});
+    $self->u32('rope.dimension_count', $hp->{head_dim} // $hp->{hidden_size} / $hp->{num_attention_heads});
+}
+
+# Rows of a head-major projection in the order llama.cpp's interleaved RoPE wants: within each head, rows
+# [0, hd/2) and [hd/2, hd) interleaved
+sub _unpermute {
+    my ($self, $t, $n_head) = @_;
+    my $rows = $t->{shape}[0];
+    my $hd = $rows / $n_head;
+    croak "$t->{name}: $rows rows are not $n_head heads of an even size" if $hd != int $hd || $hd % 2;
+    return map { my $h = $_ * $hd; map { my $i = $_; map { [$t, $h + $_ * $hd / 2 + $i, 1] } 0, 1 } 0 .. $hd / 2 - 1 } 0 .. $n_head - 1;
+}
+
+sub layer_table {
+    return [[qr/self_attn\.[qk]_proj\.(?:weight|bias)/, undef], @ROCm::Inference::Convert::LAYER];
+}
+
+sub layer_extra {
+    my ($self, $l, $p) = @_;
+    my $hp = $self->hp;
+    my $T = $self->st->{tensors};
+    my @s;
+    for (['q', $hp->{num_attention_heads}], ['k', $hp->{num_key_value_heads} // $hp->{num_attention_heads}]) {
+        for my $w (qw(weight bias)) {
+            my $t = $T->{"$p.self_attn.$_->[0]_proj.$w"} or next;
+            push @s, {name => "blk.$l.attn_$_->[0].$w", ne => [reverse @{$t->{shape}}], parts => [$self->_unpermute($t, $_->[1])]};
+        }
     }
-    push @s, $self->same('output_norm.weight', $self->t('model.norm.weight'));
-    push @s, $self->same('output.weight', $st->{tensors}{'lm_head.weight'} // $self->t('model.embed_tokens.weight'))
-        if $st->{tensors}{'lm_head.weight'} || !$self->hp->{tie_word_embeddings};
     return @s;
 }
+
+sub tensors {
+    my ($self) = @_;
+    my @s = $self->SUPER::tensors;
+    my $rp = $self->{rope}{full_attention} // $self->{rope};
+    return @s unless lc($rp->{rope_type} // '') eq 'llama3';
+    # convert_hf_to_gguf.py's, in float32 as torch computes it
+    my $hp = $self->hp;
+    my $base = $rp->{rope_theta} // 10000;
+    my $dim = $hp->{head_dim} // $hp->{hidden_size} / $hp->{num_attention_heads};
+    my ($factor, $lo, $hi, $old) = map { $rp->{$_->[0]} // $_->[1] }
+        [factor => 8], [low_freq_factor => 1], [high_freq_factor => 4], [original_max_position_embeddings => 8192];
+    my $f = sub { unpack 'f<', pack 'f<', $_[0] };
+    my @r;
+    for (my $i = 0; $i < $dim; $i += 2) {
+        my $freq = $f->(1 / $f->($f->($base) ** $f->($i / $dim)));
+        my $wl = $f->(2 * 3.141592653589793 / $freq);
+        if ($wl < $old / $hi) { push @r, 1 }
+        elsif ($wl > $old / $lo) { push @r, $factor }
+        else {
+            my $smooth = $f->(($f->($old / $wl) - $lo) / ($hi - $lo));
+            push @r, $f->(1 / $f->($f->((1 - $smooth) / $factor) + $smooth));
+        }
+    }
+    return (@s, {name => 'rope_freqs.weight', ne => [scalar @r], data => sub { pack 'f<*', @r }});
+}
+
+# Nemotron-H / Nemotron 3 (convert_hf_to_gguf.py's NemotronHModel, nemotron_h_moe with experts): Mamba-2, attention
+# and MoE layers by hybrid_override_pattern (M, *, E; - a dense MLP); the MTP head (mtp.layers.0: input fusion and
+# attention, .1: MoE and the head norm) as one more block.
+package ROCm::Inference::Convert::NemotronH;
+use Carp qw(croak);
+our @ISA = ('ROCm::Inference::Convert');
+__PACKAGE__->register(qw(NemotronHForCausalLM));
+sub arch { $_[0]{moe} ? 'nemotron_h_moe' : 'nemotron_h' }
+sub tokenizer_pre { 'pixtral' }
+
+sub init {
+    my ($self) = @_;
+    my $hp = $self->hp;
+    $self->{moe} = defined $hp->{num_experts_per_tok};
+    # the layer kinds: transformers' layers_block_type, or the pattern string it is made from
+    my %k = (M => 'mamba', '*' => 'attention', E => 'moe', '-' => 'mlp');
+    my $pat = $hp->{layers_block_type} // [map { $k{$_} // croak "hybrid_override_pattern: $_" } split //, $hp->{hybrid_override_pattern} // ''];
+    $pat = [map { {linear_attention => 'mamba', full_attention => 'attention'}->{$_} // $_ } @$pat];
+    $self->{kinds} = $pat;
+    $self->{block_count} = @$pat;
+    $self->{n_main} = @$pat;
+    $self->{mtp} = $self->{moe} && ($hp->{num_nextn_predict_layers} // 0) && grep { /^mtp\./ } @{$self->st->{order}};
+    croak 'num_nextn_predict_layers > 1 is not supported' if $self->{mtp} && $hp->{num_nextn_predict_layers} > 1;
+    if ($self->{mtp}) { push @$pat, 'mtp'; $self->{block_count}++ }
+}
+
+sub vocab {
+    my ($self) = @_;
+    my $hp = $self->hp;
+    $hp->{vocab_size} = 8 * int(($hp->{vocab_size} + 7) / 8);  # Mamba-2's padding
+    $self->vocab_gpt2;
+}
+
+sub params {
+    my ($self) = @_;
+    my $hp = $self->hp;
+    my @k = @{$self->{kinds}};
+    my $attn = sub { $_[0] eq 'attention' || $_[0] eq 'mtp' };
+    my $mlp = sub { $_[0] eq ($self->{moe} ? 'moe' : 'mlp') || $_[0] eq 'mtp' };
+    my $ff = $self->{moe} ? $hp->{moe_intermediate_size} : $hp->{intermediate_size};
+    $self->arr('feed_forward_length', [map { $mlp->($_) ? $ff : 0 } @k], ROCm::Inference::Convert::I32);
+    $self->arr('attention.head_count_kv', [map { $attn->($_) ? $hp->{num_key_value_heads} : 0 } @k], ROCm::Inference::Convert::I32);
+    $self->u32('vocab_size', $hp->{vocab_size});
+    my $hd = $hp->{head_dim} // $hp->{attention_head_dim};
+    $self->u32('rope.dimension_count', $hp->{head_dim} // $hp->{hidden_size} / $hp->{num_attention_heads});
+    $self->u32('ssm.conv_kernel', $hp->{conv_kernel});
+    $self->u32('ssm.state_size', $hp->{ssm_state_size});
+    $self->u32('ssm.group_count', $hp->{n_groups});
+    $self->u32('ssm.inner_size', $hp->{mamba_num_heads} * $hp->{mamba_head_dim});
+    $self->u32('ssm.time_step_rank', $hp->{mamba_num_heads});
+    $self->bool('rope.scaling.finetuned', 0);
+    $self->u32('context_length', 1 << 20);  # no RoPE: any length
+    $self->u32('attention.key_length', $hd);
+    $self->u32('attention.value_length', $hd);
+    $self->f32('attention.layer_norm_epsilon', $hp->{layer_norm_epsilon}) if defined $hp->{layer_norm_epsilon};
+    return unless $self->{moe};
+    $self->u32('expert_used_count', $hp->{num_experts_per_tok});
+    $self->u32('expert_feed_forward_length', $hp->{moe_intermediate_size});
+    $self->u32('expert_shared_feed_forward_length', $hp->{moe_shared_expert_intermediate_size});
+    $self->u32('expert_count', $hp->{n_routed_experts});
+    $self->u32('expert_shared_count', $hp->{n_shared_experts});
+    $self->bool('expert_weights_norm', $hp->{norm_topk_prob});
+    $self->f32('expert_weights_scale', $hp->{routed_scaling_factor});
+    $self->u32('expert_group_count', $hp->{n_group});
+    $self->u32('moe_latent_size', $hp->{moe_latent_size}) if defined $hp->{moe_latent_size};
+    $self->u32('nextn_predict_layers', $hp->{num_nextn_predict_layers}) if $self->{mtp};
+}
+
+sub _mixer {
+    my ($self, $p, $b) = @_;
+    my $hp = $self->hp;
+    my $T = $self->st->{tensors};
+    my @s = $self->map_prefix($p, "$b.", [
+        [qr/in_proj\.weight/, 'ssm_in.weight'], [qr/out_proj\.weight/, 'ssm_out.weight'],
+        [qr/conv1d\.bias/, 'ssm_conv1d.bias'], [qr/dt_bias/, 'ssm_dt.bias', f32 => 1],
+        [qr/v_proj\.weight/, 'attn_v.weight'], [qr/o_proj\.weight/, 'attn_output.weight'], [qr/[qk]_proj\.weight/, undef],
+        [qr/gate\.weight/, 'ffn_gate_inp.weight'], [qr/gate\.e_score_correction_bias/, 'exp_probs_b.bias'],
+        [qr/shared_experts\.(up|down)_proj\.weight/, 'ffn_$1_shexp.weight'],
+        [qr/(up|down)_proj\.weight/, 'ffn_$1.weight'],
+        [qr/fc1_latent_proj\.weight/, 'ffn_latent_down.weight'], [qr/fc2_latent_proj\.weight/, 'ffn_latent_up.weight'],
+        [qr/experts\.\d+\.\w+\.weight/, undef], [qr/(?:conv1d\.weight|A_log|D|norm\.weight)/, undef]]);
+    for (['q', $hp->{num_attention_heads}], ['k', $hp->{num_key_value_heads}]) {  # as LlamaModel's (undo_permute)
+        my $t = $T->{"$p.$_->[0]_proj.weight"} or next;
+        push @s, {name => "$b.attn_$_->[0].weight", ne => [reverse @{$t->{shape}}],
+                  parts => [ROCm::Inference::Convert::Llama::_unpermute($self, $t, $_->[1])]};
+    }
+    if (my $c = $T->{"$p.conv1d.weight"}) {  # [channels, 1, kernel] as [kernel, channels]
+        push @s, {name => "$b.ssm_conv1d.weight", ne => [$c->{shape}[-1], $c->{shape}[0]], parts => [[$c, 0, $c->{shape}[0]]]};
+    }
+    if (my $a = $T->{"$p.A_log"}) {
+        push @s, $self->computed("$b.ssm_a", $a, [1, $a->{shape}[0]], sub { map { -ROCm::Inference::Convert::Qwen35::exp_f32($_) } @_ },
+                                 f32 => 1);
+    }
+    if (my $d = $T->{"$p.D"}) {
+        push @s, $self->computed("$b.ssm_d", $d, [1, $d->{shape}[0]], sub { @_ }, f32 => 1);
+    }
+    if (my $n = $T->{"$p.norm.weight"}) {  # one group's widths a row
+        push @s, $self->computed("$b.ssm_norm.weight", $n, [$n->{shape}[0] / $hp->{n_groups}, $hp->{n_groups}], sub { @_ });
+    }
+    if (grep { /^\Q$p.experts.\E/ } keys %$T) {
+        my $ne = $hp->{n_routed_experts};
+        for my $w (qw(up down)) {
+            push @s, $self->stack("$b.ffn_${w}_exps.weight", [map { $self->t("$p.experts.$_.${w}_proj.weight") } 0 .. $ne - 1]);
+        }
+    }
+    return @s;
+}
+
+sub tensors {
+    my ($self) = @_;
+    my $T = $self->st->{tensors};
+    my @s = ($self->same('token_embd.weight', $self->t('backbone.embeddings.weight')),
+             $self->same('output_norm.weight', $self->t('backbone.norm_f.weight')));
+    push @s, $self->same('output.weight', $T->{'lm_head.weight'}) if $T->{'lm_head.weight'};
+    for my $l (0 .. $self->{n_main} - 1) {
+        my $p = "backbone.layers.$l";
+        push @s, $self->same("blk.$l.attn_norm.weight", $self->t("$p.norm.weight")), $self->_mixer("$p.mixer", "blk.$l");
+    }
+    if ($self->{mtp}) {
+        my $b = "blk.$self->{n_main}";
+        my %special = ('mtp.layers.0.enorm.weight' => 'nextn.enorm.weight', 'mtp.layers.0.hnorm.weight' => 'nextn.hnorm.weight',
+                       'mtp.layers.0.eh_proj.weight' => 'nextn.eh_proj.weight', 'mtp.layers.0.norm.weight' => 'attn_norm.weight',
+                       'mtp.layers.1.norm.weight' => 'post_attention_norm.weight',
+                       'mtp.layers.1.final_layernorm.weight' => 'nextn.shared_head_norm.weight');
+        for my $n (grep { /^mtp\.layers\.[01]\./ && !/\.mixer\./ } @{$self->st->{order}}) {
+            push @s, $self->same("$b." . ($special{$n} // croak "$n: no GGUF name"), $T->{$n});
+        }
+        # convert_hf_to_gguf.py keeps the MTP block's router in BF16 (its F32 rule matches the trunk's block ids)
+        push @s, map { $_->{name} eq "$b.ffn_gate_inp.weight" ? {%$_, base => 'bf16'} : $_ } $self->_mixer("mtp.layers.$_.mixer", $b)
+            for 0, 1;
+    }
+    return @s;
+}
+
+# Gemma 4 (convert_hf_to_gguf.py's Gemma4Model; gemma-4-26B-A4B's layout): sliding and full attention layers
+# (full ones K = V, wider heads, proportional RoPE through rope_freqs), a dense MLP and MoE in every layer, the
+# router's input scale and the per-expert output scale; norms as they are (no 1 + w in Gemma 4).
+package ROCm::Inference::Convert::Gemma4;
+use Carp qw(croak);
+our @ISA = ('ROCm::Inference::Convert::Decoder');
+__PACKAGE__->register(qw(Gemma4ForConditionalGeneration Gemma4ForCausalLM));
+sub arch { 'gemma4' }
+sub prefix { 'model.language_model' }
+sub skipped { qr/^model\.(?:vision_tower|embed_vision|audio_tower|embed_audio)\./ }  # the mmproj's
+
+sub vocab {
+    my ($self) = @_;
+    $self->{n_vocab} = $self->vocab_llama_hf(model => 'gemma4',
+        visible => ['<|channel>', '<channel|>', '<|tool_call>', '<tool_call|>', '<|tool_response>', '<tool_response|>', '<|"|>']);
+    $self->kv('tokenizer.ggml.add_space_prefix', ROCm::Inference::Convert::BOOL, 0);
+    $self->kv('tokenizer.ggml.add_bos_token', ROCm::Inference::Convert::BOOL, 1);
+}
+
+sub params {
+    my ($self) = @_;
+    my $hp = $self->hp;
+    my @lt = @{$hp->{layer_types}};
+    my @swa = map { $_ eq 'sliding_attention' ? 1 : 0 } @lt;
+    $self->u32('context_length', $hp->{max_position_embeddings} // 131072);
+    $self->f32('attention.layer_norm_rms_epsilon', $hp->{rms_norm_eps} // 1e-6);
+    $self->f32('final_logit_softcapping', $hp->{final_logit_softcapping}) if $hp->{final_logit_softcapping};
+    $self->u32('attention.sliding_window', $hp->{sliding_window}) if ($hp->{sliding_window_pattern} // 0) != 1;
+    $self->u32('attention.shared_kv_layers', $hp->{num_kv_shared_layers});
+    $self->u32('embedding_length_per_layer_input', $hp->{hidden_size_per_layer_input} || 0);
+    $self->arr('attention.sliding_window_pattern', \@swa, ROCm::Inference::Convert::BOOL);
+    my $hdf = $hp->{global_head_dim} // croak 'global_head_dim is needed';
+    my $hds = $hp->{head_dim};
+    $self->u32('attention.key_length', $hdf);
+    $self->u32('attention.value_length', $hdf);
+    $self->u32('attention.key_length_swa', $hds);
+    $self->u32('attention.value_length_swa', $hds);
+    my $v;
+    $self->u32('expert_feed_forward_length', $v) if defined($v = $self->find(qw(expert_intermediate_size moe_intermediate_size)));
+    croak 'use_double_wide_mlp is not supported' if $hp->{use_double_wide_mlp};
+    if (defined(my $kvf = $hp->{num_global_key_value_heads})) {
+        $self->arr('attention.head_count_kv', [map { $_ ? $hp->{num_key_value_heads} : $kvf } @swa], ROCm::Inference::Convert::I32);
+    }
+    $self->u32('rope.dimension_count', $hdf);
+    $self->u32('rope.dimension_count_swa', int($hds * ($self->{rope}{sliding_attention}{partial_rotary_factor} // 1)));
+}
+
+sub layer_table {
+    return [[qr/input_layernorm\.weight/, 'attn_norm.weight'], [qr/post_attention_layernorm\.weight/, 'post_attention_norm.weight'],
+            [qr/pre_feedforward_layernorm\.weight/, 'ffn_norm.weight'],
+            [qr/pre_feedforward_layernorm_2\.weight/, 'pre_ffw_norm_2.weight'],
+            [qr/post_feedforward_layernorm(_[12])?\.weight/, sub { 'post_ffw_norm' . ($_[0] // '') . '.weight' }],
+            [qr/self_attn\.([qkv])_proj\.weight/, 'attn_$1.weight'], [qr/self_attn\.o_proj\.weight/, 'attn_output.weight'],
+            [qr/self_attn\.([qk])_norm\.weight/, 'attn_$1_norm.weight'],
+            [qr/mlp\.(gate|up|down)_proj\.weight/, 'ffn_$1.weight'],
+            [qr/experts\.gate_up_proj/, 'ffn_gate_up_exps.weight'], [qr/experts\.down_proj/, 'ffn_down_exps.weight'],
+            [qr/router\.proj\.weight/, 'ffn_gate_inp.weight'], [qr/router\.scale/, 'ffn_gate_inp.scale', f32 => 1],
+            [qr/router\.per_expert_scale/, 'ffn_down_exps.scale', f32 => 1],
+            [qr/layer_scalar/, 'layer_output_scale.weight', f32 => 1]];
+}
+
+sub tensors {
+    my ($self) = @_;
+    my $P = $self->prefix;
+    my @s = map {  # the token embeddings without rows past the tokenizer's tokens
+        my $s = $_;
+        if ($s->{name} eq 'token_embd.weight' && $s->{ne}[1] > $self->{n_vocab}) {
+            $s = {%$s, ne => [$s->{ne}[0], $self->{n_vocab}], parts => [[$s->{parts}[0][0], 0, $self->{n_vocab}]]};
+        }
+        $s;
+    } $self->SUPER::tensors;
+    my $rf = $self->{rope}{full_attention} // croak 'rope_parameters.full_attention is needed';
+    croak "full attention RoPE $rf->{rope_type}: proportional expected" unless ($rf->{rope_type} // '') eq 'proportional';
+    my $hdf = $self->hp->{global_head_dim};
+    my $nrot = int($hdf * $rf->{partial_rotary_factor} / 2);
+    # the dimensions past the rotated ones: a factor that makes their frequency 0 (for the full attention layers)
+    my @f = ((1) x $nrot, (1e30) x (int($hdf / 2) - $nrot));
+    return (@s, {name => 'rope_freqs.weight', ne => [scalar @f], data => sub { pack 'f<*', @f }});
+}
+
+# EmbeddingGemma (convert_hf_to_gguf.py's EmbeddingGemma, a Gemma 3 text encoder as gemma-embedding): norms as 1 + w,
+# bidirectional attention, sentence-transformers pooling. The Dense modules (2_Dense, 3_Dense) are left out, as
+# convert_hf_to_gguf.py leaves them without --sentence-transformers-dense-modules.
+package ROCm::Inference::Convert::GemmaEmbedding;
+use Carp qw(croak);
+our @ISA = ('ROCm::Inference::Convert::Decoder');
+__PACKAGE__->register(qw(Gemma3TextModel));
+sub arch { 'gemma-embedding' }
+sub prefix { '' }
+
+sub init {
+    my ($self) = @_;
+    # the checkpoint's names have no model. prefix
+    $self->{P} = exists $self->st->{tensors}{'model.embed_tokens.weight'} ? 'model' : '';
+}
+
+sub vocab {
+    my ($self) = @_;
+    $self->{n_vocab} = -f File::Spec->catfile($self->{dir}, 'tokenizer.model') ? $self->vocab_sentencepiece : $self->vocab_gpt2;
+    $self->kv('tokenizer.ggml.add_space_prefix', ROCm::Inference::Convert::BOOL, 0);
+}
+
+sub params {
+    my ($self) = @_;
+    my $hp = $self->hp;
+    $self->u32('context_length', $hp->{max_position_embeddings} // 131072);
+    $self->u32('attention.head_count', $hp->{num_attention_heads} // 8);
+    $self->f32('attention.layer_norm_rms_epsilon', $hp->{rms_norm_eps} // 1e-6);
+    $self->u32('attention.key_length', $hp->{head_dim} // 256);
+    $self->u32('attention.value_length', $hp->{head_dim} // 256);
+    croak 'attn_logit_softcapping is not supported' if defined $hp->{attn_logit_softcapping};
+    $self->f32('final_logit_softcapping', $hp->{final_logit_softcapping}) if $hp->{final_logit_softcapping};
+    $self->u32('attention.sliding_window', $hp->{sliding_window} // croak 'sliding_window is needed');
+    $self->u32('attention.head_count_kv', $hp->{num_key_value_heads} // 4);
+    $self->pooling_type;
+}
+
+sub tensors {
+    my ($self) = @_;
+    my $T = $self->st->{tensors};
+    my $p0 = $self->{P} eq '' ? '' : "$self->{P}.";
+    my $e = $self->t("${p0}embed_tokens.weight");
+    my $nv = $self->{n_vocab} < $e->{shape}[0] ? $self->{n_vocab} : $e->{shape}[0];
+    my @s = ({name => 'token_embd.weight', ne => [$e->{shape}[1], $nv], parts => [[$e, 0, $nv]]});
+    my %norm = (input_layernorm => 'attn_norm', post_attention_layernorm => 'post_attention_norm',
+                pre_feedforward_layernorm => 'ffn_norm', post_feedforward_layernorm => 'post_ffw_norm',
+                'self_attn.q_norm' => 'attn_q_norm', 'self_attn.k_norm' => 'attn_k_norm');
+    my $re = join '|', map { quotemeta } keys %norm;
+    for my $l (0 .. $self->{block_count} - 1) {
+        my $p = "${p0}layers.$l";
+        push @s, $self->map_prefix($p, "blk.$l.", [[qr/(?:$re)\.weight/, undef],
+            [qr/self_attn\.([qkv])_proj\.weight/, 'attn_$1.weight'], [qr/self_attn\.o_proj\.weight/, 'attn_output.weight'],
+            [qr/mlp\.(gate|up|down)_proj\.weight/, 'ffn_$1.weight']]);
+        push @s, map { $self->ROCm::Inference::Convert::Qwen35::_norm1("blk.$l.$norm{$_}.weight", $self->t("$p.$_.weight")) }
+            sort keys %norm;
+    }
+    push @s, $self->ROCm::Inference::Convert::Qwen35::_norm1('output_norm.weight', $self->t("${p0}norm.weight"));
+    return @s;
+}
+
+package ROCm::Inference::Convert::Qwen3Moe;
+our @ISA = ('ROCm::Inference::Convert::Decoder');
+__PACKAGE__->register(qw(Qwen3MoeForCausalLM));
+sub arch { 'qwen3moe' }
+sub tokenizer_pre { 'qwen2' }
+
+sub params {
+    my ($self) = @_;
+    my $v;
+    $self->u32('expert_feed_forward_length', $v) if defined($v = $self->hp->{moe_intermediate_size});
+    $self->u32('expert_shared_feed_forward_length', $v) if defined($v = $self->hp->{shared_expert_intermediate_size});
+}
+
+# Qwen3.5 / 3.6 / 3.8 (convert_hf_to_gguf.py's Qwen3_5TextModel / Qwen3_5MoeTextModel): Gated DeltaNet layers and
+# gated full attention, the MTP block as one more layer. The norms are stored as w where the model computes 1 + w
+# (written as 1 + w); the DeltaNet's V heads, grouped by K head in the checkpoint, are written tiled (the order
+# ggml's broadcast repeats K heads in).
+package ROCm::Inference::Convert::Qwen35;
+use Carp qw(croak);
+our @ISA = ('ROCm::Inference::Convert::Decoder');
+__PACKAGE__->register(qw(Qwen3_5ForConditionalGeneration Qwen3_5ForCausalLM));
+sub arch { 'qwen35' }
+sub tokenizer_pre { 'qwen35' }
+sub skipped { qr/^model\.visual\./ }  # the vision encoder: a separate (mmproj) file
+sub prefix { 'model.language_model' }
+
+sub init {
+    my ($self) = @_;
+    my $hp = $self->hp;
+    $self->{n_main} = $hp->{num_hidden_layers};
+    $self->{n_mtp} = $hp->{mtp_num_hidden_layers} // 0;
+    $self->{n_mtp} = 0 unless grep { /^mtp\./ } @{$self->st->{order}};
+    $self->{block_count} += $self->{n_mtp};
+    $self->{rope}{mrope_section} //= [11, 11, 10];
+}
+
+sub params {
+    my ($self) = @_;
+    my $hp = $self->hp;
+    $self->ROCm::Inference::Convert::Qwen3Moe::params;
+    $self->u32('nextn_predict_layers', $self->{n_mtp}) if $self->{n_mtp};
+    $self->u32('ssm.conv_kernel', $hp->{linear_conv_kernel_dim});
+    $self->u32('ssm.state_size', $hp->{linear_key_head_dim});
+    $self->u32('ssm.group_count', $hp->{linear_num_key_heads});
+    $self->u32('ssm.time_step_rank', $hp->{linear_num_value_heads});
+    $self->u32('ssm.inner_size', $hp->{linear_value_head_dim} * $hp->{linear_num_value_heads});
+    if (my $lt = $hp->{layer_types}) {
+        croak "layer_types has " . @$lt . " entries, num_hidden_layers $self->{n_main}" unless @$lt == $self->{n_main};
+        $self->arr('attention.recurrent_layers', [(map { $_ eq 'linear_attention' ? 1 : 0 } @$lt), (0) x $self->{n_mtp}],
+                   ROCm::Inference::Convert::BOOL);
+    }
+    $self->u32('full_attention_interval', $hp->{full_attention_interval} // 4);
+    my $hd = $hp->{head_dim} // $hp->{hidden_size} / $hp->{num_attention_heads};
+    $self->u32('rope.dimension_count', int($hd * ($self->{rope}{partial_rotary_factor} // 0.25)));
+}
+
+# The output order of V heads: tiled (for each head of a K group, the K groups in turn) from grouped
+sub _v_order {
+    my ($self) = @_;
+    my $hp = $self->hp;
+    my ($nk, $nv) = ($hp->{linear_num_key_heads}, $hp->{linear_num_value_heads});
+    my $r = $nv / $nk;
+    return map { my $j = $_; map { $_ * $r + $j } 0 .. $nk - 1 } 0 .. $r - 1;
+}
+
+sub layer_table {
+    my ($self) = @_;
+    my @t = grep { "$_->[0]" !~ /post_attention_layernorm|_norm\\\.weight|input_layernorm/ } @ROCm::Inference::Convert::LAYER;
+    return [@t, [qr/(?:input_layernorm|post_attention_layernorm|self_attn\.[qk]_norm)\.weight/, undef],
+            [qr/linear_attn\.(?:A_log|dt_bias|conv1d\.weight|in_proj_\w+\.weight|out_proj\.weight)/, undef],
+            [qr/linear_attn\.norm\.weight/, 'ssm_norm.weight']];
+}
+
+sub layer_extra {
+    my ($self, $l, $p) = @_;
+    my $hp = $self->hp;
+    my $T = $self->st->{tensors};
+    my $b = "blk.$l";
+    my @s;
+    my %norm = (input_layernorm => 'attn_norm', post_attention_layernorm => 'post_attention_norm',
+                'self_attn.q_norm' => 'attn_q_norm', 'self_attn.k_norm' => 'attn_k_norm');
+    for my $k (sort keys %norm) {
+        my $t = $T->{"$p.$k.weight"} or next;
+        push @s, $self->computed("$b.$norm{$k}.weight", $t, [st_rows_cols($t)], sub { map { $_ + 1 } @_ });
+    }
+    my $a = "$p.linear_attn";
+    if (my $qkv = $T->{"$a.in_proj_qkv.weight"}) {
+        my ($nk, $nv, $dk, $dv) = @$hp{qw(linear_num_key_heads linear_num_value_heads linear_key_head_dim linear_value_head_dim)};
+        my @vo = $self->_v_order;
+        my $qk = 2 * $nk * $dk;
+        # rows of head blocks in the tiled order: [tensor, first row of the V part, rows a head]
+        my $heads = sub { my ($t, $at, $w) = @_; map { [$t, $at + $_ * $w, $w] } @vo };
+        push @s, {name => "$b.attn_qkv.weight", ne => [$qkv->{shape}[1], $qkv->{shape}[0]],
+                  parts => [[$qkv, 0, $qk], $heads->($qkv, $qk, $dv)]};
+        my $z = $self->t("$a.in_proj_z.weight");
+        push @s, {name => "$b.attn_gate.weight", ne => [reverse @{$z->{shape}}], parts => [$heads->($z, 0, $dv)]};
+        for (['a', 'ssm_alpha'], ['b', 'ssm_beta']) {
+            my $w = $self->t("$a.in_proj_$_->[0].weight");
+            push @s, {name => "$b.$_->[1].weight", ne => [reverse @{$w->{shape}}], parts => [$heads->($w, 0, 1)]};
+        }
+        my $c = $self->t("$a.conv1d.weight");  # [channels, 1, kernel] as [kernel, channels]
+        push @s, {name => "$b.ssm_conv1d.weight", ne => [$c->{shape}[-1], $c->{shape}[0]],
+                  parts => [[$c, 0, $qk], $heads->($c, $qk, $dv)]};
+        my $o = $self->t("$a.out_proj.weight");
+        push @s, {%{$self->same("$b.ssm_out.weight", $o)}, col_blocks => [$dv, \@vo]};
+        my $al = $self->t("$a.A_log");
+        push @s, $self->computed("$b.ssm_a", $al, [$nv], sub { my @v = @_; map { -exp_f32($v[$_]) } @vo });
+        my $dt = $self->t("$a.dt_bias");
+        push @s, $self->computed("$b.ssm_dt.bias", $dt, [$nv], sub { my @v = @_; @v[@vo] });
+    }
+    return @s;
+}
+
+# expf as torch computes it (the XS exp_neg_f32 negated back)
+sub exp_f32 { -unpack 'f<', ROCm::Inference::exp_neg_f32(pack 'f<', $_[0]) }
+sub st_rows_cols { my ($t) = @_; return reverse @{$t->{shape}} }
+
+sub tensors {
+    my ($self) = @_;
+    my $T = $self->st->{tensors};
+    my $P = $self->prefix;
+    my @s = grep { $_->{name} ne 'output_norm.weight' } $self->SUPER::tensors;
+    if (my $n = $T->{"$P.norm.weight"}) {
+        push @s, $self->computed('output_norm.weight', $n, [$n->{shape}[0]], sub { map { $_ + 1 } @_ });
+    }
+    for my $m (0 .. $self->{n_mtp} - 1) {  # mtp.layers.M: block n_main + M, its head tensors on the first
+        my $l = $self->{n_main} + $m;
+        my $p = "mtp.layers.$m";
+        push @s, $self->map_prefix($p, "blk.$l.", $self->layer_table), $self->layer_extra($l, $p);
+        push @s, $self->experts("$p.mlp.experts", "blk.$l", $self->n_experts) if grep { /^\Q$p.mlp.experts.\E/ } keys %$T;
+    }
+    if ($self->{n_mtp}) {
+        my $b = "blk.$self->{n_main}";
+        push @s, $self->same("$b.nextn.eh_proj.weight", $T->{'mtp.fc.weight'}) if $T->{'mtp.fc.weight'};
+        for (['pre_fc_norm_embedding', 'enorm'], ['pre_fc_norm_hidden', 'hnorm'], ['norm', 'shared_head_norm']) {
+            my $t = $T->{"mtp.$_->[0].weight"} or next;
+            push @s, $self->computed("$b.nextn.$_->[1].weight", $t, [$t->{shape}[0]], sub { map { $_ + 1 } @_ });
+        }
+        push @s, $self->mtp_extra($b);
+    }
+    return @s;
+}
+
+sub mtp_extra { () }
+
+sub _norm1 {  # a norm stored as w, applied as 1 + w
+    my ($self, $gname, $t) = @_;
+    return $self->computed($gname, $t, [$t->{shape}[0]], sub { map { $_ + 1 } @_ });
+}
+
+# Qwen3.8-Flash-Next (convert_hf_to_gguf.py's Qwen4ExpTextModel): Qwen3.5's gated DeltaNet with hyper-connections in
+# place of the layer norms, QSA sparse attention (an indexer) on the full-attention layers, PLE n-gram hash
+# embeddings on one layer. Matmuls reading the same input are written as one weight: [hc down | hc inject],
+# DeltaNet [qkv | z] and [beta | alpha].
+package ROCm::Inference::Convert::Qwen4Exp;
+use Carp qw(croak);
+our @ISA = ('ROCm::Inference::Convert::Qwen35');
+__PACKAGE__->register(qw(Qwen4ExpForConditionalGeneration Qwen4ExpForCausalLM));
+sub arch { 'qwen4exp' }
+
+sub layer_table {
+    my ($self) = @_;
+    return [@{$self->SUPER::layer_table}, [qr/(?:attn|mlp)_hyper_connection\.\w+\.weight/, undef],
+            [qr/ple\..+/, undef], [qr/self_attn\.indexer\.\w+\.weight/, undef]];
+}
+
+# 1-based in the config
+sub _ple_layers { map { $_ - 1 } @{$_[0]->hp->{ple_layer_ids} // []} }
+
+sub params {
+    my ($self) = @_;
+    my $hp = $self->hp;
+    $self->SUPER::params;
+    $self->u32('hyper_connection.count', $hp->{hc_count});
+    $self->u32('hyper_connection.low_rank', $hp->{hc_lowrank});
+    $self->u32('attention.indexer.head_count', $hp->{indexer_n_heads});
+    $self->u32('attention.indexer.key_length', $hp->{indexer_head_dim});
+    $self->u32('attention.indexer.top_k', $hp->{indexer_budget});
+    # The trunk's entries test layer_types for "full_attention", which transformers' Qwen4Exp config renames
+    # "indexed_attention" on load: convert_hf_to_gguf.py (and the published GGUFs) write 0 for every trunk layer and
+    # the ratio for the MTP block only. The engine reads them so; kept for the same file.
+    my $ratio = $hp->{indexer_compress_ratio};
+    $self->arr('attention.compress_ratios', [(0) x $self->{n_main}, ($ratio) x $self->{n_mtp}], ROCm::Inference::Convert::I32);
+    my @ple = $self->_ple_layers;
+    return unless @ple;
+    $self->arr('ple.layers', \@ple, ROCm::Inference::Convert::I32);
+    $self->u32('ple.ngram_size', $hp->{ngram_size});
+    $self->u32('ple.heads_per_ngram', $hp->{heads_per_ngram});
+    $self->u32('ple.conv_kernel', $hp->{ple_conv_kernel_size});
+    my $eos = $hp->{eos_token_id} // croak 'eos_token_id is needed: the PLE hash resets its n-grams on it';
+    $self->u32('ple.eos_token_id', ref $eos ? $eos->[-1] : $eos);
+    my $img = $self->{config}{image_token_id} // $hp->{image_token_id};
+    $self->u32('ple.image_token_id', $img) if defined $img;
+    my ($sh) = $self->_ple_shards;
+    $self->u32('embedding_length_per_layer_input', $sh->{shape}[-1]) if $sh;
+    for my $c (['layer_multipliers', 'ple.layer_multipliers'], ['ngram_heads_offsets', 'ple.head_offsets'],
+               ['ngram_heads_vocab_sizes', 'ple.head_vocab_sizes']) {
+        my ($t) = grep { $_->{name} =~ /ple_embedding\.\Q$c->[0]\E$/ } map { $self->st->{tensors}{$_} } @{$self->st->{order}};
+        croak "PLE constant $c->[0] missing from the checkpoint" unless $t;
+        $self->kv_arch($c->[1], ROCm::Inference::Convert::ARR, [ROCm::Inference::Convert::U64, [$self->ints($t)]]);
+        push @{$self->{const_used}}, $t;
+    }
+}
+
+# Integer values of a small I64 / I32 tensor
+sub ints {
+    my ($self, $t) = @_;
+    my %fh;
+    my $b = ROCm::Inference::SafeTensors::st_read_rows(\%fh, $t, 0, ROCm::Inference::SafeTensors::st_rows($t));
+    return unpack $t->{dtype} eq 'I64' ? 'q<*' : $t->{dtype} eq 'I32' ? 'l<*' : croak("$t->{name}: $t->{dtype} is not an integer"), $b;
+}
+
+# The n-gram table's shards, by index
+sub _ple_shards {
+    my ($self) = @_;
+    my $T = $self->st->{tensors};
+    my %sh = map { /\.ngram_embedding\.shard_(\d+)\.weight$/ ? ($1 => $T->{$_}) : () } keys %$T;
+    my $n = $self->hp->{split_ngram_parts} // scalar keys %sh;
+    croak scalar(keys %sh) . " PLE embedding shards, $n expected" if %sh && keys %sh != $n;
+    return map { $sh{$_} } sort { $a <=> $b } keys %sh;
+}
+
+sub _hc {  # hyper-connection mixers: [down | inject] as one, up, the norm as 1 + w
+    my ($self, $p, $b, $to) = @_;
+    my $T = $self->st->{tensors};
+    my $d = $T->{"$p.input_mix_weight_down.weight"} or return;
+    my @s = ($self->_norm1("$b.${to}_norm.weight", $self->t("$p.hc_norm.weight")),
+             $self->same("$b.${to}_up.weight", $self->t("$p.input_mix_weight_up.weight")));
+    if (my $inj = $T->{"$p.block_inject_weight.weight"}) {
+        push @s, {name => "$b.${to}_down_inject.weight", ne => [$d->{shape}[1], $d->{shape}[0] + $inj->{shape}[0]],
+                  parts => [[$d, 0, $d->{shape}[0]], [$inj, 0, $inj->{shape}[0]]]};
+    } else {
+        push @s, $self->same("$b.${to}_down.weight", $d);
+    }
+    return @s;
+}
+
+sub layer_extra {
+    my ($self, $l, $p) = @_;
+    my $hp = $self->hp;
+    my $T = $self->st->{tensors};
+    my $b = "blk.$l";
+    my %s = map { $_->{name} => $_ } $self->SUPER::layer_extra($l, $p);
+    for (['attn_qkv', 'attn_gate', 'attn_qkv_gate'], ['ssm_beta', 'ssm_alpha', 'ssm_beta_alpha']) {
+        my ($x, $y) = map { delete $s{"$b.$_.weight"} } @$_[0, 1];
+        next unless $x;
+        $s{"$b.$_->[2].weight"} = {name => "$b.$_->[2].weight", ne => [$x->{ne}[0], $x->{ne}[1] + $y->{ne}[1]],
+                                    parts => [@{$x->{parts}}, @{$y->{parts}}]};
+    }
+    my @s = map { $s{$_} } sort keys %s;
+    push @s, $self->_hc("$p.attn_hyper_connection", $b, 'hc_attn'), $self->_hc("$p.mlp_hyper_connection", $b, 'hc_ffn');
+    if (my $qk = $T->{"$p.self_attn.indexer.index_qk_proj.weight"}) {
+        my $nq = $hp->{indexer_n_heads} * $hp->{indexer_head_dim};
+        push @s, {name => "$b.indexer.q_proj.weight", ne => [$qk->{shape}[1], $nq], parts => [[$qk, 0, $nq]]},
+                 {name => "$b.indexer.k_proj.weight", ne => [$qk->{shape}[1], $qk->{shape}[0] - $nq],
+                  parts => [[$qk, $nq, $qk->{shape}[0] - $nq]]};
+        push @s, $self->_norm1("$b.indexer.q_norm.weight", $self->t("$p.self_attn.indexer.q_layernorm.weight")),
+                 $self->_norm1("$b.indexer.k_norm.weight", $self->t("$p.self_attn.indexer.k_layernorm.weight"));
+    }
+    if (my $c = $T->{"$p.ple.conv1d.weight"}) {
+        push @s, {name => "$b.ple_conv1d.weight", ne => [$c->{shape}[-1], $c->{shape}[0]], parts => [[$c, 0, $c->{shape}[0]]]};
+        push @s, $self->same("$b.ple_key.weight", $self->t("$p.ple.key_proj.weight")),
+                 $self->same("$b.ple_value.weight", $self->t("$p.ple.value_proj.weight"));
+        push @s, map { $self->_norm1("$b.ple_$_.weight", $self->t("$p.ple.$_.weight")) } qw(norm_conv norm_key norm_query);
+        my @sh = $self->_ple_shards;
+        my $rows = 0;
+        $rows += $_->{shape}[0] for @sh;
+        push @s, {name => 'per_layer_token_embd.weight', ne => [$sh[0]{shape}[-1], $rows],
+                  parts => [map { [$_, 0, $_->{shape}[0]] } @sh], uses => $self->{const_used}};
+    }
+    return @s;
+}
+
+sub tensors {
+    my ($self) = @_;
+    my @s = $self->SUPER::tensors;
+    my @hc = $self->_hc('model.language_model.hyper_connection_mixer', 'x', 'hc');
+    $_->{name} =~ s/^x\.hc_/output_hc_/ for @hc;
+    return (@s, @hc);
+}
+
+sub mtp_extra {
+    my ($self, $b) = @_;
+    my $T = $self->st->{tensors};
+    my @s;
+    if (my $e = $T->{'mtp.fc_embedding.weight'}) {  # eh_proj([e ; h]) = fc_embedding(e) + fc_hidden(h)
+        my $h = $self->t('mtp.fc_hidden.weight');
+        push @s, {name => "$b.nextn.eh_proj.weight", ne => [$e->{shape}[1] + $h->{shape}[1], $e->{shape}[0]],
+                  hcat => [$e, $h]};
+    }
+    my @hc = $self->_hc('mtp.hyper_connection_mixer', 'x', 'hc');
+    $_->{name} =~ s/^x\.hc_/$b.nextn.hc_head_/ for @hc;
+    return (@s, @hc);
+}
+
+package ROCm::Inference::Convert::Qwen35Moe;
+our @ISA = ('ROCm::Inference::Convert::Qwen35');
+__PACKAGE__->register(qw(Qwen3_5MoeForConditionalGeneration Qwen3_5MoeForCausalLM));
+sub arch { 'qwen35moe' }
 
 package ROCm::Inference::Convert::Glm5Next;
 use Carp qw(croak);

@@ -148,21 +148,37 @@ although ROCmFP4 has ~10% less weight error there (the matvecs are exact: `matve
 **Converting** (`bin/rocm-convert`, `ROCm::Inference::Convert`): a Hugging Face checkpoint directory (a git clone
 with LFS) to one GGUF without llama.cpp and without an intermediate file. `ROCm::Inference::SafeTensors` reads the
 shards' headers and rows; `json_decode` (XS) reads `config.json` / `tokenizer.json` in a fraction of a second.
-The metadata, vocabulary (byte-level BPE, special tokens, chat template) and tensor names are ports of
-`convert_hf_to_gguf.py`'s, per architecture a package (`Qwen3`, `Glm5Next`, `DeepSeek4`) with its parameters and tensor map:
-renames, experts stacked into one 3-D tensor, MLA's `kv_b_proj` split into a transposed `attn_k_b` and
-`attn_v_b`, KDA's conv1d reshape and `ssm_a = -exp(A_log)`; for DeepSeek-V4 its own layout, FP8 with E8M0
-(power-of-two) block scales, routed experts as packed FP4 moved bit for bit into MXFP4 (`repack_mxfp4`) and kept
-so, hash-routing tables as I32. A checkpoint tensor neither converted nor skipped on purpose (vision, DeepSeek's
-MTP layer) stops the conversion. A clone with LFS whose working tree holds only pointer files (no checkout) is read in place: every file
-the converter opens goes through `lfs_path`, which turns a pointer into its object under `.git/lfs/objects`. Rows stream from the shards through the encoders; FP8
-weights with 128x128 block scales (`inference_quantize_fp8_blocks`) are decoded and encoded in one step, so an FP8
-release goes to ROCmFP4 rounded once, with the same policy as for a GGUF in (one command, one writer). `tests/convert_verify.sh`: as BF16
-the output is byte for byte `convert_hf_to_gguf.py`'s (model-card keys aside) on Qwen3-0.6B and on tiny random
-GLM-5.3-Flash and DeepSeek-V4-Flash checkpoints (`tools/gen_glm5next_ckpt.py`, `tools/gen_dsv4_ckpt.py`: the
-releases' names, dtypes and layer patterns); dry runs on the real releases' headers (sparse files) convert every
-tensor: GLM-5.3-Flash 327 GB -> 171 GB FAST, DeepSeek-V4-Flash 156 GB -> 152 GB (MXFP4 experts kept). FP8 ->
-FAST directly is byte for byte F32, then that GGUF re-encoded.
+The metadata, vocabulary (byte-level BPE; byte-fallback BPE as transformers' `LlamaHfVocab` reads it;
+SentencePiece's `tokenizer.model` protobuf; special tokens, chat template) and tensor names are ports of
+`convert_hf_to_gguf.py`'s, per architecture a package with its parameters and tensor map. Every architecture the
+engine runs converts: `Qwen2`, `Qwen3`, `Qwen3Moe`, `Llama` (Q / K rows from rotate-half to interleaved, llama3
+`rope_freqs`), `Qwen35` / `Qwen35Moe` (Gated DeltaNet: V heads reordered from grouped to tiled, norms as 1 + w,
+the MTP block as one more layer), `Qwen4Exp` (Qwen3.8-Flash-Next: hyper-connections, the matmuls on one input
+merged as upstream merges them, the QSA indexer, the PLE n-gram table from its shards), `NemotronH` (Mamba-2 /
+attention / MoE by the hybrid pattern, latent MoE, the MTP head), `Gemma4` (26B-A4B's layout: K = V full
+attention, MoE beside a dense MLP, proportional RoPE as `rope_freqs`), `GemmaEmbedding` (EmbeddingGemma, its
+pooling); and two the engine does not run yet: `Glm5Next`, `DeepSeek4`. The decoder-family packages share one
+name table (`map_prefix`, which stops on a tensor it has no row for); the transformations are row and column
+selections of the source rows (`parts`, `col_blocks`, `hcat`: experts stacked, fused `gate_up_proj` split, V
+heads reordered, matrices merged), so even those stream; small computed tensors (`ssm_a = -exp(A_log)`, norms as
+1 + w, reshapes) are computed in F32 as torch computes them. MLA's `kv_b_proj` is split into a transposed
+`attn_k_b` and `attn_v_b`; for DeepSeek-V4 its own layout, FP8 with E8M0 (power-of-two) block scales, routed
+experts as packed FP4 moved bit for bit into MXFP4 (`repack_mxfp4`) and kept so, hash-routing tables as I32. A
+checkpoint tensor neither converted nor skipped on purpose (vision, DeepSeek's MTP layer) stops the conversion. A
+clone with LFS whose working tree holds only pointer files (no checkout) is read in place: every file the
+converter opens goes through `lfs_path`, which turns a pointer into its object under `.git/lfs/objects`. Rows
+stream from the shards through the encoders; FP8 weights with block scales (`inference_quantize_fp8_blocks`) are
+decoded and encoded in one step, so an FP8 release goes to ROCmFP4 rounded once, with the same policy as for a
+GGUF in (one command, one writer). `tests/convert_verify.sh`: as BF16 the output is byte for byte
+`convert_hf_to_gguf.py`'s (model-card keys aside) for every architecture, on releases (Qwen3-0.6B,
+Qwen2.5-0.5B, Qwen3.5-0.8B, embeddinggemma-300m) and on tiny random checkpoints built from the releases' own
+config and tokenizer (`tools/gen_tiny_ckpt.py`: transformers' model of the shrunk config, saved under the
+release's tensor names; `tools/gen_glm5next_ckpt.py`, `tools/gen_dsv4_ckpt.py` by hand). One exception, 1 ulp on
+a few elements of `ssm_a` and llama3's `rope_freqs`: torch's float `exp` / `pow` are MKL's vector math, not
+correctly rounded; ours (`expf`) is. Each to FAST directly is byte for byte the reference's BF16 GGUF re-encoded
+(an F32 or FP8 release: our F32 GGUF re-encoded). Dry runs on the real releases' headers convert every tensor:
+GLM-5.3-Flash 327 GB -> 171 GB FAST (converted for real, 19 h from a USB disk), DeepSeek-V4-Flash 156 GB -> 152 GB
+(MXFP4 experts kept).
 
 ## 5. Exactness and WMMA
 
@@ -305,7 +321,7 @@ less well and 2 is best; the adaptive default is within ~1% of the best fixed co
 | `mtp_verify` | draft acceptance, speculative = plain (greedy, sampled, library) |
 | `mtp_own_verify.sh` | a model's own MTP block drafts what the same block as a sidecar drafts; generation with it = without (tiny models) |
 | `store_verify.sh` | the KV block store across processes (optionally with a draft head) |
-| `convert_verify.sh` | `rocm-convert` vs llama.cpp's `convert_hf_to_gguf.py` (BF16, byte for byte) on Qwen3-0.6B and tiny GLM-5.3-Flash / DeepSeek-V4-Flash; FP8 -> FAST directly = F32 then re-encoded (needs torch and an upstream checkout) |
+| `convert_verify.sh` | `rocm-convert` vs llama.cpp's `convert_hf_to_gguf.py` (BF16, byte for byte) for every architecture (qwen2, qwen3, qwen3moe, qwen35, qwen35moe, qwen4exp, llama, nemotron_h_moe incl. Super's latent MoE + MTP, gemma4, gemma-embedding, glm5-next, deepseek4) on small releases and tiny checkpoints of the releases' configs; each to FAST directly = from the GGUF; a git-lfs pointer clone (needs torch, transformers and an upstream checkout) |
 | `quantize_verify.sh` | the encoders vs the reference's on synthetic rows and real tensors; `rocm-convert -r plain` (a GGUF in) vs ROCmFPX's `llama-quantize` on a whole model (FAST, ROCmFP4, Q8_0): the same bytes |
 | `matvec_verify`, `dequant_verify`, `attn_decode_verify`, `kv_verify`, `tokenizer_*`, `sampler_verify`, `capi_smoke` | kernels, decoders, tokenizer, C API |
 | `perl/ROCm-Inference/t/*.t` | the Perl binding (GPU tests with `ROCM_INFERENCE_TEST_*`) |

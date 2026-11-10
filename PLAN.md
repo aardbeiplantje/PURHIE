@@ -22,12 +22,19 @@
    perplexity for small per-tensor choices (K / V moved perplexity by +-2% without following precision): the KL
    divergence of the logits against the Q8_0 / BF16 model; and the recipe on Flash in the deployment (its Q8_0 LM
    head and hc mixers are untested on the real model). The converter is in too (`bin/rocm-convert`; byte for byte
-   convert_hf_to_gguf.py's on Qwen3 and a tiny GLM-5.3-Flash, `tests/convert_verify.sh`): `rocm-convert
-   /data/hf/GLM-5.3-Flash GLM-5.3-Flash-FAST.gguf` reads the FP8 release and writes FAST, no intermediate file.
+   convert_hf_to_gguf.py's for every architecture the engine runs - qwen2/3/3moe/35/35moe, qwen4exp, llama,
+   nemotron_h_moe, gemma4, gemma-embedding - and glm5-next / deepseek4, `tests/convert_verify.sh`): `rocm-convert
+   /data/hf/GLM-5.3-Flash GLM-5.3-Flash-FAST.gguf` reads the FP8 release and writes FAST, no intermediate file
+   (done 2026-11-10: 171 GB, in /models). Not converted yet: a SentencePiece Llama 2, Gemma 4's dense / per-layer
+   input variants (31B, E2B), NVFP4 / modelopt checkpoints (/data/hf/Qwen3.6-35B-A3B-NVFP4-Fast).
    DeepSeek-V4-Flash (the user's choice, 2026-11-09) converts too (`DeepSeek4`, MXFP4 experts kept: 152 GB FAST);
-   its MTP layer is left out, as upstream does (a separate draft file: to do with the MTP work). Open: the
-   model-card `general.*` keys (license, base model, size label), more architectures as needed (each a package in
-   `ROCm::Inference::Convert` checked against convert_hf_to_gguf.py), DeepSeek-V4 in the engine (`deepseek4`:
+   its MTP layer is left out, as upstream does (a separate draft file: to do with the MTP work). DeepSeek-V4.1-Flash
+   (`DeepseekV41ForCausalLM`, on /hf, 510 GB: Engram n-gram tables of 197 GB FP8, 289 GB of FP4 experts) is not
+   converted: a new package (upstream `conversion/deepseek41.py`: Engram tables, token map and numpy-PCG64 hash
+   multipliers, 32x32 FP8 blocks, shared KV / indexer layers) and ~450 GB free disk (/data has 180 GB); its experts
+   alone exceed 128 GB. Open: the model-card `general.*` keys (license, base model, size label), more
+   architectures as needed (each a package in `ROCm::Inference::Convert` checked against convert_hf_to_gguf.py),
+   DeepSeek-V4 in the engine (`deepseek4`:
    KV compressors, hash routing, grouped output projection; like GLM-5.3 it does not fit 128 GB resident).
 
 ## Status in brief
