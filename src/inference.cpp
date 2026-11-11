@@ -148,6 +148,7 @@ static bool pin_gguf(gguf_model_t* gguf, std::vector<const QuantWeight*> cpu_onl
         const char* cur = base;
         auto pin = [&](const char* end) {
             if (end <= cur) return true;
+            if (pager) (void)mlock(cur, (size_t)(end - cur));  // (as the pager's units: expert_pager.cpp)
             hipError_t e = hipHostRegister((void*)cur, (size_t)(end - cur), hipHostRegisterReadOnly);
             if (e != hipSuccess) {
                 INFER_LOG("[pin_model] hipHostRegister(GGUF map %d, %zu bytes, ReadOnly) failed: %s\n", i,

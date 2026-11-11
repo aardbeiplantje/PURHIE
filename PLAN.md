@@ -168,7 +168,23 @@ within that), 1.54 ms each (0.28 when cached: ~1.25 ms is the disk, ~3.4 GB/s) +
 (~650 ms): ~370 disk, ~200 register / release overhead, ~100 GPU. The template needs minijinja's `loop_controls`
 (`{% break %}`): `cargo build --release --features minijinja/loop_controls` in perl-minijinja-xs/minijinja/
 minijinja-cabi - scripts/setup-minijinja.sh passes it since perl-minijinja-xs 4cddee9 (the Docker build runs that
-script: to rebuild there). Open: (1) the default budget rule is untested (only
+script: to rebuild there). **Budget and policy, measured (2026-11-11, same prompt, 300 tokens):** the budget
+now counts exactly what is held (the 2 MB folios with a registered page). At 96 GB the first run made 45 tokens in
+20 minutes: registered pages are not safe from reclaim (the GPU's reads do not mark them used; evicted, the driver
+reads them back) - the pager now mlocks what it registers (and pin_gguf the rest of a paged model), and the same
+run finishes at 1.83 tok/s (80 GB: 1.53), memory pressure < 5%. Of its 155 s, 114 are registering (43,344 units,
+2.6 ms each: 28,989 of them the first touch - this one answer reads 29k of the 36k units, 123 GB from disk) and 29
+releasing (24,845, 1.16 ms each, all of it the remap; unregistering is 6 us). So a short chat is a cold start;
+only ~14k registrations (4.6% of reads) were of units released before. The reads are spread flat: the most read
+units covering 50 / 75 / 90 / 95 / 99% of them are 17.9 / 42.5 / 69.0 / 83.8 / 107.2 GB - at 96 GB at best ~97% of
+reads resident (~30 misses a token). A layer's experts of the last 1 / 2 / 4 / 8 tokens cover 29 / 37 / 45 / 56%
+of the next token's - but those are the resident ones: recency cannot predict a miss. Ideas, in order: (a) the
+cold start: keep the use counts in a file beside the model and at load read and register the most used units up
+to the budget on CPU threads, in parallel (NVMe: several GB/s; the pager reads one range at a time, ~1.1 GB/s);
+(b) evict by use count, not recency (the user's hot / cold split: rare experts registered, used, released and
+dropped at once); (c) a predictor for misses: layer L+1's router on the stream before layer L (the stream changes
+slowly) while the GPU runs layer L, to read ahead; (d) the release: 1.16 ms a unit in the remap (munlock + unmap of
+1088 pages) - batch adjacent units, or release on a CPU thread behind the forward pass. Open: (1) the default budget rule is untested (only
 explicit budgets were run), and a larger budget (~100 GB) may fit; (2) the miss rate of real text: the routing trace, which the pager's counters
 now give (`INFERENCE_VERBOSE`: registered / released at the free); (3) a cheaper miss (the remap drops the page
 tables: registering again faults 1088 pages in; try 2 MB-aligned units or MADV_POPULATE_READ on a CPU thread

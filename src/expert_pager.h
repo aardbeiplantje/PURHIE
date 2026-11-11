@@ -7,7 +7,7 @@
 // routed to: a unit is one expert of one expert tensor (its whole pages; a page it shares with a neighbour is
 // registered while either is - not for good: the page cache holds the file in 2 MB folios and a registered page
 // keeps its folio, so 36,288 such pages kept 79 GB of a 171 GB file in memory), registered at its first use, and,
-// once more than the budget is held (counted in folios), the least recently used ones are released: their pages go back to being plain page cache, which the
+// once more than the budget is held (the folios with a registered page, counted exactly), the least recently used ones are released: their pages go back to being plain page cache, which the
 // kernel may drop and read again from the file. Nothing is copied either way: the GPU reads the file's pages.
 //
 // The forward pass calls use() with a layer's routed expert ids after the router has run and before the expert
@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include "gguf_mmap.h"
@@ -48,9 +49,11 @@ struct ExpertPager {
     double st_ms = 0.0, st_release_ms = 0.0;                      // ... and the time in them / of it releasing
 
   private:
-    // p, len: its whole pages; cost: what it keeps in memory when registered (its pages' 2 MB folios);
-    // edge: the pages it shares with the experts before / after it (-1: none)
-    struct Unit { char* p; size_t len, cost; int edge[2]; int prev, next; uint32_t stamp; bool reg; };
+    // p, len: its whole pages; f0 .. f1: the folios (2 MB of the page cache) its pages and edges are in, which
+    // it keeps in memory when registered; edge: the pages it shares with the experts before / after it (-1: none)
+    struct Unit { char* p; size_t len; uintptr_t f0, f1; int edge[2]; int prev, next; uint32_t stamp; bool reg; uint32_t uses; };
+    void hold(const Unit& u);
+    void drop(const Unit& u);
     struct Edge { char* p; int refs; };
     bool edge_ref(int e);
     void edge_unref(int e);
@@ -61,6 +64,15 @@ struct ExpertPager {
     gguf_model_t* gguf;
     std::vector<Unit> units;
     std::vector<Edge> edges;
+    // Statistics for the policy (INFERENCE_VERBOSE): how well a layer's experts of the last tokens predict the
+    // next token's (what a prefetch could read ahead), by the layer's first unit; one-token calls only
+    struct Hist { std::vector<int> ids[8]; int n = 0; };
+    std::unordered_map<int, Hist> hist;
+    long long pr_total = 0, pr_hit[4] = {0, 0, 0, 0};  // ids seen / of them among the last 1, 2, 4, 8 tokens'
+    double st_unreg_ms = 0.0, st_remap_ms = 0.0;
+    void report();
+    std::unordered_map<uintptr_t, int> folios;         // registered units per folio (by address / folio size)
+    size_t folio_bytes = 0;
     std::vector<std::pair<const char*, const char*>> spans;  // the tensors' whole pages
     int head = -1, tail = -1;                          // registered units, most to least recently used
     uint32_t clock = 0;
