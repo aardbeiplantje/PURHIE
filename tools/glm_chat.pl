@@ -20,13 +20,17 @@ my $t0 = time;
 my $m = load_model($path) or die "load: " . (ROCm::Inference::get_last_error() // '?') . "\n";
 kv_cache_init($m, $ctx // 4096);
 printf STDERR "loaded in %.1f s\n", time - $t0;
-my ($n, $t1, $tf) = (0, time);
-my ($reply, $why) = chat($m, [{ role => 'user', content => $prompt }], {
-    max_new_tokens => $max,
-    temperature    => 0,
-    on_delta       => sub { my ($text, $kind) = @_; $tf //= time; ++$n; print $text; return 0 },
-});
-my $t2 = time;
-print "\n";
-printf STDERR "stop: %s; first text after %.1f s, then %d pieces in %.1f s (%.2f / s)\n", $why // '?',
-    ($tf // $t2) - $t1, $n, $t2 - ($tf // $t2), $n > 1 ? ($n - 1) / ($t2 - $tf) : 0;
+# GLM_CHAT_TURNS=N: the prompt N times, each a new conversation (the first reads the experts from disk: the
+# later ones show the speed once they are in memory)
+for my $turn (1 .. ($ENV{GLM_CHAT_TURNS} // 1)) {
+    my ($n, $t1, $tf) = (0, time);
+    my ($reply, $why) = chat($m, [{ role => 'user', content => $prompt }], {
+        max_new_tokens => $max,
+        temperature    => 0,
+        on_delta       => sub { my ($text, $kind) = @_; $tf //= time; ++$n; print $text if $turn == 1; return 0 },
+    });
+    my $t2 = time;
+    print "\n" if $turn == 1;
+    printf STDERR "turn %d stop: %s; first text after %.1f s, then %d pieces in %.1f s (%.2f / s)\n", $turn, $why // '?',
+        ($tf // $t2) - $t1, $n, $t2 - ($tf // $t2), $n > 1 ? ($n - 1) / ($t2 - $tf) : 0;
+}

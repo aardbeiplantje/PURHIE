@@ -244,6 +244,8 @@ static void make_expert_pager(inference_model* m) {
         const size_t rest = file - p->span_bytes + ((size_t)16 << 30), avail = avail_kb << 10;
         p->budget = avail > rest + ((size_t)8 << 30) ? avail - rest : (size_t)8 << 30;
     }
+    const char* ev = getenv("INFERENCE_EXPERT_EVICT");
+    p->evict = ev && ev[0] && ev[0] != '0';
     m->pager = p;
 }
 

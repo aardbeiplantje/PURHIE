@@ -38,6 +38,13 @@ struct ExpertPager {
     // Register experts ids[0 .. n) (ids outside 0 .. n_expert are skipped) of the tensors whose first units are
     // first[0 .. nt), releasing the least recently used other units over the budget. False: a registration failed
     bool use(const int* first, int nt, int n_expert, const int* ids, int n);
+    // The same without releasing anything (evict false, the default): experts are registered while the budget
+    // has room and stay; on_gpu[i] says whether ids[i]'s tensors all are - the caller computes the others on the
+    // CPU from the mapping (expert_cpu.h), whose pages the kernel caches and drops as any file's
+    bool acquire(const int* first, int nt, int n_expert, const int* ids, int n, unsigned char* on_gpu);
+    bool evict = false;                                // INFERENCE_EXPERT_EVICT=1: use(), all experts on the GPU
+    long long st_cpu = 0;                              // experts (of tokens) computed on the CPU, and the time
+    double st_cpu_ms = 0.0;
     // Unregister everything (before the mapping goes)
     void release_all();
 
@@ -76,7 +83,7 @@ struct ExpertPager {
     std::vector<std::pair<const char*, const char*>> spans;  // the tensors' whole pages
     int head = -1, tail = -1;                          // registered units, most to least recently used
     uint32_t clock = 0;
-    bool warned = false;
+    bool warned = false, full = false;
     std::mutex mtx;
 };
 

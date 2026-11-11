@@ -21,6 +21,7 @@
 #include "deltanet.h"
 #include "gpu_ops.h"
 #include "glm5_gpu.h"
+#include "expert_cpu.h"
 #include "qmatvec.h"
 #include "quant_types.h"
 
@@ -1877,8 +1878,59 @@ struct QwenModel {
         return matvec(L.Wo, glm.o, s.proj, T, P_ATTN);
     }
 
+    // The experts of this layer that are not registered with the GPU (cpu_ids: slot, expert), on the CPU's threads
+    // while the GPU runs what is queued; then their rows of s.moe_down, once the GPU has written its own
+    std::vector<unsigned char> on_gpu;
+    std::vector<std::pair<int, int>> cpu_ids;
+    std::vector<float> cpu_out, cpu_work, cpu_d;
+    std::vector<int8_t> cpu_q;
+    bool glm_cpu_experts(const LayerWeights& L, int T) {
+        const int E = eng->n_embd, NE = eng->n_expert, FE = eng->n_ff_exp, NU = eng->n_expert_used;
+        const auto t0 = std::chrono::steady_clock::now();
+        const int n = (int)cpu_ids.size();
+        const size_t wk = (size_t)4 * FE;
+        cpu_out.resize((size_t)n * E);
+        cpu_work.resize((size_t)n * wk);
+        cpu_q.resize((size_t)T * E);
+        cpu_d.resize((size_t)T * (E / 32));
+        std::vector<unsigned char> tok(T, 0);
+        for (const auto& c : cpu_ids) tok[c.first / NU] = 1;
+        for (int t = 0; t < T; ++t)  // s.xn as the GPU quantized it (current: the queue was drained after it)
+            if (tok[t]) cpu_q8_0_quantize(s.xn + (size_t)t * E, E, cpu_q.data() + (size_t)t * E, cpu_d.data() + (size_t)t * (E / 32));
+        const size_t eg = L.We_gate.row_bytes * (size_t)(L.We_gate.N / NE), ed = L.We_down.row_bytes * (size_t)(L.We_down.N / NE);
+        // what of them is not in memory: read ahead, all at once (faults alone read a 2 MB folio at a time, ~1 GB/s
+        // of a disk that gives 6)
+        const uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
+        auto ahead = [&](const void* p, size_t len) {
+            const uintptr_t b = (uintptr_t)p / pg * pg;
+            (void)madvise((void*)b, (uintptr_t)p + len - b, MADV_WILLNEED);
+        };
+        for (const auto& c : cpu_ids) {
+            ahead((const char*)L.We_gate.data + c.second * eg, eg);
+            ahead((const char*)L.We_up.data + c.second * eg, eg);
+            ahead((const char*)L.We_down.data + c.second * ed, ed);
+        }
+        cpu_parallel_for(n, [&](int i) {
+            const int t = cpu_ids[i].first / NU, e = cpu_ids[i].second;
+            cpu_expert_ffn((const char*)L.We_gate.data + e * eg, (const char*)L.We_up.data + e * eg, L.We_gate.row_bytes,
+                           (const char*)L.We_down.data + e * ed, L.We_down.row_bytes, FE, E, cpu_q.data() + (size_t)t * E,
+                           cpu_d.data() + (size_t)t * (E / 32), L.swiglu_limit, cpu_out.data() + (size_t)i * E,
+                           cpu_work.data() + (size_t)i * wk);
+        });
+        if (!sync()) return false;
+        for (int i = 0; i < n; ++i) {
+            memcpy(s.moe_down + (size_t)cpu_ids[i].first * E, cpu_out.data() + (size_t)i * E, (size_t)E * sizeof(float));
+            s.ids[cpu_ids[i].first] = cpu_ids[i].second;
+        }
+        eng->pager->st_cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        cpu_ids.clear();
+        return true;
+    }
+
     bool glm_ffn(const LayerWeights& L, int T) {
         const int E = eng->n_embd, NE = eng->n_expert, NU = eng->n_expert_used, FE = eng->n_ff_exp, FF = L.W_gate.N;
+        bool gpu_experts = true;
+        cpu_ids.clear();
         // the dense FFN, or the shared expert: from s.xn's int8 form before anything else is quantized
         if (!matvec_pair(L.W_gate, L.W_up, s.xn, s.ffg, s.ffu, T, P_FFN)) return false;
         if (L.moe && (!matvec(L.W_router, s.xn, s.r_logits, T, P_FFN) ||
@@ -1892,9 +1944,32 @@ struct QwenModel {
             // are needed here, so the queue is drained: nothing then reads an expert the pager releases)
             if (eng->pager && !eng->pager->all_registered()) {
                 if (!sync()) return false;
-                if (!eng->pager->use(L.pg_unit, 3, NE, s.ids, T * NU)) {
+                on_gpu.assign((size_t)T * NU, 0);
+                const bool ok = eng->pager->evict ? eng->pager->use(L.pg_unit, 3, NE, s.ids, T * NU)
+                                                  : eng->pager->acquire(L.pg_unit, 3, NE, s.ids, T * NU, on_gpu.data());
+                if (!ok) {
                     qwen_set_error("glm5-next: an expert could not be registered");
                     return false;
+                }
+                // (acquire: 1 = on the GPU) the others' slots: on the CPU, their ids kept in cpu_ids; the GPU
+                // computes an expert it has in their place (the token's first, else the batch's), overwritten below
+                if (!eng->pager->evict) {
+                    int any = -1;
+                    for (int i = 0; i < T * NU && any < 0; ++i)
+                        if (on_gpu[i]) any = s.ids[i];
+                    cpu_ids.clear();
+                    for (int t = 0; t < T; ++t) {
+                        int mine = any;
+                        for (int j = 0; j < NU; ++j)
+                            if (on_gpu[t * NU + j]) { mine = s.ids[t * NU + j]; break; }
+                        for (int j = 0; j < NU; ++j) {
+                            const int i = t * NU + j;
+                            if (on_gpu[i]) continue;
+                            cpu_ids.push_back({i, s.ids[i]});
+                            if (mine >= 0) s.ids[i] = mine;
+                        }
+                    }
+                    gpu_experts = any >= 0;
                 }
             }
             grouped = T >= 8 || inv;
@@ -1905,14 +1980,16 @@ struct QwenModel {
                            "moe_group"))
                     return false;
             }
-            if (!matvec_id_gate_up(L.We_gate, L.We_up, s.xn, s.moe_g, s.moe_u, FE, T, grouped, P_FFN) ||
-                !check(glm_swiglu_clamp(s.moe_g, s.moe_u, s.moe_act, T * NU, FE, L.swiglu_limit, 0), "swiglu (experts)") ||
-                !produced(s.moe_act, FE, T * NU) || !matvec_id(L.We_down, s.moe_act, 1, s.moe_down, E, T, grouped, P_FFN))
+            if (gpu_experts &&
+                (!matvec_id_gate_up(L.We_gate, L.We_up, s.xn, s.moe_g, s.moe_u, FE, T, grouped, P_FFN) ||
+                 !check(glm_swiglu_clamp(s.moe_g, s.moe_u, s.moe_act, T * NU, FE, L.swiglu_limit, 0), "swiglu (experts)") ||
+                 !produced(s.moe_act, FE, T * NU) || !matvec_id(L.We_down, s.moe_act, 1, s.moe_down, E, T, grouped, P_FFN)))
                 return false;
         }
         if (!check(glm_swiglu_clamp(s.ffg, s.ffu, s.act, T, FF, L.swiglu_limit_sh, 0), "swiglu") ||
             !produced(s.act, FF, T) || !matvec(L.W_down, s.act, L.moe ? s.sh_out : s.proj, T, P_FFN))
             return false;
+        if (!cpu_ids.empty() && !glm_cpu_experts(L, T)) return false;
         return !L.moe || check(gpu_moe_combine_scaled(s.moe_down, s.wts, s.sh_out, nullptr, nullptr, nullptr, s.proj, NU,
                                                       E, T, 0),
                                "moe_combine");

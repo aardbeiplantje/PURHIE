@@ -178,14 +178,30 @@ releasing (24,845, 1.16 ms each, all of it the remap; unregistering is 6 us). So
 only ~14k registrations (4.6% of reads) were of units released before. The reads are spread flat: the most read
 units covering 50 / 75 / 90 / 95 / 99% of them are 17.9 / 42.5 / 69.0 / 83.8 / 107.2 GB - at 96 GB at best ~97% of
 reads resident (~30 misses a token). A layer's experts of the last 1 / 2 / 4 / 8 tokens cover 29 / 37 / 45 / 56%
-of the next token's - but those are the resident ones: recency cannot predict a miss. Ideas, in order: (a) the
+of the next token's - but those are the resident ones: recency cannot predict a miss. **CPU tier (2026-11-11, user: the
+CPU can do the cold experts from disk; `src/expert_cpu.h`, default now):** the pager registers until the budget is
+full and never releases (`acquire`); an expert not on the GPU is computed on the CPU from the plain mapping -
+AVX-512 VNNI, FP4_FAST blocks x Q8_0 activations, 1.0 ms an expert on one thread (13 GB/s; scalar 12.9 ms), 8
+experts in 1.5 ms on the pool (`build/expert_cpu_bench`), equal to the GPU's result to rounding (not bit for bit:
+the slice check's CPU runs compare by tolerance). MADV_WILLNEED on a layer's CPU experts before the threads start
+(the fault path alone reads 1-1.6 GB/s of the disk's 6.5). Same prompt, 3 turns of 300 tokens in one process,
+tok/s per turn (CPU share of expert computations, wall ms each): budget ~0: 2.78 / 3.54 / 3.60 (100%, 0.71);
+20 GB: 3.58 / 3.68 / 3.66 (87%, 0.71); 40 GB: 3.94 / 4.50 / 4.28 (69%, 0.78); 60 GB: 3.57 / 4.00 / 3.74 (50%,
+1.20); 80 GB: 4.06 / 4.67 / 4.90 (33%, 1.40); default (92.6 GB here): 4.64 / 4.67 / 4.87 (25.5%, 1.68; memory
+pressure 7-13%). Runs inherit the page cache of the one before, so the curve is noisy; the default rule stays.
+First text after 0.2-0.7 s on a warm turn (6 s cold). `INFERENCE_EXPERT_EVICT=1` is the old LRU mode (1.83 tok/s).
+A CPU expert costs 4-9x the kernel's time: one answer reads ~134 GB of experts and ~110 fit, so the rest is disk;
+which experts get the GPU is first come, not most used. Next: (i) promote by use count (swap a hot CPU expert for
+a cold registered one: the release is 1.16 ms, off the forward path); (ii) read ahead from layer L+1's router;
+(iii) profile the GPU's own ~100 ms/token; (iv) the NPU (amdxdna, no /dev/accel in the container) could take the
+CPU's place behind `cpu_expert_ffn`'s interface - judged far-fetched for 13 MB of weights an expert. Ideas of
+the LRU mode, in order: (a) the
 cold start: keep the use counts in a file beside the model and at load read and register the most used units up
 to the budget on CPU threads, in parallel (NVMe: several GB/s; the pager reads one range at a time, ~1.1 GB/s);
 (b) evict by use count, not recency (the user's hot / cold split: rare experts registered, used, released and
 dropped at once); (c) a predictor for misses: layer L+1's router on the stream before layer L (the stream changes
 slowly) while the GPU runs layer L, to read ahead; (d) the release: 1.16 ms a unit in the remap (munlock + unmap of
-1088 pages) - batch adjacent units, or release on a CPU thread behind the forward pass. Open: (1) the default budget rule is untested (only
-explicit budgets were run), and a larger budget (~100 GB) may fit; (2) the miss rate of real text: the routing trace, which the pager's counters
+1088 pages) - batch adjacent units, or release on a CPU thread behind the forward pass. Open: (2) the miss rate of real text: the routing trace, which the pager's counters
 now give (`INFERENCE_VERBOSE`: registered / released at the free); (3) a cheaper miss (the remap drops the page
 tables: registering again faults 1088 pages in; try 2 MB-aligned units or MADV_POPULATE_READ on a CPU thread
 while the GPU runs the attention); (4) the MTP block's experts are registered with the rest (3.6 GB); (5) a

@@ -193,6 +193,58 @@ bool ExpertPager::use(const int* first, int nt, int n_expert, const int* ids, in
     return ok;
 }
 
+bool ExpertPager::acquire(const int* first, int nt, int n_expert, const int* ids, int n, unsigned char* on_gpu) {
+    std::lock_guard<std::mutex> lk(mtx);
+    const auto t0 = std::chrono::steady_clock::now();
+    bool ok = true, worked = false;
+    for (int i = 0; i < n; ++i) {
+        on_gpu[i] = 0;
+        if (ids[i] < 0 || ids[i] >= n_expert) continue;
+        bool all = true;
+        for (int t = 0; t < nt; ++t) all = all && first[t] >= 0 && units[first[t] + ids[i]].reg;
+        if (!all && ok && !full) {  // room for what is missing of it?
+            const size_t before = registered;
+            for (int t = 0; t < nt; ++t)
+                if (first[t] >= 0 && !units[first[t] + ids[i]].reg) hold(units[first[t] + ids[i]]);
+            all = registered <= budget;
+            for (int t = 0; t < nt && all; ++t) {
+                if (first[t] < 0) { all = false; break; }
+                Unit& u = units[first[t] + ids[i]];
+                if (u.reg) continue;
+                (void)madvise(u.p, u.len, MADV_WILLNEED);
+                (void)mlock(u.p, u.len);
+                if (hipHostRegister(u.p, u.len, hipHostRegisterReadOnly) != hipSuccess || !edge_ref(u.edge[0]) ||
+                    !edge_ref(u.edge[1])) {
+                    INFER_LOG("[expert_pager] hipHostRegister(%zu bytes) failed\n", u.len);
+                    ok = false;
+                    break;
+                }
+                u.reg = true;
+                push_front(first[t] + ids[i]);
+                ++n_registered;
+                ++st_registered;
+                worked = true;
+            }
+            if (!all || !ok) {  // no room (or an error): what was not registered is not held
+                for (int t = 0; t < nt; ++t)
+                    if (first[t] >= 0 && !units[first[t] + ids[i]].reg) drop(units[first[t] + ids[i]]);
+                // three units short of the budget: nothing more will fit (a unit is 2 to 4 folios)
+                if (ok && before + 12 * folio_bytes > budget) full = true;
+                all = false;
+            }
+        }
+        for (int t = 0; t < nt; ++t)
+            if (first[t] >= 0) ++units[first[t] + ids[i]].uses;
+        on_gpu[i] = all;
+        if (!all) ++st_cpu;
+    }
+    if (worked) {
+        ++st_calls;
+        st_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+    return ok;
+}
+
 // How the reads are spread over the experts, and how predictable they are
 void ExpertPager::report() {
     std::vector<uint32_t> v;
@@ -214,6 +266,9 @@ void ExpertPager::report() {
         INFER_LOG(" %.0f%%: %zu (%.1f GB)", s * 100, i, (double)i * (double)units[0].len / 1073741824.0);
     }
     INFER_LOG("\n[expert_pager] release: %.0f ms unregistering, %.0f ms mapping again\n", st_unreg_ms, st_remap_ms);
+    if (st_cpu)
+        INFER_LOG("[expert_pager] %lld experts of tokens computed on the CPU (%.1f%% of %llu), %.0f ms: %.2f ms each\n",
+                  st_cpu, 300.0 * st_cpu / (double)all, all / 3, st_cpu_ms, st_cpu_ms / st_cpu);
     if (pr_total)
         INFER_LOG("[expert_pager] a token's experts that the same layer used for one of the last 1 / 2 / 4 / 8 tokens: "
                   "%.1f%% / %.1f%% / %.1f%% / %.1f%% (%lld reads)\n", 100.0 * pr_hit[0] / pr_total,
