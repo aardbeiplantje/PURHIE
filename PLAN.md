@@ -167,7 +167,8 @@ computed right): 1.5 tok/s over 284 tokens at the 80 GB budget, first text after
 within that), 1.54 ms each (0.28 when cached: ~1.25 ms is the disk, ~3.4 GB/s) + 0.69 ms a release. So per token
 (~650 ms): ~370 disk, ~200 register / release overhead, ~100 GPU. The template needs minijinja's `loop_controls`
 (`{% break %}`): `cargo build --release --features minijinja/loop_controls` in perl-minijinja-xs/minijinja/
-minijinja-cabi - scripts/setup-minijinja.sh (and the Docker build) do not pass it yet. Open: (1) the default budget rule is untested (only
+minijinja-cabi - scripts/setup-minijinja.sh passes it since perl-minijinja-xs 4cddee9 (the Docker build runs that
+script: to rebuild there). Open: (1) the default budget rule is untested (only
 explicit budgets were run), and a larger budget (~100 GB) may fit; (2) the miss rate of real text: the routing trace, which the pager's counters
 now give (`INFERENCE_VERBOSE`: registered / released at the free); (3) a cheaper miss (the remap drops the page
 tables: registering again faults 1088 pages in; try 2 MB-aligned units or MADV_POPULATE_READ on a CPU thread
