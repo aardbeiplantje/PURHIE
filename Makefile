@@ -274,8 +274,8 @@ uninstall:
 	rm -f $(INSTALL_PKGCONFIGDIR)/rocm-inference.pc
 
 # Phase 4: Qwen 3 model static library
-QWEN_SRCS = $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_ops.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/deltanet.cpp $(SRCDIR)/attention.cpp $(SRCDIR)/gpu_ops.cpp $(SRCDIR)/kernel_loader.cpp
-QWEN_HDRS = $(SRCDIR)/qwen_model.h $(SRCDIR)/qwen_ops.h $(SRCDIR)/qmatvec.h $(SRCDIR)/deltanet.h $(SRCDIR)/attention.h $(SRCDIR)/gpu_ops.h $(SRCDIR)/inference_internal.h $(SRCDIR)/kernel_loader.h $(SRCDIR)/inference_log.h
+QWEN_SRCS = $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_ops.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/deltanet.cpp $(SRCDIR)/attention.cpp $(SRCDIR)/gpu_ops.cpp $(SRCDIR)/kernel_loader.cpp $(SRCDIR)/glm5_ref.cpp
+QWEN_HDRS = $(SRCDIR)/qwen_model.h $(SRCDIR)/qwen_ops.h $(SRCDIR)/qmatvec.h $(SRCDIR)/deltanet.h $(SRCDIR)/attention.h $(SRCDIR)/gpu_ops.h $(SRCDIR)/inference_internal.h $(SRCDIR)/kernel_loader.h $(SRCDIR)/inference_log.h $(SRCDIR)/glm5_ref.h
 # The engine's code objects, embedded in the library (kernels_embed.S, loaded by kernel_loader.cpp)
 ENGINE_COS = $(CODIR)/matvec_q.co $(CODIR)/gpu_ops.co $(CODIR)/deltanet.co $(CODIR)/attention.co
 
@@ -290,8 +290,9 @@ $(QWEN_MODEL_LIB): $(QWEN_SRCS) $(QWEN_HDRS) $(SRCDIR)/inference.h $(SRCDIR)/ggu
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/attention.cpp -o $(OBJDIR)/attention.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/gpu_ops.cpp -o $(OBJDIR)/gpu_ops.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/kernel_loader.cpp -o $(OBJDIR)/kernel_loader.o
+	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/glm5_ref.cpp -o $(OBJDIR)/glm5_ref.o
 	rm -f $@
-	ar rcs $@ $(OBJDIR)/qwen_model.o $(OBJDIR)/qwen_ops.o $(OBJDIR)/qmatvec.o $(OBJDIR)/deltanet.o $(OBJDIR)/attention.o $(OBJDIR)/gpu_ops.o $(OBJDIR)/kernel_loader.o $(OBJDIR)/kernels_embed.o
+	ar rcs $@ $(OBJDIR)/qwen_model.o $(OBJDIR)/qwen_ops.o $(OBJDIR)/qmatvec.o $(OBJDIR)/deltanet.o $(OBJDIR)/attention.o $(OBJDIR)/gpu_ops.o $(OBJDIR)/kernel_loader.o $(OBJDIR)/glm5_ref.o $(OBJDIR)/kernels_embed.o
 
 # Phase 4: Qwen 3 demo binary
 $(QWEN_DEMO): $(SRCDIR)/demo_qwen.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/matvec_q.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/gpu_ops.co

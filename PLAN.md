@@ -98,10 +98,17 @@ mHC `HcSinkhorn` hcs_attn / hcs_ffn, MLA `W_q_a` .. `W_v_b`, the indexer `W_ix_*
 SwiGLU clamps), shape-checked against the hparams; `inference_model_info` counts the latent + indexer rows per
 position for the cache; `inference_kv_cache_init` (and `qwen_model_create`) refuse with "the forward pass is not
 implemented yet" (`tests/glm5next_verify.sh`, quick tier: the tiny model as FAST, every block's kind, slots, FFNs,
-the refusal). The MTP block (blk.N) is not bound yet; (b) a `glm5next_verify` like `qwen4exp_verify` (teacher-forced per-layer cosines against the
-acts, then whole-model logits); (c) the forward pass, GPU kernels on FAST weights: mHC pre / post (the Sinkhorn
-on a 4x4 per token), KDA (per-channel decay in `deltanet`), the indexer (pool, score, top-k by the `moe_router`
-machinery, ties to the lower index), sparse MLA decode over the selected latents; (d) the routing trace of item 1
+the refusal). The MTP block (blk.N) is not bound yet; (b) the CPU forward pass - done 2026-11-11:
+`src/glm5_ref.cpp` (Glm5Ref: mHC with Sinkhorn, KDA with the per-channel decay, MLA over the latent with the
+k-pool DSA indexer, sigmoid MoE + shared expert with the SwiGLU clamps; weights decoded row by row in place) equals
+upstream's glm5-next on the tiny model to cosine 1.000000 in every layer, teacher-forced at all 50 positions, and
+end to end (logits, argmax); `glm5next_verify` checks it whenever the oracle is built. Indexer ties: equal pool
+scores across the top-k boundary (all heads' ReLU 0 gives exact zeros) are picked by the lower pool index here;
+llama.cpp's top_k is std::partial_sort, unordered, so it has no rule to match - the GPU kernels follow ours, and
+decode and prefill must pick alike; (c) a `glm5next_verify` like `qwen4exp_verify` (teacher-forced per-layer cosines against the
+acts, then whole-model logits); (c) the forward pass, GPU kernels on FAST weights, each checked against Glm5Ref: mHC pre / post
+(the Sinkhorn on a 4x4 per token), KDA (per-channel decay in `deltanet`), the indexer (pool, score, top-k by the
+`moe_router` machinery, ties to the lower index), sparse MLA decode over the selected latents; (d) the routing trace of item 1
 on the real file, once the deployment can spare the memory.
 
 Config read from huggingface.co/zai-org/GLM-5.3-Flash/raw/main/config.json on 2026-11-06; the numbers below are

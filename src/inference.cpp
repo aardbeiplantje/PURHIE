@@ -915,6 +915,7 @@ static bool load_glm5next(inference_model* m, GlmShape& g) {
     m->ix_topk = I("attention.indexer.top_k", 0);
     m->ix_kpool = I("attention.indexer.kpool", 0);
     m->ix_select_tail = I("attention.indexer.kpool_select_tail", 1) != 0;
+    m->ln_eps = F("attention.layer_norm_epsilon", 1e-6f);
     m->expert_weights_scale = F("expert_weights_scale", 1.0f);
     m->expert_weights_norm = I("expert_weights_norm", 1) != 0;
     m->n_head_kv = 0;

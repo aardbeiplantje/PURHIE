@@ -354,6 +354,7 @@ struct inference_model {
     int q_lora = 0, kv_lora = 0, k_mla = 0, v_mla = 0;  // MLA widths (NoPE: k_mla is all nope)
     int ix_heads = 0, ix_dim = 0, ix_topk = 0, ix_kpool = 0;
     bool ix_select_tail = true;
+    float ln_eps = 1e-6f;                               // attention.layer_norm_epsilon: the indexer key's LayerNorm
     int n_mla_layers = 0;                               // MLA layers: latent cache layers (kv_slot)
 };
 
