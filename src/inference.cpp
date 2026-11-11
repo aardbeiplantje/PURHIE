@@ -139,7 +139,7 @@ static bool pin_gguf(gguf_model_t* gguf, std::vector<const QuantWeight*> cpu_onl
         const auto pr = pager->ranges();
         skip.insert(skip.end(), pr.begin(), pr.end());
         std::sort(skip.begin(), skip.end());
-        paged_bytes = pager->total;
+        paged_bytes = pager->span_bytes;
     }
     pinned_bytes = unpinned_bytes = 0;
     for (int i = 0; i < gguf_n_maps(gguf); ++i) {
@@ -240,7 +240,7 @@ static void make_expert_pager(inference_model* m) {
     if (env) {
         p->budget = (size_t)atoll(env) << 20;
     } else {  // what is available, less the rest of the model and 16 GB for the caches, the states and the system
-        const size_t rest = file - p->total + ((size_t)16 << 30), avail = avail_kb << 10;
+        const size_t rest = file - p->span_bytes + ((size_t)16 << 30), avail = avail_kb << 10;
         p->budget = avail > rest + ((size_t)8 << 30) ? avail - rest : (size_t)8 << 30;
     }
     m->pager = p;

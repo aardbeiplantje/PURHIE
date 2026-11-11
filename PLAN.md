@@ -152,9 +152,16 @@ On the slice (18.3 GB of experts): results bit for bit the same with a 2 GB budg
 third run); with room for all of them decode costs nothing extra (11.9 ms/token either way: the drain per MoE
 layer is free, and it stops once everything is registered); a miss costs ~0.57 ms a unit with the pages in the
 page cache (0.28 registering, 0.29 unregistering + remapping), ~1.7 ms an expert - the bench's random tokens at a
-2 GB budget: 25 ms/token. Open: (1) the whole file - the budget rule (MemAvailable less the rest of the model and
-16 GB) is untested, as is a miss from the disk and whether the kernel really drops released pages under pressure
-(shown only in a standalone test); (2) the miss rate of real text: the routing trace, which the pager's counters
+2 GB budget: 25 ms/token. **The whole file runs (2026-11-11, deployment down, INFERENCE_EXPERT_PIN_MB=80000):**
+loads in seconds with 8.5 GB held; `glm5next_verify --bench <file> 16 1000` (pseudo-random prompt, greedy decode:
+routing spread over nearly all experts, close to a worst case): decode 472 ms/token, of it 337 ms in the pager -
+19% of the 1,008 expert tensors a token reads are misses, 1.7 ms each (1.15 registering incl. the read from disk,
+0.6 releasing); the other 135 ms/token is 3x the projection for all-resident weights (the drains, and the GPU's
+first read of newly registered pages?) - to profile. Memory pressure stayed under 4%. The first try held 79 GB at
+load and crawled: the single pages shared by neighbouring experts were registered for good, and a registered page
+keeps its 2 MB folio; they are now registered while a neighbour is, and the budget counts folios (it overcounts
+shared ones: an 80 GB budget is ~12,800 of the 36,288 units). Open: (1) the default budget rule is untested (only
+explicit budgets were run), and a larger budget (~100 GB) may fit; (2) the miss rate of real text: the routing trace, which the pager's counters
 now give (`INFERENCE_VERBOSE`: registered / released at the free); (3) a cheaper miss (the remap drops the page
 tables: registering again faults 1088 pages in; try 2 MB-aligned units or MADV_POPULATE_READ on a CPU thread
 while the GPU runs the attention); (4) the MTP block's experts are registered with the rest (3.6 GB); (5) a

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -15,19 +16,48 @@ int ExpertPager::add_tensor(const void* data, size_t expert_bytes, int n) {
     const uintptr_t page = (uintptr_t)sysconf(_SC_PAGESIZE);
     if (!data || n <= 0 || expert_bytes < 2 * page) return -1;
     const int first = (int)units.size();
+    // what a registered page keeps in memory is its folio of the page cache: 2 MB as the file is mapped
+    const char* env = getenv("GGUF_HUGE");
+    const uintptr_t folio = env && env[0] == '0' ? page : (uintptr_t)2 << 20;
     for (int e = 0; e < n; ++e) {
         const uintptr_t b0 = (uintptr_t)data + (size_t)e * expert_bytes;
         const uintptr_t b = (b0 + page - 1) / page * page, end = (b0 + expert_bytes) / page * page;
-        units.push_back({(char*)b, (size_t)(end - b), -1, -1, 0, false});
-        total += (size_t)(end - b);
+        Unit u{(char*)b, (size_t)(end - b), 0, {-1, -1}, -1, -1, 0, false};
+        // the page it shares with the expert before it (the one after it: that expert's)
+        if (e > 0 && b != b0) {
+            u.edge[0] = (int)edges.size();
+            units.back().edge[1] = (int)edges.size();
+            edges.push_back({(char*)(b - page), 0});
+        }
+        u.cost = (size_t)((end + (e + 1 < n && end != b0 + expert_bytes ? page : 0) + folio - 1) / folio * folio -
+                          (b - (u.edge[0] >= 0 ? page : 0)) / folio * folio);
+        total += u.cost;
+        units.push_back(u);
     }
+    const uintptr_t t0 = ((uintptr_t)data + page - 1) / page * page, t1 = ((uintptr_t)data + (size_t)n * expert_bytes) / page * page;
+    spans.push_back({(const char*)t0, (const char*)t1});
+    span_bytes += (size_t)(t1 - t0);
     return first;
 }
 
+// An edge page is registered while an expert on either side of it is
+bool ExpertPager::edge_ref(int i) {
+    if (i < 0 || edges[i].refs++ > 0) return true;
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    if (hipHostRegister(edges[i].p, page, hipHostRegisterReadOnly) == hipSuccess) return true;
+    --edges[i].refs;
+    return false;
+}
+
+void ExpertPager::edge_unref(int i) {
+    if (i < 0 || --edges[i].refs > 0) return;
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    (void)hipHostUnregister(edges[i].p);
+    (void)gguf_remap(gguf, edges[i].p, page);
+}
+
 std::vector<std::pair<const char*, const char*>> ExpertPager::ranges() const {
-    std::vector<std::pair<const char*, const char*>> r;
-    r.reserve(units.size());
-    for (const Unit& u : units) r.push_back({u.p, u.p + u.len});
+    std::vector<std::pair<const char*, const char*>> r = spans;
     std::sort(r.begin(), r.end());
     return r;
 }
@@ -54,9 +84,11 @@ bool ExpertPager::release(int i) {
     (void)hipHostUnregister(u.p);
     unlink(i);
     u.reg = false;
-    registered -= u.len;
+    registered -= u.cost;
     --n_registered;
     ++st_released;
+    edge_unref(u.edge[0]);
+    edge_unref(u.edge[1]);
     if (gguf_remap(gguf, u.p, u.len) != 0) {
         INFER_LOG("[expert_pager] cannot map %zu bytes of the model again: they stay resident\n", u.len);
         return false;
@@ -86,7 +118,7 @@ bool ExpertPager::use(const int* first, int nt, int n_expert, const int* ids, in
                 push_front(ui);
             } else {
                 add.push_back(ui);
-                need += u.len;
+                need += u.cost;
             }
         }
     }
@@ -109,9 +141,14 @@ bool ExpertPager::use(const int* first, int nt, int n_expert, const int* ids, in
             ok = false;
             break;
         }
+        if (!edge_ref(u.edge[0]) || !edge_ref(u.edge[1])) {
+            INFER_LOG("[expert_pager] hipHostRegister(a page between two experts) failed\n");
+            ok = false;  // (the unit stays unlisted but registered: release_all does not see it, the unmap frees it)
+            break;
+        }
         u.reg = true;
         push_front(ui);
-        registered += u.len;
+        registered += u.cost;
         ++n_registered;
         ++st_registered;
     }
@@ -131,6 +168,10 @@ void ExpertPager::release_all() {
             u.reg = false;
             u.prev = u.next = -1;
         }
+    for (Edge& e : edges) {
+        if (e.refs > 0) (void)hipHostUnregister(e.p);
+        e.refs = 0;
+    }
     head = tail = -1;
     registered = 0;
     n_registered = 0;
