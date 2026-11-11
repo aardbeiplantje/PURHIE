@@ -40,6 +40,8 @@ PROMPTS = [
     b" leading space, two  spaces,   three",
     b"\xe2\x96\x81 literal lower one eighth block \xe2\x96\x81\xe2\x96\x81",
     b"text</s>more <eos> and <pad>",
+    # GLM-5 (glm4 pre-tokenizer: digits in runs of three, whole words looked up before merging)
+    b"[gMASK]<sop><|system|>\nYou are helpful.<|user|>\nCount 1234567 and 2026-11-11, please<|assistant|>\n<think>ok</think>",
 ]
 
 

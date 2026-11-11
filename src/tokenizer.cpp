@@ -9,7 +9,7 @@
 //      so ' ' becomes 'Ġ'), the alphabet the vocab and merges are written in.
 //   4. BPE: adjacent symbols are merged lowest merge rank first (leftmost on ties) until no pair is in
 //      the merge table; each final symbol is looked up in the vocab.
-// Supported pre-tokenizers: qwen35, qwen2 (and models that share their regex).
+// Supported pre-tokenizers: qwen35, qwen2, llama3 (and models that share their regex: pixtral, glm4 / glm5).
 //
 // tokenizer.ggml.model = "gemma4" is SentencePiece-style BPE instead (llama.cpp's LLAMA_VOCAB_PRE_TYPE_GEMMA4):
 // stage 2 splits only into runs of newlines and runs of other text, after every space became U+2581; stage 3
@@ -140,7 +140,7 @@ enum PreType { PRE_QWEN2, PRE_QWEN35, PRE_GEMMA4, PRE_LLAMA3, PRE_SPM };
 // Word lengths (in codepoints) for llama.cpp's qwen2 / qwen35 regex:
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N} | ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
 // qwen35 treats combining marks (\p{M}) as letters in the letter run and the punctuation run. llama3 (also
-// llama.cpp's pre-tokenizer for pixtral, Nemotron-3) is qwen2's with \p{N}{1,3}: digits in runs of up to max_digits.
+// llama.cpp's pre-tokenizer for pixtral, Nemotron-3, GLM-4 / 5) is qwen2's with \p{N}{1,3}: digits in runs of up to max_digits.
 // Port of unicode_regex_split_custom_qwen2/_qwen35/_llama3.
 std::vector<size_t> split_qwen(const std::vector<uint32_t>& cpts, bool marks, int max_digits = 1) {
     std::vector<size_t> words;
@@ -612,10 +612,10 @@ tokenizer_t* tokenizer_load_from_gguf(void* gguf_model) {
     else if (pre && strcmp(pre, "qwen35") == 0) pt = PRE_QWEN35;
     else if (pre && strcmp(pre, "qwen2") == 0) pt = PRE_QWEN2;
     else if (pre && (!strcmp(pre, "llama3") || !strcmp(pre, "llama-v3") || !strcmp(pre, "llama-bpe") ||
-                     !strcmp(pre, "pixtral")))
-        pt = PRE_LLAMA3;
+                     !strcmp(pre, "pixtral") || !strcmp(pre, "glm4") || !strcmp(pre, "glm5")))
+        pt = PRE_LLAMA3;  // (glm4 / glm5, llama.cpp's CHATGLM4 with ignore_merges: the same regex and whole-word lookup)
     else {
-        INFER_LOG("[tokenizer] unsupported tokenizer.ggml.pre '%s' (supported: qwen35, qwen2, llama3, pixtral)\n",
+        INFER_LOG("[tokenizer] unsupported tokenizer.ggml.pre '%s' (supported: qwen35, qwen2, llama3, pixtral, glm4)\n",
                   pre ? pre : "");
         return nullptr;
     }

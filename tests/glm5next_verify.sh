@@ -2,7 +2,8 @@
 # glm5next_verify.sh <glm53-meta dir> [dir]: GLM-5.3-Flash (glm5-next) on a tiny random checkpoint
 # (tools/gen_glm5next_ckpt.py from the release's config and tokenizer in <glm53-meta dir>), converted to FAST by
 # rocm-convert (the Perl module built): tests/glm5next_verify.cpp, the loader, the GPU forward pass (prefill = token
-# by token; then on the float path = the CPU one, src/glm5_ref.cpp), and with the oracle the CPU forward pass
+# by token; then on the float path = the CPU one, src/glm5_ref.cpp), the tokenizer (glm4: llama.cpp's ids in
+# tests/data/glm5_tokenizer.tsv, tools/gen_tokenizer_ref.py), and with the oracle the CPU forward pass
 # against upstream llama.cpp's glm5-next on that file decoded to F32 (its activations, ref_dump acts on a 50-token
 # prompt). The oracle: build/ref_dump_stock linked to an upstream CPU build (make
 # ref_dump_stock REF_STOCK=<llama.cpp checkout> REF_STOCK_B=<its build>; PLAN.md GLM-5.3-Flash), REF_DUMP_STOCK to
@@ -31,8 +32,14 @@ else
     echo "(no oracle at $ORACLE: the loader only)"
 fi
 rc=0
-QMATVEC_NO_WMMA=1 "$ROOT/build/glm5next_verify" "$DIR/glm-tiny-fast.gguf" $REFS | grep -v '^\[LOAD\]\|^\[KV_INIT\]' || rc=1
-QWEN_MATVEC_FP32=1 "$ROOT/build/glm5next_verify" "$DIR/glm-tiny-fast.gguf" | grep -v '^\[LOAD\]\|^\[KV_INIT\]' || rc=1
+LOG=$DIR/run.log
+run() {  # the program's own exit status (not the filter's)
+    env "$@" > "$LOG" 2>&1 || rc=1
+    grep -v '^\[LOAD\]\|^\[KV_INIT\]' "$LOG"
+}
+"$ROOT/build/tokenizer_gguf_verify" "$DIR/glm-tiny-fast.gguf" "$HERE/data/glm5_tokenizer.tsv" | tail -1 | grep '^PASS' || rc=1
+run QMATVEC_NO_WMMA=1 "$ROOT/build/glm5next_verify" "$DIR/glm-tiny-fast.gguf" $REFS
+run QWEN_MATVEC_FP32=1 "$ROOT/build/glm5next_verify" "$DIR/glm-tiny-fast.gguf"
 find "$DIR" -delete
 [ $rc = 0 ] && echo "PASS: glm5-next tiny" || echo "FAIL: glm5-next tiny"
 exit $rc

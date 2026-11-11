@@ -1,6 +1,7 @@
 // glm5next_verify -- GLM-5.3-Flash (glm5-next) against the llama.cpp reference.
 //
-//   glm5next_verify <model.gguf> [ref_dir]
+//   glm5next_verify <model.gguf> [ref_dir | - [prompt.txt]]   (prompt.txt: a text instead of fixed token ids,
+//                                                                for a slice of a real model, tools/gguf_head.pl)
 //   glm5next_verify --bench <model.gguf> [prompt tokens] [decode tokens]   (speed: prefill, then decode tok/s;
 //                                                                           QWEN_PROFILE=1 adds the breakdown)
 //
@@ -134,15 +135,16 @@ static void verify_gpu(inference_model_t* m, const std::vector<int>& toks) {
         check(rc == 0, "GPU prefill");
         if (rc != 0) { printf("    %s\n", qwen_model_last_error()); return; }
         for (int l = 0; l < e.n_layer; ++l) {
-            double worst = 1.0;
+            double worst = 1.0, sum = 0.0;
             int wt = -1;
             for (int t = 0; t < T; ++t) {
                 const auto& g = c.at[(size_t)l * T + t];
                 const double cs = g.size() == (size_t)SE ? cosine(g.data(), cpu_streams[(size_t)l * T + t].data(), SE) : 0.0;
+                sum += cs;
                 if (cs < worst) worst = cs, wt = t;
             }
-            printf("    (int8 activations) GPU prefill blk.%d %s: streams worst cos vs CPU %.6f (position %d)\n", l,
-                   e.layers[l].kind == LAYER_KDA ? "KDA" : "MLA", worst, wt);
+            printf("    (int8 activations) GPU prefill blk.%d %s: streams cos vs CPU mean %.6f, worst %.6f (position %d)\n",
+                   l, e.layers[l].kind == LAYER_KDA ? "KDA" : "MLA", sum / T, worst, wt);
         }
         pre_last = lg;
     }
@@ -321,7 +323,7 @@ int main(int argc, char** argv) {
     if (argc >= 3 && !strcmp(argv[1], "--bench"))
         return bench(argv[2], argc > 3 ? atoi(argv[3]) : 512, argc > 4 ? atoi(argv[4]) : 32);
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <model.gguf> [ref_dir]\n", argv[0]);
+        fprintf(stderr, "usage: %s <model.gguf> [ref_dir | - [prompt.txt]]\n", argv[0]);
         return 2;
     }
     inference_model_info_t info;
@@ -380,12 +382,20 @@ int main(int argc, char** argv) {
     check(info.kv_bytes_per_token == (unsigned long long)full * 2 * (e.kv_lora + 3 * e.ix_dim),
           "inference_model_info: the latent + indexer cache per position (MLA layers incl. the MTP block)");
 
-    if (argc > 2) {
+    if (argc > 2 && strcmp(argv[2], "-")) {
         g_dir = argv[2];
         verify_ref(e);
     }
     std::vector<int> toks;
-    {
+    if (argc > 3) {  // a text of the model's own language (a slice of a real model: tools/gguf_head.pl)
+        std::ifstream f(argv[3]);
+        const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        int n = 0;
+        int32_t* ids = inference_tokenize(m, text.c_str(), &n);
+        for (int i = 0; ids && i < n && i < 200; ++i) toks.push_back(ids[i]);
+        inference_free_tokens(ids, n);
+        printf("    %s: %d tokens\n", argv[3], (int)toks.size());
+    } else {
         std::ifstream f(g_dir.empty() ? std::string() : g_dir + "/tokens.txt");
         int t;
         while (f >> t) toks.push_back(t);

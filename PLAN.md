@@ -112,9 +112,17 @@ top-k select (ties to the lower pool index), sparse MLA over the latents, head t
 matvecs, sigmoid router and MoE combine; GLM's caches and KDA state in its own pinned region (GlmState),
 `inference_kv_cache_init` gives it a stand-in one-layer KV cache. Checked (`glm5next_verify.sh`): on the float
 path decode = Glm5Ref at every step (cos 1.000000, all argmax); with QMATVEC_NO_WMMA=1 prefill = token by token
-bit for bit. On the int8 path against the CPU it drifts (logits cos ~0.82 by the end on the tiny model's random
-weights: near-tie indexer and router picks flip under the activation noise; layers before the first MLA layer are
-at 0.9995) - to look at on real weights. Speed (2026-11-11), measured on `GLM_BENCH=4,16` (tools/gen_glm5next_ckpt.py:
+bit for bit. On the int8 path against the CPU it drifts on the tiny model's random weights (logits cos ~0.82 by the end:
+near-tie indexer and router picks flip under the activation noise) - not so on real weights (2026-11-11): the
+release's first 8 blocks as a model (`tools/gguf_head.pl /models/GLM-5.3-Flash-FAST.gguf
+/data/conv/glm53-head8.gguf 8`: 3 dense KDA, 5 MoE, MLA + indexer at blk.3 and blk.7; 21.5 GB, kept there) give,
+on 200 tokens of English text, streams cos against the CPU of mean 0.99989 / worst 0.9948 after blk.7, logits
+worst 0.9970, the same argmax at 196 of 200 steps (other architectures' whole-model bar here: 0.99); on the float
+path GPU = CPU at every step (cos 1.000000) and with QMATVEC_NO_WMMA=1 prefill = token by token bit for bit, at
+the release's widths (`tests/glm5next_head_verify.sh`, full tier row glm5next_head8). The tokenizer: `glm4`
+(llama.cpp's CHATGLM4 + ignore_merges) is llama3's regex and whole-word lookup; ids equal upstream's on 28 prompts
+(tests/data/glm5_tokenizer.tsv, checked in glm5next_verify.sh) - before this the model loaded without a
+tokenizer. Speed (2026-11-11), measured on `GLM_BENCH=4,16` (tools/gen_glm5next_ckpt.py:
 the release's widths, 4 layers - KDA dense, 2 KDA + MoE, MLA + MoE - 16 experts; `glm5next_verify --bench`):
 decode 8.47 -> 7.5 ms/token (7.9 at 8k context), prefill 2,145 -> 3,700 tok/s at 512 tokens and 379 -> 2,320 at
 8,192. What did it: k_b / v_b as one expert-indexed matvec a layer (the heads as experts, int8, no transposes);
@@ -127,8 +135,8 @@ time; GLM's own kernels ~0.4 ms for the 4 layers). Projected to the release (45 
 ~45-50 ms/token before any expert paging. Open: prefill attention on WMMA (sparse MLA is ~40% of a long prefill:
 scalar FP32 over ~2k positions x 64 heads x 512 a token), a chunked KDA for prefill, an F16 latent cache (half the
 bytes), the MTP block, batched sequences, the stand-in KV cache's sequence features (store, checkpoints) for GLM's
-state; (d) the routing trace of item 1
-on the real file, once the deployment can spare the memory.
+state; the whole file end to end (staged: 171 GB does not fit, experts page in) - text out through the chat
+template, never run yet; (d) the routing trace of item 1 on the real file, once the deployment can spare the memory.
 
 Config read from huggingface.co/zai-org/GLM-5.3-Flash/raw/main/config.json on 2026-11-06; the numbers below are
 computed from it, not copied from its model card. 320B total / 18B active, 45 decoder layers, hidden 4096, vocab
