@@ -160,7 +160,14 @@ routing spread over nearly all experts, close to a worst case): decode 472 ms/to
 first read of newly registered pages?) - to profile. Memory pressure stayed under 4%. The first try held 79 GB at
 load and crawled: the single pages shared by neighbouring experts were registered for good, and a registered page
 keeps its 2 MB folio; they are now registered while a neighbour is, and the budget counts folios (it overcounts
-shared ones: an 80 GB budget is ~12,800 of the 36,288 units). Open: (1) the default budget rule is untested (only
+shared ones: an 80 GB budget is ~12,800 of the 36,288 units). **First text (2026-11-11):** `tools/glm_chat.pl` (ROCm::Inference::chat, the model's
+template) answers "why is the sky blue" coherently (its reasoning first: Rayleigh scattering, (700/450)^4 = 5.9
+computed right): 1.5 tok/s over 284 tokens at the 80 GB budget, first text after 15 s; 153 of 185 s in the pager -
+72,620 registrations (22% of the expert tensors read; the budget holds 35% of them, and real text does not stay
+within that), 1.54 ms each (0.28 when cached: ~1.25 ms is the disk, ~3.4 GB/s) + 0.69 ms a release. So per token
+(~650 ms): ~370 disk, ~200 register / release overhead, ~100 GPU. The template needs minijinja's `loop_controls`
+(`{% break %}`): `cargo build --release --features minijinja/loop_controls` in perl-minijinja-xs/minijinja/
+minijinja-cabi - scripts/setup-minijinja.sh (and the Docker build) do not pass it yet. Open: (1) the default budget rule is untested (only
 explicit budgets were run), and a larger budget (~100 GB) may fit; (2) the miss rate of real text: the routing trace, which the pager's counters
 now give (`INFERENCE_VERBOSE`: registered / released at the free); (3) a cheaper miss (the remap drops the page
 tables: registering again faults 1088 pages in; try 2 MB-aligned units or MADV_POPULATE_READ on a CPU thread
