@@ -159,10 +159,10 @@ now give (`INFERENCE_VERBOSE`: registered / released at the free); (3) a cheaper
 tables: registering again faults 1088 pages in; try 2 MB-aligned units or MADV_POPULATE_READ on a CPU thread
 while the GPU runs the attention); (4) the MTP block's experts are registered with the rest (3.6 GB); (5) a
 second context on the same model forwarding at the same time could have its experts released under it (one
-forward at a time is assumed everywhere; the pager would need use counts); (6) the same for deepseek4; (7) no registration at all: with `amdgpu.noretry=0` the GPU's page faults may be
-retried and the driver page the file in on demand, the kernel's LRU instead of the pager's - never tried (noretry
-is 1 here: a fault is fatal). `tools/gpu_demand_paging.cpp` tests it in six steps (build line in its header; it
-stops after the registered step while noretry is 1): to run after the user reboots with noretry=0, deployment down.
+forward at a time is assumed everywhere; the pager would need use counts); (6) the same for deepseek4; (7) no registration at all is not an option: tried 2026-11-11 after a boot with `amdgpu.noretry=0`
+(`tools/gpu_demand_paging.cpp`): a kernel reading an unregistered mapping whose pages are in memory hangs the GPU
+("HW Exception ... GPU Hang", MES stops answering, the desktop's ring times out, full GPU reset after ~20 s; no
+page fault logged). Do not repeat on this kernel / firmware; noretry=0 has no use here.
 
 Config read from huggingface.co/zai-org/GLM-5.3-Flash/raw/main/config.json on 2026-11-06; the numbers below are
 computed from it, not copied from its model card. 320B total / 18B active, 45 decoder layers, hidden 4096, vocab
