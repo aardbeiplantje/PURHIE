@@ -206,8 +206,9 @@ $(ATTN_VERIFY): $(TESTSDIR)/attn_verify.cpp $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/attn_verify.cpp $(SRCDIR)/kv_cache.cpp $(LDFLAGS) -o $@
 
 # Phase 4: Inference engine static library
-$(INFERENCE_LIB): $(SRCDIR)/inference.cpp $(SRCDIR)/inference.h $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/gguf_mmap.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/quant_types.h $(SRCDIR)/quantize.cpp $(SRCDIR)/quantize.h $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_cache.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/tokenizer.h $(SRCDIR)/unicode_flags.inc $(SRCDIR)/sampler.cpp $(SRCDIR)/sampler.h $(SRCDIR)/qwen_model.h $(SRCDIR)/sha256.cpp $(SRCDIR)/sha256.h $(SRCDIR)/inference_internal.h $(SRCDIR)/model_stage.cpp $(SRCDIR)/model_stage.h
+$(INFERENCE_LIB): $(SRCDIR)/inference.cpp $(SRCDIR)/inference.h $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/gguf_mmap.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/quant_types.h $(SRCDIR)/quantize.cpp $(SRCDIR)/quantize.h $(SRCDIR)/kv_cache.cpp $(SRCDIR)/kv_cache.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/tokenizer.h $(SRCDIR)/unicode_flags.inc $(SRCDIR)/sampler.cpp $(SRCDIR)/sampler.h $(SRCDIR)/qwen_model.h $(SRCDIR)/sha256.cpp $(SRCDIR)/sha256.h $(SRCDIR)/inference_internal.h $(SRCDIR)/model_stage.cpp $(SRCDIR)/model_stage.h $(SRCDIR)/expert_pager.cpp $(SRCDIR)/expert_pager.h
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/inference.cpp -o $(OBJDIR)/inference.o
+	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/expert_pager.cpp -o $(OBJDIR)/expert_pager.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/gguf_mmap.cpp -o $(OBJDIR)/gguf_mmap.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/quant_types.cpp -o $(OBJDIR)/quant_types.o
 	$(CLANG) $(CXXFLAGS) -ffp-contract=off -I. -fPIC -c $(SRCDIR)/quantize.cpp -o $(OBJDIR)/quantize.o
@@ -217,7 +218,7 @@ $(INFERENCE_LIB): $(SRCDIR)/inference.cpp $(SRCDIR)/inference.h $(SRCDIR)/gguf_m
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/sha256.cpp -o $(OBJDIR)/sha256.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/model_stage.cpp -o $(OBJDIR)/model_stage.o
 	rm -f $@
-	ar rcs $@ $(OBJDIR)/inference.o $(OBJDIR)/gguf_mmap.o $(OBJDIR)/quant_types.o $(OBJDIR)/quantize.o $(OBJDIR)/kv_cache.o $(OBJDIR)/tokenizer.o $(OBJDIR)/sampler.o $(OBJDIR)/sha256.o $(OBJDIR)/model_stage.o
+	ar rcs $@ $(OBJDIR)/inference.o $(OBJDIR)/gguf_mmap.o $(OBJDIR)/quant_types.o $(OBJDIR)/quantize.o $(OBJDIR)/kv_cache.o $(OBJDIR)/tokenizer.o $(OBJDIR)/sampler.o $(OBJDIR)/sha256.o $(OBJDIR)/model_stage.o $(OBJDIR)/expert_pager.o
 
 # Inference engine shared library (versioned): the whole engine (both archives, kernels embedded), exporting only
 # the public C API (src/libinference.map: inference_*, tokenizer_*, sampler_*)
@@ -275,7 +276,7 @@ uninstall:
 
 # Phase 4: Qwen 3 model static library
 QWEN_SRCS = $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_ops.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/deltanet.cpp $(SRCDIR)/attention.cpp $(SRCDIR)/gpu_ops.cpp $(SRCDIR)/kernel_loader.cpp $(SRCDIR)/glm5_ref.cpp $(SRCDIR)/glm5_gpu.cpp
-QWEN_HDRS = $(SRCDIR)/qwen_model.h $(SRCDIR)/qwen_ops.h $(SRCDIR)/qmatvec.h $(SRCDIR)/deltanet.h $(SRCDIR)/attention.h $(SRCDIR)/gpu_ops.h $(SRCDIR)/inference_internal.h $(SRCDIR)/kernel_loader.h $(SRCDIR)/inference_log.h $(SRCDIR)/glm5_ref.h $(SRCDIR)/glm5_gpu.h
+QWEN_HDRS = $(SRCDIR)/expert_pager.h $(SRCDIR)/qwen_model.h $(SRCDIR)/qwen_ops.h $(SRCDIR)/qmatvec.h $(SRCDIR)/deltanet.h $(SRCDIR)/attention.h $(SRCDIR)/gpu_ops.h $(SRCDIR)/inference_internal.h $(SRCDIR)/kernel_loader.h $(SRCDIR)/inference_log.h $(SRCDIR)/glm5_ref.h $(SRCDIR)/glm5_gpu.h
 # The engine's code objects, embedded in the library (kernels_embed.S, loaded by kernel_loader.cpp)
 ENGINE_COS = $(CODIR)/matvec_q.co $(CODIR)/gpu_ops.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/glm5_gpu.co
 

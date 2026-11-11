@@ -10,8 +10,9 @@
 2. **Concurrent runs** in rocm-inference-server (section below).
 3. **Server logging** (section below): implemented and tested (`t/62-server-log.t`); the Flash soak run is open.
 4. **GLM-5.3-Flash (`glm5_next`) as an architecture** (section below): the gate is memory capacity, not kernels -
-   95% of its 320B params are expert weights, and none of FP8 / FP4 / Q4_0 fits 128 GB, so it would page experts in from disk
-   (the deployment maps models from disk; expert pin / unpin is tabled) - measure that first. Start with the tiny GGUF generator, not the kernels. A first attempt
+   95% of its 320B params are expert weights, and none of FP8 / FP4 / Q4_0 fits 128 GB, so it reads experts from disk:
+   they are registered on demand, least recently used released (section below, done 2026-11-11 on the 8-block
+   slice; the whole file not run yet) - measure that first. Start with the tiny GGUF generator, not the kernels. A first attempt
    (4fe7dae, another agent; reverted in d4a45fa) skipped the gate and the oracle: tensor names unlike `glm-dsa`'s, a
    tiny GGUF its own loader refused, and a DSA path that reweighted dense attention output instead of selecting keys.
 
@@ -135,8 +136,30 @@ time; GLM's own kernels ~0.4 ms for the 4 layers). Projected to the release (45 
 ~45-50 ms/token before any expert paging. Open: prefill attention on WMMA (sparse MLA is ~40% of a long prefill:
 scalar FP32 over ~2k positions x 64 heads x 512 a token), a chunked KDA for prefill, an F16 latent cache (half the
 bytes), the MTP block, batched sequences, the stand-in KV cache's sequence features (store, checkpoints) for GLM's
-state; the whole file end to end (staged: 171 GB does not fit, experts page in) - text out through the chat
-template, never run yet; (d) the routing trace of item 1 on the real file, once the deployment can spare the memory.
+state; the whole file end to end - text out through the chat template, never run yet (ask the user before loading
+it on the shared host); (d) the routing trace of item 1 on the real file, once the deployment can spare the memory.
+
+**Experts registered on demand (2026-11-11, user: "go with option 1"; `src/expert_pager.h`).** What registration
+is on this stack (kernel 6.17 OEM, ROCm 7, measured with strace and mincore): `hipHostRegister` makes the range a
+KFD SVM range, which the driver keeps resident (pages evicted from it are read back within 0.2 s, launch or not) -
+so what is registered has to fit in memory, and registering all 171 GB would thrash. `hipHostUnregister` issues no
+ioctl and does not let go of the range; mapping the file over it again (`gguf_remap`: MAP_FIXED) does, and the VMAs
+merge back. So: the experts of glm5-next's MoE layers (one unit an expert of one tensor, 4.25 MB, its whole pages)
+are left out of the load's registration when the file is more than 3/4 of the memory (or `INFERENCE_EXPERT_PIN_MB=N`:
+at most N MB of them; 0: never); `glm_ffn` drains the queue after the router and hands the routed ids to the pager,
+which registers the new ones (MADV_WILLNEED on all first) and releases the least recently used over the budget.
+On the slice (18.3 GB of experts): results bit for bit the same with a 2 GB budget (`glm5next_head_verify.sh`'s
+third run); with room for all of them decode costs nothing extra (11.9 ms/token either way: the drain per MoE
+layer is free, and it stops once everything is registered); a miss costs ~0.57 ms a unit with the pages in the
+page cache (0.28 registering, 0.29 unregistering + remapping), ~1.7 ms an expert - the bench's random tokens at a
+2 GB budget: 25 ms/token. Open: (1) the whole file - the budget rule (MemAvailable less the rest of the model and
+16 GB) is untested, as is a miss from the disk and whether the kernel really drops released pages under pressure
+(shown only in a standalone test); (2) the miss rate of real text: the routing trace, which the pager's counters
+now give (`INFERENCE_VERBOSE`: registered / released at the free); (3) a cheaper miss (the remap drops the page
+tables: registering again faults 1088 pages in; try 2 MB-aligned units or MADV_POPULATE_READ on a CPU thread
+while the GPU runs the attention); (4) the MTP block's experts are registered with the rest (3.6 GB); (5) a
+second context on the same model forwarding at the same time could have its experts released under it (one
+forward at a time is assumed everywhere; the pager would need use counts); (6) the same for deepseek4.
 
 Config read from huggingface.co/zai-org/GLM-5.3-Flash/raw/main/config.json on 2026-11-06; the numbers below are
 computed from it, not copied from its model card. 320B total / 18B active, 45 decoder layers, hidden 4096, vocab
@@ -160,8 +183,8 @@ tensor shapes before sizing anything.
    12-14 / 23-27 were estimates with no stated efficiency; measure them before quoting. So "can we run it" is a routing-trace question, not a kernel question:
    route ~10k tokens through the router alone (small enough to run on CPU from a quantized copy), count the
    distinct experts hit per layer, and settle the target bpw + the pinned fraction **before** writing a kernel.
-   With expert pin / unpin tabled (2026-11-08) the cold part pages in from disk through the mapping: the routing
-   trace says how much of it a token touches.
+   The cold part is read from disk through the mapping, registered on demand (above): the routing trace says how
+   much of it a token touches.
 2. **The converter and the loader, no kernels.** The converter is done (`rocm-convert`, the GGUF names of upstream
    llama.cpp's `glm5-next`: `ssm_*` / `attn_q_a` / `attn_k_b` / `indexer.*` / `hc_*` / `blk.45.nextn.*`; see ▶ Next
    item 5); the GGUF's tensor table is what the loader binds. The loader dispatches on `general.architecture` against a
@@ -363,8 +386,6 @@ Tests and API:
 
 - Older architectures: gpt-oss, deepseek2, glm4, phi3, gemma2 / gemma3, Mistral (user, 2026-11-04).
 - The ROCmFP4_FAST WMMA kernel work (user, 2026-11-04: "move on, table this for now").
-- Expert pin / unpin for MoE models larger than memory (user, 2026-11-08: "we dont do that now, we just mmap()
-  from disk"): the deployment maps the models from disk; a model larger than memory pages in from there.
 - A CPAN release of ROCm::Inference, Minijinja and Web::Route (user, 2026-11-05: the Docker image builds them
   from source).
 

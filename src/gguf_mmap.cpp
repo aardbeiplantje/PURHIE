@@ -140,6 +140,7 @@ struct gguf_model {
     size_t          data_offs[GGUF_MAX_SPLITS];
     char           *paths[GGUF_MAX_SPLITS];     /* each file's path */
     uint64_t        ids[GGUF_MAX_SPLITS][4];    /* each file's device, inode, size, mtime (ns) at open */
+    int             fds[GGUF_MAX_SPLITS];       /* gguf_remap: each file open again, fd + 1 (0: not yet) */
 };
 
 /* ---------------------------------------------------------------------------
@@ -374,6 +375,10 @@ static void free_meta(gguf_model_t *model) {
 static void unmap_all(gguf_model_t *model) {
     for (int i = 0; i < model->n_maps; ++i)
         if (model->maps[i]) munmap(model->maps[i], model->map_sizes[i]);
+    for (int i = 0; i < GGUF_MAX_SPLITS; ++i) {
+        if (model->fds[i] > 0) close(model->fds[i] - 1);
+        model->fds[i] = 0;
+    }
     model->n_maps = 0;
     model->map_ptr = NULL;
 }
@@ -963,6 +968,33 @@ int gguf_file_identity(const gguf_model_t *m, int i, uint64_t out[4]) {
     if (!m || i < 0 || i >= m->n_maps) return -1;
     memcpy(out, m->ids[i], sizeof(m->ids[i]));
     return 0;
+}
+
+int gguf_remap(gguf_model_t *m, const void *p, size_t len) {
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    if (!m || !p || !len || (uintptr_t)p % page || len % page) return -1;
+    for (int i = 0; i < m->n_maps; ++i) {
+        const char *base = (const char *)m->maps[i];
+        if ((const char *)p < base || (const char *)p + len > base + m->map_sizes[i]) continue;
+        if (m->fds[i] <= 0) {  /* the same file as at open, or none */
+            struct stat st;
+            const int fd = open(m->paths[i], O_RDONLY);
+            if (fd < 0) return -1;
+            if (fstat(fd, &st) != 0 || (uint64_t)st.st_dev != m->ids[i][0] || (uint64_t)st.st_ino != m->ids[i][1] ||
+                (uint64_t)st.st_size != m->ids[i][2]) {
+                close(fd);
+                return -1;
+            }
+            m->fds[i] = fd + 1;
+        }
+        if (mmap((void *)p, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, m->fds[i] - 1, (off_t)((const char *)p - base)) ==
+            MAP_FAILED)
+            return -1;
+        const char *env = getenv("GGUF_HUGE");
+        if (!(env && env[0] == '0')) (void)madvise((void *)p, len, MADV_HUGEPAGE);  /* as map_file: merges back */
+        return 0;
+    }
+    return -1;
 }
 
 /* --- Low-level mmap access (for inference engine) --- */

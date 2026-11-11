@@ -1888,6 +1888,15 @@ struct QwenModel {
             return false;
         bool grouped = false;
         if (L.moe) {
+            // experts registered on demand: those the router chose, before anything reads them (the router's ids
+            // are needed here, so the queue is drained: nothing then reads an expert the pager releases)
+            if (eng->pager && !eng->pager->all_registered()) {
+                if (!sync()) return false;
+                if (!eng->pager->use(L.pg_unit, 3, NE, s.ids, T * NU)) {
+                    qwen_set_error("glm5-next: an expert could not be registered");
+                    return false;
+                }
+            }
             grouped = T >= 8 || inv;
             if (grouped) {
                 s.g_tile = std::min(qmatvec_id_batch_tile(L.We_gate.type, FE, E), qmatvec_id_batch_tile(L.We_down.type, E, FE));

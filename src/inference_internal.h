@@ -17,6 +17,7 @@
 #include "inference.h"       // opaque handle typedefs
 #include "gguf_mmap.h"        // gguf_model_t* forward decl
 #include "model_stage.h"      // ModelStage
+#include "expert_pager.h"     // ExpertPager
 #include "kv_cache.h"         // inference_kv_cache_t* forward decl
 #include "tokenizer.h"        // tokenizer_t typedef
 
@@ -102,6 +103,7 @@ struct LayerWeights {
     QuantWeight W_router;                             // ffn_gate_inp: F32 [n_expert x n_embd], router logits
     QuantWeight We_gate, We_up;                       // ffn_{gate,up}_exps: [n_expert * n_ff_exp x n_embd]
     QuantWeight We_down;                              // ffn_down_exps: [n_expert * n_embd x n_ff_exp]
+    int pg_unit[3] = {-1, -1, -1};                    // expert 0 of We_gate / We_up / We_down in m->pager (-1: not paged)
     const float* shexp_gate = nullptr;                // ffn_gate_inp_shexp: [n_embd] F32, shared-expert gate
     bool shexp = false;                               // a shared expert (W_gate / W_up / W_down); none in qwen3moe
 
@@ -238,6 +240,7 @@ struct inference_model {
     ModelStage stage;                                  // the GPU tensors' stage copy (inference_load_opts.stage_dir)
     std::string stage_info;                            // inference_stage_info
     size_t pinned_bytes = 0, unpinned_bytes = 0;       // registered / left to the CPU (token_embd, the PLE table)
+    ExpertPager* pager = nullptr;                      // the experts registered on demand, if any (expert_pager.h)
 
     QuantWeight token_embd;                            // [vocab x n_embd]; rows decoded on the CPU per token
     QuantWeight output;                                // LM head; same tensor as token_embd when tied

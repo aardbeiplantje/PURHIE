@@ -98,6 +98,11 @@ const void* gguf_map_base(const gguf_model_t *model, size_t* out_size);
  * gguf_n_maps of them, the i-th from gguf_map_at (0 is gguf_map_base). One for an unsplit file. */
 int          gguf_n_maps(const gguf_model_t *model);
 const void*  gguf_map_at(const gguf_model_t *model, int i, size_t* out_size);
+/* Map the whole pages [p, p + len) of a file's mapping again, in place (the same bytes at the same addresses, safe
+ * under readers): what a GPU registration of them holds in the kernel is dropped with the old mapping, which
+ * hipHostUnregister alone does not do (expert_pager.h). 0, or -1 (not whole pages of one mapping, or the file has
+ * been replaced since it was opened). */
+int          gguf_remap(gguf_model_t *model, const void *p, size_t len);
 
 /* Model staging (model_stage.cpp): tensor idx's bytes in its file's mapping (whatever was staged), its size, its
  * file (its size: gguf_tensor_nbytes); a copy elsewhere that gguf_get_tensor_ptr returns from now on (NULL: the mapping again); file i's path and

@@ -115,7 +115,7 @@ static std::string report_page_sizes(gguf_model_t* gguf) {
 
 static bool pin_gguf(gguf_model_t* gguf, std::vector<const QuantWeight*> cpu_only_w,
                      std::vector<std::pair<void*, size_t>>& pinned, size_t& pinned_bytes, size_t& unpinned_bytes,
-                     std::string* pages = nullptr) {
+                     std::string* pages = nullptr, const ExpertPager* pager = nullptr) {
     const size_t page = (size_t)sysconf(_SC_PAGESIZE);
     std::vector<std::pair<const char*, const char*>> skip;  // whole pages inside CPU-only tensors
     for (const QuantWeight* w : cpu_only_w) {
@@ -132,6 +132,14 @@ static bool pin_gguf(gguf_model_t* gguf, std::vector<const QuantWeight*> cpu_onl
     for (const auto& r : skip) {
         (void)madvise((void*)r.first, (size_t)(r.second - r.first), MADV_NOHUGEPAGE);
         (void)madvise((void*)r.first, (size_t)(r.second - r.first), MADV_RANDOM);
+    }
+    // ... and the experts registered on demand (expert_pager.h), which stay as the file is mapped
+    size_t paged_bytes = 0;
+    if (pager) {
+        const auto pr = pager->ranges();
+        skip.insert(skip.end(), pr.begin(), pr.end());
+        std::sort(skip.begin(), skip.end());
+        paged_bytes = pager->total;
     }
     pinned_bytes = unpinned_bytes = 0;
     for (int i = 0; i < gguf_n_maps(gguf); ++i) {
@@ -158,8 +166,12 @@ static bool pin_gguf(gguf_model_t* gguf, std::vector<const QuantWeight*> cpu_onl
         }
         if (!pin(base + size)) return false;
     }
+    unpinned_bytes -= paged_bytes;
     INFER_LOG("[pin_model] %d file(s): %zu MB registered, %zu MB left to the CPU\n", gguf_n_maps(gguf),
               pinned_bytes >> 20, unpinned_bytes >> 20);
+    if (pager)
+        INFER_LOG("[pin_model] experts: %zu MB registered on demand, at most %zu MB at a time\n", paged_bytes >> 20,
+                  pager->budget >> 20);
     const std::string p = report_page_sizes(gguf);
     if (pages) *pages = p;
     return true;
@@ -195,6 +207,45 @@ static bool pin_tensors(gguf_model_t* g, int il, std::vector<std::pair<void*, si
     return true;
 }
 
+// The experts registered on demand (expert_pager.h) when the model does not fit in memory, or as
+// INFERENCE_EXPERT_PIN_MB says: 0 never, N at most N MB of them at a time (unset: when the file is more than 3/4
+// of the memory, as much as is available now less what the rest of the model and the system take). glm5-next only
+// (the forward pass has to tell the pager which experts it is about to read: qwen_model.cpp glm_ffn); not the
+// MTP block's experts
+static void make_expert_pager(inference_model* m) {
+    if (!m->glm5 || m->n_expert <= 0) return;
+    const char* env = getenv("INFERENCE_EXPERT_PIN_MB");
+    if (env && atoll(env) <= 0) return;
+    size_t file = 0, total_kb = 0, avail_kb = 0;
+    for (int i = 0; i < gguf_n_maps(m->gguf); ++i) {
+        size_t sz = 0;
+        (void)gguf_map_at(m->gguf, i, &sz);
+        file += sz;
+    }
+    if (FILE* f = fopen("/proc/meminfo", "r")) {
+        char line[128];
+        while (fgets(line, sizeof line, f))
+            if (sscanf(line, "MemTotal: %zu kB", &total_kb) != 1) (void)sscanf(line, "MemAvailable: %zu kB", &avail_kb);
+        fclose(f);
+    }
+    if (!env && (total_kb == 0 || file <= (total_kb << 10) / 4 * 3)) return;
+    ExpertPager* p = new ExpertPager(m->gguf, 0);
+    for (LayerWeights& L : m->layers) {
+        if (!L.moe) continue;
+        QuantWeight* w[3] = {&L.We_gate, &L.We_up, &L.We_down};
+        for (int t = 0; t < 3; ++t)
+            L.pg_unit[t] = p->add_tensor(w[t]->data, w[t]->row_bytes * (size_t)(w[t]->N / m->n_expert), m->n_expert);
+    }
+    if (p->total == 0) { delete p; return; }
+    if (env) {
+        p->budget = (size_t)atoll(env) << 20;
+    } else {  // what is available, less the rest of the model and 16 GB for the caches, the states and the system
+        const size_t rest = file - p->total + ((size_t)16 << 30), avail = avail_kb << 10;
+        p->budget = avail > rest + ((size_t)8 << 30) ? avail - rest : (size_t)8 << 30;
+    }
+    m->pager = p;
+}
+
 static bool pin_model_memory(inference_model* m) {
     if (m->stage.base) {  // every tensor the GPU reads is in the stage: pin it, leave the GGUF mapping to the CPU
         const hipError_t e = hipHostRegister(m->stage.base, m->stage.bytes, hipHostRegisterReadOnly);
@@ -209,13 +260,17 @@ static bool pin_model_memory(inference_model* m) {
     }
     std::vector<const QuantWeight*> cpu_only = {&m->ple_table};
     if (m->output.data != m->token_embd.data) cpu_only.push_back(&m->token_embd);
+    make_expert_pager(m);
     std::string pages;
-    if (!pin_gguf(m->gguf, cpu_only, m->pinned, m->pinned_bytes, m->unpinned_bytes, &pages)) return false;
+    if (!pin_gguf(m->gguf, cpu_only, m->pinned, m->pinned_bytes, m->unpinned_bytes, &pages, m->pager)) return false;
     if (m->stage_info.empty()) m->stage_info = pages;  // (not staged: how the GGUF mapping is paged)
     return true;
 }
 
 static void unpin_model_memory(inference_model* m) {
+    if (m->pager) m->pager->release_all();
+    delete m->pager;
+    m->pager = nullptr;
     unpin(m->pinned);
 }
 

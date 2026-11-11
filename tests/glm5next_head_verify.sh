@@ -12,6 +12,8 @@ run() {  # the program's own exit status (not the filter's)
 }
 run QMATVEC_NO_WMMA=1 "$(dirname "$0")/../build/glm5next_verify" "$1"
 run QWEN_MATVEC_FP32=1 "$(dirname "$0")/../build/glm5next_verify" "$1"
+# ... and the same with the experts registered on demand, 2 GB of the slice's 18 at a time (src/expert_pager.h)
+run QMATVEC_NO_WMMA=1 INFERENCE_EXPERT_PIN_MB=2048 "$(dirname "$0")/../build/glm5next_verify" "$1"
 rm -f "$LOG"
 [ $rc = 0 ] && echo "PASS: glm5-next head" || echo "FAIL: glm5-next head"
 exit $rc
