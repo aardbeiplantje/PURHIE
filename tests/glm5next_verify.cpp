@@ -1,6 +1,8 @@
 // glm5next_verify -- GLM-5.3-Flash (glm5-next) against the llama.cpp reference.
 //
 //   glm5next_verify <model.gguf> [ref_dir]
+//   glm5next_verify --bench <model.gguf> [prompt tokens] [decode tokens]   (speed: prefill, then decode tok/s;
+//                                                                           QWEN_PROFILE=1 adds the breakdown)
 //
 // The model is normally tools/gen_glm5next_ckpt.py's tiny checkpoint converted to FAST (rocm-convert); ref_dir a
 // `ref_dump acts` directory of that file decoded to F32 (rocm-convert model.gguf model-f32.gguf f32) under
@@ -37,6 +39,7 @@
 #include "qwen_model.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -279,7 +282,44 @@ static void verify_ref(const inference_model& e) {
     check(cs >= 0.999 && cl >= 0.999 && am == rm, "whole model from the embeddings: streams, logits, argmax");
 }
 
+// --bench: prefill a prompt of fixed tokens, then decode greedily, timed (tools/gen_glm5next_ckpt.py's GLM_BENCH model:
+// the release's widths)
+static int bench(const char* path, int np, int nd) {
+    inference_model_t* m = inference_load_model(path);
+    if (!m || inference_kv_cache_init(m, np + nd + 16) != 0) {
+        printf("%s\n", inference_get_last_error());
+        return 1;
+    }
+    qwen_model_t* q = inference_get_qwen_model(m);
+    std::vector<int> toks;
+    for (int i = 0; i < np; ++i) toks.push_back((int)((785u + 7919u * (unsigned)i) % (unsigned)m->vocab_size));
+    std::vector<float> lg(m->vocab_size);
+    auto now = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    // a warm-up pass (kernel loads, first touches), then the timed ones
+    if (qwen_model_prefill(q, toks.data(), np, 0, lg.data()) != 0) { printf("%s\n", qwen_model_last_error()); return 1; }
+    qwen_model_profile_reset(q);
+    double t0 = now();
+    if (qwen_model_prefill(q, toks.data(), np, 0, lg.data()) != 0) { printf("%s\n", qwen_model_last_error()); return 1; }
+    const double tp = now() - t0;
+    qwen_model_profile_print(q, "prefill");
+    qwen_model_profile_reset(q);
+    int tok = (int)(std::max_element(lg.begin(), lg.end()) - lg.begin());
+    t0 = now();
+    for (int i = 0; i < nd; ++i) {
+        if (qwen_model_forward(q, tok, np + i, lg.data()) != 0) { printf("%s\n", qwen_model_last_error()); return 1; }
+        tok = (int)(std::max_element(lg.begin(), lg.end()) - lg.begin());
+    }
+    const double td = now() - t0;
+    qwen_model_profile_print(q, "decode");
+    printf("bench %s: %d layers, prefill %d tokens %.1f ms (%.1f tok/s), decode %d tokens %.2f ms/token (%.2f tok/s)\n",
+           path, m->n_layer, np, tp * 1e3, np / tp, nd, td * 1e3 / nd, nd / td);
+    inference_free_model(m);
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc >= 3 && !strcmp(argv[1], "--bench"))
+        return bench(argv[2], argc > 3 ? atoi(argv[3]) : 512, argc > 4 ? atoi(argv[4]) : 32);
     if (argc < 2) {
         fprintf(stderr, "usage: %s <model.gguf> [ref_dir]\n", argv[0]);
         return 2;

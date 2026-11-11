@@ -5,7 +5,8 @@ chat_template.jinja; huggingface.co/zai-org/GLM-5.3-Flash). The checkpoint has t
 (FP8 e4m3 weights with float32 128x128 block scales where the release has them, BF16 / F32 elsewhere), layer
 pattern (dense FFN first, KDA linear attention with sparse MLA every fourth layer, the MTP layer after the last) and
 tokenizer, at small widths, in two shards with an index: the input of tests/convert_verify.sh (rocm-convert against
-llama.cpp's convert_hf_to_gguf.py). Needs torch and safetensors.
+llama.cpp's convert_hf_to_gguf.py). GLM_BENCH=NL,E: the release's widths instead, NL layers and E experts (a speed
+benchmark). Needs torch and safetensors.
 """
 import json
 import math
@@ -21,15 +22,23 @@ os.makedirs(out, exist_ok=True)
 cfg = json.load(open(os.path.join(meta, "config.json")))
 t = cfg["text_config"]
 
-# The tiny widths: the dimensions FP8 blocks of 128 cover, and the release's head sizes where kernels assume them
-NL = 8          # decoder layers; the MTP layer is layer NL
-H = 256         # hidden
-t.update(hidden_size=H, intermediate_size=512, moe_intermediate_size=128, n_routed_experts=8, num_experts_per_tok=2,
-         num_hidden_layers=NL, num_attention_heads=2, num_key_value_heads=2, q_lora_rank=128, kv_lora_rank=128,
-         qk_nope_head_dim=64, qk_head_dim=64, v_head_dim=64, index_n_heads=4, index_head_dim=64, index_topk=16,
-         first_k_dense_replace=3)
 lin = t["linear_attn_config"]
-lin["num_heads"] = 2  # head_dim stays 128
+bench = os.environ.get("GLM_BENCH")
+if bench:
+    # GLM_BENCH=NL,E: the release's widths (a speed benchmark of its per-token work), NL layers (the first dense,
+    # every fourth MLA) and E routed experts (a token's work does not depend on how many there are)
+    NL, ne = (int(v) for v in bench.split(","))
+    H = t["hidden_size"]
+    t.update(num_hidden_layers=NL, n_routed_experts=ne, first_k_dense_replace=1)
+else:
+    # The tiny widths: the dimensions FP8 blocks of 128 cover, and the release's head sizes where kernels assume them
+    NL = 8          # decoder layers; the MTP layer is layer NL
+    H = 256         # hidden
+    t.update(hidden_size=H, intermediate_size=512, moe_intermediate_size=128, n_routed_experts=8, num_experts_per_tok=2,
+             num_hidden_layers=NL, num_attention_heads=2, num_key_value_heads=2, q_lora_rank=128, kv_lora_rank=128,
+             qk_nope_head_dim=64, qk_head_dim=64, v_head_dim=64, index_n_heads=4, index_head_dim=64, index_topk=16,
+             first_k_dense_replace=3)
+    lin["num_heads"] = 2  # head_dim stays 128
 kinds = ["deepseek_sparse_attention" if i % 4 == 3 else "linear_attention" for i in range(NL)]
 t["layer_types"] = kinds
 t["mlp_layer_types"] = ["dense" if i < t["first_k_dense_replace"] else "sparse" for i in range(NL)]

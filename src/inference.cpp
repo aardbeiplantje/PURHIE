@@ -933,6 +933,12 @@ static bool load_glm5next(inference_model* m, GlmShape& g) {
                   m->v_mla, m->ix_heads, m->ix_dim, m->ix_topk, m->ix_kpool, m->ssm_d_conv);
         return false;
     }
+    if (m->kda_head_dim != 128 || m->kv_lora % 32 != 0 || m->kv_lora > 512 || m->ix_dim % 32 != 0 || m->ix_dim > 256 ||
+        m->ix_heads * m->ix_dim > 8192 || m->ix_topk + m->ix_kpool > 2304) {  // the GPU kernels' (glm5_gpu.hip) limits
+        set_error("glm5-next: KDA head %d (128 supported), kv_lora %d, indexer %d x %d top %d not supported",
+                  m->kda_head_dim, m->kv_lora, m->ix_heads, m->ix_dim, m->ix_topk);
+        return false;
+    }
     if (gguf_arch_int(m->gguf, "rope.dimension_count", 0) != 0) {
         set_error("glm5-next: only NoPE MLA (rope.dimension_count 0) is supported");
         return false;

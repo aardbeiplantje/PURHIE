@@ -114,10 +114,20 @@ matvecs, sigmoid router and MoE combine; GLM's caches and KDA state in its own p
 path decode = Glm5Ref at every step (cos 1.000000, all argmax); with QMATVEC_NO_WMMA=1 prefill = token by token
 bit for bit. On the int8 path against the CPU it drifts (logits cos ~0.82 by the end on the tiny model's random
 weights: near-tie indexer and router picks flip under the activation noise; layers before the first MLA layer are
-at 0.9995) - to look at on real weights. Open in (c): speed (the per-head k_b / v_b matvecs are one launch a head;
-the indexer's select is one block a token with an O(256^2) scan per chunk of pools; the KDA rule a block a head);
-the MTP block; batched sequences; the stand-in KV cache's sequence features (store, checkpoints) do not cover
-GLM's state yet; (d) the routing trace of item 1
+at 0.9995) - to look at on real weights. Speed (2026-11-11), measured on `GLM_BENCH=4,16` (tools/gen_glm5next_ckpt.py:
+the release's widths, 4 layers - KDA dense, 2 KDA + MoE, MLA + MoE - 16 experts; `glm5next_verify --bench`):
+decode 8.47 -> 7.5 ms/token (7.9 at 8k context), prefill 2,145 -> 3,700 tok/s at 512 tokens and 379 -> 2,320 at
+8,192. What did it: k_b / v_b as one expert-indexed matvec a layer (the heads as experts, int8, no transposes);
+sparse MLA as split online-softmax partials (fixed 256-position splits, so a batch sums as one token does; 4 heads
+a block, a wave a position, coalesced rows) + a combine; the KDA state column in registers across a run of tokens;
+the mHC RMS folded into glm_hc_pre (fn on the raw streams, times r); the indexer's score a wave a pool with the
+queries in LDS; select with block scans; and above all fully unrolled register arrays (runtime-bounded loops over
+them had put them in scratch: 3x on prefill). Decode is now the engine's weight matvecs (~6.4 of 6.95 ms of kernel
+time; GLM's own kernels ~0.4 ms for the 4 layers). Projected to the release (45 layers, all weights resident),
+~45-50 ms/token before any expert paging. Open: prefill attention on WMMA (sparse MLA is ~40% of a long prefill:
+scalar FP32 over ~2k positions x 64 heads x 512 a token), a chunked KDA for prefill, an F16 latent cache (half the
+bytes), the MTP block, batched sequences, the stand-in KV cache's sequence features (store, checkpoints) for GLM's
+state; (d) the routing trace of item 1
 on the real file, once the deployment can spare the memory.
 
 Config read from huggingface.co/zai-org/GLM-5.3-Flash/raw/main/config.json on 2026-11-06; the numbers below are

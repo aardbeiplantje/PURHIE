@@ -6,8 +6,8 @@
 #include "kernel_loader.h"
 
 static hipModule_t g_mod = nullptr;
-static hipFunction_t f_rms_flat, f_hc_pre, f_hc_post, f_hc_mean, f_kda_conv, f_kda_l2, f_kda_rule, f_swiglu,
-    f_layernorm, f_pool, f_score, f_select, f_mla, f_swap;
+static hipFunction_t f_hc_pre, f_hc_post, f_hc_mean, f_kda_conv, f_kda_l2, f_kda_rule, f_swiglu,
+    f_layernorm, f_pool, f_score, f_select, f_mla, f_mla_comb;
 
 int glm5_gpu_init(const char* co_path) {
     if (g_mod) return 0;
@@ -17,11 +17,11 @@ int glm5_gpu_init(const char* co_path) {
         return -1;
     }
     const struct { hipFunction_t* f; const char* name; } fs[] = {
-        {&f_rms_flat, "glm_rms_flat"}, {&f_hc_pre, "glm_hc_pre"}, {&f_hc_post, "glm_hc_post"},
+        {&f_hc_pre, "glm_hc_pre"}, {&f_hc_post, "glm_hc_post"},
         {&f_hc_mean, "glm_hc_mean"}, {&f_kda_conv, "kda_conv"}, {&f_kda_l2, "kda_l2"}, {&f_kda_rule, "kda_rule"},
         {&f_swiglu, "glm_swiglu_clamp"}, {&f_layernorm, "glm_layernorm"}, {&f_pool, "glm_pool"},
-        {&f_score, "glm_index_score"}, {&f_select, "glm_index_select"}, {&f_mla, "glm_mla_attn"},
-        {&f_swap, "glm_heads_swap"}};
+        {&f_score, "glm_index_score"}, {&f_select, "glm_index_select"}, {&f_mla, "glm_mla_part"},
+        {&f_mla_comb, "glm_mla_combine"}};
     for (const auto& e : fs)
         if (hipModuleGetFunction(e.f, g_mod, e.name) != hipSuccess) {
             INFER_LOG("[glm5_gpu] kernel %s missing in %s\n", e.name, co_path);
@@ -45,15 +45,10 @@ static hipError_t launch(hipFunction_t f, unsigned gx, unsigned gy, unsigned gz,
     return hipModuleLaunchKernel(f, gx, gy, gz, bx, 1, 1, 0, stream, args, nullptr);
 }
 
-hipError_t glm_rms_flat(const float* x, float* y, int n, int T, float eps, hipStream_t stream) {
-    void* a[] = {(void*)&x, &y, &n, &eps};
-    return launch(f_rms_flat, (unsigned)T, 1, 1, 256, a, stream);
-}
-
 hipError_t glm_hc_pre(const float* mix, const float* scale, const float* base, const float* streams, float* x,
-                      float* post, float* comb, int n, int T, float eps, int iters, hipStream_t stream) {
-    void* a[] = {(void*)&mix, (void*)&scale, (void*)&base, (void*)&streams, &x, &post, &comb, &n, &eps, &iters};
-    return launch(f_hc_pre, (unsigned)T, 1, 1, 256, a, stream);
+                      float* post, float* comb, int n, int T, float eps, int iters, float rms_eps, hipStream_t stream) {
+    void* a[] = {(void*)&mix, (void*)&scale, (void*)&base, (void*)&streams, &x, &post, &comb, &n, &eps, &iters, &rms_eps};
+    return launch(f_hc_pre, blocks(n), (unsigned)T, 1, 256, a, stream);
 }
 
 hipError_t glm_hc_post(const float* x, const float* streams, const float* post, const float* comb, float* out, int n,
@@ -82,10 +77,10 @@ hipError_t kda_l2(float* qk, long long ld, int hd, int H, int T, float eps, hipS
 hipError_t kda_rule(float* S, const float* qkv, long long ld, const float* gf, const float* dt, const float* A,
                     const float* beta, const float* g2, const float* norm_w, float* out, int H, int hd, float lb,
                     float eps, int T, hipStream_t stream) {
-    if (hd < 2 || hd > 256 || (hd & (hd - 1))) return hipErrorInvalidValue;  // a block per head, a thread per column
+    if (hd != 128) return hipErrorInvalidValue;  // KDA_HD: a block per head, a thread (and its registers) per column
     void* a[] = {&S, (void*)&qkv, &ld, (void*)&gf, (void*)&dt, (void*)&A, (void*)&beta, (void*)&g2, (void*)&norm_w,
                  &out, &H, &lb, &eps, &T};
-    return launch(f_kda_rule, (unsigned)H, 1, 1, (unsigned)hd, a, stream);
+    return launch(f_kda_rule, (unsigned)H, 1, 1, 128, a, stream);
 }
 
 hipError_t glm_swiglu_clamp(const float* g, const float* u, float* out, int rows, int h, float limit,
@@ -110,8 +105,9 @@ hipError_t glm_pool(const float* ik, const float* ig, const float* ape, float* p
 hipError_t glm_index_score(const float* iq, const float* w, const float* pooled, float* score, int ld_score,
                            int pos0, int T, int kp, int nh, int d, float ws, hipStream_t stream) {
     const int max_pools = (pos0 + T) / kp;
+    if (d % 32 != 0 || d > 256 || nh * d > 8192 || nh > 64) return hipErrorInvalidValue;  // GLM_IX_MAXQ
     void* a[] = {(void*)&iq, (void*)&w, (void*)&pooled, &score, &ld_score, &pos0, &kp, &nh, &d, &ws};
-    return launch(f_score, blocks(max_pools), (unsigned)T, 1, 256, a, stream);
+    return launch(f_score, (unsigned)((max_pools + 63) / 64), (unsigned)T, 1, 256, a, stream);
 }
 
 hipError_t glm_index_select(const float* score, int ld_score, int* sel, int ld_sel, int* nsel, int pos0, int T, int kp,
@@ -121,13 +117,15 @@ hipError_t glm_index_select(const float* score, int ld_score, int* sel, int ld_s
 }
 
 hipError_t glm_mla_attn(const float* q_abs, const float* latent, const int* sel, int ld_sel, const int* nsel,
-                        float* out, int H, int T, int kl, float scale, hipStream_t stream) {
-    if (ld_sel > 4096) return hipErrorInvalidValue;  // GLM_MAX_SEL
-    void* a[] = {(void*)&q_abs, (void*)&latent, (void*)&sel, &ld_sel, (void*)&nsel, &out, &T, &kl, &scale};
-    return launch(f_mla, (unsigned)H, (unsigned)T, 1, 256, a, stream);
-}
-
-hipError_t glm_heads_swap(const float* in, float* out, int H, int T, int D, int to_ht, hipStream_t stream) {
-    void* a[] = {(void*)&in, &out, &H, &T, &D, &to_ht};
-    return launch(f_swap, blocks(D), (unsigned)H, (unsigned)T, 256, a, stream);
+                        float* part_ml, float* part_acc, float* out, int H, int T, int kl, float scale,
+                        hipStream_t stream) {
+    if (ld_sel > 9 * 256 || kl % 32 != 0 || kl > 512) return hipErrorInvalidValue;  // GLM_MAX_SPLITS, GLM_MAX_KL
+    int hg = 4;  // heads a block (GLM_HG): the largest of 4, 2, 1 dividing H (8: no faster, more registers)
+    while (H % hg) hg /= 2;
+    const unsigned nz = (unsigned)((ld_sel + 255) / 256);  // splits: blocks past a token's positions write empty ones
+    void* a[] = {(void*)&q_abs, (void*)&latent, (void*)&sel, &ld_sel, (void*)&nsel, &part_ml, &part_acc, &H, &kl, &scale, &hg};
+    hipError_t e = launch(f_mla, (unsigned)(H / hg), (unsigned)T, nz, 256, a, stream);
+    if (e != hipSuccess) return e;
+    void* b[] = {(void*)&part_ml, (void*)&part_acc, (void*)&nsel, &out, &H, &kl};
+    return launch(f_mla_comb, (unsigned)H, (unsigned)T, 1, 256, b, stream);
 }

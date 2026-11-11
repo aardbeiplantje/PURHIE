@@ -194,7 +194,8 @@ struct Scratch {
         B = rows;
         part_slots = (long long)attention_part_slots(n_ctx, rows);
         const size_t b = (size_t)rows;
-        const int GLM = m->glm5 ? std::max({m->hc_mult * E, m->n_head * m->kda_head_dim, m->n_head * m->v_mla, m->q_lora})
+        const int GLM = m->glm5 ? std::max({m->hc_mult * E, m->n_head * m->kda_head_dim, m->n_head * m->v_mla, m->q_lora,
+                                            m->n_head * m->kv_lora})
                                 : 0;  // GLM-5.3: its widest matvec inputs (the streams, KDA's d_inner, MLA's output)
         q8_max_k = (std::max({E, HQ * HD, DI, FF, NU * FE, HCD, GLM}) + 255) / 256 * 256 * rows;
         const size_t sizes[] = {b * E, b * E, b * E, b * 2 * HQ * HD, b * HQ * HD,
@@ -356,13 +357,15 @@ struct Profile {
 // [n_ctx / kpool][ix_dim]. One sequence.
 struct GlmState {
     int B = 0, n_ctx = 0, np = 0, ld_sel = 0, sc_rows = 0;
-    float *res = nullptr, *res_alt = nullptr, *flat = nullptr, *mix = nullptr, *post = nullptr, *comb = nullptr,
-          *blk = nullptr;
+    float *res = nullptr, *res_alt = nullptr, *mix = nullptr, *post = nullptr, *comb = nullptr, *blk = nullptr;
     float *kproj = nullptr, *kconv = nullptr, *fa = nullptr, *gf = nullptr, *beta = nullptr, *ga = nullptr,
           *g2 = nullptr, *lin = nullptr;
-    float *qa = nullptr, *qr = nullptr, *q = nullptr, *qT = nullptr, *qabs = nullptr, *kva = nullptr, *olat = nullptr,
-          *ovb = nullptr, *o = nullptr, *iq = nullptr, *ikraw = nullptr, *iw = nullptr, *score = nullptr;
+    float *qa = nullptr, *qr = nullptr, *q = nullptr, *qabs = nullptr, *kva = nullptr, *olat = nullptr, *o = nullptr,
+          *iq = nullptr, *ikraw = nullptr, *iw = nullptr, *score = nullptr;
     int *sel = nullptr, *nsel = nullptr;
+    int* hids = nullptr;  // [B][H]: h in every row, the "experts" of the per-head matvecs (k_b, v_b)
+    float *mla_ml = nullptr, *mla_acc = nullptr;  // sparse MLA's split partial results for GLM_MLA_ROWS tokens
+    static constexpr int GLM_MLA_ROWS = 64;
     std::vector<float*> conv, S, latent, ik, ig, pooled, ape;  // by layer (nullptr where none)
     ShmRegion mem;
 
@@ -376,13 +379,14 @@ struct GlmState {
         ld_sel = (m->ix_topk / KP) * KP + KP;
         sc_rows = (int)std::max<long long>(1, std::min<long long>(rows, (64LL << 20) / 4 / np));  // the scores' rows
         const size_t b = (size_t)rows;
-        std::vector<size_t> sz = {b * HCE, b * HCE, b * HCE, b * 24, b * 4, b * 16, b * E,
+        std::vector<size_t> sz = {b * HCE, b * HCE, b * 24, b * 4, b * 16, b * E,
                                   3 * b * DI, 3 * b * DI, b * HD, b * DI, b * H, b * HD, b * DI, b * DI,
-                                  b * QL, b * QL, b * H * KM, b * H * KM, b * H * KL, b * KL, b * H * KL, b * H * VM,
-                                  b * H * VM, b * IH * ID, b * ID, b * IH, (size_t)sc_rows * np, b * ld_sel, b};
-        std::vector<float**> pt = {&res, &res_alt, &flat, &mix, &post, &comb, &blk, &kproj, &kconv, &fa, &gf, &beta,
-                                   &ga, &g2, &lin, &qa, &qr, &q, &qT, &qabs, &kva, &olat, &ovb, &o, &iq, &ikraw, &iw,
-                                   &score, (float**)&sel, (float**)&nsel};
+                                  b * QL, b * QL, b * H * KM, b * H * KL, b * KL, b * H * KL, b * H * VM,
+                                  b * IH * ID, b * ID, b * IH, (size_t)sc_rows * np, b * ld_sel, b, b * H,
+                                  glm_mla_part_floats(H, GLM_MLA_ROWS, 0), glm_mla_part_floats(H, GLM_MLA_ROWS, KL)};
+        std::vector<float**> pt = {&res, &res_alt, &mix, &post, &comb, &blk, &kproj, &kconv, &fa, &gf, &beta,
+                                   &ga, &g2, &lin, &qa, &qr, &q, &qabs, &kva, &olat, &o, &iq, &ikraw, &iw,
+                                   &score, (float**)&sel, (float**)&nsel, (float**)&hids, &mla_ml, &mla_acc};
         const int L = m->n_layer;
         conv.assign(L, nullptr), S.assign(L, nullptr), latent.assign(L, nullptr), ik.assign(L, nullptr),
             ig.assign(L, nullptr), pooled.assign(L, nullptr), ape.assign(L, nullptr);
@@ -404,6 +408,8 @@ struct GlmState {
         if (!mem.alloc("/dev/shm/glm5_state.bin", sz.data(), (float** const*)pt.data(), sz.size(),
                        hipExtHostRegisterCoarseGrained))
             return false;
+        for (size_t r = 0; r < b; ++r)
+            for (int h = 0; h < H; ++h) hids[r * H + h] = h;
         for (int l = 0; l < L; ++l)  // the indexer's ape, decoded once
             if (ape[l])
                 for (int j = 0; j < KP; ++j)
@@ -1752,10 +1758,10 @@ struct QwenModel {
     bool glm_hc_in(const HcSinkhorn& h, const float* w, int T, ProfCat c) {
         const int E = eng->n_embd, HCE = eng->hc_mult * E;
         const float eps = (float)eng->eps;
-        if (!check(glm_rms_flat(glm.res, glm.flat, HCE, T, eps, 0), "glm_rms_flat") || !produced(glm.flat, HCE, T) ||
-            !matvec(h.fn, glm.flat, glm.mix, T, c) ||
+        // fn on the raw streams: glm_hc_pre scales the mixes by their RMS (fn . (x r) = r (fn . x))
+        if (!produced(glm.res, HCE, T) || !matvec(h.fn, glm.res, glm.mix, T, c) ||
             !check(glm_hc_pre(glm.mix, h.scale, h.base, glm.res, glm.blk, glm.post, glm.comb, E, T, eng->hc_eps,
-                              eng->hc_sinkhorn_iters, 0),
+                              eng->hc_sinkhorn_iters, eps, 0),
                    "glm_hc_pre"))
             return false;
         const qmatvec_q8* q = E % 256 == 0 ? q8_for(E, T) : nullptr;
@@ -1791,6 +1797,31 @@ struct QwenModel {
             !produced(glm.lin, DI, T))
             return false;
         return matvec(L.Wo, glm.lin, s.proj, T, P_LIN);
+    }
+
+    // y[t][h] = W_h x[t][h] for the n_head heads (W stacks them, N rows each; x, y rows [T][H][..]): an
+    // expert-indexed matvec with glm.hids as the experts, int8 when x's rows are quantized
+    bool glm_heads_matvec(const QuantWeight& W, const float* x, float* y, int N, int T) {
+        const int H = eng->n_head, K = W.K;
+        prof.bytes[P_ATTN] += (double)W.row_bytes * W.N;
+        const bool q8 = q8_src == x && q8_k == K && q8_t == T * H && qmatvec_q8_supported(W.type, K);
+        const hipError_t e = q8 ? qmatvec_launch_q8_id(W.type, W.data, W.row_bytes, glm.hids, H, 1, &s.q8, y, N, K, T, 0)
+                                : qmatvec_launch_id(W.type, W.data, W.row_bytes, glm.hids, H, 1, x, y, N, K, T, 0);
+        return check(e, "per-head matvec");
+    }
+
+    // Sparse MLA attention of T tokens (glm.qabs -> glm.olat), GLM_MLA_ROWS tokens a launch (the partials' room)
+    bool glm_attend(const float* lat, int T) {
+        const int H = eng->n_head, KL = eng->kv_lora, R = GlmState::GLM_MLA_ROWS;
+        for (int t0 = 0; t0 < T; t0 += R) {
+            const int n = std::min(R, T - t0);
+            const size_t o = (size_t)t0 * H * KL;
+            if (!check(glm_mla_attn(glm.qabs + o, lat, glm.sel + (size_t)t0 * glm.ld_sel, glm.ld_sel, glm.nsel + t0,
+                                    glm.mla_ml, glm.mla_acc, glm.olat + o, H, n, KL, 1.0f / sqrtf((float)eng->k_mla), 0),
+                       "glm_mla_attn"))
+                return false;
+        }
+        return true;
     }
 
     bool glm_mla(int l, const LayerWeights& L, int pos0, int T) {
@@ -1836,23 +1867,12 @@ struct QwenModel {
                     return false;
             }
         }  // else: the selection the MLA layer before it left in glm.sel
-        // q absorbed into the latent per head (k_b), attention over the selected latents, out of it per head (v_b)
-        if (!check(glm_heads_swap(glm.q, glm.qT, H, T, KM, 1, 0), "glm_heads_swap")) return false;
-        for (int h = 0; h < H; ++h) {
-            QuantWeight kb = L.W_k_b;
-            kb.data = L.W_k_b.row(h * KL), kb.N = KL;
-            if (!matvec(kb, glm.qT + (size_t)h * T * KM, glm.qabs + (size_t)h * T * KL, T, P_ATTN)) return false;
-        }
-        if (!check(glm_mla_attn(glm.qabs, lat, glm.sel, glm.ld_sel, glm.nsel, glm.olat, H, T, KL,
-                                1.0f / sqrtf((float)KM), 0),
-                   "glm_mla_attn"))
-            return false;
-        for (int h = 0; h < H; ++h) {
-            QuantWeight vb = L.W_v_b;
-            vb.data = L.W_v_b.row(h * VM), vb.N = VM;
-            if (!matvec(vb, glm.olat + (size_t)h * T * KL, glm.ovb + (size_t)h * T * VM, T, P_ATTN)) return false;
-        }
-        if (!check(glm_heads_swap(glm.ovb, glm.o, H, T, VM, 0, 0), "glm_heads_swap") || !produced(glm.o, H * VM, T))
+        // q absorbed into the latent per head (k_b), attention over the selected latents, out of it per head (v_b):
+        // [T][H][..] rows throughout, the heads as the "experts" of an expert-indexed matvec (one launch each)
+        if (!produced(glm.q, KM, T * H) || !glm_heads_matvec(L.W_k_b, glm.q, glm.qabs, KL, T) ||
+            !glm_attend(lat, T) ||
+            !produced(glm.olat, KL, T * H) || !glm_heads_matvec(L.W_v_b, glm.olat, glm.o, VM, T) ||
+            !produced(glm.o, H * VM, T))
             return false;
         return matvec(L.Wo, glm.o, s.proj, T, P_ATTN);
     }
