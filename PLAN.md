@@ -92,11 +92,13 @@ REF_STOCK_B=/data/conv/upstream-build`. The test model is `tools/gen_glm5next_ck
 comparison is of the forward pass alone (`ref_dump_stock acts`: 935 named activations, hc_* / kda_* / indexer_* /
 ffn_moe_* per layer). User, 2026-11-10: the reference is for numbers only, the engine keeps its UMA way (the
 GGUF mapped and pinned in place, GPU-first with the CPU alongside), and FP4-sized weights (ROCmFP4 / FAST) are the
-target. Work order: (a) the loader - `glm5-next` in `archs`, `load_glm5next` binding every tensor above into new
-LayerWeights fields (kinds LAYER_KDA / LAYER_MLA_DSA, the mHC `hc_*_fn/base/scale`, MLA `attn_q_a` .. `attn_v_b`,
-indexer `indexer.*` / `indexer_compressor_*`, `swiglu_clamp_*`), the MLA latent cache size in
-`inference_model_info` (kv_lora_rank + the indexer's key | gate | pooled rows per position instead of attn_k /
-attn_v widths); (b) a `glm5next_verify` like `qwen4exp_verify` (teacher-forced per-layer cosines against the
+target. Work order: (a) the loader - done 2026-11-11: `glm5-next` in `archs`, `load_glm5next` /
+`load_layer_glm5next` bind every tensor into LayerWeights (kinds LAYER_KDA / LAYER_MLA_DSA by head_count_kv, the
+mHC `HcSinkhorn` hcs_attn / hcs_ffn, MLA `W_q_a` .. `W_v_b`, the indexer `W_ix_*` with `ix_full` per layer, the
+SwiGLU clamps), shape-checked against the hparams; `inference_model_info` counts the latent + indexer rows per
+position for the cache; `inference_kv_cache_init` (and `qwen_model_create`) refuse with "the forward pass is not
+implemented yet" (`tests/glm5next_verify.sh`, quick tier: the tiny model as FAST, every block's kind, slots, FFNs,
+the refusal). The MTP block (blk.N) is not bound yet; (b) a `glm5next_verify` like `qwen4exp_verify` (teacher-forced per-layer cosines against the
 acts, then whole-model logits); (c) the forward pass, GPU kernels on FAST weights: mHC pre / post (the Sinkhorn
 on a 4x4 per token), KDA (per-channel decay in `deltanet`), the indexer (pool, score, top-k by the `moe_router`
 machinery, ties to the lower index), sparse MLA decode over the selected latents; (d) the routing trace of item 1

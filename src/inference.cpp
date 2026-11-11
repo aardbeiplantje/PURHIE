@@ -394,6 +394,7 @@ static bool kv_u64_array(gguf_model_t* gguf, const char* key, std::vector<uint64
 // qwen4exp hyperparameters (hyper-connections, PLE) and its global tensors; nothing for other architectures
 static bool load_qwen4exp(inference_model* m, std::vector<int>& ple_layers) {
     const std::string a = m->model_name + ".";
+    if (m->model_name != "qwen4exp") return true;  // (glm5-next's hyper_connection.* are its own mHC's)
     m->n_hc = (int)gguf_arch_int(m->gguf, "hyper_connection.count", 0);
     if (m->n_hc <= 0) return true;
     m->hc_rank = (int)gguf_arch_int(m->gguf, "hyper_connection.low_rank", 0);
@@ -864,16 +865,214 @@ static bool load_layer_nemotron(inference_model* m, int i, LayerWeights& L, cons
            check_shape("ffn_down_shexp", i, L.W_down, E, FS);
 }
 
+// A float array of the GGUF metadata (F32 or F64 elements)
+static bool kv_float_array(gguf_model_t* gguf, const char* key, std::vector<float>& out) {
+    int32_t type = -1;
+    const void* data = nullptr;
+    size_t n = 0;
+    if (gguf_kv_get_array(gguf, key, &type, &data, &n) != 0) return false;
+    out.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (type == 6) out[i] = ((const float*)data)[i];
+        else if (type == 12) out[i] = (float)((const double*)data)[i];
+        else return false;
+    }
+    return true;
+}
+
+// GLM-5.3-Flash (glm5-next; llama.cpp glm5-next.cpp load_arch_hparams): a block is KDA where head_count_kv[i] is
+// 0, else MLA with the DSA indexer (indexer.types[i]: its own indexer, else the previous layer's selection)
+struct GlmShape {
+    std::vector<int> n_kv, ix_types;
+    std::vector<float> clamp, clamp_sh;
+};
+
+static bool load_glm5next(inference_model* m, GlmShape& g) {
+    const std::string a = m->model_name + ".";
+    auto I = [&](const char* k, int64_t d) { return (int)gguf_arch_int(m->gguf, k, d); };
+    auto F = [&](const char* k, float d) { return gguf_arch_float(m->gguf, k, d); };
+    m->glm5 = true;
+    if (!kv_int_array(m->gguf, (a + "attention.head_count_kv").c_str(), g.n_kv) ||
+        (int)g.n_kv.size() < m->n_layer + m->n_nextn) {
+        set_error("glm5-next: per-layer attention.head_count_kv missing");
+        return false;
+    }
+    if (!kv_int_array(m->gguf, (a + "attention.indexer.types").c_str(), g.ix_types)) g.ix_types.clear();
+    if (!kv_float_array(m->gguf, (a + "swiglu_clamp_exp").c_str(), g.clamp)) g.clamp.clear();
+    if (!kv_float_array(m->gguf, (a + "swiglu_clamp_shexp").c_str(), g.clamp_sh)) g.clamp_sh = g.clamp;
+    m->hc_mult = I("hyper_connection.count", 0);
+    m->hc_sinkhorn_iters = I("hyper_connection.sinkhorn_iterations", 0);
+    m->hc_eps = F("hyper_connection.epsilon", 1e-6f);
+    m->n_dense_lead = I("leading_dense_block_count", 0);
+    m->kda_head_dim = I("kda.head_dim", 0);
+    m->kda_gate_lower_bound = F("kda.gate_lower_bound", -INFINITY);
+    m->q_lora = I("attention.q_lora_rank", 0);
+    m->kv_lora = I("attention.kv_lora_rank", 0);
+    m->k_mla = I("attention.key_length_mla", 0);
+    m->v_mla = I("attention.value_length_mla", 0);
+    m->ix_heads = I("attention.indexer.head_count", 0);
+    m->ix_dim = I("attention.indexer.key_length", 0);
+    m->ix_topk = I("attention.indexer.top_k", 0);
+    m->ix_kpool = I("attention.indexer.kpool", 0);
+    m->ix_select_tail = I("attention.indexer.kpool_select_tail", 1) != 0;
+    m->expert_weights_scale = F("expert_weights_scale", 1.0f);
+    m->expert_weights_norm = I("expert_weights_norm", 1) != 0;
+    m->n_head_kv = 0;
+    m->n_rot = 0;  // NoPE: KDA carries the positions
+    m->attn_gated = false;
+    if (I("expert_gating_func", 2) != 2) { set_error("glm5-next: only sigmoid expert gating is supported"); return false; }
+    if (m->hc_mult != 4 || m->hc_sinkhorn_iters < 1) {
+        set_error("glm5-next: mHC with %d streams, %d Sinkhorn iterations not supported", m->hc_mult, m->hc_sinkhorn_iters);
+        return false;
+    }
+    if (m->kda_head_dim <= 0 || m->q_lora <= 0 || m->kv_lora <= 0 || m->k_mla <= 0 || m->v_mla <= 0 ||
+        m->ix_heads <= 0 || m->ix_dim <= 0 || m->ix_kpool < 2 || m->ix_topk % m->ix_kpool != 0 || m->ssm_d_conv < 2) {
+        set_error("glm5-next: bad KDA / MLA / indexer hparams (kda head %d, q_lora %d, kv_lora %d, k/v %d/%d, "
+                  "indexer %d x %d top %d kpool %d, conv %d)", m->kda_head_dim, m->q_lora, m->kv_lora, m->k_mla,
+                  m->v_mla, m->ix_heads, m->ix_dim, m->ix_topk, m->ix_kpool, m->ssm_d_conv);
+        return false;
+    }
+    if (gguf_arch_int(m->gguf, "rope.dimension_count", 0) != 0) {
+        set_error("glm5-next: only NoPE MLA (rope.dimension_count 0) is supported");
+        return false;
+    }
+    return true;
+}
+
+static bool bind_hc_sinkhorn(inference_model* m, int i, const char* which, HcSinkhorn& h) {
+    gguf_model_t* f = m->gguf;
+    const int HC = m->hc_mult, MIX = (2 + HC) * HC;
+    char name[128];
+    auto nm = [&](const char* t) { snprintf(name, sizeof(name), "blk.%d.hc_%s_%s.weight", i, which, t); return name; };
+    if (!bind_weight(f, nm("fn"), h.fn, true) || !bind_norm(f, nm("base"), MIX, h.base, true) ||
+        !bind_norm(f, nm("scale"), 3, h.scale, true))
+        return false;
+    char what[32];
+    snprintf(what, sizeof what, "hc_%s_fn", which);
+    return check_shape(what, i, h.fn, MIX, HC * m->n_embd);
+}
+
+static bool load_layer_glm5next(inference_model* m, int i, LayerWeights& L, const GlmShape& g) {
+    gguf_model_t* f = m->gguf;
+    const int E = m->n_embd, H = m->n_head;
+    char name[128];
+    auto nm = [&](const char* t) { snprintf(name, sizeof(name), "blk.%d.%s", i, t); return name; };
+    if (!bind_norm(f, nm("attn_norm.weight"), E, L.attn_norm, true) ||
+        !bind_norm(f, nm("ffn_norm.weight"), E, L.ffn_norm, true) || !bind_hc_sinkhorn(m, i, "attn", L.hcs_attn) ||
+        !bind_hc_sinkhorn(m, i, "ffn", L.hcs_ffn))
+        return false;
+    L.swiglu_limit = i < (int)g.clamp.size() ? g.clamp[i] : 0.0f;
+    L.swiglu_limit_sh = i < (int)g.clamp_sh.size() ? g.clamp_sh[i] : L.swiglu_limit;
+    if (g.n_kv[i] == 0) {
+        L.kind = LAYER_KDA;
+        const int HD = m->kda_head_dim, DI = H * HD, DC = m->ssm_d_conv;
+        static const char* const conv[3] = {"ssm_conv1d_q.weight", "ssm_conv1d_k.weight", "ssm_conv1d_v.weight"};
+        for (int c = 0; c < 3; ++c) {  // F32 [d_conv, 1, d_inner(, 1)]: d_inner rows of d_conv taps
+            const int idx = find_tensor_index(f, nm(conv[c]));
+            const int64_t* ne = idx >= 0 ? gguf_tensor_ne(f, idx) : nullptr;
+            size_t bytes = 0;
+            const void* p = idx >= 0 ? gguf_get_tensor_ptr(f, name, &bytes) : nullptr;
+            if (!p || !ne || gguf_tensor_type(f, idx) != QT_F32 || ne[0] != DC || bytes != (size_t)DC * DI * 4) {
+                set_error("%s: expected F32 [%d x 1 x %d]", name, DC, DI);
+                return false;
+            }
+            L.kda_conv[c] = (const float*)p;
+        }
+        if (!bind_weight(f, nm("attn_q.weight"), L.Wq, true) || !bind_weight(f, nm("attn_k.weight"), L.Wk, true) ||
+            !bind_weight(f, nm("attn_v.weight"), L.Wv, true) || !bind_weight(f, nm("attn_output.weight"), L.Wo, true) ||
+            !bind_weight(f, nm("ssm_f_a.weight"), L.W_f_a, true) || !bind_weight(f, nm("ssm_f_b.weight"), L.W_f_b, true) ||
+            !bind_weight(f, nm("ssm_g_a.weight"), L.W_g_a, true) || !bind_weight(f, nm("ssm_g_b.weight"), L.W_g_b, true) ||
+            !bind_weight(f, nm("ssm_beta.weight"), L.W_beta, true) ||
+            !bind_norm(f, nm("ssm_a"), H, L.ssm_a, true) || !bind_norm(f, nm("ssm_dt.bias"), DI, L.ssm_dt, true) ||
+            !bind_norm(f, nm("ssm_norm.weight"), HD, L.ssm_norm, true))
+            return false;
+        if (!check_shape("attn_q", i, L.Wq, DI, E) || !check_shape("attn_k", i, L.Wk, DI, E) ||
+            !check_shape("attn_v", i, L.Wv, DI, E) || !check_shape("attn_output", i, L.Wo, E, DI) ||
+            !check_shape("ssm_f_a", i, L.W_f_a, HD, E) || !check_shape("ssm_f_b", i, L.W_f_b, DI, HD) ||
+            !check_shape("ssm_g_a", i, L.W_g_a, HD, E) || !check_shape("ssm_g_b", i, L.W_g_b, DI, HD) ||
+            !check_shape("ssm_beta", i, L.W_beta, H, E))
+            return false;
+    } else {
+        L.kind = LAYER_MLA_DSA;
+        L.kv_slot = m->n_mla_layers++;
+        L.ix_full = g.ix_types.empty() || (i < (int)g.ix_types.size() && g.ix_types[i] != 0);
+        const int QL = m->q_lora, KL = m->kv_lora, KM = m->k_mla, VM = m->v_mla, IH = m->ix_heads, ID = m->ix_dim;
+        if (!bind_weight(f, nm("attn_q_a.weight"), L.W_q_a, true) ||
+            !bind_norm(f, nm("attn_q_a_norm.weight"), QL, L.q_a_norm, true) ||
+            !bind_weight(f, nm("attn_q_b.weight"), L.W_q_b, true) ||
+            !bind_weight(f, nm("attn_kv_a_mqa.weight"), L.W_kv_a, true) ||
+            !bind_norm(f, nm("attn_kv_a_norm.weight"), KL, L.kv_a_norm, true) ||
+            !bind_weight(f, nm("attn_k_b.weight"), L.W_k_b, true) || !bind_weight(f, nm("attn_v_b.weight"), L.W_v_b, true) ||
+            !bind_weight(f, nm("attn_output.weight"), L.Wo, true))
+            return false;
+        if (!check_shape("attn_q_a", i, L.W_q_a, QL, E) || !check_shape("attn_q_b", i, L.W_q_b, H * KM, QL) ||
+            !check_shape("attn_kv_a_mqa", i, L.W_kv_a, KL, E) || !check_shape("attn_k_b", i, L.W_k_b, H * KL, KM) ||
+            !check_shape("attn_v_b", i, L.W_v_b, H * VM, KL) || !check_shape("attn_output", i, L.Wo, E, H * VM))
+            return false;
+        if (L.ix_full) {
+            if (!bind_weight(f, nm("indexer.attn_q_b.weight"), L.W_ix_q_b, true) ||
+                !bind_weight(f, nm("indexer.attn_k.weight"), L.W_ix_k, true) ||
+                !bind_norm(f, nm("indexer.k_norm.weight"), ID, L.ix_k_norm, true) ||
+                !bind_norm(f, nm("indexer.k_norm.bias"), ID, L.ix_k_norm_b, true) ||
+                !bind_weight(f, nm("indexer.proj.weight"), L.W_ix_proj, true) ||
+                !bind_weight(f, nm("indexer_compressor_gate.weight"), L.W_ix_gate, true) ||
+                !bind_weight(f, nm("indexer_compressor_ape.weight"), L.W_ix_ape, true))
+                return false;
+            if (!check_shape("indexer.attn_q_b", i, L.W_ix_q_b, IH * ID, QL) ||
+                !check_shape("indexer.attn_k", i, L.W_ix_k, ID, E) || !check_shape("indexer.proj", i, L.W_ix_proj, IH, E) ||
+                !check_shape("indexer_compressor_gate", i, L.W_ix_gate, ID, E) ||
+                !check_shape("indexer_compressor_ape", i, L.W_ix_ape, m->ix_kpool, ID))
+                return false;
+        } else {  // a shared indexer: the selection of the MLA layer before it, which must exist
+            bool prev = false;
+            for (int j = i - 1; j >= 0 && !prev; --j) prev = m->layers[j].kind == LAYER_MLA_DSA;
+            if (!prev) { set_error("blk.%d: a shared indexer with no MLA layer before it", i); return false; }
+        }
+    }
+    // the FFN: dense in the leading layers, else the routed experts and the shared expert
+    if (i < m->n_dense_lead) {
+        if (!bind_weight(f, nm("ffn_gate.weight"), L.W_gate, true) || !bind_weight(f, nm("ffn_up.weight"), L.W_up, true) ||
+            !bind_weight(f, nm("ffn_down.weight"), L.W_down, true))
+            return false;
+        return check_shape("ffn_gate", i, L.W_gate, m->n_ff, E) && check_shape("ffn_up", i, L.W_up, m->n_ff, E) &&
+               check_shape("ffn_down", i, L.W_down, E, m->n_ff);
+    }
+    L.moe = true;
+    L.shexp = true;
+    const int NE = m->n_expert, FE = m->n_ff_exp;
+    const int FS = FE * (int)gguf_arch_int(f, "expert_shared_count", 1);
+    if (NE <= 0 || m->n_expert_used <= 0 || m->n_expert_used > NE || FE <= 0) {
+        set_error("blk.%d: bad MoE hparams (experts %d used %d ff_exp %d)", i, NE, m->n_expert_used, FE);
+        return false;
+    }
+    if (!bind_weight(f, nm("ffn_gate_inp.weight"), L.W_router, true) ||
+        !bind_norm(f, nm("exp_probs_b.bias"), NE, L.exp_probs_b, true) ||
+        !bind_weight(f, nm("ffn_gate_exps.weight"), L.We_gate, true) ||
+        !bind_weight(f, nm("ffn_up_exps.weight"), L.We_up, true) ||
+        !bind_weight(f, nm("ffn_down_exps.weight"), L.We_down, true) ||
+        !bind_weight(f, nm("ffn_gate_shexp.weight"), L.W_gate, true) ||
+        !bind_weight(f, nm("ffn_up_shexp.weight"), L.W_up, true) ||
+        !bind_weight(f, nm("ffn_down_shexp.weight"), L.W_down, true))
+        return false;
+    return check_shape("ffn_gate_inp", i, L.W_router, NE, E) && check_shape("ffn_gate_exps", i, L.We_gate, NE * FE, E) &&
+           check_shape("ffn_up_exps", i, L.We_up, NE * FE, E) && check_shape("ffn_down_exps", i, L.We_down, NE * E, FE) &&
+           check_shape("ffn_gate_shexp", i, L.W_gate, FS, E) && check_shape("ffn_up_shexp", i, L.W_up, FS, E) &&
+           check_shape("ffn_down_shexp", i, L.W_down, E, FS);
+}
+
 static bool load_model_weights(inference_model* m, const std::vector<int>& ple_layers) {
     m->layers.resize(m->n_layer);
     Gemma4Shape g4;
     NemotronShape gn;
+    GlmShape gg;
     if (m->model_name == "gemma4" && !load_gemma4(m, g4)) return false;
     if (m->model_name == "gemma-embedding" && !load_gemma_embedding(m, g4)) return false;
     if (m->model_name == "nemotron_h_moe" && !load_nemotron(m, gn)) return false;
+    if (m->model_name == "glm5-next" && !load_glm5next(m, gg)) return false;
     for (int i = 0; i < m->n_layer; ++i)
         if (!(m->gemma4     ? load_layer_gemma4(m, i, m->layers[i], g4)
               : m->nemotron ? load_layer_nemotron(m, i, m->layers[i], gn)
+              : m->glm5     ? load_layer_glm5next(m, i, m->layers[i], gg)
                             : load_layer(m, m->gguf, i, m->layers[i], ple_layers)))
             return false;
     return true;
@@ -927,8 +1126,9 @@ int inference_model_info(const char* path, inference_model_info_t* out) {
     snprintf(out->arch, sizeof(out->arch), "%s", arch ? arch : "");
     out->n_ctx_train = gguf_context_length(g) > 0 ? gguf_context_length(g) : 0;
     // the architectures the loader runs (ARCHITECTURE.md, models)
-    static const char* const archs[] = {"qwen2",  "qwen3",  "qwen3moe", "qwen35",          "qwen35moe",
-                                        "qwen4exp", "gemma4", "llama",  "nemotron_h_moe", "gemma-embedding"};
+    static const char* const archs[] = {"qwen2",    "qwen3",  "qwen3moe", "qwen35",         "qwen35moe",
+                                        "qwen4exp", "gemma4", "llama",    "nemotron_h_moe", "gemma-embedding",
+                                        "glm5-next"};
     bool known = false;
     for (const char* a : archs) known = known || (arch && !strcmp(arch, a));
     const int64_t ty = gguf_find_kv(g, "general.type");
@@ -942,8 +1142,15 @@ int inference_model_info(const char* path, inference_model_info_t* out) {
         if (bad_type < 0 && !qt_get_traits(gguf_tensor_type(g, i))) bad_type = gguf_tensor_type(g, i);
         // K and V widths of the attention layers (an F16 cache's bytes per position)
         const char* dot = strncmp(name, "blk.", 4) ? nullptr : strchr(name + 4, '.');
-        if (dot && (!strcmp(dot, ".attn_k.weight") || !strcmp(dot, ".attn_v.weight")))
+        // (GLM-5.3's KDA layers have attn_k / attn_v too, but no cache: its MLA layers keep a latent row of
+        // kv_lora values and its indexer a key | gate | pooled row of 3 x its key width per position, F16 here)
+        const bool glm = arch && !strcmp(arch, "glm5-next");
+        if (dot && !glm && (!strcmp(dot, ".attn_k.weight") || !strcmp(dot, ".attn_v.weight")))
             out->kv_bytes_per_token += 2ull * (unsigned long long)gguf_tensor_ne(g, i)[1];
+        if (dot && glm && !strcmp(dot, ".attn_kv_a_mqa.weight"))
+            out->kv_bytes_per_token += 2ull * (unsigned long long)gguf_tensor_ne(g, i)[1];
+        if (dot && glm && !strcmp(dot, ".indexer.attn_k.weight"))
+            out->kv_bytes_per_token += 2ull * 3 * (unsigned long long)gguf_tensor_ne(g, i)[1];
     }
     if (gtype && strcmp(gtype, "model"))
         snprintf(out->why, sizeof(out->why), "not a model (general.type %s)", gtype);
@@ -1312,6 +1519,10 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
     clear_error();
     if (!m) { set_error("NULL model"); return -1; }
     if (m->seqs.size() > 1) { set_error("free the sequences (inference_seq_free) before a new KV cache"); return -1; }
+    if (m->glm5) {  // its cache is the MLA latent + the indexer's rows, and its forward pass is not written yet
+        set_error("glm5-next: the forward pass is not implemented yet (the model loads; PLAN.md, GLM-5.3-Flash)");
+        return INFERENCE_ERR_NOT_IMPLEMENTED;
+    }
     if (m->kvc_swa) { kv_cache_free(m->kvc_swa); m->kvc_swa = nullptr; }
     int window = 0;
     const int R = swa_ring_size(m, n_ctx, &window);

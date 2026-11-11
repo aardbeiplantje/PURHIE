@@ -503,6 +503,10 @@ struct QwenModel {
         eng = model;
         ++g_live_models;
         counted = true;
+        if (eng->glm5) {  // the loader binds GLM-5.3-Flash; its forward pass (mHC, KDA, MLA + DSA) is not written yet
+            qwen_set_error("glm5-next: the forward pass is not implemented yet (the model loads; PLAN.md, GLM-5.3-Flash)");
+            return false;
+        }
         if (qmatvec_init("matvec_q.co") != 0 || gpu_ops_init("gpu_ops.co") != 0) {
             qwen_set_error("cannot load matvec_q.co / gpu_ops.co (run from build/co)");
             return false;

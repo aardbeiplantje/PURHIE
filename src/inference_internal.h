@@ -46,6 +46,19 @@ enum LayerKind : int8_t {
     LAYER_LINEAR_ATTN = 1,  // Gated DeltaNet: attn_qkv, attn_gate, ssm_* tensors
     LAYER_MAMBA2      = 2,  // Nemotron-H: a Mamba-2 mixer (ssm_in, conv1d, the selective scan, ssm_out), no FFN
     LAYER_FFN         = 3,  // Nemotron-H: an FFN block alone (MoE or dense, squared ReLU), no token mixer
+    LAYER_KDA         = 4,  // GLM-5.3-Flash: Kimi Delta Attention (per-channel decay), then an FFN
+    LAYER_MLA_DSA     = 5,  // GLM-5.3-Flash: NoPE MLA over the compressed latent, keys picked by the DSA indexer
+};
+
+// The mHC mixer of GLM-5.3-Flash (DeepSeek-V4's; llama.cpp glm5-next build_hc_pre / build_hc_post): from the n_hc
+// streams, RMSNorm over all n_hc * n_embd values (no gamma) times fn gives (2 + n_hc) * n_hc mixes; scale[0..2]
+// and base give pre = sigmoid(.) + eps (the streams' weights into the block input), post = 2 sigmoid(.) (the block
+// output's weight into each stream) and comb, n_hc x n_hc made doubly stochastic by a softmax and Sinkhorn
+// iterations (how the streams mix among themselves)
+struct HcSinkhorn {
+    QuantWeight fn;                                   // [(2 + n_hc) * n_hc x n_hc * n_embd]
+    const float* base = nullptr;                      // [(2 + n_hc) * n_hc]
+    const float* scale = nullptr;                     // [3]: pre, post, comb
 };
 
 // Hyper-connection mixer (qwen4exp): the residual is n_hc parallel streams of n_embd. In place of every RMSNorm,
@@ -133,6 +146,37 @@ struct LayerWeights {
     const float* exp_probs_b = nullptr;               // [n_expert]: added to the router's sigmoid for the choice only
     QuantWeight W_lat_down, W_lat_up;                 // Super: ffn_latent_down [lat x n_embd] / _up [n_embd x lat]:
                                                       // the experts work on (and output) lat-wide rows
+
+    // GLM-5.3-Flash (glm5-next; llama.cpp glm5-next.cpp). Every block: mHC into attn_norm, the mixer, mHC into
+    // ffn_norm, the FFN (dense SwiGLU in the first layers, else sigmoid-routed experts + the shared expert), both
+    // SwiGLUs clamped at swiglu_limit (0: none).
+    HcSinkhorn hcs_attn, hcs_ffn;
+    float swiglu_limit = 0.0f, swiglu_limit_sh = 0.0f;
+    // KDA (LAYER_KDA): Wq / Wk / Wv each through its own causal conv1d (+ SiLU), L2-normed q / k; the per-channel
+    // decay g = lower_bound * sigmoid(-(f_b(f_a(x)) + dt) * A) (A = ssm_a = -exp(A_log) per head); beta =
+    // sigmoid(W_beta x) per head; the delta rule per head (head_dim x head_dim state); RMSNorm(o) * ssm_norm *
+    // sigmoid(g_b(g_a(x))) per head, then Wo. ssm_dt / ssm_a / ssm_norm / W_beta as for DeltaNet above.
+    const float* kda_conv[3] = {nullptr, nullptr, nullptr};  // q, k, v: [d_inner][d_conv] F32
+    QuantWeight W_f_a, W_f_b, W_g_a, W_g_b;          // [head_dim x n_embd], [d_inner x head_dim] each
+    // MLA (LAYER_MLA_DSA): q = q_b(RMSNorm(q_a(x)) * q_a_norm) per head (NoPE), the latent c = RMSNorm(kv_a(x)) *
+    // kv_a_norm is the cache row; q is absorbed into the latent through k_b, the output out of it through v_b
+    QuantWeight W_q_a, W_q_b, W_kv_a;                 // [q_lora x n_embd], [n_head * k_mla x q_lora], [kv_lora x n_embd]
+    const float* q_a_norm = nullptr;                  // [q_lora]
+    const float* kv_a_norm = nullptr;                 // [kv_lora]
+    QuantWeight W_k_b;                                // attn_k_b [n_head * kv_lora x k_mla]: head h's rows h * kv_lora ..
+    QuantWeight W_v_b;                                // attn_v_b [n_head * v_mla x kv_lora]
+    // The DSA indexer with k-pool compression: per position a key LayerNorm(ix_k(x)) and a pool gate
+    // ix_gate(x); each completed pool of ix_kpool positions is one pooled key, softmax(gate + ape) over the pool's
+    // positions per channel times their keys; a query's score of a pool is sum over heads of relu(q_h . k) *
+    // ix_proj(x)_h / sqrt(ix_dim * ix_heads); the top ix_topk / ix_kpool pools (and the incomplete tail) are the
+    // keys MLA attends to. ix_full: this layer has its own indexer, else it reuses the previous layer's choice.
+    bool ix_full = false;
+    QuantWeight W_ix_q_b;                             // [ix_heads * ix_dim x q_lora] (input: the normed q_a output)
+    QuantWeight W_ix_k, W_ix_gate;                    // [ix_dim x n_embd] each
+    QuantWeight W_ix_proj;                            // [ix_heads x n_embd]
+    QuantWeight W_ix_ape;                             // indexer_compressor_ape [ix_kpool x ix_dim]
+    const float* ix_k_norm = nullptr;                 // [ix_dim] LayerNorm gamma
+    const float* ix_k_norm_b = nullptr;               // [ix_dim] LayerNorm beta
 };
 
 // MTP draft head (a qwen4exp nextn sidecar GGUF, inference_set_draft_model): one more full-attention MoE block
@@ -299,6 +343,18 @@ struct inference_model {
     // output-normed rows pooled into the embedding instead of an LM head. pooling_type: 1 mean, 2 first (CLS),
     // 3 last; -1: not an embedding model
     int embed_pooling = -1;
+    // GLM-5.3-Flash (glm5-next): its own stream mixer (hcs_* in LayerWeights; n_hc stays 0, which is qwen4exp's),
+    // KDA, MLA and the DSA indexer widths
+    bool glm5 = false;
+    int hc_mult = 0, hc_sinkhorn_iters = 0;
+    float hc_eps = 1e-6f;
+    int n_dense_lead = 0;                               // leading_dense_block_count: dense FFN layers first
+    int kda_head_dim = 0;
+    float kda_gate_lower_bound = 0.0f;                  // -inf (none): softplus(g) * A instead
+    int q_lora = 0, kv_lora = 0, k_mla = 0, v_mla = 0;  // MLA widths (NoPE: k_mla is all nope)
+    int ix_heads = 0, ix_dim = 0, ix_topk = 0, ix_kpool = 0;
+    bool ix_select_tail = true;
+    int n_mla_layers = 0;                               // MLA layers: latent cache layers (kv_slot)
 };
 
 // A sequence's context while another is current (inference_seq_select swaps it with the model's fields)
