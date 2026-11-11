@@ -105,10 +105,19 @@ upstream's glm5-next on the tiny model to cosine 1.000000 in every layer, teache
 end to end (logits, argmax); `glm5next_verify` checks it whenever the oracle is built. Indexer ties: equal pool
 scores across the top-k boundary (all heads' ReLU 0 gives exact zeros) are picked by the lower pool index here;
 llama.cpp's top_k is std::partial_sort, unordered, so it has no rule to match - the GPU kernels follow ours, and
-decode and prefill must pick alike; (c) a `glm5next_verify` like `qwen4exp_verify` (teacher-forced per-layer cosines against the
-acts, then whole-model logits); (c) the forward pass, GPU kernels on FAST weights, each checked against Glm5Ref: mHC pre / post
-(the Sinkhorn on a 4x4 per token), KDA (per-channel decay in `deltanet`), the indexer (pool, score, top-k by the
-`moe_router` machinery, ties to the lower index), sparse MLA decode over the selected latents; (d) the routing trace of item 1
+decode and prefill must pick alike; (c) the GPU forward pass - first version done 2026-11-11: `forward_glm5`
+(qwen_model.cpp) with the kernels in `src/glm5_gpu.hip` (mHC pre / post / mean, KDA conv / L2 / delta rule with
+the per-channel decay and the gated norm, SwiGLU with the clamp, the indexer's LayerNorm / pooling / scores /
+top-k select (ties to the lower pool index), sparse MLA over the latents, head transposes) and the engine's own
+matvecs, sigmoid router and MoE combine; GLM's caches and KDA state in its own pinned region (GlmState),
+`inference_kv_cache_init` gives it a stand-in one-layer KV cache. Checked (`glm5next_verify.sh`): on the float
+path decode = Glm5Ref at every step (cos 1.000000, all argmax); with QMATVEC_NO_WMMA=1 prefill = token by token
+bit for bit. On the int8 path against the CPU it drifts (logits cos ~0.82 by the end on the tiny model's random
+weights: near-tie indexer and router picks flip under the activation noise; layers before the first MLA layer are
+at 0.9995) - to look at on real weights. Open in (c): speed (the per-head k_b / v_b matvecs are one launch a head;
+the indexer's select is one block a token with an O(256^2) scan per chunk of pools; the KDA rule a block a head);
+the MTP block; batched sequences; the stand-in KV cache's sequence features (store, checkpoints) do not cover
+GLM's state yet; (d) the routing trace of item 1
 on the real file, once the deployment can spare the memory.
 
 Config read from huggingface.co/zai-org/GLM-5.3-Flash/raw/main/config.json on 2026-11-06; the numbers below are

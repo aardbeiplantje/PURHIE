@@ -20,6 +20,7 @@
 #include "attention.h"
 #include "deltanet.h"
 #include "gpu_ops.h"
+#include "glm5_gpu.h"
 #include "qmatvec.h"
 #include "quant_types.h"
 
@@ -193,7 +194,9 @@ struct Scratch {
         B = rows;
         part_slots = (long long)attention_part_slots(n_ctx, rows);
         const size_t b = (size_t)rows;
-        q8_max_k = (std::max({E, HQ * HD, DI, FF, NU * FE, HCD}) + 255) / 256 * 256 * rows;
+        const int GLM = m->glm5 ? std::max({m->hc_mult * E, m->n_head * m->kda_head_dim, m->n_head * m->v_mla, m->q_lora})
+                                : 0;  // GLM-5.3: its widest matvec inputs (the streams, KDA's d_inner, MLA's output)
+        q8_max_k = (std::max({E, HQ * HD, DI, FF, NU * FE, HCD, GLM}) + 255) / 256 * 256 * rows;
         const size_t sizes[] = {b * E, b * E, b * E, b * 2 * HQ * HD, b * HQ * HD,
                                 b * HKV * HD, b * HKV * HD, b * HQ * HD, b * E,
                                 b * FF, b * FF, b * FF, (size_t)V,
@@ -346,11 +349,90 @@ struct Profile {
     }
 };
 
+// GLM-5.3-Flash (glm5-next): its per-token buffers and its state, in one pinned /dev/shm region (coarse-grained, as
+// the scratch: the GPU reads and writes it, the CPU only the embeddings and the indexer's ape). B rows a forward.
+// State: per KDA layer its conv windows [3][d_inner][d_conv - 1] and delta-rule matrices [H][hd][hd]; per MLA
+// layer the latents [n_ctx][kv_lora], the indexer's keys and pool gates [n_ctx][ix_dim] and its pooled keys
+// [n_ctx / kpool][ix_dim]. One sequence.
+struct GlmState {
+    int B = 0, n_ctx = 0, np = 0, ld_sel = 0, sc_rows = 0;
+    float *res = nullptr, *res_alt = nullptr, *flat = nullptr, *mix = nullptr, *post = nullptr, *comb = nullptr,
+          *blk = nullptr;
+    float *kproj = nullptr, *kconv = nullptr, *fa = nullptr, *gf = nullptr, *beta = nullptr, *ga = nullptr,
+          *g2 = nullptr, *lin = nullptr;
+    float *qa = nullptr, *qr = nullptr, *q = nullptr, *qT = nullptr, *qabs = nullptr, *kva = nullptr, *olat = nullptr,
+          *ovb = nullptr, *o = nullptr, *iq = nullptr, *ikraw = nullptr, *iw = nullptr, *score = nullptr;
+    int *sel = nullptr, *nsel = nullptr;
+    std::vector<float*> conv, S, latent, ik, ig, pooled, ape;  // by layer (nullptr where none)
+    ShmRegion mem;
+
+    bool alloc(const inference_model* m, int ctx, int rows) {
+        const int E = m->n_embd, HCE = m->hc_mult * E, H = m->n_head, HD = m->kda_head_dim, DI = H * HD;
+        const int QL = m->q_lora, KL = m->kv_lora, KM = m->k_mla, VM = m->v_mla, IH = m->ix_heads, ID = m->ix_dim;
+        const int KP = m->ix_kpool, NC = m->ssm_d_conv - 1;
+        B = rows;
+        n_ctx = ctx;
+        np = ctx / KP + 1;
+        ld_sel = (m->ix_topk / KP) * KP + KP;
+        sc_rows = (int)std::max<long long>(1, std::min<long long>(rows, (64LL << 20) / 4 / np));  // the scores' rows
+        const size_t b = (size_t)rows;
+        std::vector<size_t> sz = {b * HCE, b * HCE, b * HCE, b * 24, b * 4, b * 16, b * E,
+                                  3 * b * DI, 3 * b * DI, b * HD, b * DI, b * H, b * HD, b * DI, b * DI,
+                                  b * QL, b * QL, b * H * KM, b * H * KM, b * H * KL, b * KL, b * H * KL, b * H * VM,
+                                  b * H * VM, b * IH * ID, b * ID, b * IH, (size_t)sc_rows * np, b * ld_sel, b};
+        std::vector<float**> pt = {&res, &res_alt, &flat, &mix, &post, &comb, &blk, &kproj, &kconv, &fa, &gf, &beta,
+                                   &ga, &g2, &lin, &qa, &qr, &q, &qT, &qabs, &kva, &olat, &ovb, &o, &iq, &ikraw, &iw,
+                                   &score, (float**)&sel, (float**)&nsel};
+        const int L = m->n_layer;
+        conv.assign(L, nullptr), S.assign(L, nullptr), latent.assign(L, nullptr), ik.assign(L, nullptr),
+            ig.assign(L, nullptr), pooled.assign(L, nullptr), ape.assign(L, nullptr);
+        for (int l = 0; l < L; ++l) {
+            const LayerWeights& W = m->layers[l];
+            if (W.kind == LAYER_KDA) {
+                sz.push_back(3 * (size_t)DI * NC), pt.push_back(&conv[l]);
+                sz.push_back((size_t)H * HD * HD), pt.push_back(&S[l]);
+            } else if (W.kind == LAYER_MLA_DSA) {
+                sz.push_back((size_t)ctx * KL), pt.push_back(&latent[l]);
+                if (W.ix_full) {
+                    sz.push_back((size_t)ctx * ID), pt.push_back(&ik[l]);
+                    sz.push_back((size_t)ctx * ID), pt.push_back(&ig[l]);
+                    sz.push_back((size_t)np * ID), pt.push_back(&pooled[l]);
+                    sz.push_back((size_t)KP * ID), pt.push_back(&ape[l]);
+                }
+            }
+        }
+        if (!mem.alloc("/dev/shm/glm5_state.bin", sz.data(), (float** const*)pt.data(), sz.size(),
+                       hipExtHostRegisterCoarseGrained))
+            return false;
+        for (int l = 0; l < L; ++l)  // the indexer's ape, decoded once
+            if (ape[l])
+                for (int j = 0; j < KP; ++j)
+                    if (qt_to_float(m->layers[l].W_ix_ape.type, m->layers[l].W_ix_ape.row(j), ape[l] + (size_t)j * ID, ID) != 0)
+                        return false;
+        return true;
+    }
+
+    // A new sequence: the KDA states from zero (the caches are overwritten as positions come)
+    hipError_t reset(const inference_model* m) {
+        const int H = m->n_head, HD = m->kda_head_dim, DI = H * HD, NC = m->ssm_d_conv - 1;
+        for (size_t l = 0; l < conv.size(); ++l)
+            if (conv[l]) {
+                hipError_t e = hipMemsetAsync(conv[l], 0, sizeof(float) * 3 * DI * NC, 0);
+                if (e == hipSuccess) e = hipMemsetAsync(S[l], 0, sizeof(float) * H * HD * HD, 0);
+                if (e != hipSuccess) return e;
+            }
+        return hipSuccess;
+    }
+
+    void free() { mem.free(); }
+};
+
 struct QwenModel {
     inference_model* eng = nullptr;
     Profile prof;
     Scratch s;
     RecurrentState rs;
+    GlmState glm;                               // GLM-5.3-Flash's buffers and state (glm5-next only)
     qwen_layer_cb layer_cb = nullptr;
     void* layer_cb_user = nullptr;
     // int8 matvec path: s.q8 holds the quantized form of q8_src[q8_k]; matvec() uses it when its input matches.
@@ -420,6 +502,7 @@ struct QwenModel {
         head_mem.free();
         seqs_logits_mem.free();
         rs.free();
+        glm.free();
         s.mem.free();
         for (size_t j = 1; j < seqs.size(); ++j) {
             seqs[j].rs.free();
@@ -503,10 +586,6 @@ struct QwenModel {
         eng = model;
         ++g_live_models;
         counted = true;
-        if (eng->glm5) {  // the loader binds GLM-5.3-Flash; its forward pass (mHC, KDA, MLA + DSA) is not written yet
-            qwen_set_error("glm5-next: the forward pass is not implemented yet (the model loads; PLAN.md, GLM-5.3-Flash)");
-            return false;
-        }
         if (qmatvec_init("matvec_q.co") != 0 || gpu_ops_init("gpu_ops.co") != 0) {
             qwen_set_error("cannot load matvec_q.co / gpu_ops.co (run from build/co)");
             return false;
@@ -594,6 +673,16 @@ struct QwenModel {
             return false;
         }
         if (eng->gemma4 && !gemma_setup()) return false;
+        if (eng->glm5) {
+            if (glm5_gpu_init("glm5_gpu.co") != 0) {
+                qwen_set_error("cannot load glm5_gpu.co");
+                return false;
+            }
+            if (!glm.alloc(eng, n_ctx, s.B)) {
+                qwen_set_error("GLM-5.3 state allocation failed");
+                return false;
+            }
+        }
         return true;
     }
 
@@ -982,6 +1071,7 @@ struct QwenModel {
         if (eng->n_hc > 0) return forward_hc(tokens, T, pos0, logits_out);
         if (eng->gemma4) return forward_gemma(tokens, T, pos0, logits_out);
         if (eng->nemotron) return forward_nemotron(tokens, T, pos0, logits_out);
+        if (eng->glm5) return forward_glm5(tokens, T, pos0, logits_out);
         prof.start();
         for (int t = 0; t < T; ++t) {
             if (tokens[t] < 0 || tokens[t] >= eng->vocab_size) { qwen_set_error("token %d out of range", tokens[t]); return -1; }
@@ -1653,6 +1743,200 @@ struct QwenModel {
         return 0;
     }
 
+    // ------------------------------------------------------------ GLM-5.3-Flash (glm5-next)
+    // The reference is src/glm5_ref.cpp (tests/glm5next_verify.cpp compares the two). Residual: n_hc streams in
+    // glm.res; every block: the mHC mixer's input (RMSNorm of all streams, fn, then glm_hc_pre) into glm.blk, its
+    // norm into s.xn, the mixer or the FFN into s.proj, glm_hc_post back into the streams.
+
+    // The mHC mixer into the block input and its norm (gamma w) into s.xn, quantized for the next matvecs
+    bool glm_hc_in(const HcSinkhorn& h, const float* w, int T, ProfCat c) {
+        const int E = eng->n_embd, HCE = eng->hc_mult * E;
+        const float eps = (float)eng->eps;
+        if (!check(glm_rms_flat(glm.res, glm.flat, HCE, T, eps, 0), "glm_rms_flat") || !produced(glm.flat, HCE, T) ||
+            !matvec(h.fn, glm.flat, glm.mix, T, c) ||
+            !check(glm_hc_pre(glm.mix, h.scale, h.base, glm.res, glm.blk, glm.post, glm.comb, E, T, eng->hc_eps,
+                              eng->hc_sinkhorn_iters, 0),
+                   "glm_hc_pre"))
+            return false;
+        const qmatvec_q8* q = E % 256 == 0 ? q8_for(E, T) : nullptr;
+        if (!check(gpu_add_rmsnorm(glm.blk, nullptr, glm.blk, w, s.xn, E, T, eps, q, 0), "rmsnorm")) return false;
+        if (q) mark(s.xn, E, T, q);
+        else if (!produced(s.xn, E, T)) return false;
+        return true;
+    }
+
+    // The block output in s.proj back into the streams
+    bool glm_hc_out(int T) {
+        if (!check(glm_hc_post(s.proj, glm.res, glm.post, glm.comb, glm.res_alt, eng->n_embd, T, 0), "glm_hc_post"))
+            return false;
+        std::swap(glm.res, glm.res_alt);
+        return true;
+    }
+
+    bool glm_kda(int l, const LayerWeights& L, int T) {
+        const int H = eng->n_head, HD = eng->kda_head_dim, DI = H * HD;
+        const long long ld = (long long)glm.B * DI;
+        if (!matvec_multi({{&L.Wq, glm.kproj}, {&L.Wk, glm.kproj + ld}, {&L.Wv, glm.kproj + 2 * ld}, {&L.W_f_a, glm.fa},
+                           {&L.W_g_a, glm.ga}, {&L.W_beta, glm.beta}},
+                          s.xn, T, P_LIN) ||
+            !check(kda_conv(glm.kproj, glm.kconv, ld, glm.conv[l], L.kda_conv[0], L.kda_conv[1], L.kda_conv[2], DI,
+                            eng->ssm_d_conv, T, 0),
+                   "kda_conv") ||
+            !check(kda_l2(glm.kconv, ld, HD, H, T, 1e-6f, 0), "kda_l2") || !produced(glm.fa, HD, T) ||
+            !matvec(L.W_f_b, glm.fa, glm.gf, T, P_LIN) || !produced(glm.ga, HD, T) ||
+            !matvec(L.W_g_b, glm.ga, glm.g2, T, P_LIN) ||
+            !check(kda_rule(glm.S[l], glm.kconv, ld, glm.gf, L.ssm_dt, L.ssm_a, glm.beta, glm.g2, L.ssm_norm, glm.lin, H,
+                            HD, eng->kda_gate_lower_bound, (float)eng->eps, T, 0),
+                   "kda_rule") ||
+            !produced(glm.lin, DI, T))
+            return false;
+        return matvec(L.Wo, glm.lin, s.proj, T, P_LIN);
+    }
+
+    bool glm_mla(int l, const LayerWeights& L, int pos0, int T) {
+        const int H = eng->n_head, QL = eng->q_lora, KL = eng->kv_lora, KM = eng->k_mla, VM = eng->v_mla;
+        const int IH = eng->ix_heads, ID = eng->ix_dim, KP = eng->ix_kpool;
+        const float eps = (float)eng->eps;
+        // the projections of the normed input: q_a, kv_a and the indexer's key, pool gate (straight into its cache
+        // rows) and head weights
+        float* ig = L.ix_full ? glm.ig[l] + (size_t)pos0 * ID : nullptr;
+        if (L.ix_full ? !matvec_multi({{&L.W_q_a, glm.qa}, {&L.W_kv_a, glm.kva}, {&L.W_ix_k, glm.ikraw},
+                                       {&L.W_ix_gate, ig}, {&L.W_ix_proj, glm.iw}},
+                                      s.xn, T, P_ATTN)
+                      : !matvec_pair(L.W_q_a, L.W_kv_a, s.xn, glm.qa, glm.kva, T, P_ATTN))
+            return false;
+        const qmatvec_q8* qq = QL % 256 == 0 ? q8_for(QL, T) : nullptr;  // (add_rmsnorm quantizes 256-value rows)
+        if (!check(gpu_add_rmsnorm(glm.qa, nullptr, glm.qa, L.q_a_norm, glm.qr, QL, T, eps, qq, 0), "rmsnorm (q_a)"))
+            return false;
+        if (qq) mark(glm.qr, QL, T, qq);
+        else if (!produced(glm.qr, QL, T)) return false;
+        if (L.ix_full ? !matvec_pair(L.W_q_b, L.W_ix_q_b, glm.qr, glm.q, glm.iq, T, P_ATTN)
+                      : !matvec(L.W_q_b, glm.qr, glm.q, T, P_ATTN))
+            return false;
+        float* lat = glm.latent[l];
+        if (!check(gpu_add_rmsnorm(glm.kva, nullptr, glm.kva, L.kv_a_norm, lat + (size_t)pos0 * KL, KL, T, eps, nullptr, 0),
+                   "rmsnorm (kv_a)"))
+            return false;
+        if (L.ix_full) {  // the indexer: keys, the pools completed by these tokens, scores, the selection
+            const int j0 = pos0 / KP, j1 = (pos0 + T) / KP;  // pools [j0, j1) complete within pos0 .. pos0 + T - 1
+            if (!check(glm_layernorm(glm.ikraw, L.ix_k_norm, L.ix_k_norm_b, glm.ik[l] + (size_t)pos0 * ID, ID, T,
+                                     eng->ln_eps, 0),
+                       "glm_layernorm") ||
+                !check(glm_pool(glm.ik[l], glm.ig[l], glm.ape[l], glm.pooled[l], j0, j1 - j0, KP, ID, 0), "glm_pool"))
+                return false;
+            const float ws = 1.0f / sqrtf((float)(ID * IH));
+            for (int t0 = 0; t0 < T; t0 += glm.sc_rows) {  // the score rows a pass holds
+                const int n = std::min(glm.sc_rows, T - t0);
+                if (!check(glm_index_score(glm.iq + (size_t)t0 * IH * ID, glm.iw + (size_t)t0 * IH, glm.pooled[l],
+                                           glm.score, glm.np, pos0 + t0, n, KP, IH, ID, ws, 0),
+                           "glm_index_score") ||
+                    !check(glm_index_select(glm.score, glm.np, glm.sel + (size_t)t0 * glm.ld_sel, glm.ld_sel,
+                                            glm.nsel + t0, pos0 + t0, n, KP, eng->ix_topk / KP, eng->ix_select_tail, 0),
+                           "glm_index_select"))
+                    return false;
+            }
+        }  // else: the selection the MLA layer before it left in glm.sel
+        // q absorbed into the latent per head (k_b), attention over the selected latents, out of it per head (v_b)
+        if (!check(glm_heads_swap(glm.q, glm.qT, H, T, KM, 1, 0), "glm_heads_swap")) return false;
+        for (int h = 0; h < H; ++h) {
+            QuantWeight kb = L.W_k_b;
+            kb.data = L.W_k_b.row(h * KL), kb.N = KL;
+            if (!matvec(kb, glm.qT + (size_t)h * T * KM, glm.qabs + (size_t)h * T * KL, T, P_ATTN)) return false;
+        }
+        if (!check(glm_mla_attn(glm.qabs, lat, glm.sel, glm.ld_sel, glm.nsel, glm.olat, H, T, KL,
+                                1.0f / sqrtf((float)KM), 0),
+                   "glm_mla_attn"))
+            return false;
+        for (int h = 0; h < H; ++h) {
+            QuantWeight vb = L.W_v_b;
+            vb.data = L.W_v_b.row(h * VM), vb.N = VM;
+            if (!matvec(vb, glm.olat + (size_t)h * T * KL, glm.ovb + (size_t)h * T * VM, T, P_ATTN)) return false;
+        }
+        if (!check(glm_heads_swap(glm.ovb, glm.o, H, T, VM, 0, 0), "glm_heads_swap") || !produced(glm.o, H * VM, T))
+            return false;
+        return matvec(L.Wo, glm.o, s.proj, T, P_ATTN);
+    }
+
+    bool glm_ffn(const LayerWeights& L, int T) {
+        const int E = eng->n_embd, NE = eng->n_expert, NU = eng->n_expert_used, FE = eng->n_ff_exp, FF = L.W_gate.N;
+        // the dense FFN, or the shared expert: from s.xn's int8 form before anything else is quantized
+        if (!matvec_pair(L.W_gate, L.W_up, s.xn, s.ffg, s.ffu, T, P_FFN)) return false;
+        if (L.moe && (!matvec(L.W_router, s.xn, s.r_logits, T, P_FFN) ||
+                      !check(gpu_moe_router_sigmoid(s.r_logits, L.exp_probs_b, s.ids, s.wts, NE, NU,
+                                                    eng->expert_weights_norm, eng->expert_weights_scale, T, 0),
+                             "moe_router_sigmoid")))
+            return false;
+        bool grouped = false;
+        if (L.moe) {
+            grouped = T >= 8 || inv;
+            if (grouped) {
+                s.g_tile = std::min(qmatvec_id_batch_tile(L.We_gate.type, FE, E), qmatvec_id_batch_tile(L.We_down.type, E, FE));
+                if (!check(gpu_moe_group(s.ids, T, NU, NE, s.g_tile, s.g_tok, s.g_pair, s.g_ntiles, s.g_tile_e,
+                                         s.g_tile_start, s.g_tile_n, 0),
+                           "moe_group"))
+                    return false;
+            }
+            if (!matvec_id_gate_up(L.We_gate, L.We_up, s.xn, s.moe_g, s.moe_u, FE, T, grouped, P_FFN) ||
+                !check(glm_swiglu_clamp(s.moe_g, s.moe_u, s.moe_act, T * NU, FE, L.swiglu_limit, 0), "swiglu (experts)") ||
+                !produced(s.moe_act, FE, T * NU) || !matvec_id(L.We_down, s.moe_act, 1, s.moe_down, E, T, grouped, P_FFN))
+                return false;
+        }
+        if (!check(glm_swiglu_clamp(s.ffg, s.ffu, s.act, T, FF, L.swiglu_limit_sh, 0), "swiglu") ||
+            !produced(s.act, FF, T) || !matvec(L.W_down, s.act, L.moe ? s.sh_out : s.proj, T, P_FFN))
+            return false;
+        return !L.moe || check(gpu_moe_combine_scaled(s.moe_down, s.wts, s.sh_out, nullptr, nullptr, nullptr, s.proj, NU,
+                                                      E, T, 0),
+                               "moe_combine");
+    }
+
+    int forward_glm5(const int* tokens, int T, int pos0, float* logits_out) {
+        const int E = eng->n_embd, V = eng->vocab_size, HC = eng->hc_mult;
+        if (bat || spec_mid || all_out) { qwen_set_error("glm5-next: batched sequences / drafts not supported yet"); return -1; }
+        if (pos0 + T > glm.n_ctx) { qwen_set_error("positions %d..%d past the context", pos0, pos0 + T - 1); return -1; }
+        prof.start();
+        if (!sync()) return -1;  // the CPU writes the streams below
+        for (int t = 0; t < T; ++t) {
+            if (tokens[t] < 0 || tokens[t] >= V) { qwen_set_error("token %d out of range", tokens[t]); return -1; }
+            float* r = glm.res + (size_t)t * HC * E;
+            if (dbg_res_in) {
+                memcpy(r, dbg_res_in + (size_t)t * HC * E, sizeof(float) * HC * E);
+                continue;
+            }
+            if (qt_to_float(eng->token_embd.type, eng->token_embd.row(tokens[t]), r, E) != 0) {
+                qwen_set_error("cannot decode token_embd type %d", eng->token_embd.type);
+                return -1;
+            }
+            for (int h = 1; h < HC; ++h) memcpy(r + (size_t)h * E, r, sizeof(float) * E);
+        }
+        if (pos0 == 0 && !check(glm.reset(eng), "GLM state reset")) return -1;
+        prof.lap(P_EMBED);
+        const int l0 = dbg_res_in ? dbg_l0 : 0, l1 = dbg_res_in ? dbg_l1 : eng->n_layer;
+        for (int l = l0; l < l1; ++l) {
+            const LayerWeights& L = eng->layers[l];
+            const ProfCat c = L.kind == LAYER_KDA ? P_LIN : P_ATTN;
+            if (!glm_hc_in(L.hcs_attn, L.attn_norm, T, c) ||
+                !(L.kind == LAYER_KDA ? glm_kda(l, L, T) : glm_mla(l, L, pos0, T)) || !glm_hc_out(T) || !section(c) ||
+                !glm_hc_in(L.hcs_ffn, L.ffn_norm, T, P_FFN) || !glm_ffn(L, T) || !glm_hc_out(T) || !section(P_FFN))
+                return -1;
+            if (layer_cb) {  // the streams after the layer, per token
+                if (!sync()) return -1;
+                for (int t = 0; t < T; ++t) layer_cb(l, pos0 + t, glm.res + (size_t)t * HC * E, HC * E, layer_cb_user);
+                prof.start();
+            }
+        }
+        if (dbg_res_in) return sync() ? 0 : -1;
+        // the final mixer: the mean of the streams, output_norm
+        if (!check(glm_hc_mean(glm.res, glm.blk, E, T, 0), "glm_hc_mean")) return -1;
+        const qmatvec_q8* q = q8_for(E, T);
+        if (!check(gpu_add_rmsnorm(glm.blk, nullptr, glm.blk, eng->output_norm, s.xn, E, T, (float)eng->eps, q, 0),
+                   "output_norm"))
+            return -1;
+        mark(s.xn, E, T, q);
+        if (lm_head(T, nullptr) != 0) return -1;
+        if (logits_out) memcpy(logits_out, s.logits, sizeof(float) * V);
+        return 0;
+    }
+
     // ------------------------------------------------------------ hyper-connections (qwen4exp)
 
     // Combine the block output cur (none: just normalize) into the residual streams with the stream weights in
@@ -2241,7 +2525,7 @@ int qwen_model_prefill(qwen_model_t* model, const int* tokens, int n, int pos0, 
 }
 
 int qwen_model_run_layers(qwen_model_t* model, const int* tokens, int n, const float* res_in, int l0, int l1) {
-    if (!model || !tokens || !res_in || (model->eng->n_hc <= 0 && !model->eng->gemma4 && !model->eng->nemotron) || l0 < 0 ||
+    if (!model || !tokens || !res_in || (model->eng->n_hc <= 0 && !model->eng->gemma4 && !model->eng->nemotron && !model->eng->glm5) || l0 < 0 ||
         l1 > model->eng->n_layer || l0 >= l1 ||
         n > model->s.B) {
         qwen_set_error("qwen_model_run_layers: bad arguments");

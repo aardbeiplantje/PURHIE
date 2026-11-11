@@ -1042,6 +1042,7 @@ static bool load_layer_glm5next(inference_model* m, int i, LayerWeights& L, cons
     L.shexp = true;
     const int NE = m->n_expert, FE = m->n_ff_exp;
     const int FS = FE * (int)gguf_arch_int(f, "expert_shared_count", 1);
+    m->n_ff_shexp = std::max(m->n_ff_shexp, FS);  // the scratch's FFN rows hold the shared expert too
     if (NE <= 0 || m->n_expert_used <= 0 || m->n_expert_used > NE || FE <= 0) {
         set_error("blk.%d: bad MoE hparams (experts %d used %d ff_exp %d)", i, NE, m->n_expert_used, FE);
         return false;
@@ -1520,10 +1521,6 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
     clear_error();
     if (!m) { set_error("NULL model"); return -1; }
     if (m->seqs.size() > 1) { set_error("free the sequences (inference_seq_free) before a new KV cache"); return -1; }
-    if (m->glm5) {  // its cache is the MLA latent + the indexer's rows, and its forward pass is not written yet
-        set_error("glm5-next: the forward pass is not implemented yet (the model loads; PLAN.md, GLM-5.3-Flash)");
-        return INFERENCE_ERR_NOT_IMPLEMENTED;
-    }
     if (m->kvc_swa) { kv_cache_free(m->kvc_swa); m->kvc_swa = nullptr; }
     int window = 0;
     const int R = swa_ring_size(m, n_ctx, &window);
@@ -1532,6 +1529,9 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
     // One KV layer per full-attention layer (LayerWeights::kv_slot); DeltaNet layers keep recurrent state instead
     kv_cache_config_t cfg{m->n_kv_layers > 0 ? m->n_kv_layers : 1, n_ctx, m->n_embd,
                           m->kv_head_dim > 0 ? m->kv_head_dim : m->head_dim, m->n_head, m->n_head_kv, 0, m->kv_type};
+    // GLM-5.3: its caches (MLA latents, the indexer's rows) and KDA state are its own (QwenModel's GlmState); this
+    // one-layer cache of one 32-wide head only gives the sequence machinery its n_ctx
+    if (m->glm5) cfg = kv_cache_config_t{1, n_ctx, m->n_embd, 32, 1, 1, 0, m->kv_type};
     if (m->gemma4) {  // number the layers' KV slots: in the ring and the block cache, or all in the block cache
         int n_ring = 0, n_glob = 0, ring_hd = 0, ring_kv = 0, glob_hd = 0, glob_kv = 0;
         for (LayerWeights& L : m->layers) {

@@ -10,7 +10,7 @@
 // The loader: each block's kind from the file (KDA where attention.head_count_kv is 0, else MLA with the DSA
 // indexer), the indexer flags, the MLA cache slots, the FFN kinds (dense in the leading_dense_block_count layers,
 // experts + the shared expert after), the hparams, inference_model_info's cache size; and that the GPU forward
-// pass refuses cleanly (not written yet).
+// pass on it.
 // With ref_dir, the CPU forward pass (src/glm5_ref.cpp, the GPU kernels' reference) against llama.cpp's:
 //  - each layer alone from the reference's input streams at every position (teacher forcing, positions in order:
 //    the KDA state, the latents and the indexer's pools build up as in the reference): the block input (mHC pre),
@@ -21,11 +21,20 @@
 //    and llama.cpp has none (std::partial_sort): such positions are counted, not compared after the indexer;
 //  - the whole model run token by token from the embeddings: the last layer's streams and the last token's logits
 //    (cosine >= 0.999, the same argmax).
+// Then the GPU forward pass (qwen_model.cpp forward_glm5, glm5_gpu.hip), on the reference's tokens (or fixed ones):
+//  - QWEN_MATVEC_FP32=1 (float matvec inputs): token by token against the CPU one (Glm5Ref), every step's logits
+//    (cosine >= 0.9999, the same argmax): the kernels' arithmetic;
+//  - else (int8 matvec inputs, the engine's path): with QMATVEC_NO_WMMA=1 a prefill of all tokens equals
+//    token-by-token decoding bit for bit (the batched kernels: KDA over a run, the per-token selection, pools
+//    completed within a batch); with the WMMA matmuls it is printed (they sum a batch in another order). Against
+//    the CPU this path is printed, not checked: with the tiny model's random weights the int8 noise flips
+//    near-ties of the indexer's pool scores and the routers, and a flipped pick changes that position's output.
 
 #include "inference.h"
 #include "inference_internal.h"
 #include "gguf_mmap.h"
 #include "glm5_ref.h"
+#include "qwen_model.h"
 
 #include <algorithm>
 #include <cmath>
@@ -74,6 +83,106 @@ static double cosine(const float* a, const float* b, size_t n) {
     double ab = 0, aa = 0, bb = 0;
     for (size_t i = 0; i < n; ++i) ab += (double)a[i] * b[i], aa += (double)a[i] * a[i], bb += (double)b[i] * b[i];
     return aa > 0 && bb > 0 ? ab / sqrt(aa * bb) : (aa == bb ? 1.0 : 0.0);
+}
+
+
+struct StreamCapture {
+    int SE = 0;
+    std::vector<std::vector<float>> at;  // [layer * T + pos][SE]
+    int T = 0;
+};
+
+static void capture(int layer, int pos, const float* x, int n, void* user) {
+    StreamCapture* c = (StreamCapture*)user;
+    if (n != c->SE || pos >= c->T) return;
+    c->at[(size_t)layer * c->T + pos].assign(x, x + n);
+}
+
+// The GPU forward pass against the CPU one (see the top)
+static void verify_gpu(inference_model_t* m, const std::vector<int>& toks) {
+    const inference_model& e = *m;
+    const int T = (int)toks.size(), SE = e.hc_mult * e.n_embd, V = e.vocab_size;
+    const bool fp32 = getenv("QWEN_MATVEC_FP32") != nullptr;
+    qwen_model_t* q = inference_get_qwen_model(m);
+    check(q != nullptr, "GPU model");
+    if (!q) return;
+    // the CPU's streams after every layer and logits at every position
+    Glm5Ref r(&e);
+    std::vector<std::vector<float>> cpu_streams((size_t)e.n_layer * T), cpu_logits(T);
+    for (int t = 0; t < T; ++t) {
+        std::vector<float> s(SE);
+        r.embed(toks[t], s.data());
+        for (int l = 0; l < e.n_layer; ++l) {
+            r.layer(l, t, s.data());
+            cpu_streams[(size_t)l * T + t] = s;
+        }
+        cpu_logits[t].resize(V);
+        r.logits(s.data(), cpu_logits[t].data());
+    }
+    auto argmax = [&](const float* v) { return (int)(std::max_element(v, v + V) - v); };
+    std::vector<float> lg(V), pre_last;
+    StreamCapture c, d;  // the streams after every layer: prefill, token by token
+    if (!fp32) {  // a prefill of all tokens (the float path has no batched FAST expert kernel)
+        c.SE = SE, c.T = T;
+        c.at.resize((size_t)e.n_layer * T);
+        qwen_model_set_layer_callback(q, capture, &c);
+        const int rc = qwen_model_prefill(q, toks.data(), T, 0, lg.data());
+        qwen_model_set_layer_callback(q, nullptr, nullptr);
+        check(rc == 0, "GPU prefill");
+        if (rc != 0) { printf("    %s\n", qwen_model_last_error()); return; }
+        for (int l = 0; l < e.n_layer; ++l) {
+            double worst = 1.0;
+            int wt = -1;
+            for (int t = 0; t < T; ++t) {
+                const auto& g = c.at[(size_t)l * T + t];
+                const double cs = g.size() == (size_t)SE ? cosine(g.data(), cpu_streams[(size_t)l * T + t].data(), SE) : 0.0;
+                if (cs < worst) worst = cs, wt = t;
+            }
+            printf("    (int8 activations) GPU prefill blk.%d %s: streams worst cos vs CPU %.6f (position %d)\n", l,
+                   e.layers[l].kind == LAYER_KDA ? "KDA" : "MLA", worst, wt);
+        }
+        pre_last = lg;
+    }
+    double worst = 1.0;
+    int agree = 0;
+    d.SE = SE, d.T = T;
+    d.at.resize((size_t)e.n_layer * T);
+    qwen_model_set_layer_callback(q, capture, &d);
+    for (int t = 0; t < T; ++t) {  // token by token
+        if (qwen_model_forward(q, toks[t], t, lg.data()) != 0) {
+            qwen_model_set_layer_callback(q, nullptr, nullptr);
+            check(false, "GPU decode");
+            printf("    %s\n", qwen_model_last_error());
+            return;
+        }
+        worst = std::min(worst, cosine(lg.data(), cpu_logits[t].data(), V));
+        agree += argmax(lg.data()) == argmax(cpu_logits[t].data());
+    }
+    qwen_model_set_layer_callback(q, nullptr, nullptr);
+    if (!fp32)  // the first layer and position where prefill and token-by-token streams part
+        for (int l = 0; l < e.n_layer; ++l) {
+            int first = -1;
+            for (int t = 0; t < T && first < 0; ++t)
+                if (c.at[(size_t)l * T + t] != d.at[(size_t)l * T + t]) first = t;
+            if (first >= 0) {
+                printf("    prefill vs token by token: first differ after blk.%d at position %d (cos %.9f)\n", l, first,
+                       cosine(c.at[(size_t)l * T + first].data(), d.at[(size_t)l * T + first].data(), SE));
+                break;
+            }
+        }
+    printf("    GPU decode vs CPU%s: worst logits cos %.6f over %d steps, argmax agrees at %d\n",
+           fp32 ? " (float path)" : " (int8 activations: near-tie picks of the indexer and routers flip)", worst, T,
+           agree);
+    if (fp32) {
+        check(worst >= 0.9999 && agree == T, "GPU decode = CPU at every step (float path)");
+    } else {
+        size_t diff = 0;
+        for (int i = 0; i < V; ++i) diff += pre_last[i] != lg[i];
+        printf("    GPU prefill vs token by token: %zu of %d last logits differ (cos %.9f)\n", diff, V,
+               cosine(pre_last.data(), lg.data(), V));
+        if (getenv("QMATVEC_NO_WMMA"))  // (the WMMA matmuls of a batch sum in another order)
+            check(diff == 0, "GPU prefill = token by token, bit for bit (QMATVEC_NO_WMMA=1)");
+    }
 }
 
 // The CPU forward pass against the reference (see the top)
@@ -231,14 +340,22 @@ int main(int argc, char** argv) {
     check(info.kv_bytes_per_token == (unsigned long long)full * 2 * (e.kv_lora + 3 * e.ix_dim),
           "inference_model_info: the latent + indexer cache per position (MLA layers incl. the MTP block)");
 
-    // the forward pass is not written yet: kv_cache_init must refuse with that, not crash
-    const int rc = inference_kv_cache_init(m, 256);
-    check(rc != 0 && strstr(inference_get_last_error(), "not implemented"), "kv_cache_init refuses: forward pass not written");
-    printf("    %s\n", inference_get_last_error());
     if (argc > 2) {
         g_dir = argv[2];
         verify_ref(e);
     }
+    std::vector<int> toks;
+    {
+        std::ifstream f(g_dir.empty() ? std::string() : g_dir + "/tokens.txt");
+        int t;
+        while (f >> t) toks.push_back(t);
+    }
+    if (toks.empty())
+        for (int i = 0; i < 50; ++i) toks.push_back((int)((785u + 7919u * (unsigned)i) % (unsigned)e.vocab_size));
+    const int rc = inference_kv_cache_init(m, 256);
+    check(rc == 0, "kv_cache_init");
+    if (rc != 0) printf("    %s\n", inference_get_last_error());
+    else verify_gpu(m, toks);
     inference_free_model(m);
     printf(g_fail ? "FAIL: %d checks\n" : "PASS\n", g_fail);
     return g_fail ? 1 : 0;

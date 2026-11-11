@@ -58,7 +58,7 @@ while IFS= read -r line; do
     raw_model=$model raw_args=$args
     model=$(eval echo "$model") args=$(eval echo "$args")
     log="$LOGS/$name.log"
-    if [ "$model" != - ] && [ ! -f "$model" ]; then
+    if [ "$model" != - ] && [ ! -e "$model" ]; then
         printf "SKIP  %-28s no %s\n" "$name" "$model"; skip=$((skip + 1)); echo "$line" >> "$new"; continue
     fi
     t0=$SECONDS
