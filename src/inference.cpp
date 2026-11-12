@@ -273,6 +273,13 @@ static bool pin_model_memory(inference_model* m) {
     std::string pages;
     if (!pin_gguf(m->gguf, cpu_only, m->pinned, m->pinned_bytes, m->unpinned_bytes, &pages, m->pager)) return false;
     if (m->stage_info.empty()) m->stage_info = pages;  // (not staged: how the GGUF mapping is paged)
+    // The embedding table the CPU reads a row of per token (not tied to the head, so not registered): asked for now,
+    // or a token's first use waits for its page from the disk (~0.4 ms)
+    if (m->output.data != m->token_embd.data && m->token_embd.data) {
+        const uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE), a = (uintptr_t)m->token_embd.data & ~(pg - 1);
+        const uintptr_t b = (uintptr_t)m->token_embd.data + m->token_embd.row_bytes * (size_t)m->token_embd.N;
+        (void)madvise((void*)a, b - a, MADV_WILLNEED);
+    }
     return true;
 }
 
@@ -1364,6 +1371,15 @@ inference_model_t* inference_load_model_ex(const char* gguf_path, const inferenc
     }
     INFER_LOG("[LOAD] token_embd type %d, LM head type %d%s\n", m->token_embd.type, m->output.type,
             m->output.data == m->token_embd.data ? " (tied)" : "");
+
+    // A float LM head is read through an int8 (Q8_0) copy by default: half the bytes of an F16 head a token (Qwen3.6-35B:
+    // 61 -> 76 tok/s), the next-token distribution within KL 2e-4 of the float head's (tests/head_q8_verify).
+    // INFERENCE_LM_HEAD_Q8=0 or inference_set_lm_head_q8(m, 0): the float head
+    {
+        const char* hq = getenv("INFERENCE_LM_HEAD_Q8");
+        const int t = m->output.type;
+        m->lm_head_q8 = (t == QT_F32 || t == QT_F16 || t == QT_BF16) && !(hq && hq[0] == '0');
+    }
 
     // Create tokenizer from GGUF metadata (Phase 5/8)
     m->tokenizer = tokenizer_load_from_gguf(m->gguf);

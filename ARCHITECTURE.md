@@ -90,8 +90,9 @@ Weights stay in their GGUF blocks; each type has a CPU decoder (tests) and GPU k
   tokens are grouped by expert (`moe_group`) into tiles (up to 64 entries on the WMMA path, so a 1,024-token
   batch reads each expert's weights about once; 16 otherwise); an id of -1 selects an extra matrix (the shared
   expert as one more slot when generating).
-- **LM head**: on the last row only (two rows in a verify pass); opt-in int8 copy of a float head
-  (`inference_set_lm_head_q8`).
+- **LM head**: on the last row only (two rows in a verify pass); a float head is read through an int8 (Q8_0) copy, half an F16 head's
+  bytes a token (`inference_set_lm_head_q8`, `INFERENCE_LM_HEAD_Q8=0`: off; argmax equal at 99-100% of positions,
+  perplexity +0.04-0.06%, `tests/head_q8_verify`).
 
 Supported weight types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K–Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS,
 IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, MXFP4, NVFP4, ROCmFP4 and ROCmFP4_FAST; int8 kernels (single
