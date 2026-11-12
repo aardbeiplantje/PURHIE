@@ -90,6 +90,7 @@ WMMA_LAYOUT_VERIFY = $(BINDIR)/wmma_layout_verify
 MATVEC_BENCH = $(BINDIR)/matvec_bench
 DEQUANT_VERIFY   = $(BINDIR)/dequant_verify
 EXPERT_CPU_BENCH = $(BINDIR)/expert_cpu_bench
+MM_VERIFY      = $(BINDIR)/mm_verify  # an image chat through the engine vs transformers (tests/mm_verify.cpp; run from build/co)
 MROPE_VERIFY    = $(BINDIR)/mrope_verify  # Qwen3.5's M-RoPE positions vs transformers (tests/mrope_verify.cpp)
 VISION_VERIFY   = $(BINDIR)/vision_verify  # the vision tower vs transformers (tests/vision_verify.cpp; reference: /data/vision-ref)
 MATVEC_VERIFY    = $(BINDIR)/matvec_verify
@@ -191,6 +192,9 @@ $(ACTFP4_VERIFY): $(TESTSDIR)/actfp4_verify.cpp $(CODIR)/gemm_act_fp4.co
 # Phase 9: Tokenizer verification (no .co files needed)
 $(EXPERT_CPU_BENCH): $(TESTSDIR)/expert_cpu_bench.cpp $(SRCDIR)/expert_cpu.cpp $(SRCDIR)/expert_cpu.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/expert_cpu_bench.cpp $(SRCDIR)/expert_cpu.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -lpthread -o $@
+
+$(MM_VERIFY): $(TESTSDIR)/mm_verify.cpp $(SRCDIR)/vision.cpp $(SRCDIR)/vision.h $(SRCDIR)/mrope.cpp $(SRCDIR)/mrope.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) -fopenmp -I. $(TESTSDIR)/mm_verify.cpp $(SRCDIR)/vision.cpp $(SRCDIR)/mrope.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -fopenmp -o $@
 
 $(MROPE_VERIFY): $(TESTSDIR)/mrope_verify.cpp $(SRCDIR)/mrope.cpp $(SRCDIR)/mrope.h
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/mrope_verify.cpp $(SRCDIR)/mrope.cpp -o $@
@@ -461,4 +465,4 @@ verify_minimal: $(TEST_TARGET)
 	./$(TEST_TARGET) 2>&1 || echo "Test exited with code $?"
 
 # Last, so that every variable above is defined when its prerequisites are expanded
-all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(EXPERT_CPU_BENCH) $(VISION_VERIFY) $(MROPE_VERIFY) $(HEAD_Q8_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(ATTN_DECODE_VERIFY) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(PERPLEXITY) $(PASSKEY) $(GENERATE_VERIFY) $(EVENTS_TEST) $(GEMMA4_VERIFY) $(SEQ_VERIFY) $(EMBED_VERIFY) $(QWEN4EXP_VERIFY) $(GLM5NEXT_VERIFY) $(MTP_VERIFY) $(MTP_OWN_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY) $(CAPI_SMOKE) $(STORE_VERIFY) $(SPLIT_VERIFY) $(ATTN_SPLIT_VERIFY) $(ATTN_BENCH)
+all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(EXPERT_CPU_BENCH) $(VISION_VERIFY) $(MROPE_VERIFY) $(MM_VERIFY) $(HEAD_Q8_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(ATTN_DECODE_VERIFY) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(PERPLEXITY) $(PASSKEY) $(GENERATE_VERIFY) $(EVENTS_TEST) $(GEMMA4_VERIFY) $(SEQ_VERIFY) $(EMBED_VERIFY) $(QWEN4EXP_VERIFY) $(GLM5NEXT_VERIFY) $(MTP_VERIFY) $(MTP_OWN_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY) $(CAPI_SMOKE) $(STORE_VERIFY) $(SPLIT_VERIFY) $(ATTN_SPLIT_VERIFY) $(ATTN_BENCH)

@@ -165,9 +165,13 @@ transformers 5.5.1, Pillow; no torchvision in that venv). A phase is done when i
   position embedding, the 2-D rotary, the 12 blocks with full attention per image, the merger. Against the V1
   reference: patch embedding, block 0 and the merged features each have a worst row cosine of 1.000000, the
   largest absolute difference 1e-4 on the 1024-wide features. The GPU path is still to come (the same checks).
-- V4 M-RoPE in the LM forward (part 1 done 2026-11-12: `src/mrope.cpp`, the positions of transformers'
-  get_rope_index on the V1 prompt, all 169 tokens and the decode delta equal; `tests/mrope_verify.cpp`). Still to do: (t, h, w) per token for image spans, plain positions for text; the image chat's
-  logits within the usual bar of transformers, then its greedy reply equal to `reply.txt`.
+- V4 M-RoPE in the LM forward (done 2026-11-12): `src/mrope.cpp` (the positions, all 169 tokens of the V1 prompt and the
+  decode offset equal transformers' get_rope_index); the rotary kernel (`attention.hip` norm_rope) takes each token's
+  three positions with the interleaved section split, and the offset after the prompt; the engine takes the image
+  rows and positions through `inference_set_mm` before `inference_prefill`. `tests/mm_verify.cpp` (`make
+  build/mm_verify`, run from build/co) on the BF16 Qwen3.5-0.8B: the image chat's last logits at cosine 0.999986 to
+  transformers', the same argmax, and the 14 greedy reply tokens equal. Plain attention checks still pass
+  (attn_verify, attn_decode_verify, attn_split_verify); plain Qwen3.5 text was not re-run beyond that.
 - V5 image input: decoding (PNG / JPEG: vendored stb_image), the processor's resize (multiples of 32) and
   normalization in C, the image pad splice, and `image_url` parts in `/v1/chat/completions` (data: URIs). The KV store
   keys include an image hash before this is enabled (two images with the same pad tokens must not share KV).

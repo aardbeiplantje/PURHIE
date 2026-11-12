@@ -43,6 +43,12 @@ int qwen_model_prefill(qwen_model_t* model, const int* tokens, int n, int pos0, 
 // While logits is set (NULL: off), each forward pass also writes the logits of all its rows there, [rows][vocab],
 // advancing past them (inference_prefill_logits)
 void qwen_model_set_all_logits(qwen_model_t* model, float* logits);
+// Qwen3.5 prompts with images (phase V4): the next prefills of rows [base, base + n) take emb's rows (n x n_embd floats)
+// where use (n bytes) is set, and the M-RoPE positions pos3 (n x 3 int64: temporal, height, width; NULL: plain). The RoPE
+// offset becomes max + 1 - (base + n) (transformers' decode offset). emb NULL clears the overrides. 0, or -1.
+int qwen_model_set_mm(qwen_model_t* model, int base, int n, const float* emb, const unsigned char* use,
+                      const int64_t* pos3);
+int qwen_model_rope_delta(const qwen_model_t* model);
 
 // Tests, hyper-connection models only: run layers [l0, l1) on n tokens from position 0 (fresh state), starting from
 // the residual streams res_in [n][n_hc * n_embd] instead of the embeddings; the layer callback sees each layer's

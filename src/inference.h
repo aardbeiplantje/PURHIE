@@ -177,6 +177,13 @@ int inference_n_past(const inference_model_t* model);
 // than n inference_decode_token calls, same results). Afterwards the logits are those of the last token.
 // Returns 0 on success, INFERENCE_ERR_CONTEXT_FULL if they don't fit, negative on error.
 int inference_prefill(inference_model_t* model, const int32_t* tokens, int n);
+
+// Qwen3.5 prompts with images (phase V4): the next inference_prefill of n tokens at the current position takes emb's
+// rows (n x n_embd floats, the image's merged features) where use is set (n bytes), and the M-RoPE positions pos3
+// (n x 3 int64: temporal, height, width; NULL for plain RoPE). After it the decode continues at index + the offset
+// (inference_mm_rope_delta). Call again with n 0 and NULL emb to clear. Returns 0, or -1 (inference_get_last_error).
+int inference_set_mm(inference_model_t* m, int n, const float* emb, const unsigned char* use, const int64_t* pos3);
+int inference_mm_rope_delta(const inference_model_t* m);
 // The same, and the logits after every one of the n tokens into logits ([n][vocab_size] floats): row i is the
 // distribution of the token after tokens[i] (perplexity; the LM head runs on all rows, one batched matmul per
 // prefill batch, so a smaller inference_set_prefill_batch keeps its scratch down: batch x vocab floats).

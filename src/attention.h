@@ -85,6 +85,14 @@ typedef struct {
     const float* freq_factors;  // [n_rot / 2] rope_freqs: pair i's frequency divided by it (Llama 3); NULL: none
     long long part_slots;  // partial-result slots part_ml / part_acc hold (attention_part_slots(n_ctx, rows) of the
                            // caller's sizing); 0: those of this call's T. More let decoding use smaller chunks.
+    // Qwen3.5's M-RoPE (images): mpos is [T][3] device positions (temporal, height, width) of the batch's tokens,
+    // NULL for plain RoPE; mh_end / mw_end are the sections' frequency pairs: pair i takes the height's position when
+    // i % 3 == 1 and i < mh_end, the width's when i % 3 == 2 and i < mw_end (3 x the section sizes). rope_delta is
+    // added to every token's RoPE position (a prompt with an image: its decode continues at index + delta). All
+    // zero: plain RoPE.
+    const int* mpos;
+    int rope_delta;
+    int mh_end, mw_end;
 } attention_opts;
 
 // Prefill mode (qwen_model's prefill sets it around its forward passes, n_ctx > 0; 0: off): the flash kernel for

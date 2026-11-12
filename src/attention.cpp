@@ -162,10 +162,13 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
     const int NB = (n_q * D + 255) / 256;  // attn_combine workgroups per token (256 values each)
     const int n_last = pos0 + T;  // positions the last token attends to
 
+    const int* mpos = opts->mpos;
+    const int rope_delta = opts->rope_delta, mh_end = opts->mh_end, mw_end = opts->mw_end;
     void* a_prep[] = {(void*)&qfull, (void*)&k, (void*)&v, (void*)&q_norm, (void*)&k_norm, &q, &K, &V, &kv_stride,
                       &kv_shift, &kv_bstride, &n_q, &n_kv, &n_rot, &pos0, &freq_base, &eps, &gated, &rot_pairs,
                       &v_norm, &qk_norm, &kq_prep, (void*)&opts->bq, (void*)&opts->bk, (void*)&opts->bv,
-                      &rope_norm, (void*)&opts->freq_factors};
+                      &rope_norm, (void*)&opts->freq_factors, (void*)&mpos, (void*)&rope_delta, (void*)&mh_end,
+                      (void*)&mw_end};
     hipError_t e = hipModuleLaunchKernel(g_prep[hi], (unsigned)(n_q + n_kv), (unsigned)T, 1, (unsigned)D, 1, 1, 0,
                                          stream,
                                          a_prep, nullptr);

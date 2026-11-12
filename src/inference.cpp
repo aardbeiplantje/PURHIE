@@ -2164,6 +2164,19 @@ int inference_prefill(inference_model_t* m, const int32_t* tokens, int n) {
     return 0;
 }
 
+int inference_set_mm(inference_model_t* m, int n, const float* emb, const unsigned char* use, const int64_t* pos3) {
+    clear_error();
+    if (!m || !m->qwen) { set_error("Invalid state or arguments"); return -1; }
+    if (!emb) return qwen_model_set_mm(m->qwen, m->n_past, 0, nullptr, nullptr, nullptr) == 0 ? 0 : -1;
+    if (qwen_model_set_mm(m->qwen, m->n_past, n, emb, use, pos3) != 0) {
+        set_error("image rows: %s", qwen_model_last_error());
+        return -1;
+    }
+    return 0;
+}
+
+int inference_mm_rope_delta(const inference_model_t* m) { return m && m->qwen ? qwen_model_rope_delta(m->qwen) : 0; }
+
 int inference_prefill_logits(inference_model_t* m, const int32_t* tokens, int n, float* logits) {
     if (!m || !m->qwen || !logits) { clear_error(); set_error("Invalid state or arguments"); return -1; }
     qwen_model_set_all_logits(m->qwen, logits);
