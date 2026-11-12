@@ -117,8 +117,19 @@ pass, prompts prefilled in chunks between the others' tokens; not with a draft h
 - The 10 identical resends in opencode's log (5 each before two compactions, at ~210k tokens) look like failed
   requests, whose replies the log does not have.
 - Not done: a disk tier for the store; the store on by default in run.sh (the deployment sets ROCM_STORE_DIR).
-- To look at: `--parallel` by default and with speculative decoding (a draft per sequence, or verify batches);
-  several models generating at once (one forward pass each per round; GPU sharing); loads off the request path
+- **Speculative decoding under `--parallel` (scoped 2026-11-12; not started).** Blocked in the engine, not the
+  server: `forward_seqs` refuses a model with a draft head ("batched decoding: not for this architecture yet"); the
+  head's state (`mtp_carry`, `mtp_pos`, its KV cache) is one per model, not per sequence; a batched pass takes one
+  token per sequence (a second row of a sequence is refused); a verify needs k + 1 rows of one sequence, with its
+  recurrent layers run row by row and a rollback to the snapshot after row keep - per sequence (`rs_mid` is one).
+  Stages: (1) per-sequence head state (carry, pos, KV) and forward_seqs with the head run on single-token rows (drafts
+  for every sequence, no verify: a correctness check against the sequential path, bit for bit); (2) verify rows
+  (k + 1 per sequence in one pass, attention over the sequence's own KV, recurrent layers per row), tested against
+  forward_verify; (3) per-sequence rollback, the server's loop with drafts per job, the `--parallel` flag without
+  `--draft` refused lifted. Expected gain unmeasured: the sequential sidecar gave ~38 -> ~50 tok/s, the batch already
+  amortizes the weight reads across sequences, so the k + 1 rows' cost is the thing to measure first (step_chats at
+  2 sequences vs 1 on Qwen3.5-4B, then the verify rows' pass time).
+- To look at: `--parallel` by default; several models generating at once (one forward pass each per round; GPU sharing); loads off the request path
   (between rounds, or in a second process: a request that arrives during a load waits, 2 s from the page cache,
   minutes from a cold disk); fairness and queue limits per user (the logging's user and conversation id);
   llama-server on the same GPU.
