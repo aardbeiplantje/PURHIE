@@ -192,6 +192,18 @@ transformers 5.5.1, Pillow; no torchvision in that venv). A phase is done when i
   step's output.
 - I5 scheduler, the one-step sampler, PNG encoding (zlib), and `/v1/images/generations`.
 
+**MiniMax-H3-Image (requested 2026-11-12: "should be supported too"; `MiniMaxAI/MiniMax-H3-Image` on Hugging Face,
+code at github.com/MiniMax-AI/MiniMax-H3-Image).** Text-to-image and image editing. Config: the transformer is a
+`MiniMaxH3DiTModel` (50 layers, hidden 5376, 56 heads of 128, FFN 14336, 2 token-refiner layers, text width 5120,
+24 latent channels, patch 1 x 2 x 2, adaLN); the text encoder is a Qwen3-VL (64 layers, hidden 5120, FFN 25600,
+M-RoPE, GQA 64 / 8); the VAE has 24 latent channels with per-channel mean and std. Size: 204 GB of bf16 across
+diffusers and native copies; the needed parts (transformer 65 GB, text encoder 67 GB, one VAE 2.3 GB) are 134 GB,
+against 158 GB free on /data, and as FAST about a quarter of that for the 124 GB host. Blockers: its library code
+is on GitHub (this session may only read cowboytim/rocm-hip: the code needs attaching or pasting); the license is
+the MiniMax community agreement (to check before use); it is the largest item here: a new DiT, a new 64-layer text
+encoder (Qwen3-VL's text part, after V4's M-RoPE), the VAE, and the flow-matching sampler. Order: after sd-turbo's
+pipeline (I1-I5) proves the image path on a small model.
+
 Dependencies: V5 and A4 / T4 / I5 need the server's API work (multipart, binary responses); the decoders for PNG, WAV
 and the codec are small C files. Order: V1-V5 first (the Qwen3.5 checkpoints are local and the test is the same
 architecture as the user's deployed models), then A1-A4 (the smallest engine change of the three audio/image paths),
