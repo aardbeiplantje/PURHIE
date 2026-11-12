@@ -401,12 +401,24 @@ X-Remote-User` on /rocm/ (not done here).
 Speed:
 - Long-context prefill attention runs at ~25% of the FP16 WMMA peak (Qwen3.8-Flash 22% of a 32k prefill, more
   beyond; already ahead of llama.cpp's: 5.5 vs 7.7 s on Qwen3.6-35B at 32k): the largest lever for long prompts.
+  Measured 2026-11-12 (`build/attn_bench`: the kernels alone, 1,024 tokens at position 31,744, 20 runs, +-2%): D 256
+  17 TFLOPS (32 ms), D 128 12 (22 ms), D 64 13 (21 ms); at position 4,096 8-11. Ablations of attn_flash (D 256 /
+  D 128): without the softmax's exps -1% / -4%; without staging K / V after a chunk's first block (no memory reads)
+  -18% / -21%; without P V (half the WMMAs) -29% / -18%. So no single part holds it back: the WMMAs are ~58% (D 256;
+  ~29 TFLOPS while they run, near the practical FP16 peak), the staging ~18%, the per-block glue (4 barriers, sP
+  through LDS, the softmax's moves) the rest. What is left to gain is the glue and staging per position: blocks of
+  32 positions (two WMMA columns sets a barrier round; twice the LDS a workgroup) - a redesign that has to keep the
+  split invariance (ARCHITECTURE.md s5); at best ~1.2x on the kernel, 5-15% of a 32k prefill. Share of a 32k
+  prefill in attention (2026-11-12): Qwen3-0.6B 84%, Gemma-4-26B 67%, Llama-3.2-1B 63%, Qwen3.6-35B 35%,
+  Qwen3.5-4B 28%, Nemotron-Nano 25%, Qwen3.8-27B 20%.
 - Qwen3.8-27B (dense ROCmFP4_FAST) is compute-bound: matmul_wmma_q4_0_rocmfp4_fast ~26 of ~59 TOPS (70% of a 32k
   prefill); its epilogue (exact per-block scaling, ~19%) would need FP16 WMMA on pre-scaled weights (twice the
   LDS). Tabled.
 - MTP verify passes: read experts shared by the verified tokens once (~3.8 of 10 shared by two tokens: ~19% of a
   2-token pass's expert bytes); draft cost 2.7 ms, mostly the head's LM head (a vocabulary cut hurts other
   scripts; a shortlist from the main model's top logits of the previous row, or an int8 copy).
+- MoE decode (Qwen3.6-35B, 2026-11-12): the experts' matvecs stream at ~125 GB/s against ~200 for dense layers
+  (5.5 of 13 ms a token), the DeltaNet matvecs of a 2,048-wide model at ~135: latency-bound launches.
 - Decode leftovers (Flash): moe_router 48 x 14 us, hc_norm 98 x 7.6 us, deltanet_rule 36 x 19 us, hc_mix 97 x
   2.9 us, ~930 launches x ~1.7 us of gaps; each well under 5%.
 - Prefill: deltanet_conv (~100 GB/s); the quantizing producers (swiglu, add_rmsnorm_rows) compute both Q8_0 and
