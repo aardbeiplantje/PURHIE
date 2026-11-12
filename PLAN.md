@@ -15,10 +15,11 @@
    leads are in its section below.
 5. **Independent of llama.cpp** (user, 2026-11-09): `bin/rocm-convert` converts (byte for byte convert_hf_to_gguf.py's,
    `tests/convert_verify.sh`) and quantizes (`inference_quantize`; `-r plain` byte for byte llama-quantize's,
-   `tests/quantize_verify.sh`; default recipe `strix`). Open: a better quality measure than perplexity for small
-   per-tensor choices (K / V moved perplexity by +-2% without following precision): the KL divergence of the logits
-   against the Q8_0 / BF16 model; the `strix` recipe on Flash in the deployment (its Q8_0 LM head and hc mixers are
-   untested on the real model); the model-card `general.*` keys (license, base model, size label). Not converted:
+   `tests/quantize_verify.sh`; default recipe `strix`; the quality measure for a recipe is `perplexity --kl`, the
+   KL divergence from the reference model, ARCHITECTURE.md s4). Open: the recipe choices measured by KL on a real
+   model (Qwen3-30B-A3B's K / V, the Q8_0 LM head; only Qwen3-0.6B was run: strix 0.188 against plain 0.221); the
+   `strix` recipe on Flash in the deployment (its Q8_0 LM head and hc mixers are untested on the real model); the
+   model-card `general.*` keys (license, base model, size label). Not converted:
    a SentencePiece Llama 2, Gemma 4's dense / per-layer input variants (31B, E2B), NVFP4 / modelopt checkpoints
    (/data/hf/Qwen3.6-35B-A3B-NVFP4-Fast), DeepSeek-V4.1-Flash (`DeepseekV41ForCausalLM`, on /hf, 510 GB: Engram
    n-gram tables of 197 GB FP8, 289 GB of FP4 experts; a new package after upstream `conversion/deepseek41.py` and

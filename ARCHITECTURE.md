@@ -146,6 +146,10 @@ Qwen3-30B-A3B from its Q8_0 (wikitext-2 perplexity, 320 chunks of 512; 2026-11-0
 matrix FAST 8.980 (16.27 GB), FAST with a Q8_0 LM head 8.838 (16.44 GB; decode 83-88 tok/s either way), every
 matrix ROCmFP4 8.936 (17.22 GB). Attention K / V as ROCmFP4 (9.157) or kept at Q8_0 (9.013) did not beat FAST,
 although ROCmFP4 has ~10% less weight error there (the matvecs are exact: `matvec_verify`), so they take the target.
+Perplexity moves by +-2% on such choices without following the precision; the measure for a recipe is the KL
+divergence of the quantized model's predictions from the reference's (`perplexity --save-logits` on the reference,
+`--kl` on each candidate, the same text and chunks): Qwen3-0.6B from its Q8_0, 40 chunks, recipe `strix` mean KL
+0.188 and the same top token at 78.5% of the positions, recipe `plain` 0.221 and 75.9%.
 
 **Converting** (`bin/rocm-convert`, `ROCm::Inference::Convert`): a Hugging Face checkpoint directory (a git clone
 with LFS) to one GGUF without llama.cpp and without an intermediate file. `ROCm::Inference::SafeTensors` reads the
@@ -328,7 +332,7 @@ less well and 2 is best; the adaptive default is within ~1% of the best fixed co
 | `quantize_verify.sh` | the encoders vs the reference's on synthetic rows and real tensors; `rocm-convert -r plain` (a GGUF in) vs ROCmFPX's `llama-quantize` on a whole model (FAST, ROCmFP4, Q8_0): the same bytes |
 | `matvec_verify`, `dequant_verify`, `attn_decode_verify`, `kv_verify`, `tokenizer_*`, `sampler_verify`, `capi_smoke` | kernels, decoders, tokenizer, C API |
 | `perl/ROCm-Inference/t/*.t` | the Perl binding (GPU tests with `ROCM_INFERENCE_TEST_*`) |
-| `perplexity` | wikitext-2 perplexity as llama.cpp's `llama-perplexity` computes it (logits of every position: `inference_prefill_logits`) |
+| `perplexity` | wikitext-2 perplexity as llama.cpp's `llama-perplexity` computes it (logits of every position: `inference_prefill_logits`); `--save-logits FILE` on a reference model and `--kl FILE` on a quantization of it: the KL divergence per position (mean, percentiles), the scored token's probability difference and the share of the same top token (the file is `llama-perplexity --kl-divergence-base`'s format) |
 | `passkey` | long-context retrieval: a pass key hidden in wikitext-2 at several depths and context lengths, per KV cache type |
 | `regress.sh` (`make regress`, `make regress-full`) | the regression suite in `tests/regress.tsv`: perplexity baselines per model, quant type, KV cache type and context; `forward_verify` with a per-model minimum cosine; `passkey` rows; `matvec_verify`; `attn_decode_verify`; `capi_smoke` |
 
