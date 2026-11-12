@@ -157,8 +157,9 @@ transformers 5.5.1, Pillow; no torchvision in that venv). A phase is done when i
   processor's pixel_values (560 x 1536: 20 x 28 patches of 3 x 2 x 16 x 16), the grid (1, 20, 28), the token ids (169,
   140 image pads), the patch embedding, block 0's output, the merged image features (140 x 1024) and the greedy reply
   "Two shapes: a red square and a blue circle." Scripts and data stay outside the repo.
-- V2 converter: the vision tower to an mmproj-style GGUF (`rocm-convert` stops on vision tensors today); the check is
-  that the tensors read back equal the safetensors'.
+- V2 converter (done 2026-11-12): `rocm-convert --mmproj` writes the tower as F32 GGUF (`v.*` tensors, `qwen3_5_vision.*`
+  keys; the patch embedding flattened to 1536 per output); `tests/mmproj_verify.py` reads all 153 tensors back and they
+  equal the BF16 widened to F32 bit for bit. The 0.8B's file is `/data/vision-ref/q35-0.8b-mmproj.gguf` (402 MB).
 - V3 ViT forward (C, CPU first, then GPU): patch conv as a matmul over the flattened patches, 2-D positions
   (interpolated), 2-D rope, non-causal attention per image, GELU MLP, spatial merger. Check: `image_features.npy`
   within cosine 0.999, block 0 likewise.

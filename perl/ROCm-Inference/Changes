@@ -1,6 +1,8 @@
 Revision history for ROCm-Inference
 
 0.01  unreleased
+    - rocm-convert --mmproj: a Qwen3.5 checkpoint's vision tower as an mmproj GGUF (F32, v.* tensors, qwen3_5_vision.*
+      keys), checked bit for bit against the checkpoint (tests/mmproj_verify.py).
     - rocm-inference-server: POST /v1/completions, OpenAI's raw completion (the prompt text as it is, no chat template;
       plain text in choices[].text; streamed or whole), with --parallel too (a conversation of the N, as a chat).
     - the DONE line: pp/s (the prefill's rate), tg/s over the reply, and for a reply with a thinking section the

@@ -170,7 +170,10 @@ heads reordered, matrices merged), so even those stream; small computed tensors 
 1 + w, reshapes) are computed in F32 as torch computes them. MLA's `kv_b_proj` is split into a transposed
 `attn_k_b` and `attn_v_b`; for DeepSeek-V4 its own layout, FP8 with E8M0 (power-of-two) block scales, routed
 experts as packed FP4 moved bit for bit into MXFP4 (`repack_mxfp4`) and kept so, hash-routing tables as I32. A
-checkpoint tensor neither converted nor skipped on purpose (vision, DeepSeek's MTP layer) stops the conversion. A
+checkpoint tensor neither converted nor skipped on purpose (DeepSeek's MTP layer) stops the conversion. A vision
+tower (Qwen3.5's `model.visual.*`) is skipped by the text conversion and written by `--mmproj` as its own F32 GGUF
+(`v.*` tensors, `qwen3_5_vision.*` keys); `tests/mmproj_verify.py CHECKPOINT MMPROJ` reads it back and compares
+every tensor bit for bit with the checkpoint's BF16 widened to F32. A
 clone with LFS whose working tree holds only pointer files (no checkout) is read in place: every file the
 converter opens goes through `lfs_path`, which turns a pointer into its object under `.git/lfs/objects`. Rows
 stream from the shards through the encoders; FP8 weights with block scales (`inference_quantize_fp8_blocks`) are
@@ -332,6 +335,7 @@ less well and 2 is best; the adaptive default is within ~1% of the best fixed co
 | `quantize_verify.sh` | the encoders vs the reference's on synthetic rows and real tensors; `rocm-convert -r plain` (a GGUF in) vs ROCmFPX's `llama-quantize` on a whole model (FAST, ROCmFP4, Q8_0): the same bytes |
 | `matvec_verify`, `dequant_verify`, `attn_decode_verify`, `kv_verify`, `tokenizer_*`, `sampler_verify`, `capi_smoke` | kernels, decoders, tokenizer, C API |
 | `perl/ROCm-Inference/t/*.t` | the Perl binding (GPU tests with `ROCM_INFERENCE_TEST_*`) |
+| `mmproj_verify.py` | the vision tower's mmproj GGUF (`rocm-convert --mmproj`) against its checkpoint: every tensor equal bit for bit, the metadata printed |
 | `perplexity` | wikitext-2 perplexity as llama.cpp's `llama-perplexity` computes it (logits of every position: `inference_prefill_logits`); `--save-logits FILE` on a reference model and `--kl FILE` on a quantization of it: the KL divergence per position (mean, percentiles), the scored token's probability difference and the share of the same top token (the file is `llama-perplexity --kl-divergence-base`'s format) |
 | `passkey` | long-context retrieval: a pass key hidden in wikitext-2 at several depths and context lengths, per KV cache type |
 | `regress.sh` (`make regress`, `make regress-full`) | the regression suite in `tests/regress.tsv`: perplexity baselines per model, quant type, KV cache type and context; `forward_verify` with a per-model minimum cosine; `passkey` rows; `matvec_verify`; `attn_decode_verify`; `capi_smoke` |

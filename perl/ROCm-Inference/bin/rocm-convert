@@ -14,7 +14,7 @@ use ROCm::Inference::Quant ();
 
 my %o = (threads => 0, type => [], recipe => 'strix');
 GetOptions(\%o, 'type|t=s@', 'recipe|r=s', 'threads|j=i', 'arch=s', 'pre=s', 'name=s', 'dry-run|n', 'force|f',
-           'quiet|q', 'keep-cache', 'list', 'help|h')
+           'quiet|q', 'keep-cache', 'list', 'mmproj', 'help|h')
     or pod2usage(2);
 pod2usage(-verbose => 2, -exitval => 0) if $o{help};
 if ($o{list}) { print "$_\n" for ROCm::Inference::Convert::architectures(); exit 0 }
@@ -38,7 +38,7 @@ if (-d $in) {
     printf "%s: %s (%s), %d checkpoint tensors -> %s as %s\n", basename($in), $m->arch, $m->{hf_arch},
         scalar @{$m->st->{order}}, $out, $q ? $q->target : 'bf16 (as convert_hf_to_gguf.py --outtype bf16)'
         unless $o{quiet};
-    $res = eval { $m->convert($out, %a) } or fail($@);
+    $res = eval { $o{mmproj} ? $m->convert_mmproj($out, %a) : $m->convert($out, %a) } or fail($@);
 } else {
     fail("bf16-ref is for a checkpoint directory, $in is a file") unless $q;
     printf "%s -> %s as %s\n", basename($in), $out, $q->target unless $o{quiet};
@@ -77,6 +77,7 @@ rocm-convert - a Hugging Face checkpoint or a GGUF to a GGUF the engine runs, in
   rocm-convert -r plain Model-BF16.gguf Model-FAST-pure.gguf           # every matrix FAST, as llama-quantize
   rocm-convert -t 'ffn_down_exps=rocmfp4' GLM-Q8_0.gguf GLM-FAST.gguf
   rocm-convert /data/hf/Qwen3-0.6B Qwen3-0.6B-BF16.gguf bf16-ref       # as convert_hf_to_gguf.py --outtype bf16
+  rocm-convert --mmproj /hf/Qwen3.5-0.8B Qwen3.5-0.8B-mmproj.gguf      # the vision tower alone (F32)
   rocm-convert --list
 
 =head1 DESCRIPTION
@@ -161,6 +162,11 @@ Leave what is read and written in the page cache.
 =item B<--list>
 
 The checkpoint architectures supported.
+
+=item B<--mmproj>
+
+The vision tower of a checkpoint with one (Qwen3.5: C<model.visual.*>) as an mmproj GGUF, F32 and not quantized:
+the tensors under C<v.*>, the vision hyperparameters under C<qwen3_5_vision.*>. The text model is not written.
 
 =back
 

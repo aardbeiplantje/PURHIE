@@ -1534,6 +1534,67 @@ sub _norm1 {  # a norm stored as w, applied as 1 + w
 # place of the layer norms, QSA sparse attention (an indexer) on the full-attention layers, PLE n-gram hash
 # embeddings on one layer. Matmuls reading the same input are written as one weight: [hc down | hc inject],
 # DeltaNet [qkv | z] and [beta | alpha].
+# The vision tower as an mmproj GGUF (rocm-convert --mmproj): every model.visual tensor, F32 (a BF16 widened, exact),
+# under v.* names (v.blk.N.ln1 / ln2 / attn_qkv / attn_out / ffn_up / ffn_down, v.patch_embd, v.position_embd,
+# v.post_ln, v.merger.fc1 / fc2) with the vision hyperparameters under qwen3_5_vision.*. The patch embedding (a Conv3d
+# [out, in, T, H, W]) is flattened to [out, in*T*H*W] in the order the pixel rows come in (channel, temporal, row,
+# column), so the engine applies it as a matmul. No quantization: the vision tower is small, and the engine's check
+# against transformers is exact.
+sub vision_gname {
+    my ($n) = @_;
+    return 'v.patch_embd.weight' if $n eq 'model.visual.patch_embed.proj.weight';
+    return "v.patch_embd.$1" if $n =~ /^model\.visual\.patch_embed\.proj\.(bias)$/;
+    return 'v.position_embd.weight' if $n eq 'model.visual.pos_embed.weight';
+    return "v.blk.$1.ln$2.$3" if $n =~ /^model\.visual\.blocks\.(\d+)\.norm([12])\.(weight|bias)$/;
+    return "v.blk.$1.attn_qkv.$2" if $n =~ /^model\.visual\.blocks\.(\d+)\.attn\.qkv\.(weight|bias)$/;
+    return "v.blk.$1.attn_out.$2" if $n =~ /^model\.visual\.blocks\.(\d+)\.attn\.proj\.(weight|bias)$/;
+    return "v.blk.$1.ffn_up.$2" if $n =~ /^model\.visual\.blocks\.(\d+)\.mlp\.linear_fc1\.(weight|bias)$/;
+    return "v.blk.$1.ffn_down.$2" if $n =~ /^model\.visual\.blocks\.(\d+)\.mlp\.linear_fc2\.(weight|bias)$/;
+    return "v.post_ln.$1" if $n =~ /^model\.visual\.merger\.norm\.(weight|bias)$/;
+    return "v.merger.fc1.$1" if $n =~ /^model\.visual\.merger\.linear_fc1\.(weight|bias)$/;
+    return "v.merger.fc2.$1" if $n =~ /^model\.visual\.merger\.linear_fc2\.(weight|bias)$/;
+    return;
+}
+
+sub convert_mmproj {
+    my ($self, $out, %a) = @_;
+    my $vc = $self->{config}{vision_config} // croak "$self->{dir}: no vision_config";
+    my $pp = ROCm::Inference::Convert::json_file(File::Spec->catfile($self->{dir}, 'preprocessor_config.json')) // {};
+    my @kv = (
+        ['general.architecture', ROCm::Inference::Convert::STR, 'qwen3_5_vision'],
+        ['general.type', ROCm::Inference::Convert::STR, 'mmproj'],
+        ['general.file_type', ROCm::Inference::Convert::U32, 0],
+        ['qwen3_5_vision.block_count', ROCm::Inference::Convert::U32, $vc->{depth} // croak 'vision_config: no depth'],
+        ['qwen3_5_vision.embedding_length', ROCm::Inference::Convert::U32, $vc->{hidden_size}],
+        ['qwen3_5_vision.feed_forward_length', ROCm::Inference::Convert::U32, $vc->{intermediate_size}],
+        ['qwen3_5_vision.attention.head_count', ROCm::Inference::Convert::U32, $vc->{num_heads}],
+        ['qwen3_5_vision.patch_size', ROCm::Inference::Convert::U32, $vc->{patch_size}],
+        ['qwen3_5_vision.temporal_patch_size', ROCm::Inference::Convert::U32, $vc->{temporal_patch_size}],
+        ['qwen3_5_vision.spatial_merge_size', ROCm::Inference::Convert::U32, $vc->{spatial_merge_size}],
+        ['qwen3_5_vision.projection_dim', ROCm::Inference::Convert::U32, $vc->{out_hidden_size}],
+        ['qwen3_5_vision.num_position_embeddings', ROCm::Inference::Convert::U32, $vc->{num_position_embeddings}],
+        ['qwen3_5_vision.hidden_act', ROCm::Inference::Convert::STR, $vc->{hidden_act} // 'gelu_pytorch_tanh'],
+        ['qwen3_5_vision.layer_norm_epsilon', ROCm::Inference::Convert::F32, 1e-6],
+        ['qwen3_5_vision.image_mean', ROCm::Inference::Convert::ARR, [ROCm::Inference::Convert::F32, [map { 0 + $_ } @{ $pp->{image_mean} // [0.5, 0.5, 0.5] }]]],
+        ['qwen3_5_vision.image_std', ROCm::Inference::Convert::ARR, [ROCm::Inference::Convert::F32, [map { 0 + $_ } @{ $pp->{image_std} // [0.5, 0.5, 0.5] }]]],
+    );
+    my @specs;
+    for my $name (@{$self->st->{order}}) {
+        next unless $name =~ /^model\.visual\./;
+        my $g = vision_gname($name) // croak "$name: no mmproj tensor name (a vision tensor the engine does not know)";
+        my $t = $self->t($name);
+        my $ne = $name eq 'model.visual.patch_embed.proj.weight'
+            ? [reduce_mul(@{$t->{shape}}[1 .. $#{$t->{shape}}]), $t->{shape}[0]]
+            : [reverse @{$t->{shape}}];
+        push @specs, {name => $g, ne => $ne, f32 => 1, type => ROCm::Inference::Convert::gguf_type_id('f32'), from => lc $t->{dtype},
+                      in_bytes => $t->{bytes}, uses => [$t], data => sub { pack 'f<*', $self->floats($t) }};
+    }
+    croak 'no model.visual tensors in ' . $self->{dir} unless @specs;
+    return ROCm::Inference::Convert::write_file($out, \@kv, \@specs, 32, %a, reader => $self);
+}
+
+sub reduce_mul { my $n = 1; $n *= $_ for @_; return $n }
+
 package ROCm::Inference::Convert::Qwen4Exp;
 use Carp qw(croak);
 our @ISA = ('ROCm::Inference::Convert::Qwen35');
