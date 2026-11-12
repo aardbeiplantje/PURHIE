@@ -147,6 +147,41 @@ prefill ticks every ~2.5 s through the 52 s prefill, `generating` lines every 5 
 - Identity: the user (nginx X-Remote-User; a Keycloak JWT later), the client address (X-Real-IP), the conversation
   id (X-LLamaCPP-Id-slot). The docker repo's nginx needs `proxy_set_header X-Remote-User` on /rocm/ (not done).
 
+## Multimodal and audio (investigated 2026-11-12; not started)
+
+Asked for: OpenAI-style `/v1/audio/transcriptions`, image input, image generation and audio generation. Local
+checkpoints: the Qwen3.5 family (0.8B, 4B, 122B-A10B, and the Qwen3.6 NVFP4 copy) carries a vision tower (the 4B's
+safetensors: 297 `model.visual.*` tensors, 24 blocks, hidden 1024, patch 16, spatial merge 2, out 2560;
+`image_token_id` 248056); GLM-5.3 and DeepSeek-V4.1 have vision configs too. No local model has an audio config, and
+there is no diffusion, TTS or Whisper checkpoint. The engine has no encoder, no cross-attention, no mel / STFT, no
+image decoder and no multipart parsing (`qwen_ops.h`: M-RoPE is reduced to plain RoPE for text).
+
+Ranked by fit:
+1. **Image input (vision chat)**, best fit; the test model is Qwen3.5-4B (BF16 GGUF local, the vision tower in its
+   safetensors). Needs: (a) the converter writes the tower (it stops on vision tensors today, ARCHITECTURE s4); (b) the
+   ViT forward on the GPU: patch conv, 2-D positions, full non-causal attention per image (the flash kernel is
+   causal: a non-causal variant), GELU MLP, spatial merger; the matvec and norm kernels are reused; (c) M-RoPE: a
+   (t, h, w) position per token for image spans; (d) image decoding (PNG / JPEG: vendor stb_image, or pass decoded
+   pixels), resize to multiples of patch x merge, normalize; (e) splice the merged embeddings at the image pad tokens,
+   bidirectional inside each image; (f) the KV store's block keys include an image hash - two images with the same
+   pad tokens would otherwise reuse each other's KV (fix before enabling it); (g) `image_url` parts in chat messages
+   (data: URIs in the JSON, no multipart). Test: against transformers (torch 2.6 CPU and transformers 5.5.1 are in
+   /data/hf/venv) on a tiny random vision checkpoint (a generator like tools/gen_*_ckpt.py), then on the 4B. About
+   3-4 sessions.
+2. **Audio transcription**, no local model. Whisper is encoder-decoder with cross-attention, which the engine lacks.
+   A decoder-only audio LLM (an audio encoder feeding the LM, as Qwen's speech models do) reuses item 1's splice and
+   is the closer path; choose the model first. Also needed: the mel spectrogram (STFT in C), a conv stem, and
+   multipart/form-data uploads (Web::Route parses JSON; check). About 2-3 sessions after item 1 if decoder-only;
+   more for Whisper.
+3. **Audio generation (TTS)**, no local model. A speech LM emits codec tokens (decoder-only: the engine can run it),
+   then a codec decoder turns them into audio: 1-D transposed convolutions and snake activations, new kernels. Large;
+   wait for a chosen model.
+4. **Image generation**, no local model. A diffusion or flow model (UNet or DiT), a VAE decoder (2-D convs, group
+   norm), a text encoder, a scheduler, and a PNG encoder: none of it exists here. A separate engine, the largest item.
+
+Decisions needed from the user: a model for each of items 2-4 (none is local); whether the server decodes images
+(item 1) or takes decoded pixels.
+
 ## Later
 
 - **Converter follow-ups**: an importance matrix (the weighted ROCmFP4 search; collected on the GPU by the
