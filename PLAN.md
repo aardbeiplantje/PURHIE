@@ -160,9 +160,11 @@ transformers 5.5.1, Pillow; no torchvision in that venv). A phase is done when i
 - V2 converter (done 2026-11-12): `rocm-convert --mmproj` writes the tower as F32 GGUF (`v.*` tensors, `qwen3_5_vision.*`
   keys; the patch embedding flattened to 1536 per output); `tests/mmproj_verify.py` reads all 153 tensors back and they
   equal the BF16 widened to F32 bit for bit. The 0.8B's file is `/data/vision-ref/q35-0.8b-mmproj.gguf` (402 MB).
-- V3 ViT forward (C, CPU first, then GPU): patch conv as a matmul over the flattened patches, 2-D positions
-  (interpolated), 2-D rope, non-causal attention per image, GELU MLP, spatial merger. Check: `image_features.npy`
-  within cosine 0.999, block 0 likewise.
+- V3 ViT forward, host float32 (done 2026-11-12: `src/vision.{h,cpp}`, the order of operations of transformers'
+  Qwen3_5VisionModel; `tests/vision_verify.cpp` / `make build/vision_verify`): the patch embedding, the interpolated
+  position embedding, the 2-D rotary, the 12 blocks with full attention per image, the merger. Against the V1
+  reference: patch embedding, block 0 and the merged features each have a worst row cosine of 1.000000, the
+  largest absolute difference 1e-4 on the 1024-wide features. The GPU path is still to come (the same checks).
 - V4 M-RoPE in the LM forward: (t, h, w) per token for image spans, plain positions for text; the image chat's
   logits within the usual bar of transformers, then its greedy reply equal to `reply.txt`.
 - V5 image input: decoding (PNG / JPEG: vendored stb_image), the processor's resize (multiples of 32) and

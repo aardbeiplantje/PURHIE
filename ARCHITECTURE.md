@@ -336,6 +336,7 @@ less well and 2 is best; the adaptive default is within ~1% of the best fixed co
 | `matvec_verify`, `dequant_verify`, `attn_decode_verify`, `kv_verify`, `tokenizer_*`, `sampler_verify`, `capi_smoke` | kernels, decoders, tokenizer, C API |
 | `perl/ROCm-Inference/t/*.t` | the Perl binding (GPU tests with `ROCM_INFERENCE_TEST_*`) |
 | `mmproj_verify.py` | the vision tower's mmproj GGUF (`rocm-convert --mmproj`) against its checkpoint: every tensor equal bit for bit, the metadata printed |
+| `vision_verify` | the vision tower (`src/vision.cpp`, host float32) against transformers on Qwen3.5-0.8B's reference: patch embedding, block 0, the merged features, each row's cosine at least 0.999 |
 | `perplexity` | wikitext-2 perplexity as llama.cpp's `llama-perplexity` computes it (logits of every position: `inference_prefill_logits`); `--save-logits FILE` on a reference model and `--kl FILE` on a quantization of it: the KL divergence per position (mean, percentiles), the scored token's probability difference and the share of the same top token (the file is `llama-perplexity --kl-divergence-base`'s format) |
 | `passkey` | long-context retrieval: a pass key hidden in wikitext-2 at several depths and context lengths, per KV cache type |
 | `regress.sh` (`make regress`, `make regress-full`) | the regression suite in `tests/regress.tsv`: perplexity baselines per model, quant type, KV cache type and context; `forward_verify` with a per-model minimum cosine; `passkey` rows; `matvec_verify`; `attn_decode_verify`; `capi_smoke` |
