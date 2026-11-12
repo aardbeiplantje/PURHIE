@@ -349,6 +349,7 @@ struct inference_model {
     // GLM-5.3-Flash (glm5-next): its own stream mixer (hcs_* in LayerWeights; n_hc stays 0, which is qwen4exp's),
     // KDA, MLA and the DSA indexer widths
     bool glm5 = false;
+    bool cpu_only = false;                             // INFERENCE_CPU_ONLY=1 (glm5-next): nothing registered, the forward pass on the CPU (glm5_ref.h, fast)
     int hc_mult = 0, hc_sinkhorn_iters = 0;
     float hc_eps = 1e-6f;
     int n_dense_lead = 0;                               // leading_dense_block_count: dense FFN layers first

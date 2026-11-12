@@ -98,6 +98,53 @@ void cpu_matvec_fp4fast_q8(const void* W, size_t row_bytes, int N, int K, const 
     else matvec_scalar((const uint8_t*)W, row_bytes, N, K, q, d, y);
 }
 
+// Q8_0 weights: a block is its F16 scale and 32 int8; two blocks a vector
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512vnni,f16c")))
+static void matvec_q8_vnni(const uint8_t* W, size_t row_bytes, int N, int K, const int8_t* q, const float* d, float* y) {
+    const int np = K / 64;
+    for (int n = 0; n < N; ++n, W += row_bytes) {
+        __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+        const uint8_t* b = W;
+        for (int p = 0; p < np; ++p, b += 68) {
+            const __m512i w = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i*)(b + 2))),
+                                                 _mm256_loadu_si256((const __m256i*)(b + 36)), 1);
+            const __m512i x = _mm512_loadu_si512((const void*)(q + (size_t)p * 64));
+            const __mmask64 neg = _mm512_movepi8_mask(w);
+            const __m512i xs = _mm512_mask_sub_epi8(x, neg, _mm512_setzero_si512(), x);
+            const __m512i s = _mm512_dpbusd_epi32(_mm512_setzero_si512(), _mm512_abs_epi8(w), xs);
+            uint16_t h0, h1;
+            memcpy(&h0, b, 2);
+            memcpy(&h1, b + 34, 2);
+            const __m512 sc = _mm512_insertf32x8(_mm512_set1_ps(_cvtsh_ss(h0) * d[2 * p]),
+                                                 _mm256_set1_ps(_cvtsh_ss(h1) * d[2 * p + 1]), 1);
+            if (p & 1) acc1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(s), sc, acc1);
+            else acc0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(s), sc, acc0);
+        }
+        y[n] = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+    }
+}
+
+__attribute__((target("f16c")))
+void cpu_matvec_q8_q8(const void* W, size_t row_bytes, int N, int K, const int8_t* q, const float* d, float* y) {
+    if (have_vnni()) {
+        matvec_q8_vnni((const uint8_t*)W, row_bytes, N, K, q, d, y);
+        return;
+    }
+    const uint8_t* r = (const uint8_t*)W;
+    for (int n = 0; n < N; ++n, r += row_bytes) {
+        float acc = 0.0f;
+        for (int ib = 0; ib < K / 32; ++ib) {
+            const uint8_t* b = r + (size_t)ib * 34;
+            uint16_t h;
+            memcpy(&h, b, 2);
+            int s = 0;
+            for (int j = 0; j < 32; ++j) s += (int)(int8_t)b[2 + j] * q[ib * 32 + j];
+            acc += _cvtsh_ss(h) * d[ib] * (float)s;
+        }
+        y[n] = acc;
+    }
+}
+
 void cpu_expert_ffn(const void* gate, const void* up, size_t row_bytes_gu, const void* down, size_t row_bytes_d,
                     int FE, int E, const int8_t* q, const float* d, float limit, float* out, float* work) {
     float* g = work;

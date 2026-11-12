@@ -194,7 +194,15 @@ A CPU expert costs 4-9x the kernel's time: one answer reads ~134 GB of experts a
 which experts get the GPU is first come, not most used. Next: (i) promote by use count (swap a hot CPU expert for
 a cold registered one: the release is 1.16 ms, off the forward path); (ii) read ahead from layer L+1's router;
 (iii) profile the GPU's own ~100 ms/token; (iv) the NPU (amdxdna, no /dev/accel in the container) could take the
-CPU's place behind `cpu_expert_ffn`'s interface - judged far-fetched for 13 MB of weights an expert. Ideas of
+CPU's place behind `cpu_expert_ffn`'s interface - judged far-fetched for 13 MB of weights an expert. **CPU only (2026-11-12, user: "lets
+try a pure mmap cpu solution"; `INFERENCE_CPU_ONLY=1`, glm5-next):** nothing is registered or locked; the forward
+pass is `src/glm5_ref.cpp` in a fast mode (`Glm5Ref::fast`: every matvec on the pool with the VNNI kernels - FP4_FAST
+and, for the Q8_0 head, `cpu_matvec_q8_q8` - KDA / MLA heads in parallel, MADV_WILLNEED on the routed experts),
+its logits in the GPU path's buffer. Slice: 41 ms/token (GPU 12; 94 before the Q8_0 kernel), ~175 ms projected
+for the whole model in memory. Whole file, the same 3 turns: 1.85 / 2.85 / 2.94 tok/s, coherent text, memory
+pressure 4-5% - the disk again (~340 ms/token); the mix stays the default (4.9). An option for a machine without
+a usable GPU, or to leave the GPU free. Not done: batched prefill and state checkpoints (a kept prompt prefix is
+replayed token by token: first text after 13 s), sequences, the MTP draft. Ideas of
 the LRU mode, in order: (a) the
 cold start: keep the use counts in a file beside the model and at load read and register the most used units up
 to the budget on CPU threads, in parallel (NVMe: several GB/s; the pager reads one range at a time, ~1.1 GB/s);

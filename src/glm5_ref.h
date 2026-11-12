@@ -37,6 +37,8 @@ struct Glm5Ref {
     void forward(int token, int pos, float* out);
 
     const inference_model* m;
+    // The engine's CPU pass instead of the reference: threads, FP4 weights against Q8_0 activations (expert_cpu.h)
+    bool fast = false;
     struct LayerState {
         std::vector<float> conv[3];                        // KDA: the last d_conv - 1 inputs per channel, q / k / v
         std::vector<float> S;                              // KDA: [n_head][head_dim][head_dim], S[i][j]

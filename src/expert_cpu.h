@@ -19,6 +19,9 @@ void cpu_q8_0_quantize(const float* x, int K, int8_t* q, float* d);
 // y[N] = W x: N rows of K ROCmFP4_FAST values (row_bytes each; K % 64 == 0), x as Q8_0 (q[K], d[K / 32])
 void cpu_matvec_fp4fast_q8(const void* W, size_t row_bytes, int N, int K, const int8_t* q, const float* d, float* y);
 
+// The same for Q8_0 weights (34-byte blocks)
+void cpu_matvec_q8_q8(const void* W, size_t row_bytes, int N, int K, const int8_t* q, const float* d, float* y);
+
 // One expert on one token: out[E] = down . (SiLU(min(gate . x, L)) * clamp(up . x, -L, L)) (L 0: no clamp).
 // gate / up: FE rows of E values at row_bytes_gu; down: E rows of FE values at row_bytes_d; x as Q8_0 (q[E],
 // d[E / 32]). work: 3 * FE floats + FE bytes

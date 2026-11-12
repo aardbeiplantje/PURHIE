@@ -4,6 +4,7 @@
 
 #include "glm5_ref.h"
 
+#include "expert_cpu.h"
 #include "inference_internal.h"
 #include "quant_types.h"
 
@@ -11,21 +12,71 @@
 #include <cmath>
 #include <numeric>
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 namespace {
 
 float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 float silu(float x) { return x / (1.0f + expf(-x)); }
 
+// The fast mode (Glm5Ref::fast, set for the calls of one pass): loops on the CPU pool, ROCmFP4_FAST weights
+// against Q8_0 activations (expert_cpu.h) - the engine's int8 arithmetic, not the reference's floats
+bool g_fast = false;
+thread_local bool t_inpar = false;  // inside a pool loop: loops within run on the thread itself
+
+template <class F> void par(int n, const F& fn) {
+    if (!g_fast || t_inpar || n < 2) {
+        for (int i = 0; i < n; ++i) fn(i);
+        return;
+    }
+    cpu_parallel_for(n, [&](int i) {
+        t_inpar = true;
+        fn(i);
+        t_inpar = false;
+    });
+}
+
 // y[N] = W x[K]: each row decoded to float, a float dot product
 void matvec(const QuantWeight& w, const float* x, float* y, int row0 = 0, int nrows = -1) {
     if (nrows < 0) nrows = w.N - row0;
-    std::vector<float> r(w.K);
-    for (int n = 0; n < nrows; ++n) {
-        qt_to_float(w.type, w.row(row0 + n), r.data(), w.K);
-        float s = 0.0f;
-        for (int k = 0; k < w.K; ++k) s += r[k] * x[k];
-        y[n] = s;
+    const auto rows_f32 = [&](int a, int b) {
+        std::vector<float> r(w.K);
+        for (int n = a; n < b; ++n) {
+            qt_to_float(w.type, w.row(row0 + n), r.data(), w.K);
+            float s = 0.0f;
+            for (int k = 0; k < w.K; ++k) s += r[k] * x[k];
+            y[n] = s;
+        }
+    };
+    if (!g_fast) {
+        rows_f32(0, nrows);
+        return;
     }
+    const bool q8 = w.type == QT_Q8_0 && w.K % 64 == 0;
+    const bool fp4 = q8 || (w.type == QT_Q4_0_ROCMFP4_FAST && w.K % 64 == 0);  // (an int8 kernel)
+    std::vector<int8_t> q;
+    std::vector<float> d;
+    if (fp4) {
+        q.resize(w.K);
+        d.resize(w.K / 32);
+        cpu_q8_0_quantize(x, w.K, q.data(), d.data());
+    }
+    const int nc = (size_t)nrows * w.K < ((size_t)1 << 18) ? 1 : std::min(nrows, 64);
+    par(nc, [&](int c) {
+        const int a = (int)((long)nrows * c / nc), b = (int)((long)nrows * (c + 1) / nc);
+        if (q8) cpu_matvec_q8_q8(w.row(row0 + a), w.row_bytes, b - a, w.K, q.data(), d.data(), y + a);
+        else if (fp4) cpu_matvec_fp4fast_q8(w.row(row0 + a), w.row_bytes, b - a, w.K, q.data(), d.data(), y + a);
+        else rows_f32(a, b);
+    });
+}
+
+// The pages of rows [r0, r0 + n) of w, asked for ahead of their read (weights not in memory: one request for the
+// range, not a fault a page)
+void want(const QuantWeight& w, int r0, int n) {
+    static const uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
+    const uintptr_t a = (uintptr_t)w.row(r0) & ~(pg - 1), b = (uintptr_t)w.row(r0 + n);
+    (void)madvise((void*)a, b - a, MADV_WILLNEED);
 }
 
 std::vector<float> matvec(const QuantWeight& w, const float* x, int row0 = 0, int nrows = -1) {
@@ -159,6 +210,7 @@ void Glm5Ref::embed(int token, float* streams) const {
 }
 
 void Glm5Ref::logits(const float* streams, float* out) const {
+    g_fast = fast;
     const int E = m->n_embd, HC = m->hc_mult;
     std::vector<float> x(E, 0.0f), y(E);
     for (int i = 0; i < HC; ++i)
@@ -176,6 +228,7 @@ void Glm5Ref::forward(int token, int pos, float* out) {
 }
 
 void Glm5Ref::layer(int l, int pos, float* streams, Glm5LayerTrace* tr) {
+    g_fast = fast;
     const LayerWeights& L = m->layers[l];
     LayerState& S = st[l];
     const int E = m->n_embd, HC = m->hc_mult, H = m->n_head;
@@ -217,9 +270,10 @@ void Glm5Ref::layer(int l, int pos, float* streams, Glm5LayerTrace* tr) {
                                                                     : (g1 > 20.0f ? g1 : log1pf(expf(g1))) * A;
             }
         std::vector<float> beta = matvec(L.W_beta, xn.data());
-        std::vector<float> o(DI), delta(HD);
+        std::vector<float> o(DI);
         const float scale = 1.0f / sqrtf((float)HD);
-        for (int h = 0; h < H; ++h) {
+        par(H, [&](int h) {
+            std::vector<float> delta(HD);
             float* M = S.S.data() + (size_t)h * HD * HD;  // M[i * HD + j] = S[i][j]
             const float* q = qkv[0].data() + h * HD;
             const float* k = qkv[1].data() + h * HD;
@@ -241,7 +295,7 @@ void Glm5Ref::layer(int l, int pos, float* streams, Glm5LayerTrace* tr) {
                 for (int i = 0; i < HD; ++i) s += M[i * HD + j] * q[i];
                 o[h * HD + j] = s * scale;
             }
-        }
+        });
         std::vector<float> ga = matvec(L.W_g_a, xn.data()), g2 = matvec(L.W_g_b, ga.data()), gated(DI);
         for (int h = 0; h < H; ++h) {
             rmsnorm(o.data() + h * HD, L.ssm_norm, gated.data() + h * HD, HD, eps);
@@ -311,9 +365,10 @@ void Glm5Ref::layer(int l, int pos, float* streams, Glm5LayerTrace* tr) {
                 if (m->layers[j].kind == LAYER_MLA_DSA) { S.sel = st[j].sel; break; }
         }
         if (tr) tr->selected = S.sel;
-        std::vector<float> o(H * VM), qabs(KL), olat(KL), p(S.sel.size());
+        std::vector<float> o(H * VM);
         const float scale = 1.0f / sqrtf((float)KM);
-        for (int h = 0; h < H; ++h) {
+        par(H, [&](int h) {
+            std::vector<float> qabs(KL), olat(KL), p(S.sel.size());
             matvec(L.W_k_b, q.data() + (size_t)h * KM, qabs.data(), h * KL, KL);  // q absorbed into the latent
             float mx = -INFINITY, sum = 0.0f;
             for (size_t t = 0; t < S.sel.size(); ++t) {
@@ -329,7 +384,7 @@ void Glm5Ref::layer(int l, int pos, float* streams, Glm5LayerTrace* tr) {
                 for (int i = 0; i < KL; ++i) olat[i] += p[t] / sum * c[i];
             }
             matvec(L.W_v_b, olat.data(), o.data() + (size_t)h * VM, h * VM, VM);
-        }
+        });
         matvec(L.Wo, o.data(), out.data());
     }
     if (tr) tr->mixer_out = out;
@@ -354,6 +409,12 @@ void Glm5Ref::layer(int l, int pos, float* streams, Glm5LayerTrace* tr) {
         for (int k = 0; k < NU; ++k) wsum += prob[order[k]];
         wsum = std::max(wsum, 6.103515625e-5f);
         std::vector<float> y(E);
+        if (g_fast)
+            for (int k = 0; k < NU; ++k) {
+                want(L.We_gate, order[k] * FE, FE);
+                want(L.We_up, order[k] * FE, FE);
+                want(L.We_down, order[k] * E, E);
+            }
         for (int k = 0; k < NU; ++k) {
             const int e = order[k];
             const float w = (m->expert_weights_norm ? prob[e] / wsum : prob[e]) * m->expert_weights_scale;

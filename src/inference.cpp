@@ -261,6 +261,12 @@ static bool pin_model_memory(inference_model* m) {
         INFER_LOG("[pin_model] stage: %zu MB registered\n", m->pinned_bytes >> 20);
         return true;
     }
+    const char* co = getenv("INFERENCE_CPU_ONLY");
+    if (m->glm5 && co && co[0] && co[0] != '0') {  // the whole pass on the CPU, from the plain mapping (page cache)
+        m->cpu_only = true;
+        INFER_LOG("[pin_model] nothing registered: the forward pass runs on the CPU\n");
+        return true;
+    }
     std::vector<const QuantWeight*> cpu_only = {&m->ple_table};
     if (m->output.data != m->token_embd.data) cpu_only.push_back(&m->token_embd);
     make_expert_pager(m);

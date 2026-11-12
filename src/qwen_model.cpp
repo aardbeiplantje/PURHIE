@@ -21,6 +21,7 @@
 #include "deltanet.h"
 #include "gpu_ops.h"
 #include "glm5_gpu.h"
+#include "glm5_ref.h"
 #include "expert_cpu.h"
 #include "qmatvec.h"
 #include "quant_types.h"
@@ -1078,6 +1079,7 @@ struct QwenModel {
         if (eng->n_hc > 0) return forward_hc(tokens, T, pos0, logits_out);
         if (eng->gemma4) return forward_gemma(tokens, T, pos0, logits_out);
         if (eng->nemotron) return forward_nemotron(tokens, T, pos0, logits_out);
+        if (eng->glm5 && eng->cpu_only) return forward_glm5_cpu(tokens, T, pos0, logits_out);
         if (eng->glm5) return forward_glm5(tokens, T, pos0, logits_out);
         prof.start();
         for (int t = 0; t < T; ++t) {
@@ -1993,6 +1995,31 @@ struct QwenModel {
         return !L.moe || check(gpu_moe_combine_scaled(s.moe_down, s.wts, s.sh_out, nullptr, nullptr, nullptr, s.proj, NU,
                                                       E, T, 0),
                                "moe_combine");
+    }
+
+    // INFERENCE_CPU_ONLY: the CPU pass (glm5_ref.h in its fast mode), which keeps its own state; one sequence.
+    // A position before the last one (a kept prompt prefix) replays the tokens up to it: no state checkpoints yet
+    Glm5Ref* cpu_ref = nullptr;
+    std::vector<int> cpu_hist;
+    int forward_glm5_cpu(const int* tokens, int T, int pos0, float* logits_out) {
+        if (!cpu_ref) {
+            cpu_ref = new Glm5Ref(eng);
+            cpu_ref->fast = true;
+        }
+        if (pos0 > (int)cpu_hist.size()) { qwen_set_error("glm5-next on the CPU: position %d after %zu", pos0, cpu_hist.size()); return -1; }
+        if (!sync()) return -1;  // (the logits buffer is the GPU path's)
+        if (pos0 < (int)cpu_hist.size()) {
+            cpu_ref->reset();
+            cpu_hist.resize(pos0);
+            for (int p = 0; p < pos0; ++p) cpu_ref->forward(cpu_hist[p], p, nullptr);
+        }
+        for (int t = 0; t < T; ++t) {
+            if (tokens[t] < 0 || tokens[t] >= eng->vocab_size) { qwen_set_error("token %d out of range", tokens[t]); return -1; }
+            cpu_ref->forward(tokens[t], pos0 + t, t == T - 1 ? s.logits : nullptr);
+            cpu_hist.push_back(tokens[t]);
+        }
+        if (logits_out) memcpy(logits_out, s.logits, sizeof(float) * eng->vocab_size);
+        return 0;
     }
 
     int forward_glm5(const int* tokens, int T, int pos0, float* logits_out) {
