@@ -18,7 +18,9 @@ run QMATVEC_NO_WMMA=1 INFERENCE_EXPERT_PIN_MB=2048 INFERENCE_EXPERT_EVICT=1 "$(d
 # ... and with the experts on the CPU (src/expert_cpu.h; int8 activations only): all of them, then those beyond
 # 2 GB on the GPU
 run QMATVEC_NO_WMMA=1 INFERENCE_EXPERT_PIN_MB=1 "$(dirname "$0")/../build/glm5next_verify" "$1"
-run QMATVEC_NO_WMMA=1 INFERENCE_EXPERT_PIN_MB=2048 "$(dirname "$0")/../build/glm5next_verify" "$1"
+run QMATVEC_NO_WMMA=1 INFERENCE_EXPERT_PIN_MB=2048 INFERENCE_EXPERT_PROMOTE=0 "$(dirname "$0")/../build/glm5next_verify" "$1"
+# ... and with the most used experts promoted to the GPU (the set changes between the passes: not bit for bit)
+run INFERENCE_EXPERT_PIN_MB=2048 "$(dirname "$0")/../build/glm5next_verify" "$1"
 rm -f "$LOG"
 [ $rc = 0 ] && echo "PASS: glm5-next head" || echo "FAIL: glm5-next head"
 exit $rc

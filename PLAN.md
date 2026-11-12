@@ -191,10 +191,20 @@ tok/s per turn (CPU share of expert computations, wall ms each): budget ~0: 2.78
 pressure 7-13%). Runs inherit the page cache of the one before, so the curve is noisy; the default rule stays.
 First text after 0.2-0.7 s on a warm turn (6 s cold). `INFERENCE_EXPERT_EVICT=1` is the old LRU mode (1.83 tok/s).
 A CPU expert costs 4-9x the kernel's time: one answer reads ~134 GB of experts and ~110 fit, so the rest is disk;
-which experts get the GPU is first come, not most used. Next: (i) promote by use count (swap a hot CPU expert for
-a cold registered one: the release is 1.16 ms, off the forward path); (ii) read ahead from layer L+1's router;
+which experts get the GPU is first come, not most used. Next: (ii) read ahead from layer L+1's router;
 (iii) profile the GPU's own ~100 ms/token; (iv) the NPU (amdxdna, no /dev/accel in the container) could take the
-CPU's place behind `cpu_expert_ffn`'s interface - judged far-fetched for 13 MB of weights an expert. **CPU only (2026-11-12, user: "lets
+CPU's place behind `cpu_expert_ffn`'s interface - judged far-fetched for 13 MB of weights an expert. **Promotion (2026-11-12; `ExpertPager::acquire`, on by
+default, `INFERENCE_EXPERT_PROMOTE=0`: first come only):** each expert has a heat (uses, halved every 8,192 calls,
+~200 tokens); once the budget is full, a CPU expert with heat >= 2 x the least used registered one's + 4 takes its
+place (that one released), at most ~4 swaps a token (7.9 ms each: the release's remap and the read). The same
+prompt 6 times: 3.89 / 5.88 / 5.89 / 6.93 / 6.80 / 7.64 tok/s (4.9 before), CPU share 10.7%. Eight different
+prompts (`GLM_CHAT_VARY=1`: code, history, databases, Dutch, maths, a recipe, networking): mean 4.35 tok/s against
+4.01 without promotion (+8%), CPU share 21.3% against 36.5%, but a CPU expert costs 2.05 ms (1.50 without: the
+ones left are the cold ones, from disk) and the swaps took 52 of ~540 s; memory pressure 15% both ways. So a new
+subject is a new set of experts, and the disk decides: promotion pays in full only while a conversation stays on
+its subject. Next for varied use: cheaper swaps (the release on a thread behind the forward pass), fewer of
+them (a higher bar while the pressure is high), a smaller GPU budget to leave more page cache (the sweep above
+was run on one prompt). **CPU only (2026-11-12, user: "lets
 try a pure mmap cpu solution"; `INFERENCE_CPU_ONLY=1`, glm5-next):** nothing is registered or locked; the forward
 pass is `src/glm5_ref.cpp` in a fast mode (`Glm5Ref::fast`: every matvec on the pool with the VNNI kernels - FP4_FAST
 and, for the Q8_0 head, `cpu_matvec_q8_q8` - KDA / MLA heads in parallel, MADV_WILLNEED on the routed experts),

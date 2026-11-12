@@ -45,6 +45,12 @@ struct ExpertPager {
     bool evict = false;                                // INFERENCE_EXPERT_EVICT=1: use(), all experts on the GPU
     long long st_cpu = 0;                              // experts (of tokens) computed on the CPU, and the time
     double st_cpu_ms = 0.0;
+    // Once the budget is full, an expert the CPU computes that is used clearly more than the least used
+    // registered one takes its place (that one released, to be the CPU's): the GPU ends up with the most used
+    // experts, whichever came first. A few swaps a token at most; INFERENCE_EXPERT_PROMOTE=0: first come only
+    bool promote = true;
+    long long st_swaps = 0;
+    double st_swap_ms = 0.0;
     // Unregister everything (before the mapping goes)
     void release_all();
 
@@ -58,7 +64,17 @@ struct ExpertPager {
   private:
     // p, len: its whole pages; f0 .. f1: the folios (2 MB of the page cache) its pages and edges are in, which
     // it keeps in memory when registered; edge: the pages it shares with the experts before / after it (-1: none)
-    struct Unit { char* p; size_t len; uintptr_t f0, f1; int edge[2]; int prev, next; uint32_t stamp; bool reg; uint32_t uses; };
+    // heat: its recent uses (halved every kHeatPeriod acquire() calls); grp: the expert it was registered as part of
+    struct Unit { char* p; size_t len; uintptr_t f0, f1; int edge[2]; int prev, next; uint32_t stamp; bool reg; uint32_t uses; uint32_t heat; int grp; };
+    // An expert registered by acquire(): its units (one a tensor); n 0: released
+    struct Group { int u[4]; int n; };
+    std::vector<Group> groups;
+    std::vector<int> cold;                             // registered groups, least used first (rebuilt now and then)
+    size_t cold_pos = 0;
+    long long acq_calls = 0, cold_built = -1;
+    double credit = 0.0;                               // swaps allowed now (kSwapRate a call, at most kSwapBurst)
+    bool reg_units(const int* first, int nt, int id, bool* worked);
+    int coldest();
     void hold(const Unit& u);
     void drop(const Unit& u);
     struct Edge { char* p; int refs; };

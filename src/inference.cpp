@@ -246,6 +246,8 @@ static void make_expert_pager(inference_model* m) {
     }
     const char* ev = getenv("INFERENCE_EXPERT_EVICT");
     p->evict = ev && ev[0] && ev[0] != '0';
+    const char* pr = getenv("INFERENCE_EXPERT_PROMOTE");
+    p->promote = !(pr && pr[0] == '0');
     m->pager = p;
 }
 

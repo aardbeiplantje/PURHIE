@@ -22,9 +22,18 @@ kv_cache_init($m, $ctx // 4096);
 printf STDERR "loaded in %.1f s\n", time - $t0;
 # GLM_CHAT_TURNS=N: the prompt N times, each a new conversation (the first reads the experts from disk: the
 # later ones show the speed once they are in memory)
+# GLM_CHAT_VARY=1: a different prompt each turn (other subjects, other experts)
+my @vary = ('Write a Perl function that parses an ISO 8601 date and returns epoch seconds, with comments.',
+    'Summarize the causes of the French Revolution in five bullet points.',
+    'Explain how a B-tree index speeds up a database query, with a small example.',
+    'Vertaal naar het Nederlands en leg de grammatica uit: "The weather has been getting colder since last week."',
+    'What is the derivative of x^3 * sin(x)? Show the steps.',
+    'Give a recipe for a vegetarian lasagna and a shopping list.',
+    'Describe how TCP congestion control works, and what changed with BBR.');
 for my $turn (1 .. ($ENV{GLM_CHAT_TURNS} // 1)) {
     my ($n, $t1, $tf) = (0, time);
-    my ($reply, $why) = chat($m, [{ role => 'user', content => $prompt }], {
+    my $ask = $ENV{GLM_CHAT_VARY} && $turn > 1 ? $vary[($turn - 2) % @vary] : $prompt;
+    my ($reply, $why) = chat($m, [{ role => 'user', content => $ask }], {
         max_new_tokens => $max,
         temperature    => 0,
         on_delta       => sub { my ($text, $kind) = @_; $tf //= time; ++$n; print $text if $turn == 1; return 0 },
