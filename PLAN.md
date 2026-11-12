@@ -1,441 +1,161 @@
 # Project Plan: rocm-hip (Strix Halo, gfx1151)
 
 > What is open: next steps, planned work, leads. How the engine is built and what it runs: [ARCHITECTURE.md](ARCHITECTURE.md).
-> Finished work, with its measurements, is in the git history (this file was pruned of it on 2026-11-05 and 2026-11-06).
+> Finished work, with its measurements, is in the git history (this file was pruned of it on 2026-11-05, 2026-11-06
+> and 2026-11-12).
 
-## ▶ Next (week of 2026-11-09; user, 2026-11-05: "we will work on it next week")
+## ▶ Next (2026-11-12)
 
-1. **Qwen3.8-Flash-Next from BF16** (section below): the own MTP block as draft head and the parallel PLE reads are
-   in; both to be measured in the deployment (the user).
-2. **Concurrent runs** in rocm-inference-server (section below).
-3. **Server logging** (section below): implemented and tested (`t/62-server-log.t`); the Flash soak run is open.
-4. **GLM-5.3-Flash (`glm5_next`) as an architecture** (section below): the gate is memory capacity, not kernels -
-   95% of its 320B params are expert weights, and none of FP8 / FP4 / Q4_0 fits 128 GB, so it reads experts from disk:
-   they are registered on demand, least recently used released (section below, done 2026-11-11 on the 8-block
-   slice; the whole file not run yet) - measure that first. Start with the tiny GGUF generator, not the kernels. A first attempt
-   (4fe7dae, another agent; reverted in d4a45fa) skipped the gate and the oracle: tensor names unlike `glm-dsa`'s, a
-   tiny GGUF its own loader refused, and a DSA path that reweighted dense attention output instead of selecting keys.
-
-5. **Independent of llama.cpp: a quantizer and a converter here** (user, 2026-11-09: "i want to be independent of
-   llama.cpp"). One command, `bin/rocm-convert`, takes a checkpoint or a GGUF. Quantizing (`inference_quantize`; with `-r plain` byte for byte
-   llama-quantize's on FAST / ROCmFP4 / Q8_0, `tests/quantize_verify.sh`; default recipe `strix`: Q8_0 lookup
-   tables, LM head, indexer and mHC, measured in ARCHITECTURE.md s4). Open on it: a better quality measure than
-   perplexity for small per-tensor choices (K / V moved perplexity by +-2% without following precision): the KL
-   divergence of the logits against the Q8_0 / BF16 model; and the recipe on Flash in the deployment (its Q8_0 LM
-   head and hc mixers are untested on the real model). The converter is in too (`bin/rocm-convert`; byte for byte
-   convert_hf_to_gguf.py's for every architecture the engine runs - qwen2/3/3moe/35/35moe, qwen4exp, llama,
-   nemotron_h_moe, gemma4, gemma-embedding - and glm5-next / deepseek4, `tests/convert_verify.sh`): `rocm-convert
-   /data/hf/GLM-5.3-Flash GLM-5.3-Flash-FAST.gguf` reads the FP8 release and writes FAST, no intermediate file
-   (done 2026-11-10: 171 GB, in /models). Not converted yet: a SentencePiece Llama 2, Gemma 4's dense / per-layer
-   input variants (31B, E2B), NVFP4 / modelopt checkpoints (/data/hf/Qwen3.6-35B-A3B-NVFP4-Fast).
-   DeepSeek-V4-Flash (the user's choice, 2026-11-09) converts too (`DeepSeek4`, MXFP4 experts kept: 152 GB FAST);
-   its MTP layer is left out, as upstream does (a separate draft file: to do with the MTP work). DeepSeek-V4.1-Flash
-   (`DeepseekV41ForCausalLM`, on /hf, 510 GB: Engram n-gram tables of 197 GB FP8, 289 GB of FP4 experts) is not
-   converted: a new package (upstream `conversion/deepseek41.py`: Engram tables, token map and numpy-PCG64 hash
-   multipliers, 32x32 FP8 blocks, shared KV / indexer layers) and ~450 GB free disk (/data has 180 GB); its experts
-   alone exceed 128 GB. Open: the model-card `general.*` keys (license, base model, size label), more
-   architectures as needed (each a package in `ROCm::Inference::Convert` checked against convert_hf_to_gguf.py),
-   DeepSeek-V4 in the engine (`deepseek4`:
-   KV compressors, hash routing, grouped output projection; like GLM-5.3 it does not fit 128 GB resident).
+1. **Qwen3.8-Flash-Next in the deployment** (section below): the model's own MTP block as draft head and the parallel
+   PLE reads are in; both are to be measured there (the user).
+2. **Concurrent runs** (section below): the deployment runs `--parallel` now; watch the store's resume (the `kv`
+   line's mapped blocks) and the queue there.
+3. **Server logging** (section below): in; the Flash soak run is open.
+4. **GLM-5.3-Flash (`glm5_next`)**: runs whole (4.3-7.6 tok/s); its speed work is tabled (user, 2026-11-12). The open
+   leads are in its section below.
+5. **Independent of llama.cpp** (user, 2026-11-09): `bin/rocm-convert` converts (byte for byte convert_hf_to_gguf.py's,
+   `tests/convert_verify.sh`) and quantizes (`inference_quantize`; `-r plain` byte for byte llama-quantize's,
+   `tests/quantize_verify.sh`; default recipe `strix`). Open: a better quality measure than perplexity for small
+   per-tensor choices (K / V moved perplexity by +-2% without following precision): the KL divergence of the logits
+   against the Q8_0 / BF16 model; the `strix` recipe on Flash in the deployment (its Q8_0 LM head and hc mixers are
+   untested on the real model); the model-card `general.*` keys (license, base model, size label). Not converted:
+   a SentencePiece Llama 2, Gemma 4's dense / per-layer input variants (31B, E2B), NVFP4 / modelopt checkpoints
+   (/data/hf/Qwen3.6-35B-A3B-NVFP4-Fast), DeepSeek-V4.1-Flash (`DeepseekV41ForCausalLM`, on /hf, 510 GB: Engram
+   n-gram tables of 197 GB FP8, 289 GB of FP4 experts; a new package after upstream `conversion/deepseek41.py` and
+   ~450 GB free disk - /data has 180 GB; its experts alone exceed 128 GB). DeepSeek-V4-Flash converts (152 GB FAST,
+   MXFP4 experts kept; its MTP layer left out as upstream does: a separate draft file, with the MTP work) but the
+   engine has no `deepseek4` (KV compressors, hash routing, grouped output projection; like GLM-5.3 it does not fit
+   128 GB resident, so it would use the expert pager).
 
 ## Status in brief
 
 The engine runs qwen2, qwen3, qwen3moe, qwen35 / qwen35moe, qwen4exp (Qwen3.8-Flash-Next), gemma4, gemma-embedding,
-nemotron_h_moe and llama from zero-copy GGUF mappings on the UMA. Surfaces: the C API (`libinference.so`), the Perl
-XS module ROCm::Inference (Minijinja templates), rocm-inference-server (OpenAI-compatible, `--models-dir`). Regression
-suite: `make regress` / `make regress-full`. Deployed by the user's llama.cpp-rocm-gfx1151-docker (branch
-rocm-inference), which builds rocm-hip from GitHub `main`. Design: ARCHITECTURE.md; measurements: git history.
+nemotron_h_moe, llama and glm5-next (GLM-5.3-Flash, its experts paged from disk) from zero-copy GGUF mappings on the
+UMA. Surfaces: the C API (`libinference.so`), the Perl XS module ROCm::Inference (Minijinja templates),
+rocm-inference-server (OpenAI-compatible: chat, raw completions, embeddings, `--models-dir`, `--parallel`), and
+`bin/rocm-convert`. Regression suite: `make regress` / `make regress-full`. Deployed by the user's
+llama.cpp-rocm-gfx1151-docker (branch rocm-inference), which builds rocm-hip from GitHub `main` (a rebuild needs a
+new `CACHEBUST` to take new commits). Design: ARCHITECTURE.md; measurements: git history.
 
-## Qwen3.8-Flash-Next from BF16
+## Qwen3.8-Flash-Next
 
 Quantized: /models/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST-PLE_Q8_0.gguf (PLE table Q8_0 on disk). Open:
-- **The model's own MTP block as its draft head: implemented, to be measured on Flash.** `set_draft_model` with the
-  model's own file takes blk.48 from the model's mapping (pinned with it; a staged model pins the block's pages on
-  their own), with the model's embeddings and LM head and the block's final mixer nextn.hc_head_*; the server
-  drafts with it by default (`--parallel 1`, no `--draft`; `--draft none` turns it off). Attention there is dense
-  (compress ratio 4: exact below top_k 2048 x 4 positions; above, only which drafts are accepted can differ). On
-  tiny models (`tests/mtp_own_verify.sh`, regress row mtp_own_qwen4exp_tiny) it drafts exactly what the same block
-  as a sidecar drafts. Open: acceptance and tok/s on Flash (`build/mtp_verify F F 128` with F the model; the sidecar
-  measured ~38 -> ~50 tok/s). One difference to watch: the base file's nextn.hc_head_norm is the sidecar's
-  output_hc_norm + 1.0 (all its other tensors are byte-identical); every other norm in both files has the
-  converter's +1 (zero-centred gammas), so the base file is likely right and the sidecar off - if the own block's
-  acceptance is worse than the sidecar's, that is the first suspect.
-- **PLE rows in parallel: implemented, to be measured in the deployment.** It saw 400-480 tok/s on 30k-token
-  opencode prompts (2026-11-09), the GPU mostly idle: cold rows of the 50.7 GiB table read one at a time.
-  Measured on the real table (a scratch benchmark, only uncached pages): 995 us a cold row through the file's
-  MADV_HUGEPAGE mapping, 232 us in 4 KB folios with readahead (what the engine had), 77 us with MADV_RANDOM, 6.5 us
-  on 16 threads, 4.6 us with MADV_WILLNEED on the batch. Now: MADV_RANDOM on the CPU-only tensors, and ple_rows
-  decodes a batch's rows on 32 threads (PLE_THREADS; WILLNEED cost 7% on a cached table, threads gain 5%). On a
-  tiny model with a 3 GB table on the disk (gen_qwen4exp_tiny.py TINY_PLE_HEAD_ROWS=5500000), 64 wikitext chunks
-  cold: 2,140 -> 6,890 tok/s, the same perplexity. In the deployment: a 512-token chunk's 8192 rows ~0.05 s instead
-  of ~1.9 s cold.
-- **Memory budget on 124 GB** (2026-11-09). Resident: ~65 GB (all the GPU reads, experts included, pinned); the
-  rest of the 122.8 GB file (PLE table 35.8 GiB, token embeddings) is read by the CPU through the page cache, and
-  slows prefill to a crawl when that cache is squeezed. What squeezed it: a 19 GB block store in /dev/shm (tmpfs,
-  not evictable without swap), two 262k-token KV caches (`--parallel 2`), and the user's downloads (dirty pages
-  waiting for a slow disk). The server now warns at a load when the models, their KV caches and a store in memory
-  leave too little page cache for the CPU-read parts (`memory_check`), and a store on a disk works (the KV cache
-  stays in /dev/shm; blocks are copied in, 2970612). Not the cause: split-invariant prefill
-  (`QMATVEC_PREFILL_SPLIT_VARIANT=1`, set in the docker repo's run.sh on 2026-11-09, can go again).
+- **The own MTP block as draft head: to be measured on Flash.** `set_draft_model` with the model's own file takes
+  blk.48 from the model's mapping; the server drafts with it by default (`--parallel 1`, no `--draft`; `--draft none`
+  turns it off). On tiny models it drafts exactly what the same block as a sidecar drafts. Open: acceptance and tok/s
+  on Flash (`build/mtp_verify F F 128` with F the model; the sidecar measured ~38 -> ~50 tok/s). If the own block's
+  acceptance is worse than the sidecar's, the first suspect: the base file's nextn.hc_head_norm is the sidecar's
+  output_hc_norm + 1.0 (every other norm in both files has the converter's +1, so the base file is likely right and
+  the sidecar off).
+- **PLE rows in parallel: to be measured in the deployment.** Cold rows of the 50.7 GiB table were read one at a time
+  (400-480 tok/s on 30k-token opencode prompts, 2026-11-09); now MADV_RANDOM on the CPU-only tensors and a batch's
+  rows decoded on 32 threads (PLE_THREADS): a 512-token chunk's 8192 rows ~0.05 s instead of ~1.9 s cold.
+- **Memory on 124 GB**: ~65 GB resident; the PLE table and token embeddings are read by the CPU through the page
+  cache, and prefill crawls when that cache is squeezed (a block store in /dev/shm, two 262k-token KV caches,
+  downloads with dirty pages). The server warns at a load (`memory_check`); a store on a disk works.
+  `QMATVEC_PREFILL_SPLIT_VARIANT=1` in the docker repo's run.sh (2026-11-09) was not the cause and can go.
 - The fork's qwen4exp is behind upstream's (recurrent_layers as indices vs upstream's bool flags; llama-server
   rejects these files): worth porting in the fork (the user's).
 
-## GLM-5.3-Flash (`glm5_next`): what has to change, and in what order (started 2026-11-10; planned 2026-11-06)
+## GLM-5.3-Flash (`glm5_next`)
 
-**Where it stands (2026-11-10).** The release is converted (`/models/GLM-5.3-Flash-FAST.gguf`, 171 GB FAST; its
-`indexer_compressor_ape` / `_gate` came out 4-bit: the strix rule missed the underscore names, fixed since, tiny
-tensors, not worth the 19 h to redo). The oracle: upstream llama.cpp has `src/models/glm5-next.cpp` (KDA, the
-k-pool DSA indexer, NoPE MLA over the latent, DeepSeek-V4-style mHC with Sinkhorn, sigmoid MoE with the SwiGLU
-clamp); its CPU build at /data/conv/upstream-build, `make ref_dump_stock REF_STOCK=/data/conv/upstream
-REF_STOCK_B=/data/conv/upstream-build`. The test model is `tools/gen_glm5next_ckpt.py`'s tiny checkpoint
-(8 layers: 6 KDA + 2 DSA, 3 dense + 5 MoE, MTP) as FAST, the engine's input, and that file decoded to F32
-(`rocm-convert tiny-fast.gguf tiny-f32.gguf f32`), the oracle's: the same weight values on both sides, so the
-comparison is of the forward pass alone (`ref_dump_stock acts`: 935 named activations, hc_* / kda_* / indexer_* /
-ffn_moe_* per layer). User, 2026-11-10: the reference is for numbers only, the engine keeps its UMA way (the
-GGUF mapped and pinned in place, GPU-first with the CPU alongside), and FP4-sized weights (ROCmFP4 / FAST) are the
-target. Work order: (a) the loader - done 2026-11-11: `glm5-next` in `archs`, `load_glm5next` /
-`load_layer_glm5next` bind every tensor into LayerWeights (kinds LAYER_KDA / LAYER_MLA_DSA by head_count_kv, the
-mHC `HcSinkhorn` hcs_attn / hcs_ffn, MLA `W_q_a` .. `W_v_b`, the indexer `W_ix_*` with `ix_full` per layer, the
-SwiGLU clamps), shape-checked against the hparams; `inference_model_info` counts the latent + indexer rows per
-position for the cache; `inference_kv_cache_init` (and `qwen_model_create`) refuse with "the forward pass is not
-implemented yet" (`tests/glm5next_verify.sh`, quick tier: the tiny model as FAST, every block's kind, slots, FFNs,
-the refusal). The MTP block (blk.N) is not bound yet; (b) the CPU forward pass - done 2026-11-11:
-`src/glm5_ref.cpp` (Glm5Ref: mHC with Sinkhorn, KDA with the per-channel decay, MLA over the latent with the
-k-pool DSA indexer, sigmoid MoE + shared expert with the SwiGLU clamps; weights decoded row by row in place) equals
-upstream's glm5-next on the tiny model to cosine 1.000000 in every layer, teacher-forced at all 50 positions, and
-end to end (logits, argmax); `glm5next_verify` checks it whenever the oracle is built. Indexer ties: equal pool
-scores across the top-k boundary (all heads' ReLU 0 gives exact zeros) are picked by the lower pool index here;
-llama.cpp's top_k is std::partial_sort, unordered, so it has no rule to match - the GPU kernels follow ours, and
-decode and prefill must pick alike; (c) the GPU forward pass - first version done 2026-11-11: `forward_glm5`
-(qwen_model.cpp) with the kernels in `src/glm5_gpu.hip` (mHC pre / post / mean, KDA conv / L2 / delta rule with
-the per-channel decay and the gated norm, SwiGLU with the clamp, the indexer's LayerNorm / pooling / scores /
-top-k select (ties to the lower pool index), sparse MLA over the latents, head transposes) and the engine's own
-matvecs, sigmoid router and MoE combine; GLM's caches and KDA state in its own pinned region (GlmState),
-`inference_kv_cache_init` gives it a stand-in one-layer KV cache. Checked (`glm5next_verify.sh`): on the float
-path decode = Glm5Ref at every step (cos 1.000000, all argmax); with QMATVEC_NO_WMMA=1 prefill = token by token
-bit for bit. On the int8 path against the CPU it drifts on the tiny model's random weights (logits cos ~0.82 by the end:
-near-tie indexer and router picks flip under the activation noise) - not so on real weights (2026-11-11): the
-release's first 8 blocks as a model (`tools/gguf_head.pl /models/GLM-5.3-Flash-FAST.gguf
-/data/conv/glm53-head8.gguf 8`: 3 dense KDA, 5 MoE, MLA + indexer at blk.3 and blk.7; 21.5 GB, kept there) give,
-on 200 tokens of English text, streams cos against the CPU of mean 0.99989 / worst 0.9948 after blk.7, logits
-worst 0.9970, the same argmax at 196 of 200 steps (other architectures' whole-model bar here: 0.99); on the float
-path GPU = CPU at every step (cos 1.000000) and with QMATVEC_NO_WMMA=1 prefill = token by token bit for bit, at
-the release's widths (`tests/glm5next_head_verify.sh`, full tier row glm5next_head8). The tokenizer: `glm4`
-(llama.cpp's CHATGLM4 + ignore_merges) is llama3's regex and whole-word lookup; ids equal upstream's on 28 prompts
-(tests/data/glm5_tokenizer.tsv, checked in glm5next_verify.sh) - before this the model loaded without a
-tokenizer. Speed (2026-11-11), measured on `GLM_BENCH=4,16` (tools/gen_glm5next_ckpt.py:
-the release's widths, 4 layers - KDA dense, 2 KDA + MoE, MLA + MoE - 16 experts; `glm5next_verify --bench`):
-decode 8.47 -> 7.5 ms/token (7.9 at 8k context), prefill 2,145 -> 3,700 tok/s at 512 tokens and 379 -> 2,320 at
-8,192. What did it: k_b / v_b as one expert-indexed matvec a layer (the heads as experts, int8, no transposes);
-sparse MLA as split online-softmax partials (fixed 256-position splits, so a batch sums as one token does; 4 heads
-a block, a wave a position, coalesced rows) + a combine; the KDA state column in registers across a run of tokens;
-the mHC RMS folded into glm_hc_pre (fn on the raw streams, times r); the indexer's score a wave a pool with the
-queries in LDS; select with block scans; and above all fully unrolled register arrays (runtime-bounded loops over
-them had put them in scratch: 3x on prefill). Decode is now the engine's weight matvecs (~6.4 of 6.95 ms of kernel
-time; GLM's own kernels ~0.4 ms for the 4 layers). Projected to the release (45 layers, all weights resident),
-~45-50 ms/token before any expert paging. Open: prefill attention on WMMA (sparse MLA is ~40% of a long prefill:
-scalar FP32 over ~2k positions x 64 heads x 512 a token), a chunked KDA for prefill, an F16 latent cache (half the
-bytes), the MTP block, batched sequences, the stand-in KV cache's sequence features (store, checkpoints) for GLM's
-state; the whole file end to end - text out through the chat template, never run yet (ask the user before loading
-it on the shared host); (d) the routing trace of item 1 on the real file, once the deployment can spare the memory.
+**Where it stands (2026-11-12).** `/models/GLM-5.3-Flash-FAST.gguf` (171 GB FAST; its `indexer_compressor_ape` /
+`_gate` came out 4-bit - tiny tensors, not worth the 19 h to redo). Loader, CPU reference (`src/glm5_ref.cpp`, equal
+to upstream's glm5-next on the tiny model, cos 1.000000 every layer) and GPU forward pass (`forward_glm5`,
+`src/glm5_gpu.hip`) are in; the tokenizer (`glm4`) equals upstream's on 28 prompts. Tests: `tests/glm5next_verify.sh`
+(the tiny model of `tools/gen_glm5next_ckpt.py` as FAST against its F32 decode in the oracle: upstream llama.cpp's
+CPU build at /data/conv/upstream-build, `make ref_dump_stock REF_STOCK=/data/conv/upstream
+REF_STOCK_B=/data/conv/upstream-build`), `tests/glm5next_head_verify.sh` (the release's first 8 blocks as a model,
+/data/conv/glm53-head8.gguf, 21.5 GB; full tier row glm5next_head8), `glm5next_verify --bench` on `GLM_BENCH=4,16`.
+Rules (user, 2026-11-10): the reference is for numbers only; the engine keeps its UMA way (the GGUF mapped and pinned
+in place, GPU-first with the CPU alongside) and FP4-sized weights.
 
-**Experts registered on demand (2026-11-11, user: "go with option 1"; `src/expert_pager.h`).** What registration
-is on this stack (kernel 6.17 OEM, ROCm 7, measured with strace and mincore): `hipHostRegister` makes the range a
-KFD SVM range, which the driver keeps resident (pages evicted from it are read back within 0.2 s, launch or not) -
-so what is registered has to fit in memory, and registering all 171 GB would thrash. `hipHostUnregister` issues no
-ioctl and does not let go of the range; mapping the file over it again (`gguf_remap`: MAP_FIXED) does, and the VMAs
-merge back. So: the experts of glm5-next's MoE layers (one unit an expert of one tensor, 4.25 MB, its whole pages)
-are left out of the load's registration when the file is more than 3/4 of the memory (or `INFERENCE_EXPERT_PIN_MB=N`:
-at most N MB of them; 0: never); `glm_ffn` drains the queue after the router and hands the routed ids to the pager,
-which registers the new ones (MADV_WILLNEED on all first) and releases the least recently used over the budget.
-On the slice (18.3 GB of experts): results bit for bit the same with a 2 GB budget (`glm5next_head_verify.sh`'s
-third run); with room for all of them decode costs nothing extra (11.9 ms/token either way: the drain per MoE
-layer is free, and it stops once everything is registered); a miss costs ~0.57 ms a unit with the pages in the
-page cache (0.28 registering, 0.29 unregistering + remapping), ~1.7 ms an expert - the bench's random tokens at a
-2 GB budget: 25 ms/token. **The whole file runs (2026-11-11, deployment down, INFERENCE_EXPERT_PIN_MB=80000):**
-loads in seconds with 8.5 GB held; `glm5next_verify --bench <file> 16 1000` (pseudo-random prompt, greedy decode:
-routing spread over nearly all experts, close to a worst case): decode 472 ms/token, of it 337 ms in the pager -
-19% of the 1,008 expert tensors a token reads are misses, 1.7 ms each (1.15 registering incl. the read from disk,
-0.6 releasing); the other 135 ms/token is 3x the projection for all-resident weights (the drains, and the GPU's
-first read of newly registered pages?) - to profile. Memory pressure stayed under 4%. The first try held 79 GB at
-load and crawled: the single pages shared by neighbouring experts were registered for good, and a registered page
-keeps its 2 MB folio; they are now registered while a neighbour is, and the budget counts folios (it overcounts
-shared ones: an 80 GB budget is ~12,800 of the 36,288 units). **First text (2026-11-11):** `tools/glm_chat.pl` (ROCm::Inference::chat, the model's
-template) answers "why is the sky blue" coherently (its reasoning first: Rayleigh scattering, (700/450)^4 = 5.9
-computed right): 1.5 tok/s over 284 tokens at the 80 GB budget, first text after 15 s; 153 of 185 s in the pager -
-72,620 registrations (22% of the expert tensors read; the budget holds 35% of them, and real text does not stay
-within that), 1.54 ms each (0.28 when cached: ~1.25 ms is the disk, ~3.4 GB/s) + 0.69 ms a release. So per token
-(~650 ms): ~370 disk, ~200 register / release overhead, ~100 GPU. The template needs minijinja's `loop_controls`
-(`{% break %}`): `cargo build --release --features minijinja/loop_controls` in perl-minijinja-xs/minijinja/
-minijinja-cabi - scripts/setup-minijinja.sh passes it since perl-minijinja-xs 4cddee9 (the Docker build runs that
-script: to rebuild there). **Budget and policy, measured (2026-11-11, same prompt, 300 tokens):** the budget
-now counts exactly what is held (the 2 MB folios with a registered page). At 96 GB the first run made 45 tokens in
-20 minutes: registered pages are not safe from reclaim (the GPU's reads do not mark them used; evicted, the driver
-reads them back) - the pager now mlocks what it registers (and pin_gguf the rest of a paged model), and the same
-run finishes at 1.83 tok/s (80 GB: 1.53), memory pressure < 5%. Of its 155 s, 114 are registering (43,344 units,
-2.6 ms each: 28,989 of them the first touch - this one answer reads 29k of the 36k units, 123 GB from disk) and 29
-releasing (24,845, 1.16 ms each, all of it the remap; unregistering is 6 us). So a short chat is a cold start;
-only ~14k registrations (4.6% of reads) were of units released before. The reads are spread flat: the most read
-units covering 50 / 75 / 90 / 95 / 99% of them are 17.9 / 42.5 / 69.0 / 83.8 / 107.2 GB - at 96 GB at best ~97% of
-reads resident (~30 misses a token). A layer's experts of the last 1 / 2 / 4 / 8 tokens cover 29 / 37 / 45 / 56%
-of the next token's - but those are the resident ones: recency cannot predict a miss. **CPU tier (2026-11-11, user: the
-CPU can do the cold experts from disk; `src/expert_cpu.h`, default now):** the pager registers until the budget is
-full and never releases (`acquire`); an expert not on the GPU is computed on the CPU from the plain mapping -
-AVX-512 VNNI, FP4_FAST blocks x Q8_0 activations, 1.0 ms an expert on one thread (13 GB/s; scalar 12.9 ms), 8
-experts in 1.5 ms on the pool (`build/expert_cpu_bench`), equal to the GPU's result to rounding (not bit for bit:
-the slice check's CPU runs compare by tolerance). MADV_WILLNEED on a layer's CPU experts before the threads start
-(the fault path alone reads 1-1.6 GB/s of the disk's 6.5). Same prompt, 3 turns of 300 tokens in one process,
-tok/s per turn (CPU share of expert computations, wall ms each): budget ~0: 2.78 / 3.54 / 3.60 (100%, 0.71);
-20 GB: 3.58 / 3.68 / 3.66 (87%, 0.71); 40 GB: 3.94 / 4.50 / 4.28 (69%, 0.78); 60 GB: 3.57 / 4.00 / 3.74 (50%,
-1.20); 80 GB: 4.06 / 4.67 / 4.90 (33%, 1.40); default (92.6 GB here): 4.64 / 4.67 / 4.87 (25.5%, 1.68; memory
-pressure 7-13%). Runs inherit the page cache of the one before, so the curve is noisy; the default rule stays.
-First text after 0.2-0.7 s on a warm turn (6 s cold). `INFERENCE_EXPERT_EVICT=1` is the old LRU mode (1.83 tok/s).
-A CPU expert costs 4-9x the kernel's time: one answer reads ~134 GB of experts and ~110 fit, so the rest is disk;
-which experts get the GPU is first come, not most used. Next: (ii) read ahead from layer L+1's router;
-(iii) profile the GPU's own ~100 ms/token; (iv) the NPU (amdxdna, no /dev/accel in the container) could take the
-CPU's place behind `cpu_expert_ffn`'s interface - judged far-fetched for 13 MB of weights an expert. **Promotion (2026-11-12; `ExpertPager::acquire`, on by
-default, `INFERENCE_EXPERT_PROMOTE=0`: first come only):** each expert has a heat (uses, halved every 8,192 calls,
-~200 tokens); once the budget is full, a CPU expert with heat >= 2 x the least used registered one's + 4 takes its
-place (that one released), at most ~4 swaps a token (7.9 ms each: the release's remap and the read). The same
-prompt 6 times: 3.89 / 5.88 / 5.89 / 6.93 / 6.80 / 7.64 tok/s (4.9 before), CPU share 10.7%. Eight different
-prompts (`GLM_CHAT_VARY=1`: code, history, databases, Dutch, maths, a recipe, networking): mean 4.35 tok/s against
-4.01 without promotion (+8%), CPU share 21.3% against 36.5%, but a CPU expert costs 2.05 ms (1.50 without: the
-ones left are the cold ones, from disk) and the swaps took 52 of ~540 s; memory pressure 15% both ways. So a new
-subject is a new set of experts, and the disk decides: promotion pays in full only while a conversation stays on
-its subject. Next for varied use: cheaper swaps (the release on a thread behind the forward pass), fewer of
-them (a higher bar while the pressure is high), a smaller GPU budget to leave more page cache (the sweep above
-was run on one prompt). **Prompt reading (2026-11-12):** `glm5next_verify --bench <file> N 8` on the whole file
-(pseudo-random tokens: nearly every expert, the worst case; second pass): 256 tokens 28.5 tok/s, 1,024 tokens
-28.9 - the CPU tier computed an expert once a token of it (13 MB streamed each time) and called MADV_WILLNEED
-three times a token (a serial walk of 1,088 pages each: 16 threads gave 6x). Now a batch's CPU work is grouped by
-expert (`cpu_expert_ffn_batch`: a row decoded once, applied to its tokens; the same bits) and the hint is given once
-an expert: the slice with every expert on the CPU 203 -> 344 tok/s (0.16 -> 0.07 ms an expert of a token, 12x on
-16 threads); the whole file 42.9 tok/s at 256 tokens, 31.4 at 1,024 (0.33 ms: the disk - a random prompt reads
-all 154 GB of experts). A real prompt is to be measured (the deployment was started meanwhile). The user
-(2026-11-12): 4.3-7.6 tok/s is fine, GLM speed work tabled; still possible: the MTP block as draft head, reads of
-cold experts on several threads (readahead into the page cache, the mapping kept), the budget on varied prompts.
-**CPU only (2026-11-12, user: "lets
-try a pure mmap cpu solution"; `INFERENCE_CPU_ONLY=1`, glm5-next):** nothing is registered or locked; the forward
-pass is `src/glm5_ref.cpp` in a fast mode (`Glm5Ref::fast`: every matvec on the pool with the VNNI kernels - FP4_FAST
-and, for the Q8_0 head, `cpu_matvec_q8_q8` - KDA / MLA heads in parallel, MADV_WILLNEED on the routed experts),
-its logits in the GPU path's buffer. Slice: 41 ms/token (GPU 12; 94 before the Q8_0 kernel), ~175 ms projected
-for the whole model in memory. Whole file, the same 3 turns: 1.85 / 2.85 / 2.94 tok/s, coherent text, memory
-pressure 4-5% - the disk again (~340 ms/token); the mix stays the default (4.9). An option for a machine without
-a usable GPU, or to leave the GPU free. Not done: batched prefill and state checkpoints (a kept prompt prefix is
-replayed token by token: first text after 13 s), sequences, the MTP draft. Ideas of
-the LRU mode, in order: (a) the
-cold start: keep the use counts in a file beside the model and at load read and register the most used units up
-to the budget on CPU threads, in parallel (NVMe: several GB/s; the pager reads one range at a time, ~1.1 GB/s);
-(b) evict by use count, not recency (the user's hot / cold split: rare experts registered, used, released and
-dropped at once); (c) a predictor for misses: layer L+1's router on the stream before layer L (the stream changes
-slowly) while the GPU runs layer L, to read ahead; (d) the release: 1.16 ms a unit in the remap (munlock + unmap of
-1088 pages) - batch adjacent units, or release on a CPU thread behind the forward pass. Open: (2) the miss rate of real text: the routing trace, which the pager's counters
-now give (`INFERENCE_VERBOSE`: registered / released at the free); (3) a cheaper miss (the remap drops the page
-tables: registering again faults 1088 pages in; try 2 MB-aligned units or MADV_POPULATE_READ on a CPU thread
-while the GPU runs the attention); (4) the MTP block's experts are registered with the rest (3.6 GB); (5) a
-second context on the same model forwarding at the same time could have its experts released under it (one
-forward at a time is assumed everywhere; the pager would need use counts); (6) the same for deepseek4; (7) no registration at all is not an option: tried 2026-11-11 after a boot with `amdgpu.noretry=0`
-(`tools/gpu_demand_paging.cpp`): a kernel reading an unregistered mapping whose pages are in memory hangs the GPU
-("HW Exception ... GPU Hang", MES stops answering, the desktop's ring times out, full GPU reset after ~20 s; no
-page fault logged). Do not repeat on this kernel / firmware; noretry=0 has no use here.
+Memory: 95% of the 320B params are expert weights, and no 4-bit quantization fits 128 GB, so the experts are paged
+(`src/expert_pager.h`): `hipHostRegister` makes a range a KFD SVM range the driver keeps resident (so what is
+registered must fit, and is mlocked against reclaim); `hipHostUnregister` does not let go, a MAP_FIXED remap does. The
+default: the pager registers experts until the budget is full (`INFERENCE_EXPERT_PIN_MB`; 0: never), promotes the hot
+ones (`INFERENCE_EXPERT_PROMOTE=0`: first come only), and an expert not on the GPU is computed on the CPU from the plain
+mapping (`src/expert_cpu.h`, AVX-512 VNNI, a batch's work grouped by expert). `INFERENCE_EXPERT_EVICT=1` is the LRU
+mode (releases; 1.8 tok/s); `INFERENCE_CPU_ONLY=1` runs the whole forward pass on the CPU pool (2.9 tok/s, no
+registration at all; no batched prefill, checkpoints, sequences or MTP draft there). `tools/glm_chat.pl` chats through
+the model's template (needs Minijinja's `loop_controls`; scripts/setup-minijinja.sh passes it). Whole file: 4.3-7.6
+tok/s (a conversation that stays on its subject promotes its experts: the higher figure; a new subject is a new set
+and the disk decides), first text 0.2-0.7 s warm, 6 s cold; prompts 31-43 tok/s on random tokens. **Tabled (user,
+2026-11-12: this speed is fine).**
 
-Config read from huggingface.co/zai-org/GLM-5.3-Flash/raw/main/config.json on 2026-11-06; the numbers below are
-computed from it, not copied from its model card. 320B total / 18B active, 45 decoder layers, hidden 4096, vocab
-154,880, 1M context. 34 linear-attention layers (KDA) + 11 sparse-attention layers (MLA with a top-2048 index over
-a k=4-pooled compressed index) at layers 3, 7, 11 ... 43; 42 MoE layers (the first 3 layers are dense FFN), 288
-routed experts + 1 shared, top-8, sigmoid routing with `mlp.gate.e_score_correction_bias` and
-`routed_scaling_factor` 2.5; `mhc` with `hc_mult` 4 and `hc_sinkhorn_iters` 20; `swiglu_limit` 10.0;
-`num_nextn_predict_layers` 1. Two readings are inference, not config: `kda_layers` as Kimi Delta Attention
-(gated-deltanet family) and `index_kpool_compress` as key pooling by 4 with APE to restore the lost position
-information. Both set buffer sizes (`conv_dim = (2*n_k + n_v) * 128`), so check them against the checkpoint's
-tensor shapes before sizing anything.
+Open leads, when it is picked up again:
+- The MTP block (blk.45) as draft head: not bound yet; `index_share_for_mtp_iteration` means the draft shares the
+  main index, so the verify path's rollback has to roll the index back too. Its experts are registered with the
+  rest (3.6 GB).
+- Reads of cold experts on several threads (readahead into the page cache, the mapping kept); layer L+1's router
+  on the stream before layer L to read ahead; use counts kept in a file beside the model for a warm start; the GPU
+  budget on varied prompts (the sweep was on one prompt); cheaper promotion swaps (the release on a thread behind
+  the forward pass, fewer swaps under memory pressure).
+- Profile the GPU's own ~100 ms/token on the whole file (3x the all-resident projection: the drains, first reads of
+  new pages?); a real prompt's prefill rate in the deployment.
+- Prefill: sparse MLA on WMMA (~40% of a long prefill: scalar FP32 over ~2k positions x 64 heads x 512 a token); a
+  chunked KDA; an F16 latent cache (half the bytes).
+- Batched sequences; the stand-in one-layer KV cache's sequence features (store, checkpoints) for GLM's state; a
+  second context on the same model forwarding at the same time would have its experts swapped under it (one
+  forward at a time is assumed; the pager would need use counts).
+- The routing trace of real text (the pager's counters, `INFERENCE_VERBOSE`); the indexer's ties are picked by the
+  lower pool index on both paths (llama.cpp's top_k is unordered: no rule to match).
+- The NPU (amdxdna, no /dev/accel in the container) behind `cpu_expert_ffn`'s interface: judged far-fetched.
+- Vision (`glm5_next_vision`) is an independent track: an encoder path, a patch + merger projection, the image
+  token interleave, and a reply-kind channel in the C API for `reasoning_effort` / `clear_thinking`.
 
-1. **Gate: capacity, not kernels.** 42 layers x 289 experts x 3 x 4096 x 2048 = **305.5B of the 320B params
-   (95%) are expert weights**; the non-expert part (attention, embed, LM head, norms) is 14.5B. As released (FP8
-   e4m3) that is 320 GB; at ROCmFP4_FAST 4.25 bpw it is 170 GB; Q4_0 is 180 GB. None fit 128 GB, and ~2.6 bpw is
-   the first quantization that does. Pinning decides the speed: the non-experts cost 7.7 GB pinned at FP4, leaving
-   120 GB -> 8,996 of the 12,096 experts resident (**74%**), and the other 26% of expert reads are NVMe traffic at
-   3-5 GB/s, ~50x slower than the 220-256 GB/s UMA. Per token, 8 experts x 42 layers = 8.46B params are touched:
-   all of it off NVMe at 3-5 GB/s is 0.7-1.1 tok/s, 26% cold is 2.6-4.3 tok/s (the NVMe reads only, no compute), and the all-resident
-   bandwidth ceiling is 26-30 tok/s at FP8 (8.46 GB/token) and 49-57 at FP4 (4.5 GB/token) at 220-256 GB/s. The earlier
-   12-14 / 23-27 were estimates with no stated efficiency; measure them before quoting. So "can we run it" is a routing-trace question, not a kernel question:
-   route ~10k tokens through the router alone (small enough to run on CPU from a quantized copy), count the
-   distinct experts hit per layer, and settle the target bpw + the pinned fraction **before** writing a kernel.
-   The cold part is read from disk through the mapping, registered on demand (above): the routing trace says how
-   much of it a token touches.
-2. **The converter and the loader, no kernels.** The converter is done (`rocm-convert`, the GGUF names of upstream
-   llama.cpp's `glm5-next`: `ssm_*` / `attn_q_a` / `attn_k_b` / `indexer.*` / `hc_*` / `blk.45.nextn.*`; see ▶ Next
-   item 5); the GGUF's tensor table is what the loader binds. The loader dispatches on `general.architecture` against a
-   hardcoded list (`archs` in `inference_model_info`, `src/inference.cpp`), so an unknown arch fails with "architecture %s is not supported"
-   before anything runs. Tensor name -> slot map from the checkpoint's own `modules_to_not_convert` (a literal
-   tensor-name list): `self_attn.{q,k,v,qkv_proj,o,f_a,f_b,g_a,g_b,b}_proj*`, `{q,k,v}_conv1d`, `A_log`, `dt_bias`,
-   `o_norm`, `fused_qkvbfg_a_proj`, `indexer.{wq_b,wk,k_norm,weights_proj,index_kpool_compress_ape,
-   index_kpool_compress_gate}`, `hyper_connection`, `mapping_proj`, `mlp.gate`, `mlp.gate.e_score_correction_bias`.
-   Keys to carry through the loader: `index_topk` (2048), `index_kpool` (4), `index_kpool_compress`,
-   `index_share_for_mtp_iteration`, `hc_mult` (4), `hc_sinkhorn_iters` (20), `hc_eps`, `kv_lora_rank` (512),
-   `q_lora_rank` (1536), `qk_head_dim` (256), `qk_rope_head_dim` (0), `mla_use_nope`, `swiglu_limit` (10.0),
-   `first_k_dense_replace` (3), `num_nextn_predict_layers` (1). De-risk first: extend
-   `tools/gen_qwen4exp_tiny.py` into a `gen_glm5next_tiny.py` that writes a 4-layer tiny GGUF (3 dense + 1 DSA,
-   8 experts, tiny hidden) from these names, so phases 1-2 below can run on a CPU host. Hermes has ROCm 10.1 access (user, 2026-11-06), as the work host
-   does (`/opt/rocm`, hipcc, the gfx1151 GPU); phases 3-4 need the GPU, so they run on the work host.
-3. **CPU reference path against the oracle.** The vendored fork already has `llama.cpp/src/models/glm-dsa.cpp`
-   implementing MLA + the DSA indexer (`ATTENTION_KEY_LENGTH_MLA`, `ATTENTION_VALUE_LENGTH_MLA`,
-   `INDEXER_HEAD_COUNT`, `INDEXER_KEY_LENGTH`, `INDEXER_TOP_K`, `wq_b / wv_b / wo / indexer_k_norm /
-   indexer_proj`), so `tools/ref_oracle/ref_dump` is a working oracle for the sparse path from day one. Check
-   whether that file also has mHC and the KDA per-channel decay; if not, the reference for those does not exist
-   and has to be written from HF's modeling file. CPU ops in the `qwen_ops.cpp` style the forward pass and
-   `tests/forward_verify.cpp` already share: the KDA step (per-channel decay), indexer score -> kpool compress ->
-   top-k -> gather, the mHC Sinkhorn mixer, the MoE router **with sigmoid scoring + `e_score_correction_bias`**
-   (this router does softmax - a real difference, not a detail: sigmoid + bias, then top-8, then renormalize, x2.5)
-   and the `swiglu_limit` clamp at 10.0.
-   **The #1 correctness risk is here, not in the kernels:** the indexer's top-k is a *selection*, not a summation.
-   Exactness by construction (batched kernels reproducing the single-token summation order bit for bit under
-   `QMATVEC_NO_WMMA=1`) does not cover selection order - a prefill of N tokens must select exactly the entries N
-   single-token steps would have, or the sparse attention reads different positions and the logits diverge
-   silently. Pin the tie-break down (ties to the lower index, as `moe_router` already does) and test it as a
-   property, not as a perplexity number.
-4. **GPU kernels.** KDA's decay is per-**channel** diagonal, not this engine's per-head scalar gate: `g_out` grows
-   from `[T][n_v]` to `[T][n_v*128]` and the state update becomes `S *= exp(g_c)` per channel, in
-   `deltanet_pre`/`deltanet_rule` (`DELTANET_HEAD_SIZE` is already 128 and KDA's head_dim is 128, so the state
-   shape carries over unchanged). The indexer's top-2048 selection over the k=4-pooled index is the same problem
-   shape as the bitonic top-k in `moe_router` (32 index heads x 128 in, an index out) - reuse that machinery.
-   Prefill stays dense FP16-WMMA flash attention (with the whole prefix there is nothing to select); decode gathers
-   the selected 2048 positions, replacing the split-K-over-256-position-chunks decode for those 11 layers only.
-5. **KV cache layout + quantization, both gates.** MLA stores one latent of `kv_lora_rank` 512 (+ a 64 rope slot;
-   `qk_rope_head_dim` is 0, so NoPE) per position, not per-head K/V: `kv_bytes_per_token` is computed at load from
-   the `attn_k` / `attn_v` tensor widths in `src/inference.cpp` and must become a latent-cache path or the KV budget
-   is wrong by a large factor. It is a big win: 576 floats x 11 layers = **12 KB/position** in F16 against 704
-   KB/position for a 64-head x 256-dim layout, and that is what makes 1M context addressable. The block store's
-   SHA-hashed `<hash>.kvb` slots must also key on the **compressed index**, or a resumed sequence has no index for
-   its reused prefix. On quantization: the release is FP8 with dynamic scaling and gfx1151 has no FP8/BF8/FP6/FP4
-   instructions (ARCHITECTURE.md s4), so either an e4m3 -> F16 LUT decode feeding the F16 WMMA path (256-entry LUT
-   = 512 B, fits LDS) or offline requantization to ROCmFP4_FAST; the `v_perm` codebook trick that the int8 path
-   uses for 4-bit codes does not reach 8-bit codes (3-bit indices only), so there is no free version of the first.
-   Decide before the kernels, because it sets the resident set and therefore the tok/s in item 1.
+## Concurrent runs
 
-What breaks that the new-kernel list does not show: `index_share_for_mtp_iteration: true` means the draft head
-shares the main model's index, so the verify path's `deltanet_mid_states` / `qwen_model_rollback(keep)` has to roll
-the index back too or rebuild it per pass; the `n_hc == 0` dispatch (`src/inference_internal.h:95`) branches the
-whole forward pass's residual handling, and mHC replaces *every* norm, so the decode profile's `hc_norm` 98 x 7.6 us
-and `hc_mix` 97 x 2.9 us items stay and grow (a per-token 4x4 doubly-stochastic matrix, cheap per layer but on the
-critical path of all 45); and layer kinds are classified from the tensors present, never by index, so the
-classifier's predicate must learn KDA's `A_log`/`dt_bias`/`b_proj`/`f_a_proj` names or every KDA layer silently
-falls through to the wrong kind and the model runs wrong-but-silently. Vision (`glm5_next_vision`: 24 layers,
-hidden 1024, 16 heads, patch 14, 448 px, `spatial_merge_size` 2, `temporal_patch_size` 2, `projection_intermediate_size`
-10240 -> `out_hidden_size` 4096) is an independent track that can go last: the engine has no encoder and the C API
-is text-in/text-out, so it needs an encoder path, a patch + merger projection to `n_embd`, the image/video token
-interleave (image_token_id 154854, image_start/end 154830/154831, video_start/end 154832/154833) and the Perl
-template's thinking channel - the engine streams every emitted token, so `reasoning_effort` (low/high/max, default
-max) and `clear_thinking` (default false) need the reply-kind channel flag currently listed as "only if a non-Perl
-user needs it". A GLM tokenizer (vocab 154,880) is a GGUF-metadata problem for `tokenizer.cpp`, not a new tokenizer.
+Decision (user, 2026-11-07): KV persists, one conversation's cache is not cleared by another's; per-slot sequences
+are dropped. In: the block store (`--store DIR`, `--store-max` GB, lazy prompt-end snapshots written on SIGTERM), a
+switch between conversations reads the prefix back (a 27B switch: 0.79 s instead of 36.8), `preserve_thinking` (a
+new user message no longer re-prefills the previous turn), `--parallel N` (N conversations of one model in one forward
+pass, prompts prefilled in chunks between the others' tokens; not with a draft head). Open:
+- Watch the resume on the deployment (the `kv` line's mapped blocks) and `--parallel` on the 27B / 35B there (the
+  tests ran on Qwen3.5-4B). `--store-max` 32+ on the deployment (one 130k-token 27B conversation ~14 GB).
+- The 10 identical resends in opencode's log (5 each before two compactions, at ~210k tokens) look like failed
+  requests, whose replies the log does not have.
+- Not done: a disk tier for the store; the store on by default in run.sh (the deployment sets ROCM_STORE_DIR).
+- To look at: `--parallel` by default and with speculative decoding (a draft per sequence, or verify batches);
+  several models generating at once (one forward pass each per round; GPU sharing); loads off the request path
+  (between rounds, or in a second process: a request that arrives during a load waits, 2 s from the page cache,
+  minutes from a cold disk); fairness and queue limits per user (the logging's user and conversation id);
+  llama-server on the same GPU.
 
-Ordering: the gate comes first because its answer decides whether the rest is worth doing on this hardware. The
-phases after it are cheap, CPU-only and oracle-backed, and are where the indexer's selection-order risk resolves;
-GPU time on KDA / indexer / sparse attention belongs after those. An optional cheaper first target: a smaller DSA
-sibling, which the oracle already knows as `glm-dsa`, exercises KDA + indexer + MLA + MoE with none of the capacity
-problem, then scale up to the full model.
+## Server logging
 
-## Concurrent runs (to investigate; user, 2026-11-05)
-
-Found in the opencode config (opencode_fn.json, not in the repo): each agent is a slot (`X-LLamaCPP-Id-slot`: plan 6,
-build 5, explore1 4, explore2 2, verifier 3), `max_concurrency` 2, and compaction summarizes with a separate request.
-The server keeps ONE sequence, so every switch between slots re-prefills the conversation: that is the 12k-token
-reuse in the logs (the shared system prompt and tools), and a 59k prefill at 263 tok/s (227 s).
-
-Decision (user, 2026-11-07): KV persists, and one conversation's cache is not cleared by another's requests. Per-slot
-sequences are dropped (the engine does not have them; tried for llama.cpp without success). Status, checked
-2026-11-07:
-- **Persistence: implemented, opt-in.** The block store (`--store DIR`) keeps the blocks and recurrent snapshots as
-  files; a new process or a restart resumes from them. `tests/store_verify.sh` passes all four phases on
-  Qwen3-0.6B (on /dev/shm). The server uses it only with `--store`; the Docker repo passes it only when ROCM_STORE
-  is set (run.sh, llama.sh; empty by default).
-- **Switching reads the prefix back** instead of prefilling it: a sequence resumes from any stored prefix.
-- **Eviction: in.** The server trims the store to `--store-max` GB (default 16) after each request, least recently
-  used first, and logs what each request mapped and published (`kv` and `evict` lines).
-- **Measured (2026-11-08): a 27B switch.** Qwen3.8-27B, store on /dev/shm: A (12,628 tokens) cold in 35.8 s, B
-  (5,892) takes the sequence, A resumes with 12,544 tokens from the store and 93 prefilled in 0.79 s; re-prefilled
-  without the store 36.8 s (47x). 27B store files: 16 MB blocks (64 KB/token), 149.6 MB snapshots; A and B together
-  3.9 GB, 2.8 GB of it snapshots. At 16 GB, one 130k-token 27B conversation (8 GB of blocks, ~40 snapshots = 6 GB)
-  nearly fills the store: `--store-max` 32+ on the deployment (/dev/shm is RAM, shared with the models).
-- **Not done:** a disk tier; the store on by default in run.sh (the deployment sets ROCM_STORE_DIR already).
-- **Fixed (2026-11-08): a resumed agent lost its prefix.** opencode's log (505 requests, all `id_slot` 5) is one main
-  agent, append-only, with compaction requests and a subagent between; after the subagent the main agent resumed a
-  ~130k-token prefix from the store and found it evicted: blocks were touched only when mapped from the store, so
-  a conversation going on in the sequence kept its first blocks at their write time, the oldest files, while each
-  request writes a 62.8 MB snapshot (Qwen3.6-35B: 5 MB blocks; 458 requests ~28 GB > 16 GB). Now every lookup
-  touches the prompt's blocks and its deepest snapshot (`t/45-store-lru.t`). And fewer snapshots (272f5e7): sparser
-  with depth (8 per doubling past 64 blocks), and a sequence's superseded prompt-end snapshot is deleted. And (2026-11-08) lazy
-  prompt ends, the server's default (`--store-snapshots lazy|eager`, `--store-snapshot-every N`): held in a state
-  slot per sequence and written when the sequence leaves the chain, on reset / seq free / store close, and on the
-  server's SIGTERM (the Docker repo's llama.sh now forwards docker stop's SIGTERM; before, nginx was PID 1 and the
-  server was SIGKILLed). A conversation that goes on writes no prompt-end snapshot; a crash loses the held one. Open: the
-  10 identical resends in the log (5 each before two compactions, at ~210k tokens) look like failed requests,
-  whose replies the log does not have.
-- **Fixed (2026-11-08): each new user message re-prefilled the previous turn.** Qwen3.6's template renders an
-  assistant message's reasoning only after the last user message, so a new one changed the whole previous turn
-  (requests5.log #5: 20,070 of the old prompt's tokens; the deployment's log: 20,424 prefilled). The server now sets
-  `preserve_thinking` (`--no-preserve-thinking`; a request's `chat_template_kwargs` wins): 0 re-prefilled. opencode
-  sends `reasoning_content` back (37,203 of 39,613 assistant messages in requests4.log).
-Next: watch the resume on the deployment (the `kv` line's mapped blocks) and `--parallel 2` there.
-
-The server serves one request at a time unless `--parallel N`, which batches N conversations of one model (not
-with a draft head); with `--models-dir` each loaded model has its own sequences and the loop steps them in turn. A
-request that arrives during another, or during a model load (2 s from the page cache, minutes from a cold disk),
-waits: a test request waited 7 min 22 s, then ran at 38 tok/s. `--parallel 2` passes the server tests on
-Qwen3.5-4B but has not run on the 27B / 35B deployments. To look at: `--parallel` by default, and with
-speculative decoding (a draft per sequence, or verify batches); several models generating at once (one forward pass
-each per round; GPU sharing); long prefills in chunks between other requests' tokens (prefill_chunk exists); loads
-off the request path (between rounds, or in a second process); fairness and queue limits per user (with the
-logging's user and conversation id); llama-server on the same GPU.
-
-## Server logging (implemented; the Flash soak is open)
-
-The engine's event hook (C), its Perl binding (`set_event_handler`), the formatter `ROCm::Inference::Log`, the server's
-lines (start, done, prefill progress, generating every 5 s, loads, access, cancels) and the options `--log-level`,
-`--log-format`, `--log-color`, `--debug-stream` are in, for sequential and `--parallel` requests alike (a chunked
-stream prompt reports as one prefill). A client that leaves cancels its prefill also for a plain JSON request
-(Web::Route's `client_gone`). Tests: `t/05-log.t`, `t/15-events.t`, `tests/events_test` (chunked streams too), and
-`t/62-server-log.t` (Qwen3.5-4B: the lines in order, `--debug-stream`, cancels mid-prefill; both modes). Open:
+In: the engine's event hook, `set_event_handler`, `ROCm::Inference::Log`, the server's lines (start, done, prefill
+progress, generating every 5 s, loads, access, cancels), `--log-level` / `--log-format` / `--log-color` /
+`--debug-stream`, for sequential and `--parallel` requests alike; `t/05-log.t`, `t/15-events.t`, `tests/events_test`,
+`t/62-server-log.t`. Open:
 - **Soak on the Flash model**: one request with a long prompt; the prefill ticks visible in real time, no per-token
   lines. Needs a window with the deployment stopped (see the draft-events item under Open leads).
 - With `--parallel`, the done line's store counters (`kv` line) are the model's over the request, so another job's
   blocks can show in them.
-Identity: the user (nginx X-Remote-User; a Keycloak JWT later), the client address (X-Real-IP), and the conversation
-id (the X-LLamaCPP-Id-slot header of the opencode fixups). The docker repo's nginx needs `proxy_set_header
-X-Remote-User` on /rocm/ (not done here).
+- Identity: the user (nginx X-Remote-User; a Keycloak JWT later), the client address (X-Real-IP), the conversation
+  id (X-LLamaCPP-Id-slot). The docker repo's nginx needs `proxy_set_header X-Remote-User` on /rocm/ (not done).
 
 ## Later
 
 - **Converter follow-ups**: an importance matrix (the weighted ROCmFP4 search; collected on the GPU by the
   engine), and a faster encoder (AVX-512 across 16 blocks keeps each block's summation order, so the bytes stay the
   reference's).
-- **Qwen3.8-Flash-Next beyond 262,144 tokens (YaRN)** (HF card, 2026-11-06). The checkpoint is 262,144 natively
-  (`max_position_embeddings`, `rope_type` default); the card reaches 1M by a YaRN override (`factor` 4.0, original
-  262144, with an attention scale). Nothing is dropped by the converter: the GGUF has no rope-scaling keys, and the
-  engine has no YaRN. To do: YaRN frequencies and the attention scale in the RoPE, a `--rope-factor` option, and a
-  quality check at long context (not only that it runs). The 16 GB KV budget caps it at about 600k positions at F16
-  even then. Keep in mind; not started.
+- **Qwen3.8-Flash-Next beyond 262,144 tokens (YaRN)** (HF card, 2026-11-06). The checkpoint is 262,144 natively;
+  the card reaches 1M by a YaRN override (`factor` 4.0, original 262144, with an attention scale). The GGUF has no
+  rope-scaling keys and the engine has no YaRN. To do: YaRN frequencies and the attention scale in the RoPE, a
+  `--rope-factor` option, and a quality check at long context. The 16 GB KV budget caps it at about 600k positions
+  at F16 even then. Not started.
 
 ## Open leads
 
 Speed:
-- Long-context prefill attention runs at ~25% of the FP16 WMMA peak (Qwen3.8-Flash 22% of a 32k prefill, more
-  beyond; already ahead of llama.cpp's: 5.5 vs 7.7 s on Qwen3.6-35B at 32k): the largest lever for long prompts.
-  Measured 2026-11-12 (`build/attn_bench`: the kernels alone, 1,024 tokens at position 31,744, 20 runs, +-2%): D 256
-  17 TFLOPS (32 ms), D 128 12 (22 ms), D 64 13 (21 ms); at position 4,096 8-11. Ablations of attn_flash (D 256 /
-  D 128): without the softmax's exps -1% / -4%; without staging K / V after a chunk's first block (no memory reads)
-  -18% / -21%; without P V (half the WMMAs) -29% / -18%. So no single part holds it back: the WMMAs are ~58% (D 256;
-  ~29 TFLOPS while they run, near the practical FP16 peak), the staging ~18%, the per-block glue (4 barriers, sP
-  through LDS, the softmax's moves) the rest. What is left to gain is the glue and staging per position: blocks of
-  32 positions (two WMMA columns sets a barrier round; twice the LDS a workgroup) - a redesign that has to keep the
-  split invariance (ARCHITECTURE.md s5); at best ~1.2x on the kernel, 5-15% of a 32k prefill. **Tried 2026-11-12, lost:**
-  32-position blocks (each 16-column half its own S and P V product, one softmax rescale per 32 positions, D 256's Q
-  aliased with the K / V staging for the LDS) are slower on every shape: best of 20 at 31,744 - D 256 41.7 / 42.7 ms
-  (committed 31.7 / 32.6), D 128 28.3 (22.8), D 64 22.7 (21.0); the same code with 16-position blocks already loses
-  8-19% on D 256 from the aliasing. Their registers and LDS cost more than the halved barriers save; the Q row padding
-  (D + 8 halves instead of D + 4) is neutral. So the barriers are not what holds it back: the lever would be the
-  registers (D 256 runs 4 waves per SIMD at 256 VGPRs). Share of a 32k
-  prefill in attention (2026-11-12): Qwen3-0.6B 84%, Gemma-4-26B 67%, Llama-3.2-1B 63%, Qwen3.6-35B 35%,
+- Long-context prefill attention runs at ~25% of the FP16 WMMA peak (already ahead of llama.cpp's: 5.5 vs 7.7 s on
+  Qwen3.6-35B at 32k): the largest lever for long prompts. `build/attn_bench` (the kernels alone, 1,024 tokens at
+  position 31,744, best of 20, +-2%): D 256 17 TFLOPS (32 ms), D 128 12 (22 ms), D 64 13 (21 ms). Ablations: the
+  WMMAs are ~58% of D 256 (~29 TFLOPS while they run, near the practical peak), the K / V staging ~18%, the per-block
+  glue (4 barriers, sP through LDS, the softmax's moves) the rest. 32-position blocks lost (Tried and rejected), so
+  the barriers are not what holds it back: the lever left is the registers (D 256 runs 4 waves per SIMD at 256
+  VGPRs). Share of a 32k prefill in attention: Qwen3-0.6B 84%, Gemma-4-26B 67%, Llama-3.2-1B 63%, Qwen3.6-35B 35%,
   Qwen3.5-4B 28%, Nemotron-Nano 25%, Qwen3.8-27B 20%.
 - Qwen3.8-27B (dense ROCmFP4_FAST) is compute-bound: matmul_wmma_q4_0_rocmfp4_fast ~26 of ~59 TOPS (70% of a 32k
   prefill); its epilogue (exact per-block scaling, ~19%) would need FP16 WMMA on pre-scaled weights (twice the
@@ -443,8 +163,8 @@ Speed:
 - MTP verify passes: read experts shared by the verified tokens once (~3.8 of 10 shared by two tokens: ~19% of a
   2-token pass's expert bytes); draft cost 2.7 ms, mostly the head's LM head (a vocabulary cut hurts other
   scripts; a shortlist from the main model's top logits of the previous row, or an int8 copy).
-- MoE decode (Qwen3.6-35B, 2026-11-12): the experts' matvecs stream at ~125 GB/s against ~200 for dense layers
-  (5.5 of 13 ms a token), the DeltaNet matvecs of a 2,048-wide model at ~135: latency-bound launches.
+- MoE decode (Qwen3.6-35B): the experts' matvecs stream at ~125 GB/s against ~200 for dense layers (5.5 of 13 ms a
+  token), the DeltaNet matvecs of a 2,048-wide model at ~135: latency-bound launches.
 - Decode leftovers (Flash): moe_router 48 x 14 us, hc_norm 98 x 7.6 us, deltanet_rule 36 x 19 us, hc_mix 97 x
   2.9 us, ~930 launches x ~1.7 us of gaps; each well under 5%.
 - Prefill: deltanet_conv (~100 GB/s); the quantizing producers (swiglu, add_rmsnorm_rows) compute both Q8_0 and
@@ -453,14 +173,13 @@ Speed:
   matmul_f_id (no model here has them); BF16 FFN down (K 17408) the slowest shape (23 TFLOPS).
 
 Quality / correctness:
-- Prefill is split-invariant now (ARCHITECTURE.md section 5). Open: the tests that allowed for the old WMMA
-  differences between cuts (store_verify.sh and seq_verify compare first tokens, generate_verify a tolerance) can
-  demand bit-exactness; the full tier's perplexity baselines of the models not run here (the Flash model, the 122B
-  and 120B files) need `tests/regress.sh --update` on those rows (prefill attention rounds differently now).
-- Draft events are not verified: `events_test MODEL DRAFT` is written but not run. The Flash model (122.8 GB file) shares
-  the work host's 124 GB with the user's deployment: a load from /models paged in 48 GB in 11 min (~70 MB/s,
-  2026-11-08) and was stopped so as not to evict the deployment's model. Flash work needs a window with the
-  deployment stopped, or a generator for a tiny model with a draft head (tools/gen_qwen4exp_tiny.py writes none).
+- Prefill is split-invariant (ARCHITECTURE.md section 5). Open: the tests that allowed for the old WMMA differences
+  between cuts (store_verify.sh and seq_verify compare first tokens, generate_verify a tolerance) can demand
+  bit-exactness; the full tier's perplexity baselines of the models not run here (the Flash model, the 122B and 120B
+  files) need `tests/regress.sh --update` on those rows.
+- Draft events are not verified: `events_test MODEL DRAFT` is written but not run. The Flash model (122.8 GB file)
+  shares the work host's 124 GB with the deployment: Flash work needs a window with the deployment stopped, or a
+  generator for a tiny model with a draft head (tools/gen_qwen4exp_tiny.py writes none).
 - K-quants dot Q8_K activations (one scale per 256), as ggml's CPU backend; ggml's GPU backend uses q8_1 (per 32):
   ~1% better perplexity at Q2_K. An option for the K-quant kernels.
 - A quantized KV cache needs n_kv * D % 256 == 0 (Qwen2.5-0.5B, 2 x 64, cannot have one).
@@ -470,9 +189,17 @@ Quality / correctness:
   the test's buffer overrun fixed on 2026-11-04 (5e6e9e6). Close after a few clean runs.
 
 Tests and API:
-- In `make regress` (2026-11-08): kv_verify, generate_verify, events_test, seq_verify (0.6B, 4B), store_verify.sh,
-  and the Perl suites (Web::Route, Minijinja, ROCm::Inference with the server tests on Qwen3.5-4B). Still out:
-  mtp_verify and `events_test MODEL DRAFT` (the Flash model and its draft head: a window with the deployment stopped).
+- In `make regress`: kv_verify, generate_verify, events_test, seq_verify (0.6B, 4B), store_verify.sh, and the Perl
+  suites (Web::Route, Minijinja, ROCm::Inference with the server tests on Qwen3.5-4B). Still out: mtp_verify and
+  `events_test MODEL DRAFT` (the Flash model and its draft head: a window with the deployment stopped).
+- `t/60-server.t`'s "is 91 prime" content check fails on Qwen3-0.6B (the model says yes); the suite runs it on
+  Qwen3.5-4B (tests/regress.tsv). Loosen it or keep the 4B.
+- **Raw completions (`POST /v1/completions`, 2026-11-12: whole and streamed, sequential and `--parallel`) leave out
+  two parts of OpenAI's; likely not needed** (coding agents use chat; both are what evaluation harnesses use), so do
+  them when a client asks: `prompt` as an array (several prompts answered as choices[i], or token ids instead of
+  text; 400 now - on the `--parallel` server one job per prompt) and `logprobs` (per-token log-probabilities with the
+  top-N alternatives, with `echo` to score the prompt itself; always null now - needs the logits out per step:
+  `get_logits` exists, a read a token).
 - Untested: Mistral (llama architecture, SentencePiece tokenizer), Llama-3.1-8B (no files); Llama 3.1's built-in
   tools (<|python_tag|> brave_search.call(...)) not parsed; Nemotron's reply format (check against its template).
 - The XS module lacks inference_prefill_logits, model_name and set_seed (add when a Perl user needs them); a C
@@ -480,6 +207,7 @@ Tests and API:
 
 ## Tabled
 
+- GLM-5.3-Flash speed work (user, 2026-11-12: 4.3-7.6 tok/s is fine); its leads are in the GLM section.
 - Older architectures: gpt-oss, deepseek2, glm4, phi3, gemma2 / gemma3, Mistral (user, 2026-11-04).
 - The ROCmFP4_FAST WMMA kernel work (user, 2026-11-04: "move on, table this for now").
 - A CPAN release of ROCm::Inference, Minijinja and Web::Route (user, 2026-11-05: the Docker image builds them
@@ -487,6 +215,13 @@ Tests and API:
 
 ## Tried and rejected (measured; do not repeat without a new idea)
 
+- Prefill attention with 32-position blocks (2026-11-12: each 16-column half its own S and P V product, one softmax
+  rescale per 32 positions, D 256's Q aliased with the K / V staging): slower on every shape - D 256 41.7 / 42.7 ms
+  against 31.7 / 32.6, D 128 28.3 against 22.8, D 64 22.7 against 21.0; the same code with 16-position blocks
+  already loses 8-19% on D 256 from the aliasing; the Q row padding (D + 8 halves instead of D + 4) is neutral.
+- GPU reads of an unregistered mapping (2026-11-11, after a boot with `amdgpu.noretry=0`, `tools/gpu_demand_paging.cpp`):
+  a kernel reading unregistered pages that are in memory hangs the GPU ("HW Exception ... GPU Hang", a full reset
+  after ~20 s, no page fault logged). Do not repeat on this kernel / firmware; registration is not optional.
 - HIP graphs for decode launch gaps: ~0.3% (1.96 vs 1.88 us per dependent kernel; per-token parameter updates).
 - Small-kernel merges (moe_combine into add_rmsnorm: slower, every workgroup recomputes the expert sum; others
   assessed not worth it, 2026-10-21).
