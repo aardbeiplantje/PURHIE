@@ -10,7 +10,8 @@
    PLE reads are in; both are to be measured there (the user).
 2. **Concurrent runs** (section below): the deployment runs `--parallel` now; watch the store's resume (the `kv`
    line's mapped blocks) and the queue there.
-3. **Server logging** (section below): in; the Flash soak run is open.
+3. **Server logging** (section below): in and soaked on Flash (2026-11-12); nothing open on it except the `kv`
+   line's counters with several jobs.
 4. **GLM-5.3-Flash (`glm5_next`)**: runs whole (4.3-7.6 tok/s); its speed work is tabled (user, 2026-11-12). The open
    leads are in its section below.
 5. **Independent of llama.cpp** (user, 2026-11-09): `bin/rocm-convert` converts (byte for byte convert_hf_to_gguf.py's,
@@ -139,9 +140,8 @@ pass, prompts prefilled in chunks between the others' tokens; not with a draft h
 In: the engine's event hook, `set_event_handler`, `ROCm::Inference::Log`, the server's lines (start, done, prefill
 progress, generating every 5 s, loads, access, cancels), `--log-level` / `--log-format` / `--log-color` /
 `--debug-stream`, for sequential and `--parallel` requests alike; `t/05-log.t`, `t/15-events.t`, `tests/events_test`,
-`t/62-server-log.t`. Open:
-- **Soak on the Flash model**: one request with a long prompt; the prefill ticks visible in real time, no per-token
-  lines. Needs a window with the deployment stopped (see the draft-events item under Open leads).
+`t/62-server-log.t`. Soaked on the Flash model in the deployment (2026-11-12, 30k-token requests at `--parallel 4`):
+prefill ticks every ~2.5 s through the 52 s prefill, `generating` lines every 5 s, no per-token lines. Open:
 - With `--parallel`, the done line's store counters (`kv` line) are the model's over the request, so another job's
   blocks can show in them.
 - Identity: the user (nginx X-Remote-User; a Keycloak JWT later), the client address (X-Real-IP), the conversation
