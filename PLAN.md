@@ -147,7 +147,56 @@ prefill ticks every ~2.5 s through the 52 s prefill, `generating` lines every 5 
 - Identity: the user (nginx X-Remote-User; a Keycloak JWT later), the client address (X-Real-IP), the conversation
   id (X-LLamaCPP-Id-slot). The docker repo's nginx needs `proxy_set_header X-Remote-User` on /rocm/ (not done).
 
-## Multimodal and audio (investigated 2026-11-12; not started)
+## Multimodal and audio (engines in build, phased; started 2026-11-12)
+
+Phases, in order. Each ends with a check against the reference (transformers in `/data/hf/venv`: torch 2.6 CPU,
+transformers 5.5.1, Pillow; no torchvision in that venv). A phase is done when its check passes and is committed.
+
+**Vision (Qwen3.5-0.8B first; its 4B and the 122B are the same architecture):**
+- V1 reference (done 2026-11-12): `/data/vision-ref/dump.py` writes `/data/vision-ref/q35-0.8b/`: the test image, the
+  processor's pixel_values (560 x 1536: 20 x 28 patches of 3 x 2 x 16 x 16), the grid (1, 20, 28), the token ids (169,
+  140 image pads), the patch embedding, block 0's output, the merged image features (140 x 1024) and the greedy reply
+  "Two shapes: a red square and a blue circle." Scripts and data stay outside the repo.
+- V2 converter: the vision tower to an mmproj-style GGUF (`rocm-convert` stops on vision tensors today); the check is
+  that the tensors read back equal the safetensors'.
+- V3 ViT forward (C, CPU first, then GPU): patch conv as a matmul over the flattened patches, 2-D positions
+  (interpolated), 2-D rope, non-causal attention per image, GELU MLP, spatial merger. Check: `image_features.npy`
+  within cosine 0.999, block 0 likewise.
+- V4 M-RoPE in the LM forward: (t, h, w) per token for image spans, plain positions for text; the image chat's
+  logits within the usual bar of transformers, then its greedy reply equal to `reply.txt`.
+- V5 image input: decoding (PNG / JPEG: vendored stb_image), the processor's resize (multiples of 32) and
+  normalization in C, the image pad splice, and `image_url` parts in `/v1/chat/completions` (data: URIs). The KV store
+  keys include an image hash before this is enabled (two images with the same pad tokens must not share KV).
+
+**Audio transcription (whisper-tiny, `/data/hf-small/whisper-tiny`):**
+- A1 reference: log-mel features (WhisperFeatureExtractor), the encoder output, and greedy tokens for a test WAV.
+- A2 mel in C: STFT (400-point window, 160 hop), 80 mel filters, log scale; check against A1's features.
+- A3 whisper in the engine: a converter package (GGUF of the encoder-decoder), the conv stem, the encoder (non-causal),
+  the decoder with self- and cross-attention (the encoder output cached once per request); check the greedy tokens.
+- A4 `/v1/audio/transcriptions`: multipart/form-data upload (Web::Route parses JSON only: add it), the JSON reply.
+
+**Speech generation (Qwen3-TTS 0.6B, `/data/hf-small/Qwen3-TTS-12Hz-0.6B-Base` and its tokenizer):**
+- T1 reference: the talker's codes and the waveform for a fixed text (transformers 5.5.1 may not have this model:
+  check, else the official package).
+- T2 talker as an engine architecture: decoder LM plus its code predictor; check the codes.
+- T3 codec decoder (`Qwen3-TTS-Tokenizer-12Hz`): convolutions and transformer blocks in the engine; check the samples.
+- T4 `/v1/audio/speech` returning WAV.
+
+**Image generation (sd-turbo, `/data/hf-small/sd-turbo`):**
+- I1 reference: diffusers is not in the venv (pip install if the registry allows it); the one-step output for a fixed
+  seed and prompt, and the intermediate latents.
+- I2 CLIP text encoder (1024-wide) in the engine; check the embeddings.
+- I3 VAE decoder (2-D convs, group norm, mid attention); check the image from a fixed latent.
+- I4 UNet (2-D convs, resnet blocks, self- and cross-attention transformers, up/down sampling); check one denoising
+  step's output.
+- I5 scheduler, the one-step sampler, PNG encoding (zlib), and `/v1/images/generations`.
+
+Dependencies: V5 and A4 / T4 / I5 need the server's API work (multipart, binary responses); the decoders for PNG, WAV
+and the codec are small C files. Order: V1-V5 first (the Qwen3.5 checkpoints are local and the test is the same
+architecture as the user's deployed models), then A1-A4 (the smallest engine change of the three audio/image paths),
+then T1-T4, then I1-I5 (the largest: UNet and VAE kernels are new).
+
+**Investigated 2026-11-12 (the background for the phases above):**
 
 Asked for: OpenAI-style `/v1/audio/transcriptions`, image input, image generation and audio generation. Local
 checkpoints: the Qwen3.5 family (0.8B, 4B, 122B-A10B, and the Qwen3.6 NVFP4 copy) carries a vision tower (the 4B's
