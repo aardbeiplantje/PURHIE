@@ -428,7 +428,13 @@ Speed:
   ~29 TFLOPS while they run, near the practical FP16 peak), the staging ~18%, the per-block glue (4 barriers, sP
   through LDS, the softmax's moves) the rest. What is left to gain is the glue and staging per position: blocks of
   32 positions (two WMMA columns sets a barrier round; twice the LDS a workgroup) - a redesign that has to keep the
-  split invariance (ARCHITECTURE.md s5); at best ~1.2x on the kernel, 5-15% of a 32k prefill. Share of a 32k
+  split invariance (ARCHITECTURE.md s5); at best ~1.2x on the kernel, 5-15% of a 32k prefill. **Tried 2026-11-12, lost:**
+  32-position blocks (each 16-column half its own S and P V product, one softmax rescale per 32 positions, D 256's Q
+  aliased with the K / V staging for the LDS) are slower on every shape: best of 20 at 31,744 - D 256 41.7 / 42.7 ms
+  (committed 31.7 / 32.6), D 128 28.3 (22.8), D 64 22.7 (21.0); the same code with 16-position blocks already loses
+  8-19% on D 256 from the aliasing. Their registers and LDS cost more than the halved barriers save; the Q row padding
+  (D + 8 halves instead of D + 4) is neutral. So the barriers are not what holds it back: the lever would be the
+  registers (D 256 runs 4 waves per SIMD at 256 VGPRs). Share of a 32k
   prefill in attention (2026-11-12): Qwen3-0.6B 84%, Gemma-4-26B 67%, Llama-3.2-1B 63%, Qwen3.6-35B 35%,
   Qwen3.5-4B 28%, Nemotron-Nano 25%, Qwen3.8-27B 20%.
 - Qwen3.8-27B (dense ROCmFP4_FAST) is compute-bound: matmul_wmma_q4_0_rocmfp4_fast ~26 of ~59 TOPS (70% of a 32k
