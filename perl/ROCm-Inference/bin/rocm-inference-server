@@ -778,7 +778,7 @@ route::post '/v1/chat/completions' => sub {
           total_tokens => $prompt_tokens + $completion_tokens };
     };
 
-    return start_job($r, $id, $messages, $opts, $p, $q) if $parallel > 1;
+    return start_job($r, $id, $opts, $p, $q, messages => $messages) if $parallel > 1;
 
     unless ($p->{stream}) {
         local $r->{busy} = 1;
@@ -850,7 +850,7 @@ route::post '/v1/chat/completions' => sub {
 
 # POST /v1/completions (OpenAI's raw completions): the prompt text as it is, no chat template and no reasoning split,
 # tokenized as chat's text is (with the BOS the model wants) and continued by the model; the reply is plain text,
-# choices[].text. The sequential path only: the --parallel jobs are the chat route's.
+# choices[].text. With --parallel, a job of the loop as a chat is (a raw stream in its sequence).
 route::post '/v1/completions' => sub {
     my ($req) = @_;
     my $p = $req->{json};
@@ -858,13 +858,14 @@ route::post '/v1/completions' => sub {
     my $r = pick($p, 'chat');
     my ($m, $name) = @$r{qw(m id)};
     error(400, "'prompt' is a string: the text the model continues") if !defined $p->{prompt} || ref $p->{prompt};
-    error(501, 'raw completions need the sequential server (no --parallel above 1)') if $parallel > 1;
     my $q = request_ctx($req, $r);
     my $id = $q->{req} =~ s/^chatcmpl-/cmpl-/r;
+    $q->{req} = $id;  # (the log lines' request id as the response's)
     my $opts = options($p, $r);
     delete @$opts{qw(vars max_thinking_tokens)};
     start_line($q, $p, $opts);
     my $ids = tokenize($m, $p->{prompt});
+    return start_job($r, $id, $opts, $p, $q, prompt => $ids) if $parallel > 1;
     my ($completion, $text, $write) = (0, '');
     my $usage = sub {
         { prompt_tokens => scalar @$ids, completion_tokens => $completion, total_tokens => @$ids + $completion };
@@ -945,20 +946,25 @@ route::post '/v1/completions' => sub {
 # loop (tick) advances every running job by one token, a model's all in one forward pass (batched decoding); its
 # response pulls what the job produced (SSE events, or the JSON at the end). A client that leaves cancels its job.
 
-# A job for this request; the response pulls its output
+# A job for this request (a chat: messages => \@messages; a raw completion: prompt => \@ids); the response pulls its
+# output
 sub start_job {
-    my ($r, $id, $messages, $opts, $p, $q) = @_;
+    my ($r, $id, $opts, $p, $q, %what) = @_;
     $opts = { %$opts, prefill_chunk => $o{'prefill-chunk'} // 512 };
     delete $opts->{on_token};  # (a step gives the job its tokens)
-    my %vars = %{ $opts->{vars} // {} };
-    my $text = eval { chat_render($r->{m}, $messages, %vars) };  # template errors are this request's (400), now
-    error(400, $@ =~ s/ at \S+ line \d+\.?\n?\z//r) unless defined $text;
-    my $job = { r => $r, id => $id, messages => $messages, opts => $opts, stream => $p->{stream} ? 1 : 0, out => [],
-                q => $q, queued => Time::HiRes::time(),
-                prompt => tokenize($r->{m}, $text), completion => 0,
+    my $job = { r => $r, id => $id, opts => $opts, stream => $p->{stream} ? 1 : 0, out => [],
+                q => $q, queued => Time::HiRes::time(), completion => 0,
                 usage_chunk => ref $p->{stream_options} eq 'HASH' && $p->{stream_options}{include_usage} };
+    if ($what{messages}) {
+        my %vars = %{ $opts->{vars} // {} };
+        my $text = eval { chat_render($r->{m}, $what{messages}, %vars) };  # template errors are this request's (400), now
+        error(400, $@ =~ s/ at \S+ line \d+\.?\n?\z//r) unless defined $text;
+        @$job{qw(messages prompt)} = ($what{messages}, tokenize($r->{m}, $text));
+    } else {
+        @$job{qw(raw prompt)} = (1, $what{prompt});
+    }
     push @{ $r->{queue} }, $job;
-    if ($job->{stream}) {
+    if ($job->{stream} && !$job->{raw}) {
         push @{ $job->{out} }, chunk($job, { role => 'assistant', content => '' }, undef);
     }
     my $type = $job->{stream} ? 'text/event-stream' : 'application/json';
@@ -968,10 +974,36 @@ sub start_job {
     }, on_close => sub { cancel($job) });
 }
 
+# A streamed piece of the job's reply: a chat's delta, or (a raw job) the delta's content as choices[].text
 sub chunk {
     my ($job, $delta, $finish) = @_;
+    return sse({ id => $job->{id}, object => 'text_completion', created => time, model => $job->{r}{id},
+                 choices => [ { index => 0, text => $delta->{content} // '', logprobs => undef, finish_reason => $finish } ] })
+        if $job->{raw};
     return sse({ id => $job->{id}, object => 'chat.completion.chunk', created => time, model => $job->{r}{id},
                  choices => [ { index => 0, delta => $delta, finish_reason => $finish } ] });
+}
+
+# A raw completion as the loop runs a chat: stream_begin on the job's sequence, stepped by step_chats with the chats
+# (its _took as ROCm::Inference::ChatStream's: the step's text as a content delta, and whether it goes on)
+{
+    package RawStream;
+    sub new {
+        my ($class, $m, $ids, $opts) = @_;
+        return bless { m => $m, n => 0, prompt_n => scalar @$ids, text => '',
+                       stream => ROCm::Inference::stream_begin($m, $ids, { reuse_prefix => 1, %$opts }) }, $class;
+    }
+    sub _took {
+        my ($c, $tok, $text, $going, $why) = @_;
+        $c->{reason} = $why;
+        ++$c->{n} if $tok >= 0 && !ROCm::Inference::token_is_eog($c->{m}, $tok);
+        $c->{text} .= $text if length $text;
+        if (!$going) { $c->{done} = 1; $c->{stream}->free }
+        return (length $text ? [ [ $text, 'content' ] ] : [], !$c->{done});
+    }
+    sub tokens { $_[0]{n} }
+    sub prompt_tokens { $_[0]{prompt_n} }
+    sub result { my ($c) = @_; return unless $c->{done}; return ($c->{text}, $c->{reason}, { content => $c->{text} }) }
 }
 
 sub release {
@@ -1059,9 +1091,14 @@ sub job_output {
             push @{ $job->{out} }, chunk($job, { tool_calls => [ map { { index => $_, %{ $calls[$_] } } } 0 .. $#calls ] }, undef);
         }
         push @{ $job->{out} }, chunk($job, {}, finish_reason($why, $msg));
-        push @{ $job->{out} }, sse({ id => $job->{id}, object => 'chat.completion.chunk', created => time,
-                                     model => $job->{r}{id}, choices => [], usage => \%usage }) if $job->{usage_chunk};
+        push @{ $job->{out} }, sse({ id => $job->{id}, object => $job->{raw} ? 'text_completion' : 'chat.completion.chunk',
+                                     created => time, model => $job->{r}{id}, choices => [], usage => \%usage })
+            if $job->{usage_chunk};
         push @{ $job->{out} }, sse('[DONE]');
+    } elsif ($job->{raw}) {
+        push @{ $job->{out} }, $J->encode({ id => $job->{id}, object => 'text_completion', created => time,
+            model => $job->{r}{id}, usage => \%usage,
+            choices => [ { index => 0, text => $content, logprobs => undef, finish_reason => finish_reason($why, $msg) } ] });
     } else {
         my %out = (role => 'assistant', content => $content);
         $out{reasoning_content} = $msg->{reasoning_content} if defined $msg->{reasoning_content};
@@ -1096,7 +1133,8 @@ sub tick {
             seq_select($m, $slot->{seq});
             {
                 local $r->{cur} = $job->{q};  # (its events: the prompt synced with the sequence, the store's blocks)
-                $job->{chat} = eval { chat_start($m, $job->{messages}, $job->{opts}) };
+                $job->{chat} = eval { $job->{raw} ? RawStream->new($m, $job->{prompt}, $job->{opts})
+                                                  : chat_start($m, $job->{messages}, $job->{opts}) };
             }
             $job->{q}{queued_ms} = 1000 * (Time::HiRes::time() - $job->{queued}) if $job->{q};
             if (!$job->{chat}) { job_error($job, $@); next }
@@ -1384,7 +1422,8 @@ C<max_thinking_tokens> (or C<thinking_budget_tokens>): close the reasoning after
 
 C<POST /v1/completions> is OpenAI's raw completion: C<prompt> (a string) is continued as it is, with no chat template
 and no reasoning split; the reply is plain text in C<choices[].text>. It takes C<max_tokens>, C<temperature>, C<top_p>,
-C<seed>, C<stop> and C<stream> as chat does. The sequential server only: with C<--parallel> above 1 it answers 501.
+C<seed>, C<stop> and C<stream> as chat does. With C<--parallel>, a raw completion is a conversation of the N, as a
+chat is.
 
 C<model> picks the model: with C<--models-dir> one from C<GET /v1/models> (loaded when needed; an unknown one is a
 404), none: the one used last (or the only one); with C<--model> alone any name gets that model. C<GET /v1/models>

@@ -72,25 +72,27 @@ is($st, 200, 'chat');
 like($r->{choices}[0]{message}{content}, qr/red|blue|yellow/i, 'the answer');
 ok($r->{usage}{prompt_tokens} > 0 && $r->{usage}{completion_tokens} > 0, 'usage');
 
-# raw completions: the prompt as it is, plain text back (the sequential server only)
-if ($parallel == 1) {
+# raw completions: the prompt as it is, plain text back
+{
     ($st, $body) = http(POST => '/v1/completions', { temperature => 0, max_tokens => 8, prompt => 'The capital of France is' });
     my $c = $J->decode($body);
     is($st, 200, 'raw completions');
     is($c->{object}, 'text_completion', 'a text completion');
     like($c->{choices}[0]{text}, qr/Paris/, 'the text continues the prompt');
     is($c->{usage}{completion_tokens}, 8, 'its usage');
+    is($c->{choices}[0]{finish_reason}, 'length', 'its finish_reason');
     ($st, $body) = http(POST => '/v1/completions', { max_tokens => 8, prompt => [ 'a' ] });
     is($st, 400, 'a prompt that is not a string is refused');
     my $rhead;
     ($st, $body, $rhead) = http(POST => '/v1/completions', { temperature => 0, max_tokens => 4, stream => JSON::PP::true,
-        prompt => 'One, two,' });
+        prompt => 'One, two,', stream_options => { include_usage => JSON::PP::true } });
     like($rhead, qr{Content-Type: text/event-stream}, 'a raw event stream');
     my @rev = map { /^data: (.*)/ ? $1 : () } split /\n\n/, $body;
     is($rev[-1], '[DONE]', 'the raw stream ends with [DONE]');
-} else {
-    ($st, $body) = http(POST => '/v1/completions', { max_tokens => 8, prompt => 'Hi' });
-    is($st, 501, 'raw completions need --parallel 1');
+    my @rc = map { $J->decode($_) } @rev[ 0 .. $#rev - 1 ];
+    my $text = join '', map { $_->{choices}[0] ? $_->{choices}[0]{text} // '' : '' } @rc;
+    like($text, qr/three/i, "the raw stream's text: $text");
+    is((grep { $_->{usage} } @rc)[0]{usage}{completion_tokens}, 4, 'its usage chunk');
 }
 
 my $head;
