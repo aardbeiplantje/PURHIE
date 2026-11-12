@@ -153,8 +153,17 @@ Asked for: OpenAI-style `/v1/audio/transcriptions`, image input, image generatio
 checkpoints: the Qwen3.5 family (0.8B, 4B, 122B-A10B, and the Qwen3.6 NVFP4 copy) carries a vision tower (the 4B's
 safetensors: 297 `model.visual.*` tensors, 24 blocks, hidden 1024, patch 16, spatial merge 2, out 2560;
 `image_token_id` 248056); GLM-5.3 and DeepSeek-V4.1 have vision configs too. No local model has an audio config, and
-there is no diffusion, TTS or Whisper checkpoint. The engine has no encoder, no cross-attention, no mel / STFT, no
-image decoder and no multipart parsing (`qwen_ops.h`: M-RoPE is reduced to plain RoPE for text).
+there is no diffusion, TTS or Whisper checkpoint in /models. The engine has no encoder, no cross-attention, no mel / STFT,
+no image decoder and no multipart parsing (`qwen_ops.h`: M-RoPE is reduced to plain RoPE for text).
+
+Downloaded for the test (2026-11-12, `/data/hf-small`, 5.7 GB, from Hugging Face; the fetch script is `fetch.py`
+there): `whisper-tiny` (openai/whisper-tiny, 151 MB: encoder-decoder, 4 + 4 layers, d 384, 80 mel bins, 1500 source
+positions), `sd-turbo` (stabilityai/sd-turbo, fp16 UNet / VAE / text encoder: an SD 2.1-type UNet with
+cross-attention dim 1024, one-step sampling), `Qwen3-TTS-12Hz-0.6B-Base` (2.4 GB: a talker LM plus a speaker encoder)
+and `Qwen3-TTS-Tokenizer-12Hz` (651 MB: the codec whose `decoder_config` turns codes into audio). The vision test
+needs no download: `/hf/Qwen3.5-0.8B` and `/hf/Qwen3.5-4B` (safetensors) carry the vision tower. The user's own local
+models live outside this host's mounts (their deployment's `/mnt/data3/models` is not visible here): paths needed
+to test them here.
 
 Ranked by fit:
 1. **Image input (vision chat)**, best fit; the test model is Qwen3.5-4B (BF16 GGUF local, the vision tower in its
@@ -179,8 +188,9 @@ Ranked by fit:
 4. **Image generation**, no local model. A diffusion or flow model (UNet or DiT), a VAE decoder (2-D convs, group
    norm), a text encoder, a scheduler, and a PNG encoder: none of it exists here. A separate engine, the largest item.
 
-Decisions needed from the user: a model for each of items 2-4 (none is local); whether the server decodes images
-(item 1) or takes decoded pixels.
+Models chosen for the tests (downloaded above): item 2 whisper-tiny (encoder-decoder, so it shows what the engine
+must add); item 3 Qwen3-TTS 0.6B with its tokenizer; item 4 sd-turbo. Still open: whether the server decodes images
+(item 1) or takes decoded pixels; the paths of the user's own local models, if they should be tested on this host.
 
 ## Later
 
