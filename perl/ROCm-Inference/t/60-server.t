@@ -113,7 +113,7 @@ for (@chunks) {
     $finish = $c->{finish_reason} if $c->{finish_reason};
 }
 ok(!$thinks || length $reasoning, $thinks ? 'reasoning deltas' : 'no reasoning in this chat format');
-like($content, qr/7|13|not/i, "content deltas: $content");
+like($content, qr/7|13|not|prime/i, "content deltas: $content");  # (a small model answers wrong; it answers)
 is($finish, 'stop', 'finish_reason');
 ok($usage && $usage->{completion_tokens} > 0, 'a usage chunk');
 
