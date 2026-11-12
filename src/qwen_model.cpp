@@ -1907,17 +1907,44 @@ struct QwenModel {
             const uintptr_t b = (uintptr_t)p / pg * pg;
             (void)madvise((void*)b, (uintptr_t)p + len - b, MADV_WILLNEED);
         };
-        for (const auto& c : cpu_ids) {
-            ahead((const char*)L.We_gate.data + c.second * eg, eg);
-            ahead((const char*)L.We_up.data + c.second * eg, eg);
-            ahead((const char*)L.We_down.data + c.second * ed, ed);
+        // by expert: an expert's weights are read once for all the tokens of the batch routed to it (a prefill
+        // batch reads each ~13 MB expert once, not once a token: 16 threads streaming it per token are bound by
+        // the memory's bandwidth, 0.49 ms an expert of a token against 0.06)
+        std::vector<int> ord(n), g0;
+        for (int i = 0; i < n; ++i) ord[i] = i;
+        std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return cpu_ids[a].second < cpu_ids[b].second; });
+        for (int i = 0; i < n; ++i)  // groups of at most 64 tokens (their activations stay in the core's cache)
+            if (i == 0 || cpu_ids[ord[i]].second != cpu_ids[ord[i - 1]].second || i - g0.back() >= 64) g0.push_back(i);
+        g0.push_back(n);
+        for (size_t gi = 0; gi + 1 < g0.size(); ++gi) {  // (once an expert, not once a token of it: a call walks 1,088 pages)
+            const int e = cpu_ids[ord[g0[gi]]].second;
+            if (gi > 0 && e == cpu_ids[ord[g0[gi - 1]]].second) continue;
+            ahead((const char*)L.We_gate.data + e * eg, eg);
+            ahead((const char*)L.We_up.data + e * eg, eg);
+            ahead((const char*)L.We_down.data + e * ed, ed);
         }
-        cpu_parallel_for(n, [&](int i) {
-            const int t = cpu_ids[i].first / NU, e = cpu_ids[i].second;
-            cpu_expert_ffn((const char*)L.We_gate.data + e * eg, (const char*)L.We_up.data + e * eg, L.We_gate.row_bytes,
-                           (const char*)L.We_down.data + e * ed, L.We_down.row_bytes, FE, E, cpu_q.data() + (size_t)t * E,
-                           cpu_d.data() + (size_t)t * (E / 32), L.swiglu_limit, cpu_out.data() + (size_t)i * E,
-                           cpu_work.data() + (size_t)i * wk);
+        cpu_parallel_for((int)g0.size() - 1, [&](int gi) {
+            const int a = g0[gi], m = g0[gi + 1] - a, e = cpu_ids[ord[a]].second;
+            if (m == 1) {
+                const int i = ord[a], t = cpu_ids[i].first / NU;
+                cpu_expert_ffn((const char*)L.We_gate.data + e * eg, (const char*)L.We_up.data + e * eg, L.We_gate.row_bytes,
+                               (const char*)L.We_down.data + e * ed, L.We_down.row_bytes, FE, E, cpu_q.data() + (size_t)t * E,
+                               cpu_d.data() + (size_t)t * (E / 32), L.swiglu_limit, cpu_out.data() + (size_t)i * E,
+                               cpu_work.data() + (size_t)i * wk);
+                return;
+            }
+            std::vector<const int8_t*> qp(m);
+            std::vector<const float*> dp(m);
+            std::vector<float*> op(m);
+            for (int k = 0; k < m; ++k) {
+                const int i = ord[a + k], t = cpu_ids[i].first / NU;
+                qp[k] = cpu_q.data() + (size_t)t * E;
+                dp[k] = cpu_d.data() + (size_t)t * (E / 32);
+                op[k] = cpu_out.data() + (size_t)i * E;
+            }
+            cpu_expert_ffn_batch((const char*)L.We_gate.data + e * eg, (const char*)L.We_up.data + e * eg,
+                                 L.We_gate.row_bytes, (const char*)L.We_down.data + e * ed, L.We_down.row_bytes, FE, E, m,
+                                 qp.data(), dp.data(), L.swiglu_limit, op.data());
         });
         if (!sync()) return false;
         for (int i = 0; i < n; ++i) {

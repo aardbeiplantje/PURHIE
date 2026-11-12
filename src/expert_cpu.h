@@ -28,6 +28,12 @@ void cpu_matvec_q8_q8(const void* W, size_t row_bytes, int N, int K, const int8_
 void cpu_expert_ffn(const void* gate, const void* up, size_t row_bytes_gu, const void* down, size_t row_bytes_d,
                     int FE, int E, const int8_t* q, const float* d, float limit, float* out, float* work);
 
+// The same expert on m tokens (q[t], d[t] -> out[t]): its weights read once. Each token's result is
+// cpu_expert_ffn's, bit for bit
+void cpu_expert_ffn_batch(const void* gate, const void* up, size_t row_bytes_gu, const void* down, size_t row_bytes_d,
+                          int FE, int E, int m, const int8_t* const* q, const float* const* d, float limit,
+                          float* const* out);
+
 // fn(i) for i in 0 .. n on the pool's threads (INFERENCE_CPU_THREADS, default the cores less one, at most 16) and
 // the caller's; returns when all are done
 void cpu_parallel_for(int n, const std::function<void(int)>& fn);

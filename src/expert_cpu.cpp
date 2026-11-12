@@ -98,6 +98,92 @@ void cpu_matvec_fp4fast_q8(const void* W, size_t row_bytes, int N, int K, const 
     else matvec_scalar((const uint8_t*)W, row_bytes, N, K, q, d, y);
 }
 
+// m tokens against the same rows: a row's weights are decoded once (|w|, the signs, the block scales) and applied
+// to each token - the weights are read from memory once, not once a token. Each token's sum is matvec_vnni's,
+// bit for bit (the same partial sums in the same order)
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")))
+static void matmul_vnni(const uint8_t* W, size_t row_bytes, int N, int K, int m, const int8_t* const* q,
+                        const float* const* d, float* const* y) {
+    const float* st = scale_table();
+    const __m512i cb = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i*)kCodebook));
+    const __m128i m4 = _mm_set1_epi8(15);
+    const int np = K / 64;
+    std::vector<__m512i> wabs(np);
+    std::vector<__mmask64> wneg(np);
+    std::vector<float> ws(2 * (size_t)np);
+    for (int n = 0; n < N; ++n, W += row_bytes) {
+        const uint8_t* b = W;
+        for (int p = 0; p < np; ++p, b += 34) {
+            const __m128i n0 = _mm_loadu_si128((const __m128i*)b), n1 = _mm_loadu_si128((const __m128i*)(b + 17));
+            __m512i nib = _mm512_castsi128_si512(_mm_and_si128(n0, m4));
+            nib = _mm512_inserti32x4(nib, _mm_and_si128(_mm_srli_epi16(n0, 4), m4), 1);
+            nib = _mm512_inserti32x4(nib, _mm_and_si128(n1, m4), 2);
+            nib = _mm512_inserti32x4(nib, _mm_and_si128(_mm_srli_epi16(n1, 4), m4), 3);
+            const __m512i w = _mm512_shuffle_epi8(cb, nib);
+            wneg[p] = _mm512_movepi8_mask(w);
+            wabs[p] = _mm512_abs_epi8(w);
+            ws[2 * p] = st[b[16]];
+            ws[2 * p + 1] = st[b[33]];
+        }
+        for (int t = 0; t < m; ++t) {
+            const int8_t* qt = q[t];
+            const float* dt = d[t];
+            __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+            for (int p = 0; p < np; ++p) {
+                const __m512i x = _mm512_loadu_si512((const void*)(qt + (size_t)p * 64));
+                const __m512i xs = _mm512_mask_sub_epi8(x, wneg[p], _mm512_setzero_si512(), x);
+                const __m512i s = _mm512_dpbusd_epi32(_mm512_setzero_si512(), wabs[p], xs);
+                const __m512 sc = _mm512_insertf32x8(_mm512_set1_ps(ws[2 * p] * dt[2 * p]),
+                                                     _mm256_set1_ps(ws[2 * p + 1] * dt[2 * p + 1]), 1);
+                if (p & 1) acc1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(s), sc, acc1);
+                else acc0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(s), sc, acc0);
+            }
+            y[t][n] = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+        }
+    }
+}
+
+static void matmul_fp4fast_q8(const void* W, size_t row_bytes, int N, int K, int m, const int8_t* const* q,
+                              const float* const* d, float* const* y) {
+    if (have_vnni() && m > 1) {
+        matmul_vnni((const uint8_t*)W, row_bytes, N, K, m, q, d, y);
+        return;
+    }
+    for (int t = 0; t < m; ++t) cpu_matvec_fp4fast_q8(W, row_bytes, N, K, q[t], d[t], y[t]);
+}
+
+void cpu_expert_ffn_batch(const void* gate, const void* up, size_t row_bytes_gu, const void* down, size_t row_bytes_d,
+                          int FE, int E, int m, const int8_t* const* q, const float* const* d, float limit,
+                          float* const* out) {
+    std::vector<float> g((size_t)m * FE), u((size_t)m * FE), dq((size_t)m * (FE / 32));
+    std::vector<int8_t> aq((size_t)m * FE);
+    std::vector<float*> gp(m), up_(m);
+    std::vector<const int8_t*> aqp(m);
+    std::vector<const float*> dqp(m);
+    for (int t = 0; t < m; ++t) {
+        gp[t] = g.data() + (size_t)t * FE;
+        up_[t] = u.data() + (size_t)t * FE;
+        aqp[t] = aq.data() + (size_t)t * FE;
+        dqp[t] = dq.data() + (size_t)t * (FE / 32);
+    }
+    matmul_fp4fast_q8(gate, row_bytes_gu, FE, E, m, q, d, gp.data());
+    matmul_fp4fast_q8(up, row_bytes_gu, FE, E, m, q, d, up_.data());
+    for (int t = 0; t < m; ++t) {
+        float* gt = gp[t];
+        const float* ut = up_[t];
+        for (int i = 0; i < FE; ++i) {  // as cpu_expert_ffn
+            float gv = gt[i], uv = ut[i];
+            if (limit > 0.0f) {
+                gv = fminf(gv, limit);
+                uv = fminf(fmaxf(uv, -limit), limit);
+            }
+            gt[i] = gv / (1.0f + expf(-gv)) * uv;
+        }
+        cpu_q8_0_quantize(gt, FE, aq.data() + (size_t)t * FE, dq.data() + (size_t)t * (FE / 32));
+    }
+    matmul_fp4fast_q8(down, row_bytes_d, E, FE, m, aqp.data(), dqp.data(), out);
+}
+
 // Q8_0 weights: a block is its F16 scale and 32 int8; two blocks a vector
 __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512vnni,f16c")))
 static void matvec_q8_vnni(const uint8_t* W, size_t row_bytes, int N, int K, const int8_t* q, const float* d, float* y) {

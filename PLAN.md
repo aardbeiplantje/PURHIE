@@ -204,7 +204,17 @@ ones left are the cold ones, from disk) and the swaps took 52 of ~540 s; memory 
 subject is a new set of experts, and the disk decides: promotion pays in full only while a conversation stays on
 its subject. Next for varied use: cheaper swaps (the release on a thread behind the forward pass), fewer of
 them (a higher bar while the pressure is high), a smaller GPU budget to leave more page cache (the sweep above
-was run on one prompt). **CPU only (2026-11-12, user: "lets
+was run on one prompt). **Prompt reading (2026-11-12):** `glm5next_verify --bench <file> N 8` on the whole file
+(pseudo-random tokens: nearly every expert, the worst case; second pass): 256 tokens 28.5 tok/s, 1,024 tokens
+28.9 - the CPU tier computed an expert once a token of it (13 MB streamed each time) and called MADV_WILLNEED
+three times a token (a serial walk of 1,088 pages each: 16 threads gave 6x). Now a batch's CPU work is grouped by
+expert (`cpu_expert_ffn_batch`: a row decoded once, applied to its tokens; the same bits) and the hint is given once
+an expert: the slice with every expert on the CPU 203 -> 344 tok/s (0.16 -> 0.07 ms an expert of a token, 12x on
+16 threads); the whole file 42.9 tok/s at 256 tokens, 31.4 at 1,024 (0.33 ms: the disk - a random prompt reads
+all 154 GB of experts). A real prompt is to be measured (the deployment was started meanwhile). The user
+(2026-11-12): 4.3-7.6 tok/s is fine, GLM speed work tabled; still possible: the MTP block as draft head, reads of
+cold experts on several threads (readahead into the page cache, the mapping kept), the budget on varied prompts.
+**CPU only (2026-11-12, user: "lets
 try a pure mmap cpu solution"; `INFERENCE_CPU_ONLY=1`, glm5-next):** nothing is registered or locked; the forward
 pass is `src/glm5_ref.cpp` in a fast mode (`Glm5Ref::fast`: every matvec on the pool with the VNNI kernels - FP4_FAST
 and, for the Q8_0 head, `cpu_matvec_q8_q8` - KDA / MLA heads in parallel, MADV_WILLNEED on the routed experts),
