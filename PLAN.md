@@ -484,10 +484,50 @@ DiT and the text encoder, no ROCmFP4 unless the user asks for it):
   (one tile) cosine 1.0000000, max difference 2e-5 of the peak; a 40 x 40 latent (9 tiles, blended) cosine 1.0000000, 5e-5 of
   the peak. Two seconds for both with the load. The device is required (no host path yet). diffusers 0.43.0 is in
   `/data/diff43b` (installed without its dependencies; import with `PYTHONPATH=/data/diff43b:/data/diff-site`).
-- M3 DiT: `MiniMaxH3DiTModel` (token refiner, the adaLN blocks, 3-axis RoPE, the GQA-less 56-head attention) on the
-  device with the BF16 GEMM path (the GEMM needs a BF16 operand and WMMA for speed: a 4096-token forward of 33B
-  parameters is about 0.3 PFLOP per step, six steps, so the plain fp32 tile would take minutes per image). Checked
-  block by block against diffusers with the real weights (one block at a time, the input random).
+- M3 DiT: `MiniMaxH3DiTModel`, the t2i path (one packed sequence: text rows, then the generated image rows; no
+  reference images). **Converted 2026-11-13:** `rocm-convert` now knows it (`Convert::MiniMaxDiT`: the checkpoint's
+  531 tensors in BF16 copied raw, the names as they are, the configuration as keys `minimax_h3_dit.*`): 66.28 GB at
+  `/data/minimax-h3/dit-bf16.gguf`, 64 s. Before this the answer to "does rocm-convert convert it" was no: the
+  architecture was not in its list, so it is a converter module like the VAE's (BF16 is copied, not re-encoded).
+  Spec read from `/data/minimax-ref/diffusers` (2026-11-13):
+  - Token layout: `text_token_tags` 1 for the prompt rows (the text encoder's hidden state 50, through `condition_proj`
+    (5120 -> 5376) and the 2-block `token_refiner` (plain pre-norm, no AdaLN, no RoPE, full attention over the text, the
+    `final_norm`)), then the image rows with tag 0. Latent (24, H/16, W/16) patchified to tokens of 24 x 1 x 2 x 2 = 96
+    values, layout (c, ph, pw) per token, tokens row-major over (h', w'), `video_patch_proj` (96 -> 5376). Image tokens for
+    1024 x 1024: 32 x 32 = 1024. The unpatchify is the exact inverse (the decoder's input order, M2).
+  - Rotary: 3 axes (t, h, w) of 16 frequencies each, `inv_freq[k] = 10000^(-k/16)` (rope_theta 10000, the default; the
+    config does not set it), concatenated and doubled: 96 rotated channels of the 128-wide head, rotate-half. Text rows:
+    t = 0..T-1, h = w = 0. Image rows: t = T, and (h, w) on the grid `2 * sqrt(area)`-normalized of
+    `np.linspace(left, left + ratio, n, endpoint=False) * 32` with ratio = n / sqrt(area), left = (1 - ratio) / 2
+    (`_spatial_position_grid`, float64): for a square canvas, the centres of 32 cells over [0, 32).
+  - Timestep: one value per step, t = 1 - sigma (the six sigmas of `pdd_config.json`, t from 0 to 0.9675..0.768), unscaled.
+    `time_proj`: sinusoid of 256 with `flip_sin_to_cos` (cos first), downscale shift 0; then `time_embedder`
+    (linear 256 -> 5376, SiLU, linear 5376 -> 2688; the checkpoint's `proj_in` / `proj_out`).
+  - AdaLN, per block: `adaln_proj.linear` (2688 -> 6 x 5376 x 3, bias) on SiLU(temb); the 6 chunks are shift, scale, gate
+    for the attention and for the MLP, each a table of rows `t * 3 + tag` (tags: 0 image, 1 text). Each row of the
+    sequence picks its row by that index. Attention and MLP: x = x + gate * f(RMSNorm(x) * (1 + scale) + shift).
+  - Attention: fused `attn.qkv_proj` (5376 -> 3 x 5376, no bias) split into q, k, v (56 heads of 128); RMS-normed q and
+    k per head (eps 1e-5, no affine); rotary; non-causal full attention over the whole sequence (text and image rows
+    together); `attn.out_proj` (no bias).
+  - MLP: `mlp.fc1` (5376 -> 2 x 14336, no bias): the first half is the value, the second the gate: value * SiLU(gate);
+    `mlp.fc2` (14336 -> 5376, no bias).
+  - Output: `final_layer.norm` (RMSNorm with weight, eps 1e-5) then `final_layer.adaln_proj.linear` (2688 -> 2 x 5376,
+    bias): shift, scale per timestep row (`timestep_indices`, all 0 for t2i): x * (1 + scale) + shift; then the PDD head
+    of this step: `pdd_fused_heads.safetensors` (`video_out.weight` [6, 96, 5376], `video_out.bias` [6, 96], F32: one
+    head per sampling step; the checkpoint's own `final_layer.video_out` is not used by the pipeline's `pdd_proj_out`).
+    Velocity of the image rows only.
+  - Sampler (`MiniMaxH3Scheduler`, euler velocity form, no guidance: it is baked in, so one forward per step, six
+    forwards per image): x_{i+1} = x_i + (sigma_i - sigma_{i+1}) * v_i. Initial x: noise (N(0, 1), 24 x H/16 x W/16).
+  - Cost: about 0.35 GMAC per token per block (qkv + out + fc1 + fc2), 50 blocks: 17 GMAC per token, 1100 tokens: 19 TMAC
+    per forward (38 TFLOP), six forwards per image: about 230 TFLOP at 1024 x 1024. The adaLN projections are per timestep
+    (13 GB of the 66 GB, applied once per block per step). At the fp32 tile's 3 TFLOPS that is a minute and a half per
+    image: BF16 operands in a tensor-core GEMM are needed for a usable speed (M3's second half).
+  - Plan: (a) the engine's BF16 A operand in the GEMM (the bf16 weight's high half in a float, as the F16 path does);
+    (b) `src/minimax_dit.{h,cpp}` with the token refiner, the blocks, the output, the sampler; (c) the verifiers:
+    per-block against diffusers (block 0 with the real weights, fp32 reference from the same BF16 values; the modules
+    built from the reference classes, the checkpoint's keys mapped: `attn.qkv_proj` to `attn.to_qkv` fused, `blocks.N` to
+    `transformer_blocks.N`), then the whole forward on a small canvas (256 x 256) against a torch BF16 run on the GPU
+    (the full model fits the UMA as a device model; the CPU reference cannot hold 132 GB as fp32).
 - M4 sampler and PDD: the six-sigma euler velocity loop, the fused heads from `pdd_fused_heads.safetensors` (check
   what they replace), t2i end to end against the diffusers pipeline (same seed, the same initial noise).
 - M5 server: the image endpoint's model choice (the request's `model` field; today there is one `--sd` file), the
