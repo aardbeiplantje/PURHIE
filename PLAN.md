@@ -381,7 +381,26 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   with one attention head over the positions, four up blocks of three resnets with nearest upsampling and a 3x3 conv,
   GroupNorm 32 (eps 1e-6), SiLU, conv_out; direct convolution along the rows, OpenMP over the channels). `tests/sd_vae_verify`
   (`make build/sd_vae_verify`): the float decode of the reference latents at cosine 1.0000000 and 1.7e-6 of the peak 9.85
-  against diffusers' decode (16.7 s on 16 threads: unoptimized; the GPU's job). Next: I4 the UNet's one step.
+  against diffusers' decode (16.7 s on 16 threads: unoptimized; the GPU's job).
+  **I4 done 2026-11-13:** the UNet (`sd_unet`: the sinusoidal time embedding, ResnetBlock2D with the time projection,
+  Transformer2DModel with linear projections, self- and cross-attention (heads of 64), GEGLU; the down, mid and up blocks
+  with the skip connections; the stride-2 downsamplers, the nearest upsamplers). `tests/sd_unet_verify.cpp` (`make
+  build/sd_unet_verify`): one prediction at t = 999 against the pipeline's captured call (its input, the prompt's states,
+  its output): cosine 1.0000000, 1.7e-6 of the peak 6.85; 8.1 s on 16 threads. The pipeline's latents: `prepare_latents`
+  scales the latents it is given by sigma once more (the reference's initial latents are noise * sigma^2; the UNet input
+  is noise * sigma, as captured: the Euler step is latents - sigma * eps, checked).
+  **I5 done 2026-11-13:** the sampler (`sd_generate`: the one Euler step to sigma 0 from sigma = 14.6147 (the scaled-linear
+  schedule at t = 999), the VAE, diffusers' postprocess to 8 bits), the PNG (`sd_encode_png`: zlib, IHDR/IDAT/IEND, CRCs),
+  the seeded latents (`sd_random_latents`: a Mersenne Twister and Box-Muller, not torch's sequence). `tests/sd_image_verify.cpp`
+  (`make build/sd_image_verify`): the reference image (512 x 512, seed 0 of the pipeline) reproduced: 99.9961% of the bytes
+  equal, the largest step 1, the PNG written by the engine decodes (PIL) to the same pixels. The Perl binding
+  (`ROCm::Inference::sd_load($gguf)->generate($prompt, size => '512x512', seed => N)` returns the PNG bytes; `t/67-image.t`,
+  env-gated: 7 checks pass) and the server (`--sd FILE.gguf`, `POST /v1/images/generations`: prompt, size (multiples of 8,
+  64 to 1024), n (1), seed, response_format b64_json (default; the PNG in data[0].b64_json) or png (image/png); checked:
+  a 128 x 128 image in 3.3 s, the 400s). Measured on the host (16 threads): a 512 x 512 image takes about half a minute
+  (text 0.5 s, UNet 8 s, VAE 17 s): the VAE and the UNet's convolutions are the next speed items (the GPU's job: the
+  same fp16 weights in place). Not yet: the torch-identical seeded noise (the reference image is the proof of the
+  arithmetic, not of the seed), the multi-step samplers (sd-turbo is one step), the server's one image at a time.
 
 **MiniMax-H3-Image (requested 2026-11-12: "should be supported too"; `MiniMaxAI/MiniMax-H3-Image` on Hugging Face,
 code at github.com/MiniMax-AI/MiniMax-H3-Image).** Text-to-image and image editing. Config: the transformer is a

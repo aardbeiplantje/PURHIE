@@ -23,6 +23,7 @@
 #include "whisper.h"
 #include "qwen3tts_speech.h"
 #include "audio.h"
+#include "sd.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -1523,5 +1524,60 @@ _audio_wav_samples(wav, rate)
     if (audio_decode_wav(data, len, rate, &out, &n) != 0) croak("ROCm::Inference: %s", audio_last_error());
     RETVAL = newSVpvn((const char*)out, (STRLEN)(n * sizeof(float)));
     audio_free(out);
+  OUTPUT:
+    RETVAL
+
+# ---- Images (Stable Diffusion, sd-turbo: src/sd.{h,cpp}). A handle is the model; the PNG is made in the engine.
+
+IV
+_sd_open(path)
+    const char* path
+  CODE:
+    sd_model_t* m = sd_open(path);
+    if (!m) croak("ROCm::Inference: sd_open: %s", sd_last_error());
+    RETVAL = PTR2IV(m);
+  OUTPUT:
+    RETVAL
+
+void
+_sd_close(h)
+    IV h
+  CODE:
+    sd_close(INT2PTR(sd_model_t*, h));
+
+SV*
+_sd_generate_png(h, prompt, seed, width, height)
+    IV h
+    SV* prompt
+    UV seed
+    int width
+    int height
+  CODE:
+    /* the PNG bytes of one image: seeded latents, the initial scale of the scheduler, one step */
+    sd_model_t* m = INT2PTR(sd_model_t*, h);
+    const size_t nl = (size_t)4 * (height / 8) * (width / 8);
+    float* lat = (float*)malloc(sizeof(float) * nl);
+    uint8_t* rgb = (uint8_t*)malloc((size_t)3 * width * height);
+    uint8_t* png = NULL;
+    size_t n = 0;
+    if (!lat || !rgb) { free(lat); free(rgb); croak("ROCm::Inference: out of memory"); }
+    float sigma = 0.0f;
+    if (sd_random_latents((uint64_t)seed, height, width, lat) != 0 || sd_init_sigma(m, &sigma) != 0) {
+        free(lat); free(rgb);
+        croak("ROCm::Inference: sd latents: %s", sd_last_error());
+    }
+    for (size_t i = 0; i < nl; ++i) lat[i] *= sigma;
+    if (sd_generate(m, SvPV_nolen(prompt), lat, height, width, rgb) != 0) {
+        free(lat); free(rgb);
+        croak("ROCm::Inference: sd_generate: %s", sd_last_error());
+    }
+    free(lat);
+    if (sd_encode_png(rgb, width, height, &png, &n) != 0) {
+        free(rgb);
+        croak("ROCm::Inference: sd_encode_png: %s", sd_last_error());
+    }
+    free(rgb);
+    RETVAL = newSVpvn((const char*)png, (STRLEN)n);
+    sd_free_png(png);
   OUTPUT:
     RETVAL

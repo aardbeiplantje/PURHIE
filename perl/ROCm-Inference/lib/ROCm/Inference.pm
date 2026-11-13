@@ -26,7 +26,7 @@ our @EXPORT_OK = qw(
     store_open store_close store_set_lazy store_stats store_block_names
     chat_render chat reply_tags
     vision_load image_prompt set_mm mm_rope_delta whisper_load speech_load speech_wav16 speech_voice speech_voice_write
-    speech_wav_samples
+    speech_wav_samples sd_load
     STOP_NONE STOP_EOG STOP_MAX_TOKENS STOP_STRING STOP_CALLBACK STOP_CONTEXT_FULL
 );
 our %EXPORT_TAGS = (all => \@EXPORT_OK);
@@ -725,6 +725,39 @@ sub speech_wav16 {
     my $n = length $pcm;
     return pack('a4 V a4 a4 V v v V V v v a4 V', 'RIFF', 36 + $n, 'WAVE', 'fmt ', 16, 1, 1, $rate, $rate * 2, 2, 16,
                 'data', $n) . $pcm;
+}
+
+# sd_load($gguf): the image model (rocm-convert of a diffusers pipeline: sd-turbo) as a ROCm::Inference::Image object;
+# $img->generate($prompt, size => '512x512', seed => 0) returns the PNG bytes (one step; on the host, about half a minute
+# at 512 x 512). The seed fixes the latents (not torch's sequence).
+sub sd_load {
+    my ($path) = @_;
+    return ROCm::Inference::Image->new($path);
+}
+
+package ROCm::Inference::Image;
+
+sub new {
+    my ($class, $path) = @_;
+    my $h = ROCm::Inference::_sd_open($path);
+    return bless { h => $h, path => $path }, $class;
+}
+
+sub generate {
+    my ($img, $prompt, %o) = @_;
+    my ($w, $h) = (512, 512);
+    if (defined $o{size}) {
+        ($w, $h) = $o{size} =~ /\A(\d+)x(\d+)\z/ or die "size: WIDTHxHEIGHT, not '$o{size}'\n";
+    }
+    die "size: multiples of 8 between 64 and 1024\n"
+        unless $w % 8 == 0 && $h % 8 == 0 && $w >= 64 && $h >= 64 && $w <= 1024 && $h <= 1024;
+    return ROCm::Inference::_sd_generate_png($img->{h}, $prompt, $o{seed} // 0, $w, $h);
+}
+
+sub DESTROY {
+    my ($img) = @_;
+    ROCm::Inference::_sd_close($img->{h}) if $img->{h};
+    $img->{h} = 0;
 }
 
 package ROCm::Inference::Speech;

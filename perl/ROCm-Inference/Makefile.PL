@@ -71,7 +71,7 @@ WriteMakefile(
     LICENSE            => 'unrestricted',  # the Unlicense (public domain), as the rocm-hip repository
     MIN_PERL_VERSION   => '5.010',
     INC                => "-I$inc",
-    LIBS               => ["-L$lib -linference"],
+    LIBS               => ["-L$lib -linference -lz"],
     dynamic_lib        => { OTHERLDFLAGS => "-Wl,-rpath,$lib" },
     CONFIGURE_REQUIRES => { 'ExtUtils::MakeMaker' => '6.64' },
     PREREQ_PM          => { 'Carp' => 0, 'Exporter' => 0, 'XSLoader' => 0 },

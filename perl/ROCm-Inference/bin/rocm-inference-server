@@ -25,14 +25,14 @@ GetOptions(\%o, 'model=s', 'models-dir=s', 'models-max=i', 'models-margin=f', 'k
            'name=s', 'draft=s', 'store=s', 'max_tokens=i', 'swa-ring=i', 'stage=s', 'recache', 'kv-type=s',
            'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'preserve-thinking!', 'log!', 'log-level=s', 'log-format=s', 'log-color=s',
            'thinking-low=i', 'thinking-medium=i', 'thinking-high=i',
-           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'mmproj=s', 'whisper=s', 'tts=s', 'tts-codec=s', 'voices=s', 'help')
+           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'mmproj=s', 'whisper=s', 'tts=s', 'tts-codec=s', 'voices=s', 'sd=s', 'help')
     or pod2usage(2);
 # The log: --nolog is level none; --log-level, --log-format, --log-color are checked by the formatter
 our $LOG = eval { ROCm::Inference::Log->new(level => ($o{log} // 1) ? ($o{'log-level'} // 'info') : 'none',
                                               format => $o{'log-format'} // 'text', color => $o{'log-color'} // 'auto') }
     or die "--log-level, --log-format, --log-color: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n";
 pod2usage(-verbose => 2, -exitval => 0) if $o{help};
-pod2usage("--model, --models-dir, --whisper or --tts is required\n") unless $o{model} || $o{'models-dir'} || $o{whisper} || $o{tts};
+pod2usage("--model, --models-dir, --whisper, --tts or --sd is required\n") unless $o{model} || $o{'models-dir'} || $o{whisper} || $o{tts} || $o{sd};
 ROCm::Inference::_require_minijinja()
     or die "rocm-inference-server needs the Minijinja module $ROCm::Inference::MINIJINJA_VERSION\n";
 my $no_draft = ($o{draft} // '') eq 'none';  # (no draft head, not even a model's own MTP block)
@@ -60,6 +60,11 @@ die "--voices: no directory $o{voices}\n" if $o{voices} && !-d $o{voices};
 my $TTS = $o{tts} ? eval { speech_load($o{tts}, $o{'tts-codec'}) } : undef;
 die "--tts $o{tts}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" if $o{tts} && !$TTS;
 my $tts_name = $o{tts} ? basename($o{tts}) =~ s/\.gguf\z//r : undef;
+# the image model (--sd FILE.gguf, rocm-convert of a diffusers pipeline such as sd-turbo): /v1/images/generations
+die "--sd: no file $o{sd}\n" if $o{sd} && !-f $o{sd};
+my $IMAGE = $o{sd} ? eval { sd_load($o{sd}) } : undef;
+die "--sd $o{sd}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" if $o{sd} && !$IMAGE;
+my $sd_name = $o{sd} ? basename($o{sd}) =~ s/\.gguf\z//r : undef;
 my $kv_type = $o{'kv-type'} // 'auto';
 die "--kv-type: auto, f16, q8_0 or q4_0\n" unless $kv_type =~ /\A(?:auto|f16|q8_0|q4_0)\z/;
 my $created = time;
@@ -894,6 +899,34 @@ route::get '/v1/audio/voices' => sub {
     return { data => \@v };
 };
 
+# OpenAI's image generation: a JSON body with the prompt, the size (WIDTHxHEIGHT, multiples of 8 from 64 to 1024; 512x512 by
+# default), n (1: one image per request) and response_format (b64_json: the PNG in base64 in data[0].b64_json; or png: the
+# PNG bytes as image/png), the optional seed (the latents; 0 by default). One image at a time, on the host (about half a
+# minute at 512 x 512 with sd-turbo's one step).
+route::post '/v1/images/generations' => sub {
+    my ($req) = @_;
+    error(503, 'no image model: start the server with --sd FILE.gguf', 'server_error') unless $IMAGE;
+    my $p = $req->{json};
+    ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
+    my $prompt = $p->{prompt};
+    error(400, "'prompt' is required") unless defined $prompt && !ref $prompt && length $prompt;
+    error(400, 'prompt: at most 1000 characters') if length $prompt > 1000;
+    my $n = $p->{n} // 1;
+    error(400, 'n: 1 (one image per request)') unless $n =~ /\A1\z/;
+    my $size = $p->{size} // '512x512';
+    error(400, "size: WIDTHxHEIGHT, not '$size'") unless $size =~ /\A\d+x\d+\z/;
+    my $fmt = $p->{response_format} // 'b64_json';
+    error(400, "response_format: b64_json or png, not '$fmt'") unless $fmt =~ /\A(?:b64_json|png)\z/;
+    my $seed = $p->{seed} // 0;
+    error(400, 'seed: a whole number') unless $seed =~ /\A\d+\z/;
+    my $png = eval { $IMAGE->generate($prompt, size => $size, seed => $seed) };
+    error(400, $@ =~ s/ at \S+ line \d+\.?\n?\z//r) if $@;
+    $LOG->info('request', event => 'image', msg => sprintf('%s: %s, seed %d, %d bytes of PNG', $sd_name, $size, $seed, length $png));
+    return [200, ['Content-Type' => 'image/png'], $png] if $fmt eq 'png';
+    require MIME::Base64;
+    return { created => time, data => [{ b64_json => MIME::Base64::encode_base64($png, '') }] };
+};
+
 route::post '/v1/chat/completions' => sub {
     my ($req) = @_;
     my $p = $req->{json};
@@ -1360,7 +1393,7 @@ if ($o{'models-dir'}) {
         ($parallel > 1 ? ", $parallel conversations at once" : ''));
 } else {
     $LOG->info('model', event => 'serve', msg => "serving on $o{listen}: no chat model" .
-        ($WHISPER ? ", speech model $whisper_name" : '') . ($TTS ? ", speech synthesis $tts_name" : ''));
+        ($WHISPER ? ", speech model $whisper_name" : '') . ($TTS ? ", speech synthesis $tts_name" : '') . ($IMAGE ? ", images $sd_name" : ''));
 }
 run(listen => $o{listen}, log => $LOG->enabled('info') ? \&access_line : 0, defined $o{mode} ? (mode => oct $o{mode}) : (),
     $parallel > 1 ? (tick => \&tick) : ());

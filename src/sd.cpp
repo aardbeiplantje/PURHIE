@@ -6,6 +6,8 @@
 
 #include "gguf_mmap.h"
 
+#include <zlib.h>
+
 #include <immintrin.h>
 
 #include <algorithm>
@@ -14,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <random>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -177,6 +180,8 @@ struct sd_model {
         te_pad = 49407;
     std::vector<int> vae_ch;                        // the VAE's block_out_channels
     int vae_layers = 2, vae_groups = 32, vae_latent = 4;
+    int sched_train = 1000;
+    float sched_beta_start = 0.00085f, sched_beta_end = 0.012f;
     float vae_scale = 0.18215f;
     std::vector<std::string> vocab;                 // by id
     std::unordered_map<std::string, int> token_id;  // vocab string -> id
@@ -280,10 +285,14 @@ void clip_forward(const sd_model* m, const int* ids, float* out) {
 // attention head over the positions, a resnet), the four up blocks (resnets, nearest upsampling and a convolution), the
 // output norm, SiLU, conv_out). Channel-major planes [C][H][W]; the weights F16 in place.
 
-// 2-D convolution, stride 1, zero padding p: y [cout][H'][W'] with H' = H + 2p - k + 1. The inner loop runs along the row.
-void conv2d(const float* x, int cin, int H, int W, const T16& w, const T16* b, int k, int p, float* y) {
+// 2-D convolution with stride st and zero padding p: y [cout][H'][W'], H' = (H + 2p - k) / st + 1. The inner loop runs
+// along the output row (stride 1: contiguous).
+void conv2d_s(const float* x, int cin, int H, int W, const T16& w, const T16* b, int k, int p, int st, float* y, int* Ho_out = nullptr,
+              int* Wo_out = nullptr) {
     const int cout = (int)w.ne[3];
-    const int Ho = H + 2 * p - k + 1, Wo = W + 2 * p - k + 1;
+    const int Ho = (H + 2 * p - k) / st + 1, Wo = (W + 2 * p - k) / st + 1;
+    if (Ho_out) *Ho_out = Ho;
+    if (Wo_out) *Wo_out = Wo;
 #pragma omp parallel for schedule(static)
     for (int o = 0; o < cout; ++o) {
         float* yp = y + (size_t)o * Ho * Wo;
@@ -294,19 +303,29 @@ void conv2d(const float* x, int cin, int H, int W, const T16& w, const T16* b, i
             for (int ky = 0; ky < k; ++ky)
                 for (int kx = 0; kx < k; ++kx) {
                     const float wv = f16(w.p[(((size_t)o * cin + c) * k + ky) * k + kx]);
+                    // output xx reads input column xx * st + kx - p: the valid output columns
                     const int dx = kx - p;
-                    const int x0 = std::max(0, -dx), x1 = std::min(Wo, W - dx);
+                    const int x0 = dx >= 0 ? 0 : (-dx + st - 1) / st;
+                    const int x1 = std::min(Wo, (W - dx + st - 1) / st);
                     for (int yy = 0; yy < Ho; ++yy) {
-                        const int sy = yy + ky - p;
+                        const int sy = yy * st + ky - p;
                         if (sy < 0 || sy >= H) continue;
                         float* yr = yp + (size_t)yy * Wo;
-                        const float* xr = xp + (size_t)sy * W + dx;
+                        const float* xr = xp + (size_t)sy * W;
+                        if (st == 1) {
 #pragma omp simd
-                        for (int xx = x0; xx < x1; ++xx) yr[xx] += wv * xr[xx];
+                            for (int xx = x0; xx < x1; ++xx) yr[xx] += wv * xr[xx + dx];
+                        } else {
+                            for (int xx = x0; xx < x1; ++xx) yr[xx] += wv * xr[xx * st + dx];
+                        }
                     }
                 }
         }
     }
+}
+
+void conv2d(const float* x, int cin, int H, int W, const T16& w, const T16* b, int k, int p, float* y) {
+    conv2d_s(x, cin, H, W, w, b, k, p, 1, y);
 }
 
 // GroupNorm over `groups` groups of channels (biased variance), per-channel affine: y = (x - mean) / sqrt(var + eps) * w + b
@@ -463,6 +482,261 @@ void vae_decode_planes(const sd_model* m, const VaeCfg& cfg, const float* z, int
     conv2d(n.data(), c0, H, W, need(m, "decoder.conv_out.weight"), &need(m, "decoder.conv_out.bias"), 3, 1, out);
 }
 
+
+// ---- the UNet (UNet2DConditionModel, SD 2.x: sinusoidal time embedding, ResnetBlock2D with the time projection,
+// Transformer2DModel with linear projections (self-attention, cross-attention over the prompt, GEGLU feed-forward), the
+// down, mid and up blocks with the skip connections; heads of width 64).
+
+// the sinusoidal embedding of t (flip_sin_to_cos: cos first; frequencies exp(-ln(10000) i / half))
+void time_embedding(float t, int dim, float* out) {
+    const int half = dim / 2;
+    for (int i = 0; i < half; ++i) {
+        const double f = std::exp(-std::log(10000.0) * i / half);
+        out[i] = (float)std::cos(t * f);
+        out[half + i] = (float)std::sin(t * f);
+    }
+}
+
+// the channels of a conv weight [cout][cin][k][k]
+int conv_cin(const T16& w) { return (int)w.ne[2]; }
+int conv_cout(const T16& w) { return (int)w.ne[3]; }
+
+// ResnetBlock2D: norm1, SiLU, conv1, the time projection added per channel, norm2, SiLU, conv2, the input (through a 1x1
+// shortcut when the channels change), added
+void unet_resnet(const sd_model* m, const std::string& p, const float* x, int H, int W, const float* temb_act, float* out) {
+    const T16& c1 = need(m, p + "conv1.weight");
+    const int cin = conv_cin(c1), cout = conv_cout(c1), HW = H * W;
+    std::vector<float> h((size_t)cin * HW), c((size_t)cout * HW), g((size_t)cout * HW);
+    group_norm(x, cin, HW, 32, need(m, p + "norm1.weight"), need(m, p + "norm1.bias"), 1e-5f, h.data());
+    silu_in(h.data(), h.size());
+    conv2d(h.data(), cin, H, W, c1, &need(m, p + "conv1.bias"), 3, 1, c.data());
+    // the time embedding's projection: [cout] per channel
+    const T16& tw = need(m, p + "time_emb_proj.weight");
+    const T16& tb = need(m, p + "time_emb_proj.bias");
+    std::vector<float> tp(cout);
+    linear16(temb_act, 1, tw, &tb, tp.data());
+    for (int ch = 0; ch < cout; ++ch)
+        for (int i = 0; i < HW; ++i) c[(size_t)ch * HW + i] += tp[ch];
+    group_norm(c.data(), cout, HW, 32, need(m, p + "norm2.weight"), need(m, p + "norm2.bias"), 1e-5f, g.data());
+    silu_in(g.data(), g.size());
+    conv2d(g.data(), cout, H, W, need(m, p + "conv2.weight"), &need(m, p + "conv2.bias"), 3, 1, out);
+    if (cin == cout) {
+        for (size_t i = 0; i < (size_t)cout * HW; ++i) out[i] += x[i];
+    } else {
+        std::vector<float> sc((size_t)cout * HW);
+        conv2d(x, cin, H, W, need(m, p + "conv_shortcut.weight"), &need(m, p + "conv_shortcut.bias"), 1, 0, sc.data());
+        for (size_t i = 0; i < (size_t)cout * HW; ++i) out[i] += sc[i];
+    }
+}
+
+// attention over token rows: q [Tq][C], k and v [Tk][C] (C = heads * 64): out [Tq][C], per row streaming softmax
+void attend(const float* q, int Tq, const float* k, const float* v, int Tk, int C, int heads, float* out) {
+    const int D = C / heads;
+    const float scale = 1.0f / std::sqrt((float)D);
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < Tq; ++i) {
+        std::vector<float> row(Tk);
+        for (int hd = 0; hd < heads; ++hd) {
+            const float* qr = q + (size_t)i * C + hd * D;
+            float mx = -INFINITY;
+            for (int j = 0; j < Tk; ++j) {
+                const float* kr = k + (size_t)j * C + hd * D;
+                float d = 0.0f;
+                for (int c = 0; c < D; ++c) d += qr[c] * kr[c];
+                row[j] = d * scale;
+                mx = std::max(mx, row[j]);
+            }
+            double z = 0.0;
+            for (int j = 0; j < Tk; ++j) {
+                row[j] = std::exp(row[j] - mx);
+                z += row[j];
+            }
+            float* o = out + (size_t)i * C + hd * D;
+            for (int c = 0; c < D; ++c) o[c] = 0.0f;
+            for (int j = 0; j < Tk; ++j) {
+                const float pw = (float)(row[j] / z);
+                const float* vr = v + (size_t)j * C + hd * D;
+                for (int c = 0; c < D; ++c) o[c] += pw * vr[c];
+            }
+        }
+    }
+}
+
+// Transformer2DModel: GroupNorm, proj_in (linear), one BasicTransformerBlock (self-attention, cross-attention over the
+// context [Tc][1024], GEGLU feed-forward, each with its LayerNorm and residual), proj_out (linear), the input added
+void unet_transformer(const sd_model* m, const std::string& p, float* x, int C, int H, int W, const float* ctx, int Tc, int heads) {
+    const int HW = H * W;
+    std::vector<float> n((size_t)C * HW), t((size_t)HW * C);
+    group_norm(x, C, HW, 32, need(m, p + "norm.weight"), need(m, p + "norm.bias"), 1e-6f, n.data());
+    for (int c = 0; c < C; ++c)
+        for (int i = 0; i < HW; ++i) t[(size_t)i * C + c] = n[(size_t)c * HW + i];
+    std::vector<float> h((size_t)HW * C);
+    linear16(t.data(), HW, need(m, p + "proj_in.weight"), &need(m, p + "proj_in.bias"), h.data());
+    const std::string b = p + "transformer_blocks.0.";
+    std::vector<float> ln((size_t)HW * C), q((size_t)HW * C), k((size_t)HW * C), v((size_t)HW * C), a((size_t)HW * C),
+        tmp((size_t)HW * C);
+    auto norm = [&](const std::string& name) {
+        layer_norm(h.data(), HW, C, need(m, b + name + ".weight"), need(m, b + name + ".bias"), 1e-5f, ln.data());
+    };
+    // self-attention
+    norm("norm1");
+    linear16(ln.data(), HW, need(m, b + "attn1.to_q.weight"), nullptr, q.data());
+    linear16(ln.data(), HW, need(m, b + "attn1.to_k.weight"), nullptr, k.data());
+    linear16(ln.data(), HW, need(m, b + "attn1.to_v.weight"), nullptr, v.data());
+    attend(q.data(), HW, k.data(), v.data(), HW, C, heads, a.data());
+    linear16(a.data(), HW, need(m, b + "attn1.to_out.0.weight"), &need(m, b + "attn1.to_out.0.bias"), tmp.data());
+    for (size_t i = 0; i < h.size(); ++i) h[i] += tmp[i];
+    // cross-attention over the prompt
+    norm("norm2");
+    std::vector<float> kc((size_t)Tc * C), vc((size_t)Tc * C);
+    linear16(ln.data(), HW, need(m, b + "attn2.to_q.weight"), nullptr, q.data());
+    linear16(ctx, Tc, need(m, b + "attn2.to_k.weight"), nullptr, kc.data());
+    linear16(ctx, Tc, need(m, b + "attn2.to_v.weight"), nullptr, vc.data());
+    attend(q.data(), HW, kc.data(), vc.data(), Tc, C, heads, a.data());
+    linear16(a.data(), HW, need(m, b + "attn2.to_out.0.weight"), &need(m, b + "attn2.to_out.0.bias"), tmp.data());
+    for (size_t i = 0; i < h.size(); ++i) h[i] += tmp[i];
+    // GEGLU feed-forward: the projection's halves, the hidden times the GELU of the gate
+    norm("norm3");
+    const int ff = (int)need(m, b + "ff.net.2.weight").ne[0];  // the inner width (4 C)
+    std::vector<float> pj((size_t)HW * 2 * ff), g2((size_t)HW * ff);
+    linear16(ln.data(), HW, need(m, b + "ff.net.0.proj.weight"), &need(m, b + "ff.net.0.proj.bias"), pj.data());
+    for (int i = 0; i < HW; ++i)
+        for (int j = 0; j < ff; ++j) {
+            const float hid = pj[(size_t)i * 2 * ff + j], gate = pj[(size_t)i * 2 * ff + ff + j];
+            g2[(size_t)i * ff + j] = hid * (0.5f * gate * (1.0f + std::erf(gate / std::sqrt(2.0f))));
+        }
+    linear16(g2.data(), HW, need(m, b + "ff.net.2.weight"), &need(m, b + "ff.net.2.bias"), tmp.data());
+    for (size_t i = 0; i < h.size(); ++i) h[i] += tmp[i];
+    // proj_out and the residual
+    linear16(h.data(), HW, need(m, p + "proj_out.weight"), &need(m, p + "proj_out.bias"), tmp.data());
+    for (int c = 0; c < C; ++c)
+        for (int i = 0; i < HW; ++i) x[(size_t)c * HW + i] += tmp[(size_t)i * C + c];
+}
+
+
+// the UNet's forward: sample [4][h][w] at the timestep t, the context [77][1024]; out [4][h][w]
+void unet_forward(const sd_model* m, const float* sample, int h, int w, float t, const float* ctx, int Tc, float* out) {
+    // the time embedding: the sinusoid (320), linear, SiLU, linear (1280); the resnets take its SiLU
+    std::vector<float> te(320), e1(1280), e2(1280), ta(1280);
+    time_embedding(t, 320, te.data());
+    linear16(te.data(), 1, need(m, "time_embedding.linear_1.weight"), &need(m, "time_embedding.linear_1.bias"), e1.data());
+    silu_in(e1.data(), e1.size());
+    linear16(e1.data(), 1, need(m, "time_embedding.linear_2.weight"), &need(m, "time_embedding.linear_2.bias"), e2.data());
+    ta = e2;
+    silu_in(ta.data(), ta.size());
+    // conv_in
+    int H = h, W = w;
+    std::vector<float> x((size_t)320 * H * W);
+    conv2d(sample, 4, H, W, need(m, "conv_in.weight"), &need(m, "conv_in.bias"), 3, 1, x.data());
+    // the down blocks, each skip recorded: the input, every resnet's output, every downsampler's output
+    std::vector<std::vector<float>> skips;
+    skips.push_back(x);
+    for (int b = 0; b < 4; ++b) {
+        const bool attn = b < 3;
+        for (int j = 0; j < 2; ++j) {
+            const std::string rp = "down_blocks." + std::to_string(b) + ".resnets." + std::to_string(j) + ".";
+            const int cout = conv_cout(need(m, rp + "conv1.weight"));
+            std::vector<float> y((size_t)cout * H * W);
+            unet_resnet(m, rp, x.data(), H, W, ta.data(), y.data());
+            x.swap(y);
+            if (attn) unet_transformer(m, "down_blocks." + std::to_string(b) + ".attentions." + std::to_string(j) + ".", x.data(),
+                                       cout, H, W, ctx, Tc, cout / 64);
+            skips.push_back(x);
+        }
+        if (b < 3) {  // the downsampler: a 3x3 convolution with stride 2
+            const std::string dp = "down_blocks." + std::to_string(b) + ".downsamplers.0.conv.";
+            const T16& dw = need(m, dp + "weight");
+            const int C = conv_cout(dw), cin = conv_cin(dw);
+            int H2 = 0, W2 = 0;
+            std::vector<float> y((size_t)C * ((H + 2 - 3) / 2 + 1) * ((W + 2 - 3) / 2 + 1));
+            conv2d_s(x.data(), cin, H, W, dw, &need(m, dp + "bias"), 3, 1, 2, y.data(), &H2, &W2);
+            x.swap(y);
+            H = H2;
+            W = W2;
+            skips.push_back(x);
+        }
+    }
+    // the mid block: a resnet, a transformer over the 1280 channels, a resnet
+    {
+        const int C = 1280;
+        std::vector<float> y((size_t)C * H * W);
+        unet_resnet(m, "mid_block.resnets.0.", x.data(), H, W, ta.data(), y.data());
+        x.swap(y);
+        unet_transformer(m, "mid_block.attentions.0.", x.data(), C, H, W, ctx, Tc, C / 64);
+        y.assign((size_t)C * H * W, 0.0f);
+        unet_resnet(m, "mid_block.resnets.1.", x.data(), H, W, ta.data(), y.data());
+        x.swap(y);
+    }
+    // the up blocks: three resnets each over the concatenated skips (the last ones first), then the upsampler
+    for (int b = 0; b < 4; ++b) {
+        const bool attn = b > 0;
+        for (int j = 0; j < 3; ++j) {
+            std::vector<float> skip = skips.back();
+            skips.pop_back();
+            const int xc = (int)(x.size() / ((size_t)H * W)), sc = (int)(skip.size() / ((size_t)H * W));
+            std::vector<float> cat((size_t)(xc + sc) * H * W);
+            std::memcpy(cat.data(), x.data(), sizeof(float) * x.size());
+            std::memcpy(cat.data() + x.size(), skip.data(), sizeof(float) * skip.size());
+            const std::string rp = "up_blocks." + std::to_string(b) + ".resnets." + std::to_string(j) + ".";
+            const int cout = conv_cout(need(m, rp + "conv1.weight"));
+            std::vector<float> y((size_t)cout * H * W);
+            unet_resnet(m, rp, cat.data(), H, W, ta.data(), y.data());
+            x.swap(y);
+            if (attn) unet_transformer(m, "up_blocks." + std::to_string(b) + ".attentions." + std::to_string(j) + ".", x.data(),
+                                       cout, H, W, ctx, Tc, cout / 64);
+        }
+        if (b < 3) {  // the upsampler: nearest 2x, then a 3x3 convolution
+            const std::string up = "up_blocks." + std::to_string(b) + ".upsamplers.0.conv.";
+            const T16& uw = need(m, up + "weight");
+            const int C = conv_cout(uw);
+            std::vector<float> u((size_t)C * 2 * H * 2 * W), y((size_t)C * 2 * H * 2 * W);
+            upsample2(x.data(), C, H, W, u.data());
+            H *= 2;
+            W *= 2;
+            conv2d(u.data(), C, H, W, uw, &need(m, up + "bias"), 3, 1, y.data());
+            x.swap(y);
+        }
+    }
+    // the output: norm, SiLU, conv_out (320 -> 4)
+    const int HW = H * W;
+    std::vector<float> n((size_t)320 * HW);
+    group_norm(x.data(), 320, HW, 32, need(m, "conv_norm_out.weight"), need(m, "conv_norm_out.bias"), 1e-5f, n.data());
+    silu_in(n.data(), n.size());
+    conv2d(n.data(), 320, H, W, need(m, "conv_out.weight"), &need(m, "conv_out.bias"), 3, 1, out);
+}
+
+}  // namespace
+
+namespace {
+
+// The noise level of the one step (EulerDiscreteScheduler, trailing spacing, one step: t = 999): sigma = sqrt((1 - a) / a)
+// with the scaled-linear schedule's cumulative product a (beta from sqrt(beta_start) to sqrt(beta_end), 1000 steps)
+double sigma_at(const sd_model* m, int t) {
+    const double b0 = std::sqrt((double)m->sched_beta_start), b1 = std::sqrt((double)m->sched_beta_end);
+    double a = 1.0;
+    for (int i = 0; i <= t; ++i) {
+        const double b = (b0 + (b1 - b0) * i / (m->sched_train - 1)) * (b0 + (b1 - b0) * i / (m->sched_train - 1));
+        a *= 1.0 - b;
+    }
+    return std::sqrt((1.0 - a) / a);
+}
+
+// PNG: IHDR, one IDAT of the zlib-compressed rows (filter 0), IEND; CRCs by zlib's crc32
+void put_be32(std::vector<uint8_t>& v, uint32_t x) {
+    v.push_back((uint8_t)(x >> 24));
+    v.push_back((uint8_t)(x >> 16));
+    v.push_back((uint8_t)(x >> 8));
+    v.push_back((uint8_t)x);
+}
+
+void png_chunk(std::vector<uint8_t>& out, const char* type, const std::vector<uint8_t>& data) {
+    put_be32(out, (uint32_t)data.size());
+    std::vector<uint8_t> td(type, type + 4);
+    td.insert(td.end(), data.begin(), data.end());
+    out.insert(out.end(), td.begin(), td.end());
+    put_be32(out, (uint32_t)crc32(0L, td.data(), (uInt)td.size()));
+}
+
 }  // namespace
 
 extern "C" {
@@ -487,6 +761,9 @@ sd_model_t* sd_open(const char* gguf_path) {
         m->te_eos = kv("te.eos");
         m->te_pad = kv("te.pad");
         m->vae_layers = kv("vae.layers_per_block");
+        m->sched_train = kv("sched.num_train_timesteps") > 0 ? kv("sched.num_train_timesteps") : 1000;
+        m->sched_beta_start = gguf_arch_float(m->g, "sched.beta_start", 0.00085f);
+        m->sched_beta_end = gguf_arch_float(m->g, "sched.beta_end", 0.012f);
         m->vae_groups = kv("vae.norm_groups");
         m->vae_latent = kv("vae.latent_channels");
         m->vae_scale = gguf_arch_float(m->g, "vae.scaling_factor", 0.18215f);
@@ -612,6 +889,112 @@ int sd_vae_decode(sd_model_t* m, const float* latents, int h, int w, float* imag
         return -1;
     }
 }
+
+int unet_call(sd_model_t* m, const float* sample, int h, int w, float t, const float* ctx, float* out) {
+    try {
+        unet_forward(m, sample, h, w, t, ctx, m->te_ctx, out);
+        return 0;
+    } catch (const std::exception& e) {
+        g_error = e.what();
+        return -1;
+    }
+}
+
+int sd_unet(sd_model_t* m, const float* sample, int h, int w, float t, const float* ctx, float* out) {
+    if (!m || !sample || !ctx || !out || h <= 0 || w <= 0 || h % 8 || w % 8) { g_error = "sd_unet: bad arguments"; return -1; }
+    try {
+        unet_forward(m, sample, h, w, t, ctx, m->te_ctx, out);
+        return 0;
+    } catch (const std::exception& e) {
+        g_error = e.what();
+        return -1;
+    }
+}
+
+
+int sd_random_latents(uint64_t seed, int h, int w, float* out) {
+    if (!out || h <= 0 || w <= 0 || h % 8 || w % 8) { g_error = "sd_random_latents: bad arguments"; return -1; }
+    // standard normal values from a Mersenne Twister (the seed fixes the image; this is not torch's sequence)
+    std::mt19937_64 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    const size_t n = (size_t)4 * (h / 8) * (w / 8);
+    for (size_t i = 0; i < n; ++i) out[i] = nd(rng);
+    return 0;
+}
+
+int sd_init_sigma(sd_model_t* m, float* sigma) {
+    if (!m || !sigma) { g_error = "sd_init_sigma: bad arguments"; return -1; }
+    *sigma = (float)sigma_at(m, m->sched_train - 1);
+    return 0;
+}
+
+int sd_generate(sd_model_t* m, const char* prompt, const float* init, int h, int w, uint8_t* rgb) {
+    if (!m || !prompt || !init || !rgb || h <= 0 || w <= 0 || h % 8 || w % 8) { g_error = "sd_generate: bad arguments"; return -1; }
+    try {
+        const int C = 4, lh = h / 8, lw = w / 8, HW = lh * lw;
+        std::vector<float> ctx((size_t)m->te_ctx * m->te_dim);
+        if (sd_encode_prompt(m, prompt, ctx.data()) != 0) throw std::runtime_error(g_error);
+        // one Euler step from the noise level sigma to 0 (epsilon prediction): the model input is x / sqrt(sigma^2 + 1)
+        const double sigma = sigma_at(m, m->sched_train - 1);
+        std::vector<float> x(init, init + (size_t)C * HW), in(x.size()), eps(x.size());
+        for (size_t i = 0; i < x.size(); ++i) in[i] = (float)(x[i] / std::sqrt(sigma * sigma + 1.0));
+        if (unet_call(m, in.data(), lh, lw, (float)(m->sched_train - 1), ctx.data(), eps.data()) != 0)
+            throw std::runtime_error(g_error);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = (float)(x[i] - sigma * eps[i]);
+        // the VAE: the image planes in [-1, 1], then diffusers' postprocess: (v / 2 + 0.5) clamped to [0, 1], times 255, rounded
+        std::vector<float> img((size_t)3 * h * w);
+        if (sd_vae_decode(m, x.data(), lh, lw, img.data()) != 0) throw std::runtime_error(g_error);
+        for (int y = 0; y < h; ++y)
+            for (int xx = 0; xx < w; ++xx)
+                for (int c = 0; c < 3; ++c) {
+                    float v = img[((size_t)c * h + y) * w + xx] / 2.0f + 0.5f;
+                    v = std::min(1.0f, std::max(0.0f, v));
+                    rgb[((size_t)y * w + xx) * 3 + c] = (uint8_t)std::lround(v * 255.0f);
+                }
+        return 0;
+    } catch (const std::exception& e) {
+        g_error = e.what();
+        return -1;
+    }
+}
+
+int sd_encode_png(const uint8_t* rgb, int w, int h, uint8_t** out, size_t* n) {
+    if (!rgb || !out || !n || w <= 0 || h <= 0) { g_error = "sd_encode_png: bad arguments"; return -1; }
+    try {
+        std::vector<uint8_t> raw((size_t)h * (1 + 3 * w));
+        for (int y = 0; y < h; ++y) {
+            raw[(size_t)y * (1 + 3 * w)] = 0;  // filter: none
+            std::memcpy(&raw[(size_t)y * (1 + 3 * w) + 1], rgb + (size_t)y * 3 * w, (size_t)3 * w);
+        }
+        uLongf zlen = compressBound(raw.size());
+        std::vector<uint8_t> z(zlen);
+        if (compress2(z.data(), &zlen, raw.data(), raw.size(), 6) != Z_OK) throw std::runtime_error("sd_encode_png: zlib");
+        z.resize(zlen);
+        std::vector<uint8_t> png = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+        std::vector<uint8_t> ihdr;
+        put_be32(ihdr, (uint32_t)w);
+        put_be32(ihdr, (uint32_t)h);
+        ihdr.push_back(8);  // bit depth
+        ihdr.push_back(2);  // RGB
+        ihdr.push_back(0);
+        ihdr.push_back(0);
+        ihdr.push_back(0);
+        png_chunk(png, "IHDR", ihdr);
+        png_chunk(png, "IDAT", z);
+        png_chunk(png, "IEND", {});
+        uint8_t* buf = static_cast<uint8_t*>(std::malloc(png.size()));
+        if (!buf) throw std::runtime_error("sd_encode_png: no memory");
+        std::memcpy(buf, png.data(), png.size());
+        *out = buf;
+        *n = png.size();
+        return 0;
+    } catch (const std::exception& e) {
+        g_error = e.what();
+        return -1;
+    }
+}
+
+void sd_free_png(uint8_t* png) { std::free(png); }
 
 int sd_encode_prompt(sd_model_t* m, const char* prompt, float* out) {
     if (!m || !prompt || !out) { g_error = "sd_encode_prompt: bad arguments"; return -1; }
