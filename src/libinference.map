@@ -8,6 +8,8 @@ LIBINFERENCE_1 {
         vision_*;
         image_*;
         mrope_*;
+        whisper_*;
+        mel_*;
     local:
         *;
 };

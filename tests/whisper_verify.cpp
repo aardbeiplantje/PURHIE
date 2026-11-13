@@ -5,9 +5,10 @@
 //
 // The GGUF: rocm-convert of the checkpoint (perl/ROCm-Inference: the Whisper converter, F32). The reference directory:
 // samples.npy (the clip's waveform), encoder_out.npy (1 x 1500 x 384 float32), tokens.npy (int64: the greedy tokens after
-// the prompt, without the end-of-transcript token). Passes when every encoder row's cosine is at least 0.9999, its largest
-// difference at most 1e-4 of the reference's largest value (float32 accumulation over the blocks; the reference is torch
-// float32), and the decoder's tokens equal the reference's.
+// the prompt, without the end-of-transcript token), clip.wav (the same clip as a 16-bit WAV). Passes when the WAV decodes
+// to the waveform, every encoder row's cosine is at least 0.9999, its largest difference at most 1e-4 of the reference's
+// largest value (float32 accumulation over the blocks; the reference is torch float32), the decoder's tokens equal the
+// reference's, the special tokens have their ids, and whisper_transcribe gives the reference's text.
 #include "mel.h"
 #include "whisper.h"
 
@@ -17,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -80,9 +82,27 @@ int main(int argc, char** argv) {
     const std::vector<float> samples = as_f32(load_npy(dir + "/samples.npy"));
     const std::vector<float> want_enc = as_f32(load_npy(dir + "/encoder_out.npy"));
     const std::vector<int64_t> want_tokens = as_i64(load_npy(dir + "/tokens.npy"));
+    // the WAV: the same clip (16-bit PCM, so the waveform is exact)
+    std::vector<unsigned char> wav;
+    {
+        std::ifstream f(dir + "/clip.wav", std::ios::binary);
+        wav.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
 
     whisper_model_t* m = whisper_open(argv[1]);
     if (!m) { std::fprintf(stderr, "whisper_open: %s\n", whisper_last_error()); return 1; }
+    float* wav_samples = nullptr;
+    size_t wav_n = 0;
+    if (whisper_decode_wav(wav.data(), wav.size(), &wav_samples, &wav_n) != 0) {
+        std::fprintf(stderr, "whisper_decode_wav: %s\n", whisper_last_error());
+        return 1;
+    }
+    double wav_diff = wav_n == samples.size() ? 0.0 : 1e9;
+    for (size_t i = 0; i < wav_n && i < samples.size(); ++i) wav_diff = std::fmax(wav_diff, std::fabs(wav_samples[i] - samples[i]));
+    whisper_free_samples(wav_samples);
+    const bool wav_ok = wav_diff <= 1e-6;
+    std::printf("wav: %zu samples, max |diff| to the waveform %.3e  %s\n", wav_n, wav_diff, wav_ok ? "ok" : "FAIL");
+
     const int T = whisper_n_audio_ctx(m), C = whisper_n_audio_state(m);
     if ((size_t)T * C != want_enc.size()) { std::fprintf(stderr, "encoder reference has %zu values, %d x %d expected\n", want_enc.size(), T, C); return 2; }
 
@@ -127,8 +147,18 @@ int main(int argc, char** argv) {
         for (int64_t t : want_tokens) std::printf(" %lld", (long long)t);
         std::printf("\n");
     }
+    // the special tokens (the language, the task, the timestamps) and the transcription of the clip
+    const bool ids_ok = whisper_token_id(m, "<|en|>") == 50259 && whisper_token_id(m, "<|transcribe|>") == 50359 &&
+                        whisper_token_id(m, "<|notimestamps|>") == 50363 && whisper_token_id(m, "<|nolang|>") < 0;
+    std::printf("special tokens: %s\n", ids_ok ? "ok" : "FAIL");
+    char text[1024];
+    const int nt = whisper_transcribe(m, samples.data(), samples.size(), "en", text, sizeof text);
+    // (the reference's text: transformers' decode of the same greedy tokens, with its leading space)
+    const char* want_text = " Mr. Quilter is the apostle of the middle classes and we are glad to welcome his gospel.";
+    const bool text_ok = nt == (int)want_tokens.size() && std::strcmp(text, want_text) == 0;
+    std::printf("transcribe: %d tokens, \"%s\"%s\n", nt, text, text_ok ? "" : "  FAIL");
     whisper_close(m);
-    const bool pass = enc_ok && tok_ok && eot == 50257;
+    const bool pass = enc_ok && tok_ok && eot == 50257 && wav_ok && ids_ok && text_ok;
     std::printf("%s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

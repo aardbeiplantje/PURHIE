@@ -20,6 +20,7 @@
 #include "vision.h"
 #include "image.h"
 #include "mrope.h"
+#include "whisper.h"
 
 #define HANDLE_CLASS "ROCm::Inference::Model"
 
@@ -1324,3 +1325,44 @@ DESTROY(h)
         inference_free_model(m);  /* also frees the KV cache */
         sv_setiv(SvRV(h), 0);
     }
+
+MODULE = ROCm::Inference    PACKAGE = ROCm::Inference
+
+IV
+_whisper_open(path)
+    const char* path
+  CODE:
+    whisper_model_t* wm = whisper_open(path);
+    if (!wm) croak("ROCm::Inference: whisper_open: %s", whisper_last_error());
+    RETVAL = PTR2IV(wm);
+  OUTPUT:
+    RETVAL
+
+void
+_whisper_close(wm)
+    IV wm
+  CODE:
+    whisper_close(INT2PTR(whisper_model_t*, wm));
+
+void
+_whisper_transcribe(wm, wav, language)
+    IV wm
+    SV* wav
+    SV* language
+  PPCODE:
+    /* (text, tokens): a WAV file's bytes (16 kHz mono after the decode; up to 30 s), the language's code or undef */
+    STRLEN len = 0;
+    const unsigned char* data = (const unsigned char*)SvPV(wav, len);
+    float* samples = NULL;
+    size_t n = 0;
+    if (whisper_decode_wav(data, len, &samples, &n) != 0) croak("ROCm::Inference: %s", whisper_last_error());
+    char text[8192];
+    const char* lang = SvOK(language) ? SvPV_nolen(language) : NULL;
+    const int k = whisper_transcribe(INT2PTR(whisper_model_t*, wm), samples, n, lang, text, sizeof text);
+    whisper_free_samples(samples);
+    if (k < 0) croak("ROCm::Inference: whisper_transcribe: %s", whisper_last_error());
+    SV* out = newSVpv(text, 0);
+    SvUTF8_on(out);
+    EXTEND(SP, 2);
+    PUSHs(sv_2mortal(out));
+    PUSHs(sv_2mortal(newSViv(k)));

@@ -203,7 +203,16 @@ transformers 5.5.1, Pillow; no torchvision in that venv). A phase is done when i
   (computed once), the tied head, greedy with the generation config's suppressions. `tests/whisper_verify.cpp` (`make
   build/whisper_verify`): the encoder from the mel (A2) at worst row cosine 1.0000000, max difference 7e-5 of the largest
   value; the 21 greedy tokens equal the reference's, EOT 50257; 1.9 s on 16 threads. One clip only so far.
-- A4 `/v1/audio/transcriptions`: multipart/form-data upload (Web::Route parses JSON only: add it), the JSON reply.
+- A4 `/v1/audio/transcriptions` (done 2026-11-13): the converter writes the vocabulary (tokenizer.ggml.*, `pre`
+  `qwen2`: only special tokens are encoded, by exact text); the engine decodes a WAV (PCM 8-32 / float, mono mix, linear
+  resampling to 16 kHz) and transcribes up to 30 s (`whisper_transcribe`: the language, transcribe and no-timestamps
+  prompt, greedy, the text). The Perl binding (`ROCm::Inference::whisper_load`) and the server (`--whisper FILE`, which
+  needs no chat model; `POST /v1/audio/transcriptions`, multipart: `file`, `language`, `response_format` json|text)
+  with ROCm::Inference::Multipart. Checks: `make build/whisper_verify` (the WAV equals the reference waveform exactly,
+  the special-token ids, the text equal to transformers' transcription) and `perl/ROCm-Inference/t/64-audio.t` (the
+  multipart parser always; the server test env-gated: ROCM_INFERENCE_TEST_WHISPER, ROCM_INFERENCE_TEST_WAV) passes.
+  Open: long-form audio (over 30 s: chunking with timestamps), other languages than English are only checked by the
+  token table (the test is English), translate, the GPU path, and resampling is linear (not band-limited).
 
 **Speech generation (Qwen3-TTS 0.6B, `/data/hf-small/Qwen3-TTS-12Hz-0.6B-Base` and its tokenizer):**
 - T1 reference: the talker's codes and the waveform for a fixed text (transformers 5.5.1 may not have this model:

@@ -25,7 +25,7 @@ our @EXPORT_OK = qw(
     generate last_prompt_stats last_error
     store_open store_close store_set_lazy store_stats store_block_names
     chat_render chat reply_tags
-    vision_load image_prompt set_mm mm_rope_delta
+    vision_load image_prompt set_mm mm_rope_delta whisper_load
     STOP_NONE STOP_EOG STOP_MAX_TOKENS STOP_STRING STOP_CALLBACK STOP_CONTEXT_FULL
 );
 our %EXPORT_TAGS = (all => \@EXPORT_OK);
@@ -519,6 +519,36 @@ sub DESTROY {
 
 package ROCm::Inference;
 
+# whisper_load($gguf): the speech recognizer (rocm-convert of a Whisper checkpoint) as a ROCm::Inference::Whisper object;
+# $w->transcribe($wav_bytes, language => 'en') returns the text (UTF-8) and in list context its token count. A WAV file
+# of up to 30 s (PCM 8 to 32 bits or float, any rate: 16 kHz mono after the decode). The text keeps its leading space.
+sub whisper_load {
+    my ($path) = @_;
+    return ROCm::Inference::Whisper->new($path);
+}
+
+package ROCm::Inference::Whisper;
+
+sub new {
+    my ($class, $path) = @_;
+    my $h = ROCm::Inference::_whisper_open($path);
+    return bless { h => $h, path => $path }, $class;
+}
+
+sub transcribe {
+    my ($w, $wav, %o) = @_;
+    my ($text, $n) = ROCm::Inference::_whisper_transcribe($w->{h}, $wav, $o{language});
+    return wantarray ? ($text, $n) : $text;
+}
+
+sub DESTROY {
+    my ($w) = @_;
+    ROCm::Inference::_whisper_close($w->{h}) if $w->{h};
+    $w->{h} = 0;
+}
+
+package ROCm::Inference;
+
 # chat_start($m, \@messages, \%options): chat one token per step on the current sequence. Options as chat's but
 # on_delta / on_token. $c->step returns (\@deltas, $going): the reply's new pieces as [$text, $kind] (reasoning,
 # content, tool_call) and whether it goes on; $c->result then returns ($content, $reason, $message) as chat does.
@@ -877,6 +907,13 @@ Embedding models (EmbeddingGemma: GGUF architecture C<gemma-embedding>; after C<
 longest input, at most 2048 tokens): C<embedding_dim> is the embedding's length (0 for other models), C<embed>
 returns the embedding of one input's token ids (C<tokenize>'s, with BOS and EOS) as an array reference, scaled to
 length 1 unless C<$normalize> is 0. Dies when the input is longer than the KV cache.
+
+=item whisper_load($gguf)
+
+A speech model (Whisper, rocm-convert of its checkpoint; the engine on the host, src/whisper.{h,cpp}).
+C<< $w->transcribe($wav_bytes, language => 'en') >> returns the text (UTF-8, with its leading space) and in list context
+the token count. The input is a WAV file (PCM 8 to 32 bits or float, any rate, converted to 16 kHz mono by linear
+interpolation) of up to 30 s; longer audio, or another format, dies.
 
 =item vision_load($mmproj), image_prompt($m, $vision, \@ids, \@images), set_mm, mm_rope_delta
 

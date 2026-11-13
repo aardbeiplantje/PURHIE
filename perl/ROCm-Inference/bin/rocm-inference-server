@@ -16,6 +16,7 @@ use Time::HiRes ();
 use ROCm::Inference qw(:all);
 use ROCm::Inference::Log;
 use ROCm::Inference::Store qw(store_evict store_usage);
+use ROCm::Inference::Multipart;
 use Web::Route;
 
 my %o = (listen => './rocm-inference.sock', max_tokens => 0, 'models-margin' => 4, 'kv-budget' => 16,
@@ -24,14 +25,14 @@ GetOptions(\%o, 'model=s', 'models-dir=s', 'models-max=i', 'models-margin=f', 'k
            'name=s', 'draft=s', 'store=s', 'max_tokens=i', 'swa-ring=i', 'stage=s', 'recache', 'kv-type=s',
            'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'preserve-thinking!', 'log!', 'log-level=s', 'log-format=s', 'log-color=s',
            'thinking-low=i', 'thinking-medium=i', 'thinking-high=i',
-           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'mmproj=s', 'help')
+           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'mmproj=s', 'whisper=s', 'help')
     or pod2usage(2);
 # The log: --nolog is level none; --log-level, --log-format, --log-color are checked by the formatter
 our $LOG = eval { ROCm::Inference::Log->new(level => ($o{log} // 1) ? ($o{'log-level'} // 'info') : 'none',
                                               format => $o{'log-format'} // 'text', color => $o{'log-color'} // 'auto') }
     or die "--log-level, --log-format, --log-color: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n";
 pod2usage(-verbose => 2, -exitval => 0) if $o{help};
-pod2usage("--model or --models-dir is required\n") unless $o{model} || $o{'models-dir'};
+pod2usage("--model, --models-dir or --whisper is required\n") unless $o{model} || $o{'models-dir'} || $o{whisper};
 ROCm::Inference::_require_minijinja()
     or die "rocm-inference-server needs the Minijinja module $ROCm::Inference::MINIJINJA_VERSION\n";
 my $no_draft = ($o{draft} // '') eq 'none';  # (no draft head, not even a model's own MTP block)
@@ -45,6 +46,11 @@ die "--store-snapshots: lazy or eager\n" unless $o{'store-snapshots'} =~ /\A(?:l
 die "--store-snapshot-every N: 0 or more\n" if ($o{'store-snapshot-every'} // 4) < 0;
 die "--parallel: not with --draft (speculative decoding is single-sequence)\n" if $parallel > 1 && $o{draft};
 die "--mmproj: no file $o{mmproj}\n" if $o{mmproj} && !-f $o{mmproj};
+die "--whisper: no file $o{whisper}\n" if $o{whisper} && !-f $o{whisper};
+# the speech model (--whisper, a Whisper GGUF): /v1/audio/transcriptions; the model's name is its file name
+my $WHISPER = $o{whisper} ? eval { whisper_load($o{whisper}) } : undef;
+die "--whisper $o{whisper}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" if $o{whisper} && !$WHISPER;
+my $whisper_name = $o{whisper} ? basename($o{whisper}) =~ s/\.gguf\z//r : undef;
 my $kv_type = $o{'kv-type'} // 'auto';
 die "--kv-type: auto, f16, q8_0 or q4_0\n" unless $kv_type =~ /\A(?:auto|f16|q8_0|q4_0)\z/;
 my $created = time;
@@ -763,6 +769,31 @@ sub access_line {
                msg => sprintf('%s %s %d %.0f ms', $req->{method} // '-', $req->{path} // '-', $status, $ms));
 }
 
+# OpenAI's transcription: a multipart/form-data body with the audio file (a WAV: PCM 8 to 32 bits or float, up to 30 s),
+# optional language (a code, default en) and response_format (json, the default, or text). 'model' is accepted and
+# ignored: a server has one speech model (--whisper)
+route::post '/v1/audio/transcriptions' => sub {
+    my ($req) = @_;
+    my $ct = $req->{headers}{'content-type'} // '';
+    error(400, 'expected multipart/form-data with the audio file in the part "file"') unless $ct =~ m{multipart/form-data}i;
+    error(503, 'no speech model: start the server with --whisper FILE.gguf', 'server_error') unless $WHISPER;
+    my $parts = eval { ROCm::Inference::Multipart::parse($req->{body}, $ct) }
+        or error(400, 'bad multipart body: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r));
+    my $file = $parts->{file} or error(400, "'file' is required (a WAV file)");
+    my $field = sub { my $p = $parts->{$_[0]} or return undef; (my $v = $p->{data}) =~ s/\A\s+|\s+\z//g; $v };
+    my $lang = $field->('language') // 'en';
+    error(400, "language: a code such as en, not '$lang'") unless $lang =~ /\A[a-z]{2,3}\z/;
+    my $fmt = $field->('response_format') // 'json';
+    error(400, "response_format: json or text, not '$fmt'") unless $fmt =~ /\A(?:json|text)\z/;
+    my ($text) = eval { $WHISPER->transcribe($file->{data}, language => $lang) };
+    error(400, $@ =~ s/ at \S+ line \d+\.?\n?\z//r) if $@;
+    $text =~ s/\A\s+|\s+\z//g;
+    $LOG->info('request', event => 'transcription', msg => sprintf('%s: %d bytes, language %s, %d chars of text',
+                                                               $whisper_name, length $file->{data}, $lang, length $text));
+    return text($text) if $fmt eq 'text';
+    return { text => $text };
+};
+
 route::post '/v1/chat/completions' => sub {
     my ($req) = @_;
     my $p = $req->{json};
@@ -1224,10 +1255,12 @@ if ($o{'models-dir'}) {
     my @ids = sort keys %M;
     $LOG->info('model', event => 'serve', msg => join(' ', "serving", scalar @ids, "models from $o{'models-dir'} on $o{listen}",
         ($parallel > 1 ? ", $parallel conversations at once per model" : ''), ": @ids"));
-} else {
-    my $r = $default{chat} // $default{embedding};
+} elsif (my $r = $default{chat} // $default{embedding}) {
     $LOG->info('model', model => $r->{id}, event => 'serve', msg => "serving on $o{listen}: context $r->{ctx} tokens (trained $r->{info}{n_ctx_train})" .
         ($parallel > 1 ? ", $parallel conversations at once" : ''));
+} else {
+    $LOG->info('model', event => 'serve', msg => "serving on $o{listen}: no chat model" .
+        ($WHISPER ? ", speech model $whisper_name" : ''));
 }
 run(listen => $o{listen}, log => $LOG->enabled('info') ? \&access_line : 0, defined $o{mode} ? (mode => oct $o{mode}) : (),
     $parallel > 1 ? (tick => \&tick) : ());
@@ -1369,6 +1402,11 @@ The vision tower (C<rocm-convert --mmproj> of a Qwen3.5 checkpoint) for images i
 parts of type C<image_url> take a C<data:image/...;base64,...> URL (the server does not fetch URLs). Its output must be
 the model's width (else the model answers without images, with a warning). Not with C<--parallel> above 1.
 
+=item --whisper F<whisper.gguf>
+
+A speech model (C<rocm-convert> of a Whisper checkpoint, e.g. openai/whisper-tiny) for C</v1/audio/transcriptions>.
+Runs on the host (not the GPU), one request at a time. A server with only this option needs no chat model.
+
 =item --draft F<file.gguf> | none
 
 An MTP draft head for speculative decoding (Qwen3.8-Flash-Next). Without it (and without C<--parallel>), a model
@@ -1461,6 +1499,12 @@ X-LLamaCPP-Id-slot header of the opencode fixups). See L<ROCm::Inference::Log>.
 =back
 
 =head1 API
+
+C<POST /v1/audio/transcriptions> (with C<--whisper>): a C<multipart/form-data> body with the audio in the part C<file>
+(a WAV: PCM 8, 16, 24 or 32 bits, or 32-bit float, any channels and rate; up to 30 s, longer audio is refused), and the
+parts C<language> (a code such as C<en>, the default; the model's languages) and C<response_format> (C<json>, the
+default, C<{"text": ...}>; or C<text>, the plain text). C<model> is accepted and ignored. The text has no leading or
+trailing space.
 
 C<GET /health>, C<GET /v1/models>, C<GET /v1/models/{id}> and C<POST /v1/chat/completions>, as OpenAI's:
 C<messages> (text content, images as C<image_url> parts with a data: URL with C<--mmproj>; tool calls and tool

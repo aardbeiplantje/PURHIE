@@ -13,6 +13,7 @@ lib/ROCm/Inference/GGUF.pm
 lib/ROCm/Inference/Quant.pm
 lib/ROCm/Inference/SafeTensors.pm
 lib/ROCm/Inference/Log.pm
+lib/ROCm/Inference/Multipart.pm
 lib/ROCm/Inference/Store.pm
 t/00-load.t
 t/05-log.t
@@ -26,6 +27,8 @@ t/40-store-policy.t
 t/45-store-lru.t
 t/50-draft.t
 t/60-server.t
+t/63-server-image.t
+t/64-audio.t
 t/62-server-log.t
 t/65-models-dir.t
 t/70-stage.t

@@ -2053,7 +2053,8 @@ sub tensors {
 # PLAN.md). F32 only: the checkpoints are F32 and small (tiny: 151 MB). The tensors keep their values and row-major
 # layout (GGUF's shape is the PyTorch shape reversed); the names are llama.cpp's whisper names where they exist
 # (encoder.blk.N.attn_q, ...), the rest are the engine's (src/whisper.cpp). The generation settings the engine applies
-# (suppress_tokens, begin_suppress_tokens, the decoder start and end tokens) are stored as whisper.* keys.
+# (suppress_tokens, begin_suppress_tokens, the decoder start and end tokens) are stored as whisper.* keys, and the
+# tokenizer's vocabulary as tokenizer.ggml.* (the engine decodes the text with it).
 package ROCm::Inference::Convert::Whisper;
 use strict;
 use warnings;
@@ -2124,6 +2125,13 @@ sub convert {
         ['whisper.suppress_tokens', $ARR, [$U32, [$ids->($gc->{suppress_tokens})]]],
         ['whisper.begin_suppress_tokens', $ARR, [$U32, [$ids->($gc->{begin_suppress_tokens})]]],
     );
+    # the vocabulary (tokenizer.ggml.*, byte-level BPE as the GPT-2 family: tokenizer.json's), for the text of a reply
+    $self->{kv} = [];
+    $self->{kv_at} = {};
+    # (the pre-tokenizer names the regex that splits text before BPE: the engine only encodes special tokens, which
+    # match whole, so the GPT-2-style 'qwen2' regex serves; the engine has no 'default' one)
+    $self->vocab_gpt2(pre => 'qwen2');
+    push @kv, @{$self->{kv}};
     my @specs;
     for my $name (@{$self->st->{order}}) {
         my $g = gname($name) // croak "$name: no whisper tensor name (a tensor the engine does not know)";

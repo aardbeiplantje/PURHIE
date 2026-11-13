@@ -5,13 +5,17 @@
 
 #include "gguf_mmap.h"
 #include "mel.h"
+#include "tokenizer.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -68,6 +72,8 @@ struct whisper_model {
     int sot = 0, eot = 0;
     float eps = 1e-5f;
     std::vector<int> suppress, begin_suppress;
+    tokenizer_t* tok = nullptr;      // the GGUF's vocabulary (tokenizer.ggml.*), decodes the text
+    std::unordered_map<std::string, int> special;  // the vocabulary's control markers ("<|en|>", ...) by text
     const float *conv1_w = nullptr, *conv1_b = nullptr, *conv2_w = nullptr, *conv2_b = nullptr;
     const float* enc_pos = nullptr;  // [n_actx][n_astate]
     Norm enc_post;
@@ -77,6 +83,7 @@ struct whisper_model {
     Norm dec_post;
     std::vector<DecLayer> dec;
     ~whisper_model() {
+        if (tok) tokenizer_free(tok);
         if (g) gguf_mmap_close(g);
     }
 };
@@ -286,6 +293,18 @@ whisper_model_t* whisper_open(const char* gguf_path) {
         ints("whisper.suppress_tokens", m->suppress);
         ints("whisper.begin_suppress_tokens", m->begin_suppress);
 
+        m->tok = tokenizer_load_from_gguf(m->g);
+        if (!m->tok) throw std::runtime_error("whisper: no tokenizer.ggml.* vocabulary in the GGUF");
+        // the control markers by their text (the language, task and timestamp tokens are whole strings in the vocabulary)
+        {
+            const char** vocab = nullptr;
+            size_t n_vocab = 0;
+            if (gguf_kv_get_string_array(m->g, "tokenizer.ggml.tokens", &vocab, &n_vocab) != 0)
+                throw std::runtime_error("whisper: no tokenizer.ggml.tokens");
+            for (size_t i = 0; i < n_vocab; ++i)
+                if (vocab[i] && std::strncmp(vocab[i], "<|", 2) == 0) m->special.emplace(vocab[i], (int)i);
+        }
+
         const int C = m->n_astate, T = m->n_actx, Ct = m->n_tstate, F = m->n_affn, FT = m->n_tffn;
         m->conv1_w = tensor(m->g, "encoder.conv1.weight", (size_t)C * m->n_mels * 3);
         m->conv1_b = tensor(m->g, "encoder.conv1.bias", C);
@@ -349,6 +368,107 @@ whisper_model_t* whisper_open(const char* gguf_path) {
 }
 
 void whisper_close(whisper_model_t* model) { delete model; }
+
+int whisper_decode_wav(const unsigned char* d, size_t n, float** samples_out, size_t* count_out) {
+    if (!d || !samples_out || !count_out) { g_error = "whisper_decode_wav: null argument"; return -1; }
+    *samples_out = nullptr;
+    *count_out = 0;
+    auto u16 = [&](size_t p) { return (unsigned)(d[p] | (d[p + 1] << 8)); };
+    auto u32 = [&](size_t p) { return (unsigned long)(d[p] | (d[p + 1] << 8) | (d[p + 2] << 16)) | ((unsigned long)d[p + 3] << 24); };
+    if (n < 12 || std::memcmp(d, "RIFF", 4) != 0 || std::memcmp(d + 8, "WAVE", 4) != 0) {
+        g_error = "not a WAV file (RIFF WAVE)";
+        return -1;
+    }
+    bool have_fmt = false;
+    unsigned fmt_tag = 0, channels = 0, bits = 0;
+    unsigned long rate = 0;
+    size_t data_at = 0, data_n = 0;
+    bool have_data = false;
+    size_t p = 12;
+    while (p + 8 <= n) {
+        const unsigned long size = u32(p + 4);
+        const size_t body = p + 8;
+        const size_t avail = std::min<size_t>(size, n - body);
+        if (std::memcmp(d + p, "fmt ", 4) == 0 && avail >= 16) {
+            have_fmt = true;
+            fmt_tag = u16(body);
+            channels = u16(body + 2);
+            rate = u32(body + 4);
+            bits = u16(body + 14);
+            if (fmt_tag == 0xFFFE && avail >= 26) fmt_tag = u16(body + 24);  // WAVE_FORMAT_EXTENSIBLE: the sub-format
+        } else if (std::memcmp(d + p, "data", 4) == 0) {
+            have_data = true;
+            data_at = body;
+            data_n = avail;
+            break;  // (the samples are the last thing that matters)
+        }
+        p = body + size + (size & 1);
+    }
+    if (!have_fmt || !have_data) { g_error = "WAV: no fmt or data chunk"; return -1; }
+    const bool pcm = fmt_tag == 1, flt = fmt_tag == 3;
+    if (!(pcm && (bits == 8 || bits == 16 || bits == 24 || bits == 32)) && !(flt && bits == 32)) {
+        g_error = "WAV: only PCM 8, 16, 24, 32-bit or 32-bit float";
+        return -1;
+    }
+    if (channels == 0 || rate == 0) { g_error = "WAV: no channels or rate"; return -1; }
+    const size_t bps = bits / 8, frame = bps * channels;
+    const size_t frames = data_n / frame;
+    std::vector<float> mono(frames);
+    for (size_t i = 0; i < frames; ++i) {
+        double acc = 0.0;
+        for (unsigned c = 0; c < channels; ++c) {
+            const unsigned char* s = d + data_at + i * frame + c * bps;
+            double v;
+            if (flt) {
+                float f;
+                std::memcpy(&f, s, 4);
+                v = f;
+            } else if (bits == 8) {
+                v = ((int)s[0] - 128) / 128.0;
+            } else if (bits == 16) {
+                v = (int16_t)(s[0] | (s[1] << 8)) / 32768.0;
+            } else if (bits == 24) {
+                const int32_t x = (int32_t)((uint32_t)s[0] << 8 | (uint32_t)s[1] << 16 | (uint32_t)s[2] << 24);
+                v = (x >> 8) / 8388608.0;
+            } else {
+                const int32_t x = (int32_t)((uint32_t)s[0] | (uint32_t)s[1] << 8 | (uint32_t)s[2] << 16 | (uint32_t)s[3] << 24);
+                v = x / 2147483648.0;
+            }
+            acc += v;
+        }
+        mono[i] = (float)(acc / channels);
+    }
+    // 16 kHz by linear interpolation
+    std::vector<float> out;
+    if (rate == 16000) {
+        out = std::move(mono);
+    } else {
+        const double step = (double)rate / 16000.0;
+        const size_t len = (size_t)std::llround(frames / step);
+        out.resize(len);
+        for (size_t i = 0; i < len; ++i) {
+            const double pos = i * step;
+            const size_t i0 = (size_t)pos;
+            const double f = pos - i0;
+            const float a = mono[std::min(i0, frames - 1)], b = mono[std::min(i0 + 1, frames - 1)];
+            out[i] = (float)(a + (b - a) * f);
+        }
+    }
+    float* buf = static_cast<float*>(std::malloc(sizeof(float) * std::max<size_t>(out.size(), 1)));
+    if (!buf) { g_error = "whisper_decode_wav: no memory"; return -1; }
+    std::memcpy(buf, out.data(), sizeof(float) * out.size());
+    *samples_out = buf;
+    *count_out = out.size();
+    return 0;
+}
+
+void whisper_free_samples(float* samples) { std::free(samples); }
+
+int whisper_token_id(const whisper_model_t* m, const char* text) {
+    if (!m || !text) return -1;
+    const auto it = m->special.find(text);
+    return it == m->special.end() ? -1 : it->second;
+}
 
 const char* whisper_last_error(void) { return g_error.c_str(); }
 
@@ -425,6 +545,44 @@ int whisper_greedy(whisper_model_t* m, const float* enc, const int* prompt, int 
             next = argmax_suppressed(m, logits.data(), false);
         }
         return n_out;
+    } catch (const std::exception& e) {
+        g_error = e.what();
+        return -1;
+    }
+}
+
+int whisper_transcribe(whisper_model_t* m, const float* samples, size_t n, const char* language, char* text,
+                       size_t text_len) {
+    if (!m || (!samples && n > 0) || !text || text_len == 0) { g_error = "whisper_transcribe: bad arguments"; return -1; }
+    if (n > (size_t)WHISPER_CHUNK_SAMPLES) { g_error = "whisper_transcribe: longer than 30 s (long-form is not supported)"; return -1; }
+    try {
+        const std::string lang = std::string("<|") + (language && *language ? language : "en") + "|>";
+        const int lang_id = whisper_token_id(m, lang.c_str());
+        const int transcribe = whisper_token_id(m, "<|transcribe|>"), notimestamps = whisper_token_id(m, "<|notimestamps|>");
+        if (lang_id < 0) { g_error = "whisper_transcribe: unknown language " + lang; return -1; }
+        if (transcribe < 0 || notimestamps < 0) throw std::runtime_error("whisper: no task or timestamp tokens in the vocabulary");
+        const int prompt[4] = {m->sot, lang_id, transcribe, notimestamps};
+
+        std::vector<float> mel((size_t)80 * WHISPER_N_FRAMES);
+        if (whisper_log_mel(samples, (int)n, 80, mel.data()) != 0) throw std::runtime_error("whisper_log_mel failed");
+        std::vector<float> enc((size_t)m->n_actx * m->n_astate);
+        if (whisper_encode(m, mel.data(), enc.data()) != 0) throw std::runtime_error(g_error);
+        std::vector<int> ids(std::max(1, m->n_tctx - 4));
+        const int k = whisper_greedy(m, enc.data(), prompt, 4, (int)ids.size(), ids.data());
+        if (k < 0) throw std::runtime_error(g_error);
+
+        // the text: the tokenizer's detokenization (its length is the full one; retry with a buffer that holds it)
+        std::vector<char> buf(64 + 8 * (size_t)k);
+        int len = tokenizer_detokenize(m->tok, ids.data(), k, buf.data(), (int)buf.size());
+        if (len < 0) throw std::runtime_error("whisper: detokenize failed");
+        if ((size_t)len >= buf.size()) {
+            buf.assign((size_t)len + 1, 0);
+            len = tokenizer_detokenize(m->tok, ids.data(), k, buf.data(), (int)buf.size());
+        }
+        if (len < 0 || (size_t)len + 1 > text_len) { g_error = "whisper_transcribe: the text does not fit"; return -1; }
+        std::memcpy(text, buf.data(), (size_t)len);
+        text[len] = 0;
+        return k;
     } catch (const std::exception& e) {
         g_error = e.what();
         return -1;
