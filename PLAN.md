@@ -172,9 +172,13 @@ transformers 5.5.1, Pillow; no torchvision in that venv). A phase is done when i
   build/mm_verify`, run from build/co) on the BF16 Qwen3.5-0.8B: the image chat's last logits at cosine 0.999986 to
   transformers', the same argmax, and the 14 greedy reply tokens equal. Plain attention checks still pass
   (attn_verify, attn_decode_verify, attn_split_verify); plain Qwen3.5 text was not re-run beyond that.
-- V5 image input: decoding (PNG / JPEG: vendored stb_image), the processor's resize (multiples of 32) and
-  normalization in C, the image pad splice, and `image_url` parts in `/v1/chat/completions` (data: URIs). The KV store
-  keys include an image hash before this is enabled (two images with the same pad tokens must not share KV).
+- V5 image input (in progress 2026-11-13): the processor is done - `src/image.{h,cpp}` (stb_image in
+  `src/third_party/`, public domain; PIL-style bicubic; smart_resize; the merge-order pixel rows): `tests/image_verify.cpp`
+  on the V1 PNG: pixel rows equal to transformers' (max |diff| 0), features at cosine 1.000000; on a 757 x 541 PNG
+  (a real downscale): max |diff| 0.0078 (one 8-bit step), features at 0.999995. Still to do: `image_url` parts in
+  `/v1/chat/completions` (data: URIs), the pad expansion in the chat's tokens, the XS binding of `inference_set_mm`,
+  and the KV store: image blocks must not share keys (not until a hash is in the key, the store is off for image
+  requests).
 
 **Audio transcription (whisper-tiny, `/data/hf-small/whisper-tiny`):**
 - A1 reference: log-mel features (WhisperFeatureExtractor), the encoder output, and greedy tokens for a test WAV.
