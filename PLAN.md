@@ -322,6 +322,14 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
 - W2 translate: `task` translate (the `<|translate|>` token in the prompt) through the endpoint.
 - W3 other languages: a French and a Chinese clip (qwen-tts speech, the Whisper reference from transformers) with the
   engine's tokens equal to transformers' greedy tokens under the same language token.
+  **Done 2026-11-13:** `whisper_transcribe_task` (`src/whisper.cpp`): clips of any length in windows of at most 30 s, each
+  window's end at the quietest 0.1 s frame of its last 10 s (or the window's end), the texts joined; the task transcribe or
+  translate (the `<|translate|>` token). The Perl binding (`transcribe($wav, language, task)`) and the endpoint's `task`
+  field; the docs say any length. Checks: `t/66-whisper-long.t` (env-gated): a 38 s clip (the reference sentence six times,
+  0.5 s apart) gives the sentence six times (126 tokens, 6.8 s on 16 threads); a French clip (qwen-tts speech in the
+  clip's voice, /data/audio-ref/lang/dump.py) transcribes and translates exactly as transformers' whisper-tiny does (20 and
+  10 tokens, equal texts). Open: the cut is a pause, not a timestamp (a word at a window's end with no pause is not
+  protected), no previous-text conditioning across windows.
 - U1 threads: the host matmuls and convolutions run on the 16 cores (OpenMP over output rows); real-time factors
   measured for the speech (talker frames per second) and the transcription (seconds of audio per second).
 - U2 GPU path (UMA: the GGUF map is pinned, so the GPU reads the same pages): decided after U1 by the measured split;

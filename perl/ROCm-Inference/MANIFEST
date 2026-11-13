@@ -30,6 +30,7 @@ t/60-server.t
 t/63-server-image.t
 t/64-audio.t
 t/65-speech.t
+t/66-whisper-long.t
 t/62-server-log.t
 t/65-models-dir.t
 t/70-stage.t

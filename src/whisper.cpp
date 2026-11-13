@@ -469,42 +469,90 @@ int whisper_greedy(whisper_model_t* m, const float* enc, const int* prompt, int 
     }
 }
 
-int whisper_transcribe(whisper_model_t* m, const float* samples, size_t n, const char* language, char* text,
-                       size_t text_len) {
+// One window of at most 30 s: the prompt (<|startoftranscript|> <|language|> <|transcribe|> or <|translate|>,
+// <|notimestamps|>), the encoder, the greedy decoding, the text. Returns the tokens, or -1.
+static int transcribe_window(whisper_model_t* m, const float* samples, size_t n, const std::string& lang, bool translate,
+                             std::string& out) {
+    const int lang_id = whisper_token_id(m, lang.c_str());
+    const int task_id = whisper_token_id(m, translate ? "<|translate|>" : "<|transcribe|>");
+    const int notimestamps = whisper_token_id(m, "<|notimestamps|>");
+    if (lang_id < 0) { g_error = "whisper_transcribe: unknown language " + lang; return -1; }
+    if (task_id < 0 || notimestamps < 0) throw std::runtime_error("whisper: no task or timestamp tokens in the vocabulary");
+    const int prompt[4] = {m->sot, lang_id, task_id, notimestamps};
+
+    std::vector<float> mel((size_t)80 * WHISPER_N_FRAMES);
+    if (whisper_log_mel(samples, (int)n, 80, mel.data()) != 0) throw std::runtime_error("whisper_log_mel failed");
+    std::vector<float> enc((size_t)m->n_actx * m->n_astate);
+    if (whisper_encode(m, mel.data(), enc.data()) != 0) throw std::runtime_error(g_error);
+    std::vector<int> ids(std::max(1, m->n_tctx - 4));
+    const int k = whisper_greedy(m, enc.data(), prompt, 4, (int)ids.size(), ids.data());
+    if (k < 0) throw std::runtime_error(g_error);
+
+    // the text: the tokenizer's detokenization (its length is the full one; retry with a buffer that holds it)
+    std::vector<char> buf(64 + 8 * (size_t)k);
+    int len = tokenizer_detokenize(m->tok, ids.data(), k, buf.data(), (int)buf.size());
+    if (len < 0) throw std::runtime_error("whisper: detokenize failed");
+    if ((size_t)len >= buf.size()) {
+        buf.assign((size_t)len + 1, 0);
+        len = tokenizer_detokenize(m->tok, ids.data(), k, buf.data(), (int)buf.size());
+    }
+    if (len < 0) throw std::runtime_error("whisper: detokenize failed");
+    out.assign(buf.data(), (size_t)len);
+    return k;
+}
+
+// Where a long clip is cut: the quietest 0.1 s frame in the last 10 s of a 30 s window (so no word is cut mid-way when the
+// clip has a pause there), or the window's end when the clip has no pause before it.
+static size_t quiet_cut(const float* x, size_t n, size_t begin, size_t end) {
+    const size_t frame = 1600;  // 0.1 s at 16 kHz
+    size_t best = end;
+    double best_e = INFINITY;
+    for (size_t f = begin; f + frame <= end; f += frame) {
+        double e = 0.0;
+        for (size_t i = f; i < f + frame; ++i) e += (double)x[i] * x[i];
+        if (e < best_e) {
+            best_e = e;
+            best = f + frame / 2;
+        }
+    }
+    return std::min(best, n);
+}
+
+int whisper_transcribe_task(whisper_model_t* m, const float* samples, size_t n, const char* language, const char* task,
+                            char* text, size_t text_len) {
     if (!m || (!samples && n > 0) || !text || text_len == 0) { g_error = "whisper_transcribe: bad arguments"; return -1; }
-    if (n > (size_t)WHISPER_CHUNK_SAMPLES) { g_error = "whisper_transcribe: longer than 30 s (long-form is not supported)"; return -1; }
+    const bool translate = task && std::string(task) == "translate";
+    if (task && !translate && std::string(task) != "transcribe") { g_error = "whisper_transcribe: task transcribe or translate"; return -1; }
     try {
         const std::string lang = std::string("<|") + (language && *language ? language : "en") + "|>";
-        const int lang_id = whisper_token_id(m, lang.c_str());
-        const int transcribe = whisper_token_id(m, "<|transcribe|>"), notimestamps = whisper_token_id(m, "<|notimestamps|>");
-        if (lang_id < 0) { g_error = "whisper_transcribe: unknown language " + lang; return -1; }
-        if (transcribe < 0 || notimestamps < 0) throw std::runtime_error("whisper: no task or timestamp tokens in the vocabulary");
-        const int prompt[4] = {m->sot, lang_id, transcribe, notimestamps};
-
-        std::vector<float> mel((size_t)80 * WHISPER_N_FRAMES);
-        if (whisper_log_mel(samples, (int)n, 80, mel.data()) != 0) throw std::runtime_error("whisper_log_mel failed");
-        std::vector<float> enc((size_t)m->n_actx * m->n_astate);
-        if (whisper_encode(m, mel.data(), enc.data()) != 0) throw std::runtime_error(g_error);
-        std::vector<int> ids(std::max(1, m->n_tctx - 4));
-        const int k = whisper_greedy(m, enc.data(), prompt, 4, (int)ids.size(), ids.data());
-        if (k < 0) throw std::runtime_error(g_error);
-
-        // the text: the tokenizer's detokenization (its length is the full one; retry with a buffer that holds it)
-        std::vector<char> buf(64 + 8 * (size_t)k);
-        int len = tokenizer_detokenize(m->tok, ids.data(), k, buf.data(), (int)buf.size());
-        if (len < 0) throw std::runtime_error("whisper: detokenize failed");
-        if ((size_t)len >= buf.size()) {
-            buf.assign((size_t)len + 1, 0);
-            len = tokenizer_detokenize(m->tok, ids.data(), k, buf.data(), (int)buf.size());
+        // the clip in windows of at most 30 s: each window's end at a quiet point of its last 10 s
+        const size_t window = (size_t)WHISPER_CHUNK_SAMPLES, quiet_from = window - 10 * 16000;
+        std::string all;
+        int tokens = 0;
+        size_t pos = 0;
+        while (pos < n) {
+            size_t end = n - pos <= window ? n : pos + quiet_cut(samples + pos, n - pos, quiet_from, window);
+            if (end <= pos) end = std::min(n, pos + window);
+            std::string part;
+            const int k = transcribe_window(m, samples + pos, end - pos, lang, translate, part);
+            if (k < 0) return -1;
+            all += part;
+            tokens += k;
+            pos = end;
         }
-        if (len < 0 || (size_t)len + 1 > text_len) { g_error = "whisper_transcribe: the text does not fit"; return -1; }
-        std::memcpy(text, buf.data(), (size_t)len);
-        text[len] = 0;
-        return k;
+        if (all.size() + 1 > text_len) { g_error = "whisper_transcribe: the text does not fit"; return -1; }
+        std::memcpy(text, all.data(), all.size());
+        text[all.size()] = 0;
+        return tokens;
     } catch (const std::exception& e) {
         g_error = e.what();
         return -1;
     }
+}
+
+int whisper_transcribe(whisper_model_t* m, const float* samples, size_t n, const char* language, char* text,
+                       size_t text_len) {
+    return whisper_transcribe_task(m, samples, n, language, "transcribe", text, text_len);
 }
 
 }  // extern "C"

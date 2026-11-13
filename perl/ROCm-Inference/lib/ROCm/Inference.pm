@@ -536,9 +536,11 @@ sub new {
     return bless { h => $h, path => $path }, $class;
 }
 
+# $w->transcribe($wav, language => 'en', task => 'transcribe' | 'translate'): any length of audio (long-form: windows of
+# 30 s, cut at quiet points); the text in UTF-8
 sub transcribe {
     my ($w, $wav, %o) = @_;
-    my ($text, $n) = ROCm::Inference::_whisper_transcribe($w->{h}, $wav, $o{language});
+    my ($text, $n) = ROCm::Inference::_whisper_transcribe($w->{h}, $wav, $o{language}, $o{task});
     return wantarray ? ($text, $n) : $text;
 }
 

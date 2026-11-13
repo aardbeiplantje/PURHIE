@@ -1355,23 +1355,29 @@ _whisper_close(wm)
     whisper_close(INT2PTR(whisper_model_t*, wm));
 
 void
-_whisper_transcribe(wm, wav, language)
+_whisper_transcribe(wm, wav, language, task)
     IV wm
     SV* wav
     SV* language
+    SV* task
   PPCODE:
-    /* (text, tokens): a WAV file's bytes (16 kHz mono after the decode; up to 30 s), the language's code or undef */
+    /* (text, tokens): a WAV file's bytes (mono float32 at 16 kHz after the decode; any length: long-form), the language's
+     * code or undef, the task (transcribe or translate; undef: transcribe) */
     STRLEN len = 0;
     const unsigned char* data = (const unsigned char*)SvPV(wav, len);
     float* samples = NULL;
     size_t n = 0;
     if (whisper_decode_wav(data, len, &samples, &n) != 0) croak("ROCm::Inference: %s", whisper_last_error());
-    char text[8192];
+    /* the text: long-form clips are joined from their windows; a buffer of 64 KiB holds an hour of speech's text */
+    char* text = (char*)malloc(65536);
+    if (!text) { whisper_free_samples(samples); croak("ROCm::Inference: out of memory"); }
     const char* lang = SvOK(language) ? SvPV_nolen(language) : NULL;
-    const int k = whisper_transcribe(INT2PTR(whisper_model_t*, wm), samples, n, lang, text, sizeof text);
+    const char* tsk = SvOK(task) ? SvPV_nolen(task) : NULL;
+    const int k = whisper_transcribe_task(INT2PTR(whisper_model_t*, wm), samples, n, lang, tsk, text, 65536);
     whisper_free_samples(samples);
-    if (k < 0) croak("ROCm::Inference: whisper_transcribe: %s", whisper_last_error());
+    if (k < 0) { free(text); croak("ROCm::Inference: whisper_transcribe: %s", whisper_last_error()); }
     SV* out = newSVpv(text, 0);
+    free(text);
     SvUTF8_on(out);
     EXTEND(SP, 2);
     PUSHs(sv_2mortal(out));
