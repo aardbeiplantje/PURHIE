@@ -559,6 +559,13 @@ DiT and the text encoder, no ROCmFP4 unless the user asks for it):
     step for it. The six-step sampler (`mmdit_sample`) against the reference's six steps from the
     same noise: cosine 0.999993 (`tests/mm_dit_verify`, `tests/mm_dit_ref.py`). Still open: a larger BF16 tile, the
     attention's softmax passes, and the server's wiring for the DiT.
+  **Speed and server (2026-11-13, items 1 and 2):** a 256 request (generated on the 2048 canvas, 4105 tokens) takes **222 s**
+  end to end, down from 352 s: the flash attention (`sd_flash_attn`) and the 256 x 128 GEMM tile for the large token counts
+  (the linears 27 s to 17.7 s per forward; the released-canvas sampler cosine unchanged, 0.993806). Phases (`MM_PIPE_DEBUG=1`):
+  text 12 s, DiT load 17 s, sampler 169 s, VAE 23 s. Still open: the linears (about 9 TFLOPS: a larger LDS stage or a
+  256 x 256 tile), the flash kernel (about 2.5 TFLOPS), and the DiT weights read from the mapping on every forward. The server
+  route is in: `--minimax DIR` (`ROCm::Inference::MiniMaxImage`), `/v1/images/generations` with `"model": "minimax-h3-image"`
+  (default 1024 x 1024, sizes multiples of 32 from 256 to 2048); `t/68-minimax-image.t` passes its four checks.
     (The earlier line: the sampler (`mmdit_sample`) is written but not yet
     compared end to end.
   - Plan (as written before the engine): (a) the engine's BF16 A operand in the GEMM (the bf16 weight's high half in a float, as the F16 path does);
