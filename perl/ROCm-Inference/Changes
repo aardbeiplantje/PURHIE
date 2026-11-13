@@ -1,6 +1,7 @@
 Revision history for ROCm-Inference
 
 0.01  unreleased
+    - rocm-convert: the Qwen3-TTS-Tokenizer-12Hz decoder as an F32 GGUF (codec.* tensors; the encoder is skipped).
     - rocm-convert: Qwen3-TTS (Qwen3TTSForConditionalGeneration, the 0.6B Base's talker and code predictor) as an F32
       GGUF (talker.* / pred.* tensors, qwen3tts.* keys); the speaker encoder and the codec are not converted yet.
     - rocm-convert: Whisper (WhisperForConditionalGeneration) as an F32 GGUF of the encoder-decoder (whisper.* keys,

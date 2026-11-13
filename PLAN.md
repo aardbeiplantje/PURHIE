@@ -236,7 +236,15 @@ transformers 5.5.1, Pillow; no torchvision in that venv). A phase is done when i
   codes frame for frame (199 frames; the engine returns 200 because the reference's max count drops one). Not yet: the
   sampling loop (top-k, temperature 0.9, the sub-talker's sampling: torch's RNG is not reproduced), the speaker encoder
   (the x-vector for the speaker embedding, an input here), the BF16 weights, and a Perl binding.
-- T3 codec decoder (`Qwen3-TTS-Tokenizer-12Hz`): convolutions and transformer blocks in the engine; check the samples.
+- T3 codec decoder (done 2026-11-13, host float32): `ROCm::Inference::Convert::Qwen3TTSTokenizer12` (the decoder's F32
+  tensors as `codec.*`; the encoder skipped on purpose) writes `/data/audio-ref/tts/qwen3tts-codec.gguf` (456 MB).
+  `src/qwen3tts_codec.{h,cpp}`: the residual quantizer (first codebook plus the 15 others, each with its projection), the
+  causal pre-conv, the 8-layer sliding-window transformer (16 heads of 64 inside a 512-wide state), the two ConvNeXt
+  upsamplers, the four decoder blocks (Snake, transposed convolution, dilated residual units), the output convolution and
+  the clamp; chunks of 300 frames with 25 of left context as `chunked_decode`. `tests/qwen3tts_codec_verify.cpp` (`make
+  build/qwen3tts_codec_verify`, about 55 s): the reference clip's own 74 frames decode to qwen-tts's wave (cosine 1.0000000,
+  1.4e-5 of the scale), and the talker's 50 frames decode, after qwen-tts's cut of the reference's share, to the T1 wave
+  (cosine 1.0000000, 1e-5 of the scale).
 - T4 `/v1/audio/speech` returning WAV.
 
 **Image generation (sd-turbo, `/data/hf-small/sd-turbo`):**

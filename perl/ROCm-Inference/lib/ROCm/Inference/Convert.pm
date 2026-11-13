@@ -65,6 +65,7 @@ sub open_model {
     my %hp = %$cfg;
     %hp = (%hp, %{$cfg->{text_config}}) if ref $cfg->{text_config} eq 'HASH';
     %hp = (%hp, %{$cfg->{talker_config}}) if ref $cfg->{talker_config} eq 'HASH';  # (Qwen3-TTS: the layers are there)
+    %hp = (%hp, %{$cfg->{decoder_config}}) if ref $cfg->{decoder_config} eq 'HASH';  # (the Qwen3-TTS codec: its decoder's)
     my $self = bless {dir => $dir, config => $cfg, hp => \%hp, hf_arch => $hf_arch, kv => [], kv_at => {},
                       opt => \%opt}, $pkg;
     $self->{st} = st_open($dir);
@@ -2267,6 +2268,109 @@ sub convert {
                       in_bytes => $t->{bytes}, uses => [$t], data => sub { pack 'f<*', $self->floats($t) }};
     }
     croak 'no talker tensors in ' . $self->{dir} unless @specs;
+    return ROCm::Inference::Convert::write_file($out, \@kv, \@specs, 32, %a, reader => $self);
+}
+
+
+# Qwen3-TTS-Tokenizer-12Hz (Qwen3TTSTokenizerV2Model: the 12.5 Hz codec of the speech; phase T3 of PLAN.md), its decoder
+# (codes to a 24 kHz waveform). F32, the checkpoint's own. The encoder (encoder.*, and the encode path of the quantizer's
+# input projections) is skipped on purpose: the engine decodes. The names: codec.q_first / q_rest (the codebooks and their
+# output projections), codec.pre_conv, codec.tf (the pre-transformer), codec.up.S (the transposed convolutions and the
+# ConvNeXt blocks), codec.dec.B (the decoder blocks: snake, transposed convolution, residual units), codec.dec.out_*.
+package ROCm::Inference::Convert::Qwen3TTSTokenizer12;
+use strict;
+use warnings;
+use Carp qw(croak);
+use File::Basename qw(basename);
+our @ISA = ('ROCm::Inference::Convert');
+__PACKAGE__->register('Qwen3TTSTokenizerV2Model');
+
+sub arch { 'qwen3tts_codec' }
+
+my %TF_BLOCK = (
+    'self_attn.q_proj' => 'attn_q', 'self_attn.k_proj' => 'attn_k', 'self_attn.v_proj' => 'attn_v',
+    'self_attn.o_proj' => 'attn_o', 'input_layernorm' => 'attn_norm', 'post_attention_layernorm' => 'ffn_norm',
+    'mlp.gate_proj' => 'ffn_gate', 'mlp.up_proj' => 'ffn_up', 'mlp.down_proj' => 'ffn_down',
+    'self_attn_layer_scale' => 'attn_scale', 'mlp_layer_scale' => 'ffn_scale',
+);
+
+# The GGUF name of a checkpoint decoder tensor (undef: skipped by the caller, or unknown)
+sub gname {
+    my ($hf) = @_;
+    my $n = $hf;
+    if ($n =~ /^decoder\.quantizer\.(rvq_first|rvq_rest)\.output_proj\.weight$/) { return "codec.$1.out.weight" }
+    if ($n =~ /^decoder\.quantizer\.(rvq_first|rvq_rest)\.vq\.layers\.(\d+)\._codebook\.(cluster_usage|embedding_sum)$/) {
+        return "codec.$1.$2.$3";
+    }
+    return "codec.pre_conv.$1" if $n =~ /^decoder\.pre_conv\.conv\.(weight|bias)$/;
+    return "codec.tf.in.$1" if $n =~ /^decoder\.pre_transformer\.input_proj\.(weight|bias)$/;
+    return "codec.tf.out.$1" if $n =~ /^decoder\.pre_transformer\.output_proj\.(weight|bias)$/;
+    return "codec.tf.norm.weight" if $n eq 'decoder.pre_transformer.norm.weight';
+    if ($n =~ /^decoder\.pre_transformer\.layers\.(\d+)\.(.+?)(\.weight|\.scale)?$/) {
+        my ($l, $part, $suf) = ($1, $2, $3 // '');
+        my $g = $TF_BLOCK{$part} // return undef;
+        return "codec.tf.blk.$l.$g" . ($suf eq '.scale' ? '' : $suf eq '.weight' ? '.weight' : '');
+    }
+    if ($n =~ /^decoder\.upsample\.(\d+)\.0\.conv\.(weight|bias)$/) { return "codec.up.$1.conv.$2" }
+    if ($n =~ /^decoder\.upsample\.(\d+)\.1\.dwconv\.conv\.(weight|bias)$/) { return "codec.up.$1.cnx.dwconv.$2" }
+    if ($n =~ /^decoder\.upsample\.(\d+)\.1\.(norm|pwconv1|pwconv2)\.(weight|bias)$/) { return "codec.up.$1.cnx.$2.$3" }
+    if ($n =~ /^decoder\.upsample\.(\d+)\.1\.gamma$/) { return "codec.up.$1.cnx.gamma" }
+    if ($n =~ /^decoder\.decoder\.0\.conv\.(weight|bias)$/) { return "codec.dec.in.$1" }
+    if ($n =~ /^decoder\.decoder\.([1-4])\.block\.0\.(alpha|beta)$/) { return "codec.dec.$1.snake.$2" }
+    if ($n =~ /^decoder\.decoder\.([1-4])\.block\.1\.conv\.(weight|bias)$/) { return "codec.dec.$1.up.$2" }
+    if ($n =~ /^decoder\.decoder\.([1-4])\.block\.([2-4])\.(act1|act2)\.(alpha|beta)$/) {
+        return "codec.dec.$1.res." . ($2 - 2) . ".$3.$4";
+    }
+    if ($n =~ /^decoder\.decoder\.([1-4])\.block\.([2-4])\.(conv1|conv2)\.conv\.(weight|bias)$/) {
+        return "codec.dec.$1.res." . ($2 - 2) . ".$3.$4";
+    }
+    return 'codec.dec.out_snake.' . $1 if $n =~ /^decoder\.decoder\.5\.(alpha|beta)$/;
+    return "codec.dec.out.$1" if $n =~ /^decoder\.decoder\.6\.conv\.(weight|bias)$/;
+    return undef;
+}
+
+sub convert {
+    my ($self, $out, %a) = @_;
+    croak 'qwen3tts_codec: F32 only (the codec is small and its values are checked)' if $a{quant};
+    my $dc = $self->{config}{decoder_config} // croak 'config: no decoder_config';
+    my $U32 = ROCm::Inference::Convert::U32;
+    my $STR = ROCm::Inference::Convert::STR;
+    my $F32 = ROCm::Inference::Convert::F32;
+    my $ARR = ROCm::Inference::Convert::ARR;
+    my @kv = (
+        ['general.architecture', $STR, 'qwen3tts_codec'],
+        ['general.type', $STR, 'model'],
+        ['general.name', $STR, $a{name} // ROCm::Inference::Convert::_model_name(basename($self->{dir}))],
+        ['general.file_type', $U32, 0],
+        ['qwen3tts_codec.n_quantizers', $U32, $dc->{num_quantizers} // croak 'no num_quantizers'],
+        ['qwen3tts_codec.codebook_size', $U32, $dc->{codebook_size}],
+        ['qwen3tts_codec.codebook_dim', $U32, $dc->{codebook_dim} / 2],
+        ['qwen3tts_codec.latent_dim', $U32, $dc->{latent_dim}],
+        ['qwen3tts_codec.tf.n_layer', $U32, $dc->{num_hidden_layers}],
+        ['qwen3tts_codec.tf.n_embd', $U32, $dc->{hidden_size}],
+        ['qwen3tts_codec.tf.n_head', $U32, $dc->{num_attention_heads}],
+        ['qwen3tts_codec.tf.head_dim', $U32, $dc->{head_dim}],
+        ['qwen3tts_codec.tf.n_ff', $U32, $dc->{intermediate_size}],
+        ['qwen3tts_codec.tf.sliding_window', $U32, $dc->{sliding_window}],
+        ['qwen3tts_codec.tf.rope_theta', $F32, 0 + $dc->{rope_theta}],
+        ['qwen3tts_codec.tf.rms_eps', $F32, 0 + $dc->{rms_norm_eps}],
+        ['qwen3tts_codec.decoder_dim', $U32, $dc->{decoder_dim}],
+        ['qwen3tts_codec.upsample_rates', $ARR, [$U32, [map { int $_ } @{$dc->{upsample_rates}}]]],
+        ['qwen3tts_codec.upsampling_ratios', $ARR, [$U32, [map { int $_ } @{$dc->{upsampling_ratios}}]]],
+        ['qwen3tts_codec.sample_rate', $U32, $self->{config}{output_sample_rate} // 24000],
+    );
+    my @specs;
+    my %skipped;
+    for my $name (@{$self->st->{order}}) {
+        if ($name !~ /^decoder\./) { $skipped{$name =~ /^(\w+)/ ? $1 : $name}++; next }
+        if ($name =~ /^decoder\.quantizer\.rvq_\w+\.input_proj\.weight$/) { $skipped{encode}++; next }  # (the encoder's path)
+        my $g = gname($name) // croak "$name: no codec tensor name (a decoder tensor the engine does not know)";
+        my $t = $self->t($name);
+        push @specs, {name => $g, ne => [reverse @{$t->{shape}}], f32 => 1,
+                      type => ROCm::Inference::Convert::gguf_type_id('f32'), from => lc $t->{dtype},
+                      in_bytes => $t->{bytes}, uses => [$t], data => sub { pack 'f<*', $self->floats($t) }};
+    }
+    croak 'no decoder tensors in ' . $self->{dir} unless @specs;
     return ROCm::Inference::Convert::write_file($out, \@kv, \@specs, 32, %a, reader => $self);
 }
 
