@@ -40,8 +40,8 @@ llama.cpp-rocm-gfx1151-docker (branch rocm-inference), which builds rocm-hip fro
 new `CACHEBUST` to take new commits). Design: ARCHITECTURE.md; measurements: git history.
 
 6. **Multimodal and audio (section below, 2026-11-13)**: audio done through the voice clone from new audio, long-form
-   and translate; open: the talker's fused device block (U2: the device path is verified but slower per linear; the
-   whole block on the device is the next step), the image path's speed (the VAE and the UNet on the host: about half a
+   and translate; the talker's fused device block is the default (U2: 44 ms per frame against 51 to 55 on the host); open:
+   the device frame's launches and syncs, the image path's speed (the VAE and the UNet on the host: about half a
    minute per 512 x 512 image; the GPU's job), MiniMax-H3-Image (inspect the checkout, the license) and the vision
    tower's device path. The ComfyUI safetensors question: converted by rocm-convert as F16/BF16 GGUF (the engine reads
    them in place; sd-turbo is done that way).
@@ -345,18 +345,25 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   measured for the speech (talker frames per second) and the transcription (seconds of audio per second).
 - U2 GPU path (UMA: the GGUF map is pinned, so the GPU reads the same pages): decided after U1 by the measured split;
   the talker's and the whisper's matmuls are the candidates (the engine's existing F32/BF16 GEMM kernels).
-  **Measured 2026-11-13 (the device path, opt-in: `QWEN3TTS_DEVICE=gpu`):** the GGUF mapping registered read-only
-  (`hipHostRegister`, coarse-grained: the UMA pattern of qwen_model's /dev/shm regions), the BF16 linears through a new
-  `matvec_bf16f` / `matmul_f_bf16f` kernel pair (fp32 activations; the existing BF16 kernels round the activations to
-  bf16, which costs 1.8e-3 of the peak, too coarse for the talker's checks) via `qmatvec_launch_bf16f`. A warm matvec of
-  4 MB of BF16 takes 17 to 37 us (about 110 to 240 GB/s: the weights are read from DRAM as the frame needs them). The
-  talker verifier passes on the device path (cosine 1.0000000, 6.8e-7 of the scale). But the talker's linears are
-  synchronized one by one (the activations staged through two pinned buffers, a launch and a stream sync per linear, ~430
-  per frame), so a frame takes 77 ms on the device against 52 ms on the host (41 frames: 3.16 s against 2.15 s). The host
-  stays the default. The next step for the device: the whole talker block on the device (rms norm, rotary, the KV
-  cache attention, the SiLU MLP as the engine's qwen kernels do) so that one frame is a few launches, not hundreds.
-  Activations are staged through pinned buffers (a few KB per call, a copy of activations only; the weights are never
-  copied).
+  **Per-linear path, measured 2026-11-13 (`QWEN3TTS_DEVICE=linear`, kept for comparison):** the GGUF mapping registered
+  read-only (`hipHostRegister`, coarse-grained: the UMA pattern of qwen_model's /dev/shm regions), the BF16 linears through
+  `matvec_bf16f` / `matmul_f_bf16f` (fp32 activations: the existing BF16 kernels round the activations to bf16, 1.8e-3 of
+  the peak, too coarse for the talker's checks) via `qmatvec_launch_bf16f`. A warm matvec of 4 MB of BF16 takes 17 to 37 us.
+  But one synchronized launch per linear (~430 per frame) made a frame 77 ms against 52 ms on the host.
+  **Fused talker, done 2026-11-13 (the default; `QWEN3TTS_DEVICE` unset or `gpu`; `QWEN3TTS_DEVICE=cpu` forces the host):**
+  one token's block on the device (`src/talker_gpu.hip`: RMS norm, rotary, the KV cache store and attention, the SiLU MLP,
+  the residual adds, the BF16 matvecs of the per-linear kernels) for the talker's 28 layers and the code predictor's 5
+  layers and 15 heads. The activations are UMA arenas (registered pages); the weights are read in place. One frame syncs
+  about 17 times: after the predictor's first stack, after each of its 15 heads (the sampler reads the logits on the host)
+  and after the talker's head. Checks: the greedy frames equal qwen-tts's (199 frames); the sampled top-k 1 frames equal the
+  greedy; the talker, speaker, codec and speech verifiers pass in the default mode, in `linear` and in `cpu`; the Perl
+  speech test passes (13); three device runs identical. 41 frames: 43.7 ms per frame (1.79 s) against 51 to 55 ms on the
+  host (2.08 to 2.27 s), about 15 to 20% faster. A frame reads about 3 GB of weights (the predictor's five layers 16
+  times); at the 110 to 240 GB/s measured for a matvec that is 13 to 27 ms of the 44 ms. A race found and fixed on the
+  way: the host wrote the codec embedding into the pinned row the predictor's first stack still read; it showed only
+  when the debug syncs were in (a wrong frame 0 without them). A run holds `gpu::run_mu`: one fused talker at a time.
+  Next for the device: fewer launches and syncs per frame (the norm, rotary and the KV store fused into the attention; one
+  kernel per predictor step; the sampler on the device), then the measurement again.
 
 **Image generation (sd-turbo, `/data/hf-small/sd-turbo`):**
 - I1 reference: diffusers is not in the venv (pip install if the registry allows it); the one-step output for a fixed

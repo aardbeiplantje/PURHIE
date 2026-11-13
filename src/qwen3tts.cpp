@@ -12,6 +12,9 @@
 
 #include <hip/hip_runtime.h>
 
+#include "kernel_loader.h"
+#include <sys/mman.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -74,26 +77,30 @@ inline void mat_row(const Mat& M, int r, float* out) {
     }
 }
 
-// The device path of the BF16 matrices (UMA: the GPU reads the registered GGUF mapping in place; the activations pass through
-// two pinned buffers, a few KB per call against MB of weights). Off unless QWEN3TTS_DEVICE=gpu. The buffers are
-// shared by the process: one talker runs on the device at a time (the mutex).
+// The device paths (UMA: the GPU reads the registered GGUF mapping in place; the activations pass through two pinned buffers,
+// a few KB per call against MB of weights). QWEN3TTS_DEVICE selects: "gpu" (the default when a device is present: the
+// talker's and the code predictor's blocks run on the device, one token at a time, see dev:: below), "linear" (one
+// staged launch per BF16 linear: measured 77 ms against the host's 52 ms per frame, kept for comparison), "cpu" (host
+// only). The staging buffers are shared by the process (gpu::mu); one fused talker runs at a time (gpu::run_mu).
 namespace gpu {
-std::mutex mu;
+std::mutex mu;      // the registered mappings and the staging buffers (linear mode)
+std::mutex run_mu;  // one fused talker at a time (the device path of qwen3tts_generate)
 std::vector<std::pair<const void*, size_t>> mapped;  // the registered GGUF mappings (read-only)
 float* stage_in = nullptr;
 float* stage_out = nullptr;
 size_t stage_cap = 0;  // floats
 int state = -1;        // -1: not tried, 0: host only, 1: device
+bool per_linear = false;  // QWEN3TTS_DEVICE=linear: the staged BF16 linears (in_mapping is then true for the mappings)
 
 // The device path is on when a device is present, the kernels load and the staging buffers are pinned.
 bool ready() {
     std::lock_guard<std::mutex> lk(mu);
     if (state >= 0) return state == 1;
     state = 0;
-    // opt-in: QWEN3TTS_DEVICE=gpu (measured: one synchronized launch per linear is slower than the host's SIMD path on
-    // this machine, 77 ms against 52 ms per frame; the device path needs fused blocks, see PLAN.md U2)
     const char* dev = getenv("QWEN3TTS_DEVICE");
-    if (!dev || std::string(dev) != "gpu") return false;
+    const std::string want = dev ? dev : "gpu";
+    if (want != "gpu" && want != "linear") return false;
+    per_linear = want == "linear";
     int n = 0;
     if (hipGetDeviceCount(&n) != hipSuccess || n < 1) return false;
     if (qmatvec_init("matvec_q.co") != 0) return false;
@@ -128,6 +135,7 @@ void unmap(const void* base) {
 
 bool in_mapping(const void* p) {
     std::lock_guard<std::mutex> lk(mu);
+    if (!per_linear) return false;  // the fused path reads its weights through dev::, not through linear()
     for (const auto& r : mapped)
         if (p >= r.first && static_cast<const char*>(p) < static_cast<const char*>(r.first) + r.second) return true;
     return false;
@@ -553,6 +561,150 @@ struct qwen3tts_model {
 };
 
 namespace {
+
+// ---- The device path of the talker (QWEN3TTS_DEVICE=gpu): one token's block on the device, as talker_gpu.hip's kernels
+// and the BF16 matvecs (qmatvec_launch_bf16f) on registered host memory: the caches, the activations and the rope tables
+// are in an arena of coarse-grained registered pages (UMA: the host writes and reads them directly, the GPU reads and
+// writes the same pages; the host syncs the stream before reading a result).
+namespace dev {
+
+hipModule_t mod = nullptr;
+hipFunction_t f_rmsnorm = nullptr, f_rope = nullptr, f_kv = nullptr, f_attn = nullptr, f_silu = nullptr, f_add = nullptr;
+
+bool load() {
+    if (f_attn) return true;
+    if (kernel_module_load(&mod, "talker_gpu.co") != hipSuccess) return false;
+    hipFunction_t* fns[] = {&f_rmsnorm, &f_rope, &f_kv, &f_attn, &f_silu, &f_add};
+    const char* names[] = {"tk_rmsnorm", "tk_rope", "tk_kv_store", "tk_attn", "tk_silu_mul", "tk_add"};
+    for (int i = 0; i < 6; ++i)
+        if (hipModuleGetFunction(fns[i], mod, names[i]) != hipSuccess) return false;
+    return true;
+}
+
+// the arena: registered anonymous pages, carved into 256-byte aligned float arrays
+struct Arena {
+    char* base = nullptr;
+    size_t size = 0, used = 0;
+    bool open(size_t bytes) {
+        void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) return false;
+        if (hipHostRegister(p, bytes, hipExtHostRegisterCoarseGrained) != hipSuccess) {
+            munmap(p, bytes);
+            return false;
+        }
+        base = static_cast<char*>(p);
+        size = bytes;
+        used = 0;
+        return true;
+    }
+    float* alloc(size_t n) {
+        used = (used + 255) & ~(size_t)255;
+        if (used + n * sizeof(float) > size) throw std::runtime_error("qwen3tts device: the arena is too small");
+        float* p = reinterpret_cast<float*>(base + used);
+        used += n * sizeof(float);
+        return p;
+    }
+    void close() {
+        if (!base) return;
+        (void)hipHostUnregister(base);
+        munmap(base, size);
+        base = nullptr;
+    }
+    ~Arena() { close(); }
+};
+
+void launch(hipFunction_t f, unsigned blocks, unsigned threads, unsigned shm, void** args) {
+    if (hipModuleLaunchKernel(f, blocks, 1, 1, threads, 1, 1, shm, 0, args, nullptr) != hipSuccess)
+        throw std::runtime_error("qwen3tts device: a kernel launch failed");
+}
+
+// y = W x for one token (the BF16 matrix in place; fp32 activations)
+void mv(const Mat& W, const float* x, float* y) {
+    if (!W.h) throw std::runtime_error("qwen3tts device: a matrix is not BF16");
+    if (qmatvec_launch_bf16f(W.h, sizeof(uint16_t) * (size_t)W.cols, x, y, W.rows, W.cols, 1, 0) != hipSuccess)
+        throw std::runtime_error("qwen3tts device: the matvec launch failed");
+}
+
+// rows of n values: y = rms_norm(x) * w, one block per row (y may be x)
+void rms(const float* x, float* y, int rows, int n, const float* w, float eps) {
+    void* args[] = {(void*)&x, (void*)&w, (void*)&y, (void*)&n, (void*)&eps};
+    launch(f_rmsnorm, (unsigned)rows, 256, 0, args);
+}
+
+void rope(float* x, int heads, int D, int pos, const float* cs, const float* sn) {
+    const int threads = heads * (D / 2);
+    void* args[] = {(void*)&x, (void*)&cs, (void*)&sn, (void*)&heads, (void*)&D, (void*)&pos};
+    launch(f_rope, (unsigned)((threads + 255) / 256), 256, 0, args);
+}
+
+// one pre-norm block for one token at position pos: x [C] in place; the layer's cache rows kc / vc [maxL][Hkv * D]
+struct Work {
+    float *h, *q, *k, *v, *att, *o, *g, *u;
+};
+
+void block(const Block& B, const Dims& d, float* x, float* kc, float* vc, int pos, const float* cs, const float* sn,
+           const Work& w) {
+    const int C = d.C, KD = d.Hkv * d.D;
+    rms(x, w.h, 1, C, B.attn_norm, d.eps);
+    mv(B.q.w, w.h, w.q);
+    mv(B.k.w, w.h, w.k);
+    mv(B.v.w, w.h, w.v);
+    rms(w.q, w.q, d.H, d.D, B.q_norm, d.eps);
+    rms(w.k, w.k, d.Hkv, d.D, B.k_norm, d.eps);
+    rope(w.q, d.H, d.D, pos, cs, sn);
+    rope(w.k, d.Hkv, d.D, pos, cs, sn);
+    {
+        const float *k = w.k, *v = w.v;
+        void* args[] = {(void*)&k, (void*)&v, (void*)&kc, (void*)&vc, (void*)&pos, (void*)&KD};
+        launch(f_kv, (unsigned)((KD + 255) / 256), 256, 0, args);
+    }
+    {
+        const float* q = w.q;
+        const int n_ctx = pos + 1, H = d.H, Hkv = d.Hkv, D = d.D;
+        void* args[] = {(void*)&q, (void*)&kc, (void*)&vc, (void*)&w.att, (void*)&n_ctx, (void*)&H, (void*)&Hkv, (void*)&D};
+        launch(f_attn, (unsigned)d.H, 256, (unsigned)(n_ctx * sizeof(float)), args);
+    }
+    mv(B.o.w, w.att, w.o);
+    {
+        const float* o = w.o;
+        void* args[] = {(void*)&x, (void*)&o, (void*)&C};
+        launch(f_add, (unsigned)((C + 255) / 256), 256, 0, args);
+    }
+    rms(x, w.h, 1, C, B.ffn_norm, d.eps);
+    mv(B.gate.w, w.h, w.g);
+    mv(B.up.w, w.h, w.u);
+    {
+        const int FF = d.FF;
+        const float* u = w.u;
+        void* args[] = {(void*)&w.g, (void*)&u, (void*)&FF};
+        launch(f_silu, (unsigned)((FF + 255) / 256), 256, 0, args);
+    }
+    mv(B.down.w, w.g, w.o);
+    {
+        const float* o = w.o;
+        void* args[] = {(void*)&x, (void*)&o, (void*)&C};
+        launch(f_add, (unsigned)((C + 255) / 256), 256, 0, args);
+    }
+}
+
+// the head: rms_norm (the final norm) then the matrix, for one token: normed [C], out [rows]
+void head(const float* x, const float* norm_w, const Mat& W, float eps, int C, float* normed, float* out) {
+    rms(x, normed, 1, C, norm_w, eps);
+    mv(W, normed, out);
+}
+
+// cos and sin of pos * theta^(-2i/D) for pos < rows, as the host's rope (double angles, rounded to float)
+void rope_tables(int rows, int D, double theta, float* cs, float* sn) {
+    const int half = D / 2;
+    for (int p = 0; p < rows; ++p)
+        for (int i = 0; i < half; ++i) {
+            const double f = (double)p * std::pow(theta, -2.0 * i / D);
+            cs[(size_t)p * half + i] = (float)std::cos(f);
+            sn[(size_t)p * half + i] = (float)std::sin(f);
+        }
+}
+
+}  // namespace dev
 
 Dims talker_dims(const qwen3tts_model* m) { return Dims{m->C, m->H, m->Hkv, m->D, m->FF, m->eps, m->theta}; }
 Dims pred_dims(const qwen3tts_model* m) { return Dims{m->pC, m->pH, m->pHkv, m->pD, m->pFF, m->eps, m->theta}; }
@@ -1007,7 +1159,8 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
     try {
         const int C = m->C, V = m->codec_vocab, ncb = m->ncb;
         const Dims d = talker_dims(m);
-        const int KD = d.Hkv * d.D;
+        const Dims pd = pred_dims(m);
+        const int KD = d.Hkv * d.D, pKD = pd.Hkv * pd.D, HD = d.H * d.D, pHD = pd.H * pd.D;
         // the prefill's rows: the role, the codec prefix, and the reference's frames with the text (its length: the frames
         // plus one, with the nine rows before)
         const int maxP = 10 + R;
@@ -1018,26 +1171,86 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
                                    &P, trailing.data(), maxT, &nt, pad.data()) != 0)
             return -1;
         const int maxL = P + max_frames + 1;
-        std::vector<std::vector<float>> kc(m->n_layer, std::vector<float>((size_t)maxL * KD)), vc(m->n_layer, std::vector<float>((size_t)maxL * KD));
-        // the prefill
+        const bool dev_on = gpu::ready() && m->gpu_base && dev::load();
+        if (dev_on && pd.C != C) throw std::runtime_error("qwen3tts device: the predictor's width is not the talker's");
+        // one fused talker on the device at a time: the runs share stream 0 and each syncs it (the host's runs are not held)
+        std::unique_lock<std::mutex> run_lock(gpu::run_mu, std::defer_lock);
+        if (dev_on) run_lock.lock();
+        // the caches and the activations: the arena (registered pages) on the device path, the host's vectors otherwise
+        dev::Arena arena;
+        std::vector<std::vector<float>> kc_h, vc_h, pk_h, pv_h;
+        std::vector<float> xrow_h(C), hid_h(C), logits_h(V), lv_h(m->pvocab), pin_h((size_t)C), pn_h(C);
+        std::vector<float*> kc(m->n_layer), vc(m->n_layer), pkc(m->pn_layer), pvc(m->pn_layer);
+        float *xrow = xrow_h.data(), *hid = hid_h.data(), *logits = logits_h.data(), *plogits = lv_h.data(), *pin = pin_h.data(),
+              *pn = pn_h.data(), *rcs = nullptr, *rsn = nullptr, *prcs = nullptr, *prsn = nullptr;
+        dev::Work work{};
+        if (dev_on) {
+            const int mxC = std::max(C, pd.C), mxHD = std::max(HD, pHD), mxKD = std::max(KD, pKD), mxFF = std::max(d.FF, pd.FF);
+            const size_t floats = (size_t)2 * m->n_layer * maxL * KD + (size_t)2 * m->pn_layer * (ncb + 1) * pKD +
+                                  (size_t)maxL * (d.D / 2) * 2 + (size_t)(ncb + 1) * (pd.D / 2) * 2 +
+                                  (size_t)(3 * C + V + m->pvocab + 2 * mxC + mxC + C) + (size_t)(mxC + 2 * mxKD + 2 * mxHD + mxC + 2 * mxFF);
+            const size_t slack_allocs = (size_t)2 * m->n_layer + 2 * m->pn_layer + 4 + 14 + 8;
+            if (!arena.open(floats * sizeof(float) + 256 * slack_allocs + 4096)) throw std::runtime_error("qwen3tts device: arena");
+            for (int l = 0; l < m->n_layer; ++l) {
+                kc[l] = arena.alloc((size_t)maxL * KD);
+                vc[l] = arena.alloc((size_t)maxL * KD);
+            }
+            for (int l = 0; l < m->pn_layer; ++l) {
+                pkc[l] = arena.alloc((size_t)(ncb + 1) * pKD);
+                pvc[l] = arena.alloc((size_t)(ncb + 1) * pKD);
+            }
+            rcs = arena.alloc((size_t)maxL * (d.D / 2));
+            rsn = arena.alloc((size_t)maxL * (d.D / 2));
+            prcs = arena.alloc((size_t)(ncb + 1) * (pd.D / 2));
+            prsn = arena.alloc((size_t)(ncb + 1) * (pd.D / 2));
+            xrow = arena.alloc(C);
+            hid = arena.alloc(C);
+            logits = arena.alloc(V);
+            plogits = arena.alloc(m->pvocab);
+            pin = arena.alloc(mxC);
+            pn = arena.alloc(pd.C);
+            work.h = arena.alloc(mxC);
+            work.q = arena.alloc(mxHD);
+            work.k = arena.alloc(mxKD);
+            work.v = arena.alloc(mxKD);
+            work.att = arena.alloc(mxHD);
+            work.o = arena.alloc(mxC);
+            work.g = arena.alloc(mxFF);
+            work.u = arena.alloc(mxFF);
+            dev::rope_tables(maxL, d.D, d.theta, rcs, rsn);
+            dev::rope_tables(ncb + 1, pd.D, pd.theta, prcs, prsn);
+        } else {
+            kc_h.assign(m->n_layer, std::vector<float>((size_t)maxL * KD));
+            vc_h.assign(m->n_layer, std::vector<float>((size_t)maxL * KD));
+            for (int l = 0; l < m->n_layer; ++l) {
+                kc[l] = kc_h[l].data();
+                vc[l] = vc_h[l].data();
+            }
+        }
+        // the prefill (on the host, into the caches)
         std::vector<float> x(prefill.begin(), prefill.begin() + (size_t)P * C);
-        for (int l = 0; l < m->n_layer; ++l) block_step(m->blk[l], d, x.data(), P, 0, kc[l].data(), vc[l].data());
-        std::vector<float> hid(C), logits(V), xrow(C);
-        auto head = [&](const float* last) {
-            rms_norm(last, 1, C, m->eps, m->out_norm, hid.data());
-            linear(hid.data(), 1, m->codec_head, logits.data());
+        for (int l = 0; l < m->n_layer; ++l) block_step(m->blk[l], d, x.data(), P, 0, kc[l], vc[l]);
+        auto head_host = [&](const float* last) {
+            rms_norm(last, 1, C, m->eps, m->out_norm, hid);
+            linear(hid, 1, m->codec_head, logits);
         };
-        head(x.data() + (size_t)(P - 1) * C);
+        head_host(x.data() + (size_t)(P - 1) * C);
         int pos = P;
         std::vector<int> history;
         const int eos = m->codec_eos;
         uint64_t rng = s->seed;
         int n_out = 0;
         std::vector<int> frame(ncb);
-        std::vector<float> lv(m->pvocab);
+        std::vector<float> lv(m->pvocab);  // the host predictor's logits (the device path writes plogits)
+        auto sync = [&]() {
+            if (hipStreamSynchronize(0) != hipSuccess) throw std::runtime_error("qwen3tts device: the stream failed");
+        };
+        auto pred_stack = [&](int p) {  // one token of the predictor at position p, through its layers (pin in place)
+            for (int l = 0; l < m->pn_layer; ++l) dev::block(m->pblk[l], pd, pin, pkc[l], pvc[l], p, prcs, prsn, work);
+        };
         for (int t = 0; t < max_frames; ++t) {
             // the talker's logits, processed as qwen-tts does (repetition penalty, the suppressed range, the minimum)
-            std::vector<float> lg(logits);
+            std::vector<float> lg(logits, logits + V);
             // (once per distinct token, as the transformers' processor: its scatter over the unique ids)
             std::vector<int> seen(history);
             std::sort(seen.begin(), seen.end());
@@ -1052,26 +1265,25 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
             const int c0 = sample_token(lg.data(), V, s->temperature, s->top_k, &rng);
             if (c0 == eos) break;
             history.push_back(c0);
-            // the code predictor, with its own cache: the rows H, E(c0), then each new codebook's embedding; the row
-            // k's output gives codebook k through head k - 1 (causal: one new row per codebook)
+            // the code predictor: the rows H, E(c0), then each new codebook's embedding; the output row k gives codebook k
+            // through head k - 1 (causal: one new row per codebook)
             std::fill(frame.begin(), frame.end(), 0);
             frame[0] = c0;
-            {
-                const int pKD = m->pHkv * m->pD;
-                const Dims pd = pred_dims(m);
-                std::vector<std::vector<float>> pk(m->pn_layer, std::vector<float>((size_t)(ncb + 1) * pKD)),
-                    pv(m->pn_layer, std::vector<float>((size_t)(ncb + 1) * pKD));
-                std::vector<float> px((size_t)2 * C), pn((size_t)C);
-                std::memcpy(px.data(), hid.data(), sizeof(float) * C);
+            if (!dev_on) {
+                const int pKDh = m->pHkv * m->pD;
+                std::vector<std::vector<float>> pk(m->pn_layer, std::vector<float>((size_t)(ncb + 1) * pKDh)),
+                    pv(m->pn_layer, std::vector<float>((size_t)(ncb + 1) * pKDh));
+                std::vector<float> px((size_t)2 * C), pnh((size_t)C);
+                std::memcpy(px.data(), hid, sizeof(float) * C);
                 mat_row(m->codec_embd, c0, px.data() + C);
                 for (int l = 0; l < m->pn_layer; ++l) block_step(m->pblk[l], pd, px.data(), 2, 0, pk[l].data(), pv[l].data());
                 std::vector<float> row(C);
                 for (int k = 1; k < ncb; ++k) {
                     // the output row k (the last one processed) predicts codebook k through head k - 1
                     const float* last = k == 1 ? px.data() + C : row.data();
-                    rms_norm(last, 1, C, m->eps, m->pred_out_norm, pn.data());
+                    rms_norm(last, 1, C, m->eps, m->pred_out_norm, pnh.data());
                     const Lin& hd = m->pred_head[k - 1];
-                    linear(pn.data(), 1, hd, lv.data());
+                    linear(pnh.data(), 1, hd, lv.data());
                     const int best = sample_token(lv.data(), m->pvocab, s->sub_temperature, s->sub_top_k, &rng);
                     frame[k] = best;
                     if (k + 1 < ncb) {
@@ -1080,17 +1292,42 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
                         for (int l = 0; l < m->pn_layer; ++l) block_step(m->pblk[l], pd, row.data(), 1, k + 1, pk[l].data(), pv[l].data());
                     }
                 }
+            } else {
+                // the same on the device: pin holds the predictor's current row (the output of its last token)
+                std::memcpy(pin, hid, sizeof(float) * C);
+                pred_stack(0);
+                sync();  // the host writes pin next: the stack above must have finished with it
+                mat_row(m->codec_embd, c0, pin);
+                pred_stack(1);
+                for (int k = 1; k < ncb; ++k) {
+                    dev::head(pin, m->pred_out_norm, m->pred_head[k - 1].w, m->eps, pd.C, pn, plogits);
+                    sync();
+                    const int best = sample_token(plogits, m->pvocab, s->sub_temperature, s->sub_top_k, &rng);
+                    frame[k] = best;
+                    if (k + 1 < ncb) {
+                        mat_row(m->pred_embd[k - 1], best, pin);
+                        pred_stack(k + 1);
+                    }
+                }
             }
             std::memcpy(out_codes + (size_t)n_out * ncb, frame.data(), sizeof(int) * ncb);
             ++n_out;
             if (t + 1 == max_frames) break;
             // the next input: the frame's sum plus the trailing text (the pad after the trailing rows)
             const float* tr = t < nt ? &trailing[(size_t)t * C] : pad.data();
-            if (qwen3tts_frame_input(m, frame.data(), tr, xrow.data()) != 0) return -1;
-            for (int l = 0; l < m->n_layer; ++l) block_step(m->blk[l], d, xrow.data(), 1, pos, kc[l].data(), vc[l].data());
-            ++pos;
-            head(xrow.data());
+            if (qwen3tts_frame_input(m, frame.data(), tr, xrow) != 0) return -1;
+            if (dev_on) {
+                for (int l = 0; l < m->n_layer; ++l) dev::block(m->blk[l], d, xrow, kc[l], vc[l], pos, rcs, rsn, work);
+                ++pos;
+                dev::head(xrow, m->out_norm, m->codec_head.w, m->eps, C, hid, logits);
+                sync();
+            } else {
+                for (int l = 0; l < m->n_layer; ++l) block_step(m->blk[l], d, xrow, 1, pos, kc[l], vc[l]);
+                ++pos;
+                head_host(xrow);
+            }
         }
+        arena.close();
         return n_out;
     } catch (const std::exception& e) {
         g_error = e.what();
