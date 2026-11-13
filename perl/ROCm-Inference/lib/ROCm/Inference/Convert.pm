@@ -251,7 +251,7 @@ sub vocab_gpt2 {
     }
     my $max = 0;
     $max < $_ and $max = $_ for keys %rev;
-    my $n = $self->find('vocab_size') // $max + 1;
+    my $n = $opt{n} // $self->find('vocab_size') // $max + 1;
     croak "tokenizer.json has id $max past vocab_size $n" unless $max < $n;
     my (@tok, @type);
     for my $i (0 .. $n - 1) {
@@ -2253,6 +2253,25 @@ sub convert {
         ['qwen3tts.languages', $ARR, [$STR, [@langs]]],
         ['qwen3tts.language_ids', $ARR, [$U32, [map { int $lang->{$_} } @langs]]],
     );
+    # the text tokenizer: the checkpoint's vocab.json and merges.txt (no tokenizer.json), the Qwen2 byte-level BPE the
+    # talker's text side was trained with (the engine encodes the chat template with it)
+    my $vocab = ROCm::Inference::Convert::json_file(File::Spec->catfile($self->{dir}, 'vocab.json')) or croak "$self->{dir}: no vocab.json";
+    open my $mh, '<', File::Spec->catfile($self->{dir}, 'merges.txt') or croak "$self->{dir}: no merges.txt: $!";
+    my @merges;
+    while (my $l = <$mh>) {
+        chomp $l;
+        next if $l =~ /^#/ || $l eq '';
+        push @merges, $l;
+    }
+    close $mh;
+    $self->{tokenizer} = {model => {vocab => $vocab, merges => \@merges}};
+    $self->{kv} = [];
+    $self->{kv_at} = {};
+    # (the vocabulary's size: the largest id of the model's and the added tokens, not the codec's vocab_size)
+    my $tc = ROCm::Inference::Convert::json_file(File::Spec->catfile($self->{dir}, 'tokenizer_config.json')) // {};
+    my $n_vocab = 1 + (sort { $b <=> $a } ((values %$vocab), map { 0 + $_ } keys %{$tc->{added_tokens_decoder} // {}}))[0];
+    $self->vocab_gpt2(pre => 'qwen2', n => $n_vocab);
+    push @kv, @{$self->{kv}};
     my @specs;
     my %skipped;
     for my $name (@{$self->st->{order}}) {

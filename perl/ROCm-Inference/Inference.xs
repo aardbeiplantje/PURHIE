@@ -21,6 +21,15 @@
 #include "image.h"
 #include "mrope.h"
 #include "whisper.h"
+#include "qwen3tts_speech.h"
+#include <stdlib.h>
+#include <string.h>
+
+/* a speech handle: the talker and the codec of one voice-capable model pair */
+typedef struct {
+    qwen3tts_model_t* m;
+    qwen3tts_codec_t* c;
+} speech_handle;
 
 #define HANDLE_CLASS "ROCm::Inference::Model"
 
@@ -1366,3 +1375,98 @@ _whisper_transcribe(wm, wav, language)
     EXTEND(SP, 2);
     PUSHs(sv_2mortal(out));
     PUSHs(sv_2mortal(newSViv(k)));
+
+# ---- Speech (Qwen3-TTS: the talker, the codec; src/qwen3tts_speech.{h,cpp}). A handle is the talker and the codec.
+
+IV
+_speech_open(talker, codec)
+    const char* talker
+    const char* codec
+  CODE:
+    qwen3tts_model_t* m = qwen3tts_open(talker);
+    if (!m) croak("ROCm::Inference: qwen3tts_open: %s", qwen3tts_last_error());
+    qwen3tts_codec_t* c = qwen3tts_codec_open(codec);
+    if (!c) {
+        qwen3tts_close(m);
+        croak("ROCm::Inference: qwen3tts_codec_open: %s", qwen3tts_codec_last_error());
+    }
+    speech_handle* h = (speech_handle*)malloc(sizeof(speech_handle));
+    if (!h) { qwen3tts_codec_close(c); qwen3tts_close(m); croak("ROCm::Inference: out of memory"); }
+    h->m = m;
+    h->c = c;
+    RETVAL = PTR2IV(h);
+  OUTPUT:
+    RETVAL
+
+void
+_speech_close(h)
+    IV h
+  CODE:
+    speech_handle* s = INT2PTR(speech_handle*, h);
+    if (s) {
+        qwen3tts_codec_close(s->c);
+        qwen3tts_close(s->m);
+        free(s);
+    }
+
+int
+_speech_n_embd(h)
+    IV h
+  CODE:
+    speech_handle* s = INT2PTR(speech_handle*, h);
+    RETVAL = qwen3tts_n_embd(s->m);
+  OUTPUT:
+    RETVAL
+
+void
+_speech_speak(h, text, ref_text, language, codes, spk, R, temperature, top_k, repetition_penalty, sub_temperature, sub_top_k, seed, max_frames)
+    IV h
+    const char* text
+    const char* ref_text
+    const char* language
+    SV* codes
+    SV* spk
+    int R
+    double temperature
+    int top_k
+    double repetition_penalty
+    double sub_temperature
+    int sub_top_k
+    UV seed
+    int max_frames
+  PPCODE:
+    /* (the samples as float32 bytes, the talker's frames): the voice's codes (R x 16 int32) and speaker embedding */
+    speech_handle* s = INT2PTR(speech_handle*, h);
+    STRLEN cl = 0, sl = 0;
+    const char* cb = SvPV(codes, cl);
+    const char* sb = SvPV(spk, sl);
+    const int ncb = qwen3tts_n_codebooks(s->m), C = qwen3tts_n_embd(s->m);
+    if (R < 1 || cl != (STRLEN)R * ncb * 4) croak("ROCm::Inference: the voice's codes: %d frames of %d codebooks, %lu bytes", R, ncb, (unsigned long)cl);
+    if (sl != (STRLEN)C * 4) croak("ROCm::Inference: the voice's speaker embedding: %d floats, %lu bytes", C, (unsigned long)sl);
+    const int lang = qwen3tts_language_id(s->m, language);
+    if (lang < 0) croak("ROCm::Inference: no language '%s'", language);
+    int* ids = (int*)malloc(sizeof(int) * (size_t)R * ncb);
+    float* spkf = (float*)malloc(sizeof(float) * (size_t)C);
+    if (!ids || !spkf) { free(ids); free(spkf); croak("ROCm::Inference: out of memory"); }
+    /* little-endian int32 and float32 (the voice files): memcpy on this host's order */
+    memcpy(ids, cb, cl);
+    memcpy(spkf, sb, sl);
+    qwen3tts_sampling_t smp;
+    smp.temperature = (float)temperature;
+    smp.top_k = top_k;
+    smp.repetition_penalty = (float)repetition_penalty;
+    smp.sub_temperature = (float)sub_temperature;
+    smp.sub_top_k = sub_top_k;
+    smp.seed = (uint64_t)seed;
+    float* wav = NULL;
+    size_t n = 0;
+    int frames = 0;
+    const int rc = qwen3tts_speak(s->m, s->c, text, ref_text, ids, R, spkf, lang, &smp, max_frames, &wav, &n, &frames);
+    free(ids);
+    free(spkf);
+    if (rc != 0) croak("ROCm::Inference: qwen3tts_speak: %s", qwen3tts_last_error());
+    SV* out = newSVpvn((const char*)wav, (STRLEN)(n * sizeof(float)));
+    qwen3tts_speech_free_wav(wav);
+    EXTEND(SP, 2);
+    PUSHs(sv_2mortal(out));
+    PUSHs(sv_2mortal(newSViv(frames)));

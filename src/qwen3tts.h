@@ -7,6 +7,7 @@
 #define QWEN3TTS_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -47,6 +48,34 @@ int qwen3tts_talker_forward(qwen3tts_model_t* model, const float* X, int L, floa
  * that predicted the frame's first codebook, and the frame's codes [T][16]; logits [T][15][pred_vocab] for codebooks
  * 1..15 (the codes 1..14 are the inputs). Returns 0, or -1. */
 int qwen3tts_code_predictor(qwen3tts_model_t* model, const float* H, const int* codes, int T, float* logits);
+
+/* The sampling of the codec frames (qwen-tts's generation config: do_sample, top_k 50, temperature 0.9, repetition_penalty
+ * 1.05; the code predictor's the same without the penalty). temperature <= 0 is the argmax; top_k 0 keeps every token.
+ * seed starts the generator (splitmix64). */
+typedef struct qwen3tts_sampling {
+    float temperature;
+    int top_k;
+    float repetition_penalty;
+    float sub_temperature;  /* the code predictor's */
+    int sub_top_k;
+    uint64_t seed;
+} qwen3tts_sampling_t;
+
+qwen3tts_sampling_t qwen3tts_sampling_default(void);  /* the generation config above, seed 0 */
+
+/* One token from logits[n] (the temperature, then the top_k most likely; the state advances by one draw). Returns the
+ * token, or -1 on a null argument. */
+int qwen3tts_sample(const float* logits, int n, float temperature, int top_k, uint64_t* state);
+
+/* The chat template's ids of a text, as qwen-tts tokenizes it: "<|im_start|>assistant\n" TEXT "<|im_end|>\n<|im_start|>assistant\n"
+ * (the model's GGUF tokenizer). Returns the number of ids (at most max_ids), or -1. */
+int qwen3tts_tokenize_chat(qwen3tts_model_t* model, const char* text, int* ids, int max_ids);
+
+/* Generation of the codec frames with the sampling s (non-null), the same prefill and loop as qwen3tts_generate_greedy:
+ * the talker samples the first codebook, the code predictor the other 15. Returns the number of frames, or -1. */
+int qwen3tts_generate(qwen3tts_model_t* model, const int* text_ids, int n_text, const int* ref_ids, int n_ref,
+                      const int* ref_codes, int R, const float* spk, int language_id, const qwen3tts_sampling_t* s,
+                      int max_frames, int* out_codes);
 
 /* Greedy generation of the codec frames (qwen-tts's generate with do_sample off, the sub-talker greedy too): the prefill,
  * then per frame the talker's argmax of the first codebook (the logits after the repetition penalty, the codec range

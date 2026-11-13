@@ -207,6 +207,52 @@ int main(int argc, char** argv) {
     }
     pass = pass && greedy_ok;
 
+    // the chat ids of the two texts (qwen-tts's tokenizer of the same strings: text_ids.npy, ref_ids.npy; meta.json's)
+    {
+        std::vector<int> ids(512);
+        const int nt = qwen3tts_tokenize_chat(m, "Hello, this is a short test of the speech synthesis.", ids.data(), 512);
+        const int nr = qwen3tts_tokenize_chat(m, "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL",
+                                              ids.data() + 256, 256);
+        // (the reference's ids as the prefill takes them: the template without its last three ids, the assistant header)
+        const bool tok_ok = nt == (int)text_ids.size() && nr - 3 == (int)ref_ids.size() &&
+                            std::equal(text_ids.begin(), text_ids.end(), ids.begin()) &&
+                            std::equal(ref_ids.begin(), ref_ids.end(), ids.begin() + 256);
+        std::printf("tokenizer: the text %d ids, the reference %d ids (34 for the prefill), equal to qwen-tts's  %s\n", nt, nr, tok_ok ? "ok" : "FAIL");
+        pass = pass && tok_ok;
+    }
+
+    // the sampler: the top k keeps only the k most likely tokens; temperature 0 is the argmax; the draws follow the softmax
+    {
+        const float lg[6] = {0.0f, 1.0f, 2.0f, 3.0f, -INFINITY, 0.5f};
+        uint64_t st = 7;
+        bool k_ok = true;
+        for (int i = 0; i < 2000; ++i) {
+            const int v = qwen3tts_sample(lg, 6, 1.0f, 2, &st);
+            if (v != 2 && v != 3) k_ok = false;
+        }
+        const bool argmax_ok = qwen3tts_sample(lg, 6, 0.0f, 50, &st) == 3;
+        const float two[2] = {0.0f, 1.0986123f};  // softmax: 1/4 and 3/4
+        int ones = 0;
+        for (int i = 0; i < 4000; ++i) ones += qwen3tts_sample(two, 2, 1.0f, 0, &st) == 1;
+        const bool dist_ok = ones > 2850 && ones < 3150;
+        std::printf("sampler: top_k 2 keeps {2, 3} %s; temperature 0 is the argmax %s; 3/4 of 4000 draws (%d) %s\n",
+                    k_ok ? "ok" : "FAIL", argmax_ok ? "ok" : "FAIL", ones, dist_ok ? "ok" : "FAIL");
+        pass = pass && k_ok && argmax_ok && dist_ok;
+    }
+
+    // the sampled generation with top_k 1 is the greedy one (the sampling path's own check: the same frames)
+    {
+        qwen3tts_sampling_t s = qwen3tts_sampling_default();
+        s.top_k = 1;
+        s.sub_top_k = 1;
+        std::vector<int> gen1((size_t)200 * ncb);
+        const int n1 = qwen3tts_generate(m, text_ids.data(), (int)text_ids.size(), ref_ids.data(), (int)ref_ids.size(),
+                                         ref_codes.data(), R, spk.data(), lang, &s, 200, gen1.data());
+        const bool same = n1 == ng && std::equal(gen.begin(), gen.begin() + (size_t)n1 * ncb, gen1.begin());
+        std::printf("sampled generation with top_k 1: %d frames, %s\n", n1, same ? "equal to the greedy frames  ok" : "FAIL");
+        pass = pass && same;
+    }
+
     qwen3tts_close(m);
     std::printf("%s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;

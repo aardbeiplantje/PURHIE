@@ -6,6 +6,7 @@
 #include "qwen3tts.h"
 
 #include "gguf_mmap.h"
+#include "tokenizer.h"
 
 #include <algorithm>
 #include <cctype>
@@ -166,6 +167,7 @@ void block_step(const Block& B, const Dims& d, float* x, int n, int pos0, float*
 
 struct qwen3tts_model {
     gguf_model_t* g = nullptr;
+    tokenizer_t* tok = nullptr;  // the GGUF's vocabulary (NULL: none)
     int n_layer = 0, C = 0, H = 0, Hkv = 0, D = 0, FF = 0, text_vocab = 0, text_C = 0, codec_vocab = 0, ncb = 0;
     float eps = 1e-6f;
     double theta = 1e6;
@@ -223,6 +225,48 @@ void codec_rows(const qwen3tts_model* m, const std::vector<int>& ids, float* out
 }  // namespace
 
 extern "C" {
+
+// splitmix64's next draw (the state advances) and one token from logits[n]: the temperature, then the top_k most likely
+// kept (0: all), drawn from the softmax; temperature <= 0: the first maximum
+uint64_t next_u64(uint64_t* state) {
+    uint64_t z = (*state += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+int sample_token(const float* logits, int n, float temperature, int top_k, uint64_t* state) {
+    if (temperature <= 0.0f) {
+        int best = 0;
+        for (int v = 1; v < n; ++v)
+            if (logits[v] > logits[best]) best = v;
+        return best;
+    }
+    std::vector<int> idx;
+    idx.reserve((size_t)n);
+    for (int v = 0; v < n; ++v)
+        if (logits[v] > -INFINITY) idx.push_back(v);
+    if (idx.empty()) return 0;
+    if (top_k > 0 && top_k < (int)idx.size()) {
+        std::nth_element(idx.begin(), idx.begin() + (top_k - 1), idx.end(),
+                         [&](int a, int b) { return logits[a] > logits[b]; });
+        idx.resize((size_t)top_k);
+    }
+    float mx = -INFINITY;
+    for (int v : idx) mx = std::max(mx, logits[v]);
+    std::vector<double> p(idx.size());
+    double sum = 0.0;
+    for (size_t i = 0; i < idx.size(); ++i) {
+        p[i] = std::exp((double)(logits[idx[i]] - mx) / (double)temperature);
+        sum += p[i];
+    }
+    double r = (double)(next_u64(state) >> 11) * (1.0 / 9007199254740992.0) * sum;
+    for (size_t i = 0; i < idx.size(); ++i) {
+        r -= p[i];
+        if (r < 0.0) return idx[i];
+    }
+    return idx.back();
+}
 
 qwen3tts_model_t* qwen3tts_open(const char* gguf_path) {
     try {
@@ -321,6 +365,7 @@ qwen3tts_model_t* qwen3tts_open(const char* gguf_path) {
         for (int l = 0; l < m->pn_layer; ++l)
             m->pblk.push_back(block_of("pred.blk." + std::to_string(l) + ".", m->pC, m->pH, m->pHkv, m->pD, m->pFF));
         m->pred_out_norm = tensor(m->g, "pred.out_norm.weight", m->pC);
+        m->tok = tokenizer_load_from_gguf(m->g);  // (NULL when the GGUF has no vocabulary)
         return m.release();
     } catch (const std::exception& e) {
         g_error = e.what();
@@ -328,7 +373,11 @@ qwen3tts_model_t* qwen3tts_open(const char* gguf_path) {
     }
 }
 
-void qwen3tts_close(qwen3tts_model_t* model) { delete model; }
+void qwen3tts_close(qwen3tts_model_t* model) {
+    if (!model) return;
+    tokenizer_free(model->tok);
+    delete model;
+}
 
 const char* qwen3tts_last_error(void) { return g_error.c_str(); }
 
@@ -517,22 +566,54 @@ int qwen3tts_code_predictor(qwen3tts_model_t* m, const float* H, const int* code
     }
 }
 
-int qwen3tts_generate_greedy(qwen3tts_model_t* m, const int* text_ids, int n_text, const int* ref_ids, int n_ref,
-                             const int* ref_codes, int R, const float* spk, int language_id, float repetition_penalty,
-                             int max_frames, int* out_codes) {
-    if (!m || !text_ids || !ref_ids || !ref_codes || !spk || !out_codes || max_frames <= 0 || repetition_penalty <= 0.0f) {
-        g_error = "qwen3tts_generate_greedy: bad arguments";
+int qwen3tts_sample(const float* logits, int n, float temperature, int top_k, uint64_t* state) {
+    if (!logits || n <= 0 || !state) return -1;
+    return sample_token(logits, n, temperature, top_k, state);
+}
+
+qwen3tts_sampling_t qwen3tts_sampling_default(void) {
+    qwen3tts_sampling_t s;
+    s.temperature = 0.9f;
+    s.top_k = 50;
+    s.repetition_penalty = 1.05f;
+    s.sub_temperature = 0.9f;
+    s.sub_top_k = 50;
+    s.seed = 0;
+    return s;
+}
+
+int qwen3tts_tokenize_chat(qwen3tts_model_t* m, const char* text, int* ids, int max_ids) {
+    if (!m || !text || !ids || max_ids <= 0) { g_error = "qwen3tts_tokenize_chat: bad arguments"; return -1; }
+    if (!m->tok) { g_error = "qwen3tts_tokenize_chat: the GGUF has no tokenizer"; return -1; }
+    const std::string s = std::string("<|im_start|>assistant\n") + text + "<|im_end|>\n<|im_start|>assistant\n";
+    std::vector<int> buf(s.size() + 2);  // (tokenizer_encode's bound: the text's length plus 2)
+    const int n = tokenizer_encode(m->tok, s.c_str(), buf.data(), (int)buf.size());
+    if (n < 0) { g_error = "qwen3tts_tokenize_chat: encoding failed"; return -1; }
+    if (n > max_ids) { g_error = "qwen3tts_tokenize_chat: ids is too small"; return -1; }
+    std::memcpy(ids, buf.data(), sizeof(int) * (size_t)n);
+    return n;
+}
+
+int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, const int* ref_ids, int n_ref,
+                      const int* ref_codes, int R, const float* spk, int language_id, const qwen3tts_sampling_t* s,
+                      int max_frames, int* out_codes) {
+    if (!m || !text_ids || !ref_ids || !ref_codes || !spk || !s || !out_codes || max_frames <= 0 ||
+        s->repetition_penalty <= 0.0f) {
+        g_error = "qwen3tts_generate: bad arguments";
         return -1;
     }
     try {
         const int C = m->C, V = m->codec_vocab, ncb = m->ncb;
         const Dims d = talker_dims(m);
         const int KD = d.Hkv * d.D;
-        const int maxP = 128;
-        std::vector<float> prefill((size_t)maxP * C), trailing(8 * (size_t)C), pad(C);
+        // the prefill's rows: the role, the codec prefix, and the reference's frames with the text (its length: the frames
+        // plus one, with the nine rows before)
+        const int maxP = 10 + R;
+        const int maxT = n_text + n_ref + 2;  // (the text left after the frames: at most the texts' ids)
+        std::vector<float> prefill((size_t)maxP * C), trailing((size_t)maxT * C), pad(C);
         int P = 0, nt = 0;
         if (qwen3tts_build_prefill(m, text_ids, n_text, ref_ids, n_ref, ref_codes, R, spk, language_id, prefill.data(), maxP,
-                                   &P, trailing.data(), 8, &nt, pad.data()) != 0)
+                                   &P, trailing.data(), maxT, &nt, pad.data()) != 0)
             return -1;
         const int maxL = P + max_frames + 1;
         std::vector<std::vector<float>> kc(m->n_layer, std::vector<float>((size_t)maxL * KD)), vc(m->n_layer, std::vector<float>((size_t)maxL * KD));
@@ -548,8 +629,10 @@ int qwen3tts_generate_greedy(qwen3tts_model_t* m, const int* text_ids, int n_tex
         int pos = P;
         std::vector<int> history;
         const int eos = m->codec_eos;
+        uint64_t rng = s->seed;
         int n_out = 0;
         std::vector<int> frame(ncb);
+        std::vector<float> lv(m->pvocab);
         for (int t = 0; t < max_frames; ++t) {
             // the talker's logits, processed as qwen-tts does (repetition penalty, the suppressed range, the minimum)
             std::vector<float> lg(logits);
@@ -559,17 +642,15 @@ int qwen3tts_generate_greedy(qwen3tts_model_t* m, const int* text_ids, int n_tex
             seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
             for (int h : seen) {
                 float& l = lg[h];
-                l = l < 0.0f ? l * repetition_penalty : l / repetition_penalty;
+                l = l < 0.0f ? l * s->repetition_penalty : l / s->repetition_penalty;
             }
             for (int v = V - 1024; v < V; ++v)
                 if (v != eos) lg[v] = -INFINITY;
             if (t < 2) lg[eos] = -INFINITY;
-            int c0 = 0;
-            for (int v = 1; v < V; ++v)
-                if (lg[v] > lg[c0]) c0 = v;
+            const int c0 = sample_token(lg.data(), V, s->temperature, s->top_k, &rng);
             if (c0 == eos) break;
             history.push_back(c0);
-            // the code predictor, greedy, with its own cache: the rows H, E(c0), then each new codebook's embedding; the row
+            // the code predictor, with its own cache: the rows H, E(c0), then each new codebook's embedding; the row
             // k's output gives codebook k through head k - 1 (causal: one new row per codebook)
             std::fill(frame.begin(), frame.end(), 0);
             frame[0] = c0;
@@ -588,14 +669,13 @@ int qwen3tts_generate_greedy(qwen3tts_model_t* m, const int* text_ids, int n_tex
                     const float* last = k == 1 ? px.data() + C : row.data();
                     rms_norm(last, 1, C, m->eps, m->pred_out_norm, pn.data());
                     const Lin& hd = m->pred_head[k - 1];
-                    int best = 0;
-                    float bv = -INFINITY;
                     for (int v = 0; v < m->pvocab; ++v) {
                         const float* wr = hd.w + (size_t)v * C;
                         float acc = 0.0f;
                         for (int i = 0; i < C; ++i) acc += pn[i] * wr[i];
-                        if (acc > bv) { bv = acc; best = v; }
+                        lv[v] = acc;
                     }
+                    const int best = sample_token(lv.data(), m->pvocab, s->sub_temperature, s->sub_top_k, &rng);
                     frame[k] = best;
                     if (k + 1 < ncb) {
                         // the next row: codebook k's embedding in the table k - 1, at position k + 1
@@ -619,6 +699,18 @@ int qwen3tts_generate_greedy(qwen3tts_model_t* m, const int* text_ids, int n_tex
         g_error = e.what();
         return -1;
     }
+}
+
+int qwen3tts_generate_greedy(qwen3tts_model_t* m, const int* text_ids, int n_text, const int* ref_ids, int n_ref,
+                             const int* ref_codes, int R, const float* spk, int language_id, float repetition_penalty,
+                             int max_frames, int* out_codes) {
+    qwen3tts_sampling_t g = qwen3tts_sampling_default();
+    g.temperature = 0.0f;
+    g.sub_temperature = 0.0f;
+    g.top_k = 0;
+    g.sub_top_k = 0;
+    g.repetition_penalty = repetition_penalty;
+    return qwen3tts_generate(m, text_ids, n_text, ref_ids, n_ref, ref_codes, R, spk, language_id, &g, max_frames, out_codes);
 }
 
 }  // extern "C"

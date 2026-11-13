@@ -25,7 +25,7 @@ our @EXPORT_OK = qw(
     generate last_prompt_stats last_error
     store_open store_close store_set_lazy store_stats store_block_names
     chat_render chat reply_tags
-    vision_load image_prompt set_mm mm_rope_delta whisper_load
+    vision_load image_prompt set_mm mm_rope_delta whisper_load speech_load speech_wav16 speech_voice
     STOP_NONE STOP_EOG STOP_MAX_TOKENS STOP_STRING STOP_CALLBACK STOP_CONTEXT_FULL
 );
 our %EXPORT_TAGS = (all => \@EXPORT_OK);
@@ -658,6 +658,67 @@ sub result {
     my ($c) = @_;
     return unless $c->{done};
     return ($c->{msg}{content}, $c->{reason}, $c->{msg});
+}
+
+package ROCm::Inference;
+
+package ROCm::Inference;
+
+# speech_load($talker_gguf, $codec_gguf): the Qwen3-TTS pair (rocm-convert of the 0.6B Base checkpoint and of its speech
+# tokenizer's decoder) as a ROCm::Inference::Speech object. $s->speak($text, voice => $v, language => 'english', ...)
+# returns the samples (24 kHz float32, packed) and the talker's frame count; speech_wav16 turns them into a WAV file.
+sub speech_load {
+    my ($talker, $codec) = @_;
+    return ROCm::Inference::Speech->new($talker, $codec);
+}
+
+# speech_voice($dir): a voice directory (tools/qwen3tts_voice.py): {ref_text, frames, codes (packed int32), spk (packed
+# float32)}
+sub speech_voice {
+    my ($dir) = @_;
+    my $js = do { local $/; open my $fh, '<', "$dir/voice.json" or die "$dir/voice.json: $!\n"; <$fh> };
+    my $v = ROCm::Inference::json_decode($js);
+    my $codes = do { local $/; open my $fh, '<:raw', "$dir/codes.i32" or die "$dir/codes.i32: $!\n"; <$fh> };
+    my $spk = do { local $/; open my $fh, '<:raw', "$dir/spk.f32" or die "$dir/spk.f32: $!\n"; <$fh> };
+    die "$dir: the voice's files do not match voice.json\n"
+        unless length($codes) == $v->{frames} * $v->{codebooks} * 4 && length($spk) == $v->{n_embd} * 4;
+    return { ref_text => $v->{ref_text}, frames => $v->{frames}, codes => $codes, spk => $spk };
+}
+
+# speech_wav16($samples, $rate): a mono 16-bit PCM WAV file's bytes of float32 samples (clipped to [-1, 1])
+sub speech_wav16 {
+    my ($samples, $rate) = @_;
+    $rate //= 24000;
+    my @f = unpack 'f<*', $samples;
+    my $pcm = pack 's<*', map { my $v = $_ > 1 ? 1 : $_ < -1 ? -1 : $_; int(sprintf('%.0f', $v * 32767)) } @f;
+    my $n = length $pcm;
+    return pack('a4 V a4 a4 V v v V V v v a4 V', 'RIFF', 36 + $n, 'WAVE', 'fmt ', 16, 1, 1, $rate, $rate * 2, 2, 16,
+                'data', $n) . $pcm;
+}
+
+package ROCm::Inference::Speech;
+
+sub new {
+    my ($class, $talker, $codec) = @_;
+    my $h = ROCm::Inference::_speech_open($talker, $codec);
+    return bless { h => $h, talker => $talker, codec => $codec }, $class;
+}
+
+# ($samples, $frames) = $s->speak($text, voice => $voice, language => 'english', temperature => 0.9, top_k => 50,
+# repetition_penalty => 1.05, sub_temperature => 0.9, sub_top_k => 50, seed => 0, max_frames => 2048)
+sub speak {
+    my ($s, $text, %o) = @_;
+    my $v = $o{voice} or die "speak: voice => {ref_text, frames, codes, spk}\n";
+    my ($samples, $frames) = ROCm::Inference::_speech_speak($s->{h}, $text, $v->{ref_text}, $o{language} // 'english',
+        $v->{codes}, $v->{spk}, $v->{frames}, $o{temperature} // 0.9, $o{top_k} // 50, $o{repetition_penalty} // 1.05,
+        $o{sub_temperature} // 0.9, $o{sub_top_k} // 50, $o{seed} // 0, $o{max_frames} // 2048);
+    return wantarray ? ($samples, $frames) : $samples;
+}
+
+sub DESTROY {
+    my ($s) = @_;
+    ROCm::Inference::_speech_close($s->{h}) if $s->{h};
+    $s->{h} = 0;
 }
 
 package ROCm::Inference;

@@ -245,7 +245,17 @@ transformers 5.5.1, Pillow; no torchvision in that venv). A phase is done when i
   build/qwen3tts_codec_verify`, about 55 s): the reference clip's own 74 frames decode to qwen-tts's wave (cosine 1.0000000,
   1.4e-5 of the scale), and the talker's 50 frames decode, after qwen-tts's cut of the reference's share, to the T1 wave
   (cosine 1.0000000, 1e-5 of the scale).
-- T4 `/v1/audio/speech` returning WAV.
+- T4 `/v1/audio/speech` returning WAV (done 2026-11-13, first version): the text's chat ids (the GGUF's tokenizer, now in
+  the talker GGUF as tokenizer.ggml.*), the sampling (`qwen3tts_generate`: top_k 50, temperature 0.9, repetition penalty
+  1.05 for the talker, top_k 50 and temperature 0.9 for the code predictor; splitmix64 from the seed), the codec, the cut
+  of the reference's share (`src/qwen3tts_speech.{h,cpp}`, `qwen3tts_speak`). A voice is a directory (voice.json,
+  codes.i32, spk.f32) written by `tools/qwen3tts_voice.py` (qwen-tts's speaker embedding and speech-tokenizer encoder,
+  outside the engine). Checks: the tokenizer's ids equal qwen-tts's, top_k 1 gives the greedy frames, `qwen3tts_speech_verify`
+  (same seed the same wave, another seed other frames, the level), Whisper reads the seed-0 speech back as "Hello, this is
+  a short test of the speech synthesis.", the endpoint returns the WAV (t/65-speech.t). Not yet: the speaker encoder and
+  the codec encoder in the engine (the voice comes from the Python tool), a voice-clone from new audio on the server,
+  the sampled frames are not torch's (its generator), streaming, response formats other than wav, long texts are not
+  chunked, one request at a time.
 
 **Image generation (sd-turbo, `/data/hf-small/sd-turbo`):**
 - I1 reference: diffusers is not in the venv (pip install if the registry allows it); the one-step output for a fixed
