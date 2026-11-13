@@ -751,3 +751,124 @@ sd_flash_attn(const uint16_t* __restrict__ qb, const uint16_t* __restrict__ kb, 
         for (int dt = 0; dt < 8; ++dt) out[(long)gm * C + h * 128 + dt * 16 + c16] = O[dt][i] * inv;
     }
 }
+
+// The 256 x 128 tile with BF16 activations (linear_bf16 converts the F32 input once per call, sd_to_bf16): the activations are
+// read at half the bytes of sd_gemm_wmma256's, which was the bottleneck (the output tiles re-read them 16 times). A 32-wide
+// k-tile, LDS double-buffered, the next tile loaded into registers while the WMMAs run on the current one (one barrier per
+// k-tile). The output is staged through LDS, so each lane stores 8 consecutive rows at once (cs_m == 1). Same operands,
+// strides, batches and tails as sd_gemm_wmma; blocks of 256 threads; K a multiple of 32. Measured on 4096 x 4105 x 4096:
+// 16.1 ms (the F32 tile) -> 8.8 ms; the outputs are bit-identical to the BF16 tile without the staging.
+#define G256B_PAD 40
+
+// The 16 x 16 accumulator tiles of one wave through its own staging area (16 x 17 floats at ep): row = column of the output
+// (gn), so the lanes write gm contiguously. Tails: rows and columns beyond M and N are not stored.
+__device__ __forceinline__ void gemm256_store(f32x8_t (&acc)[4][4], float* ep_base, int w, int l, int wm, int wn, int bm, int bn,
+                                              float* __restrict__ C, long cs_m, long cs_n, const float* __restrict__ biasf,
+                                              float alpha, float beta, int M, int N) {
+    float* ep = ep_base + w * (16 * 17);
+    for (int mt = 0; mt < 4; ++mt)
+        for (int nt = 0; nt < 4; ++nt) {
+            for (int i = 0; i < 8; ++i) ep[(l & 15) * 17 + 2 * i + (l >> 4)] = alpha * acc[mt][nt][i];
+            __builtin_amdgcn_wave_barrier();
+            const int gl = l >> 1, half = (l & 1) * 8;
+            const int gn = bn + wn * 64 + nt * 16 + gl, gm0 = bm + wm * 64 + mt * 16 + half;
+            if (gn < N && gm0 + 8 <= M && cs_m == 1) {  // a full 8 rows: two float4 stores (the rows are 16-byte aligned)
+                float v[8];
+                for (int q = 0; q < 8; ++q) v[q] = ep[gl * 17 + half + q];
+                if (biasf)
+                    for (int q = 0; q < 8; ++q) v[q] += biasf[gm0 + q];
+                float* dst = C + (long)gn * cs_n + gm0;
+                if (beta != 0.0f)
+                    for (int q = 0; q < 8; ++q) v[q] += beta * dst[q];
+                *reinterpret_cast<float4*>(dst) = {v[0], v[1], v[2], v[3]};
+                *reinterpret_cast<float4*>(dst + 4) = {v[4], v[5], v[6], v[7]};
+            } else if (gn < N) {
+                for (int q = 0; q < 8; ++q) {
+                    const int gm = gm0 + q;
+                    if (gm < M) {
+                        float v = ep[gl * 17 + half + q];
+                        if (biasf) v += biasf[gm];
+                        const long off = (long)gm * cs_m + (long)gn * cs_n;
+                        if (beta != 0.0f) v += beta * C[off];
+                        C[off] = v;
+                    }
+                }
+            }
+            __builtin_amdgcn_wave_barrier();
+        }
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+sd_gemm_wmma256b(const uint16_t* __restrict__ A0, long lda, const uint16_t* __restrict__ B0, long sbn, float* __restrict__ C0,
+                 long cs_m, long cs_n, const float* __restrict__ biasf, float alpha, float beta, int M, int N, int K, long bsA,
+                 long bsB, long bsC) {
+    const uint16_t* A = A0 + blockIdx.z * bsA;
+    const uint16_t* B = B0 + blockIdx.z * bsB;
+    float* C = C0 + blockIdx.z * bsC;
+    __shared__ __attribute__((aligned(16))) uint16_t As[2][256][G256B_PAD];
+    __shared__ __attribute__((aligned(16))) uint16_t Bs[2][128][G256B_PAD];
+    const int t = threadIdx.x, w = t >> 5, l = t & 31;
+    const int wm = w >> 1, wn = w & 1;  // wm 0..3 (64 rows each), wn 0..1 (64 columns each)
+    const int bm = blockIdx.y * 256, bn = blockIdx.x * 128;
+    const int bn_row = t >> 1, bh = (t & 1) * 16;  // B: thread t loads 16 values of column t >> 1
+    uint4 ra[4], rb[2];
+    f32x8_t acc[4][4];
+    for (int a = 0; a < 4; ++a)
+        for (int b = 0; b < 4; ++b)
+            for (int i = 0; i < 8; ++i) acc[a][b][i] = 0.0f;
+    auto loadA = [&](int k0) {
+        const int gm = bm + t;
+        for (int j = 0; j < 4; ++j) {
+            ra[j] = {0u, 0u, 0u, 0u};
+            if (gm < M) ra[j] = *reinterpret_cast<const uint4*>(A + (long)gm * lda + k0 + 8 * j);
+        }
+    };
+    auto loadB = [&](int k0) {
+        const int gn = bn + bn_row;
+        for (int j = 0; j < 2; ++j) {
+            rb[j] = {0u, 0u, 0u, 0u};
+            if (gn < N) rb[j] = *reinterpret_cast<const uint4*>(B + (long)gn * sbn + k0 + bh + 8 * j);
+        }
+    };
+    auto storeA = [&](int buf) {
+        for (int j = 0; j < 4; ++j) *reinterpret_cast<uint4*>(&As[buf][t][8 * j]) = ra[j];
+    };
+    auto storeB = [&](int buf) {
+        for (int j = 0; j < 2; ++j) *reinterpret_cast<uint4*>(&Bs[buf][bn_row][bh + 8 * j]) = rb[j];
+    };
+    loadA(0);
+    loadB(0);
+    storeA(0);
+    storeB(0);
+    __syncthreads();
+    int cur = 0;
+    for (int k0 = 0; k0 < K; k0 += 32) {
+        const bool more = k0 + 32 < K;
+        if (more) {
+            loadA(k0 + 32);
+            loadB(k0 + 32);
+        }
+        for (int ks = 0; ks < 2; ++ks) {
+            bf16x16_t af[4], bfr[4];
+            for (int mt = 0; mt < 4; ++mt) {
+                const int row = wm * 64 + mt * 16 + (l & 15);
+                __builtin_memcpy(&af[mt], &As[cur][row][ks * 16], sizeof(bf16x16_t));
+            }
+            for (int nt = 0; nt < 4; ++nt) {
+                const int col = wn * 64 + nt * 16 + (l & 15);
+                __builtin_memcpy(&bfr[nt], &Bs[cur][col][ks * 16], sizeof(bf16x16_t));
+            }
+            for (int mt = 0; mt < 4; ++mt)
+                for (int nt = 0; nt < 4; ++nt)
+                    acc[mt][nt] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af[mt], bfr[nt], acc[mt][nt]);
+        }
+        if (more) {
+            storeA(cur ^ 1);
+            storeB(cur ^ 1);
+        }
+        __syncthreads();
+        cur ^= 1;
+    }
+    __syncthreads();  // the last k-tile's reads of the staging memory (the LDS below is reused for the output)
+    gemm256_store(acc, reinterpret_cast<float*>(&As[0][0]), w, l, wm, wn, bm, bn, C, cs_m, cs_n, biasf, alpha, beta, M, N);
+}

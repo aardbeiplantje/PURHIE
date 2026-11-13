@@ -6,9 +6,14 @@
 
 ## ▶ Next (2026-11-13)
 
-1. **MiniMax-H3-Image speed** (2026-11-13): a 256 request takes 222 s on the 2048 canvas. The linears run at about 9 TFLOPS
-   (17.7 s per forward at 4105 tokens): a wider LDS stage or a 256 x 256 tile. The flash attention runs at about 2.5 TFLOPS
-   (4.6 s per forward): a wider key tile, two query waves per key stage. Measure with `MM_PIPE_DEBUG=1` and `MMDIT_PROF=1`.
+1. **MiniMax-H3-Image speed** (2026-11-13). The linears: `sd_gemm_wmma256b` (BF16 activations, converted once per call; a
+   32-wide k-tile double-buffered in LDS; the output staged through LDS for 8-row stores) runs 4096 x 4105 x 4096 in 8.8 ms
+   (15.6 TFLOPS) against 16.1 ms for the F32-activation tile; the 1024 canvas velocity 4.00 s (4.76 s before). Found by
+   ablation: the F32 activations, re-read per 256 output rows, were the bottleneck (compute was not). Not done: a 256 x 256
+   tile did no better (16 waves, single stage); swapping the block order is slower. Open: flash attention (about 2.5 TFLOPS,
+   4.6 s per forward at 4105 tokens): more query waves per block, a wider key tile. `tests/mm_dit_verify` fails on its
+   reference files (velocity cosine 0.99852 at step 0, sampler 0.985) on the committed build too: the reference is stale
+   against the released weights; `tests/mm_canvas_verify` (released latents) is unchanged at cosine 0.99381.
 2. **MiniMax server behaviour** (done 2026-11-13, see the record below): images queue, one at a time (no 503).
 3. **MiniMax quantization** (later, the user): FP8 or ROCmFP4 for the DiT (66 GB BF16 now). Measure the quality cost first;
    BF16 stays the default until that is known.

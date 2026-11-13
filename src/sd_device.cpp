@@ -30,7 +30,7 @@ int g_state = -1;  // -1: not tried, 0: host only, 1: device
 hipModule_t g_mod = nullptr;
 hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn_sum = nullptr, f_gn_sq = nullptr,
               f_gn_apply = nullptr, f_silu = nullptr, f_add = nullptr, f_upsample2 = nullptr, f_softmax = nullptr,
-              f_layer_norm = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
+              f_layer_norm = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma256b = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
               f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr;
 
 constexpr int kThreads = 256;
@@ -56,7 +56,7 @@ bool init() {
         const char* name;
     };
     const Entry entries[] = {
-        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_gemm_wmma256, "sd_gemm_wmma256"}, {&f_flash, "sd_flash_attn"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"},
+        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_gemm_wmma256, "sd_gemm_wmma256"}, {&f_gemm_wmma256b, "sd_gemm_wmma256b"}, {&f_flash, "sd_flash_attn"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"},
         {&f_transpose_pad, "sd_transpose_pad"}, {&f_softmax_bf16, "sd_softmax_bf16"}, {&f_softmax_bf16w, "sd_softmax_bf16_w"},
         {&f_gn_sum, "sd_gn_sum"},       {&f_gn_sq, "sd_gn_sq"},         {&f_gn_apply, "sd_gn_apply"},
         {&f_silu, "sd_silu"},           {&f_add, "sd_add"},             {&f_upsample2, "sd_upsample2"},
@@ -183,14 +183,37 @@ void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, cons
     if (in % 64 == 0) {
         const bool big = out >= 128;
         const bool huge = out >= 256 && T >= 1024;  // the 256 x 128 tile for the large token counts
+        const float alpha = 1.0f, beta = 0.0f;
+        const int M = out, N = T, K = in;
+        const long bs0 = 0;
+        if (huge && f_gemm_wmma256b) {
+            // the activations converted to BF16 once (the tile re-reads them once per 256 output rows: the F32 bytes were the
+            // bottleneck, see sd_gemm_wmma256b)
+            const long nb = (long)T * in;
+            uint16_t* xb = static_cast<uint16_t*>(alloc(sizeof(uint16_t) * (size_t)nb));
+            const float* xs = x;
+            void* ac[] = {(void*)&xs, (void*)&xb, (void*)&nb};
+            launch(f_to_bf16, dim3((unsigned)((nb + kThreads - 1) / kThreads)), ac);
+            const uint16_t* A = W;
+            const uint16_t* B = xb;
+            float* C = y;
+            const long lda = in, sbn = in, cs_m = 1, cs_n = out;
+            const float* bf = b;
+            void* args[] = {(void*)&A, (void*)&lda, (void*)&B, (void*)&sbn, (void*)&C, (void*)&cs_m, (void*)&cs_n,
+                            (void*)&bf, (void*)&alpha, (void*)&beta, (void*)&M, (void*)&N, (void*)&K, (void*)&bs0, (void*)&bs0,
+                            (void*)&bs0};
+            check(hipModuleLaunchKernel(f_gemm_wmma256b, (unsigned)((N + 127) / 128), (unsigned)((M + 255) / 256), 1, 256, 1, 1, 0,
+                                        nullptr, args, nullptr),
+                  "wmma gemm 256b");
+            sync();
+            release(xb, sizeof(uint16_t) * (size_t)nb);
+            return;
+        }
         const uint16_t* A = W;
         const float* B = x;
         float* C = y;
         const long lda = in, sbn = in, cs_m = 1, cs_n = out;
         const float* bf = b;
-        const float alpha = 1.0f, beta = 0.0f;
-        const int M = out, N = T, K = in;
-        const long bs0 = 0;
         void* args[] = {(void*)&A, (void*)&lda, (void*)&B, (void*)&sbn, (void*)&C, (void*)&cs_m, (void*)&cs_n,
                         (void*)&bf, (void*)&alpha, (void*)&beta, (void*)&M, (void*)&N, (void*)&K, (void*)&bs0, (void*)&bs0,
                         (void*)&bs0};
