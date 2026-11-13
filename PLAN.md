@@ -465,8 +465,15 @@ DiT and the text encoder, no ROCmFP4 unless the user asks for it):
   peak (about 170 to 220 of 15000 to 16000): the reference's bf16 residual stream against the engine's fp32, accumulated
   over 50 layers (not isolated; the cosine is the criterion here). The engine's dense-layer path is qwen3's, so the
   conditioning is the same code the Qwen3 models run.
-- M2 VAE: `MiniMaxH3ImageVAE` decoder (24 channels, the per-channel mean and std for the latents) in the engine, checked
-  against diffusers on a fixed latent (cf. sd_vae_verify).
+- M2 VAE: `MiniMaxH3ImageVAE` decoder, checked against diffusers on a fixed latent (cf. sd_vae_verify). Corrected
+  2026-11-13 from reading `/hf/MiniMax-H3-Image/vae` (the 2.3 GB file's tensors): it is not a conv decoder. The decoder is a
+  ViT: `x_embedder` (24 latent channels to 1024 per token), 4 register tokens and a mask token, 24 transformer blocks at
+  width 1024 (16 heads of 64, QKV fused, RMS-normed q and k without affine, gated SiLU FFN 4096, layer scales `scale1`
+  and `scale2`, 2-D RoPE with theta 100 and half of the head dim), `norm_out`, and `proj_out` to 768 values per token
+  (3 x 16 x 16: one output token is a 16 x 16 pixel patch; how the latent positions map to tokens is in the reference). The encoder
+  (3-D causal convs, `vae_clip_length` 17) is for edit only. Per-channel latent mean and std from the config. Tiled decode
+  (`vae_tile_size` 256, overlap 64) in the reference. Reference: `/data/minimax-ref/diffusers/models/autoencoders/
+  autoencoder_kl_minimax_h3_image.py` (838 lines). Not started.
 - M3 DiT: `MiniMaxH3DiTModel` (token refiner, the adaLN blocks, 3-axis RoPE, the GQA-less 56-head attention) on the
   device with the BF16 GEMM path (the GEMM needs a BF16 operand and WMMA for speed: a 4096-token forward of 33B
   parameters is about 0.3 PFLOP per step, six steps, so the plain fp32 tile would take minutes per image). Checked
