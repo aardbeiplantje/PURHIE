@@ -87,75 +87,85 @@ const float* tensor(const gguf_model_t* g, const std::string& name, size_t count
     return static_cast<const float*>(p);
 }
 
-// y[t][o] = x[t][:] . w[o][:] + b[o] for T rows of x [T][in]
+// y[t][o] = x[t][:] . w[o][:] + b[o] for T rows of x [T][in]: parallel over the output rows, each row read once for the T
+// inputs
 void linear(const float* x, int T, const Lin& L, float* y) {
-    const long long n = (long long)T * L.out;
 #pragma omp parallel for schedule(static)
-    for (long long idx = 0; idx < n; ++idx) {
-        const int t = (int)(idx / L.out), o = (int)(idx % L.out);
-        const float* xr = x + (size_t)t * L.in;
+    for (int o = 0; o < L.out; ++o) {
         const float* wr = L.w + (size_t)o * L.in;
-        float acc = L.b ? L.b[o] : 0.0f;
-        for (int i = 0; i < L.in; ++i) acc += xr[i] * wr[i];
-        y[(size_t)t * L.out + o] = acc;
+        const float bias = L.b ? L.b[o] : 0.0f;
+        for (int t = 0; t < T; ++t) {
+            const float* xr = x + (size_t)t * L.in;
+            float acc = 0.0f;
+#pragma omp simd reduction(+ : acc)
+            for (int i = 0; i < L.in; ++i) acc += xr[i] * wr[i];
+            y[(size_t)t * L.out + o] = bias + acc;
+        }
     }
 }
 
-// The causal convolution of x [cin][T] (left padding (k - 1) * dil): y [cout][T]; groups == cin == cout is depthwise
+// The causal convolution of x [cin][T] (left padding (k - 1) * dil): y [cout][T]; groups == cin == cout is depthwise.
+// Each output row is built from shifted input rows (the inner loop runs along time: contiguous, vectorized); the sums
+// run in the same order as the per-sample form (bias, then the input channels, then the taps).
 void conv_causal(const float* x, int T, const Conv& C, float* y) {
     const int pad = (C.k - 1) * C.dil;
-    const long long n = (long long)C.cout * T;
     if (C.groups == 1) {
 #pragma omp parallel for schedule(static)
-        for (long long idx = 0; idx < n; ++idx) {
-            const int o = (int)(idx / T), t = (int)(idx % T);
-            float acc = C.b ? C.b[o] : 0.0f;
+        for (int o = 0; o < C.cout; ++o) {
+            float* yr = y + (size_t)o * T;
+            const float bias = C.b ? C.b[o] : 0.0f;
+            for (int t = 0; t < T; ++t) yr[t] = bias;
             for (int c = 0; c < C.cin; ++c) {
-                const float* wr = C.w + ((size_t)o * C.cin + c) * C.k;
                 const float* xr = x + (size_t)c * T;
+                const float* wr = C.w + ((size_t)o * C.cin + c) * C.k;
                 for (int k = 0; k < C.k; ++k) {
-                    const int i = t + k * C.dil - pad;
-                    if (i >= 0) acc += wr[k] * xr[i];
+                    const int sh = k * C.dil - pad;  // y[t] += w * x[t + sh] where 0 <= t + sh < T
+                    const float w = wr[k];
+                    const int t0 = std::max(0, -sh), t1 = std::min(T, T - sh);
+#pragma omp simd
+                    for (int t = t0; t < t1; ++t) yr[t] += w * xr[t + sh];
                 }
             }
-            y[(size_t)o * T + t] = acc;
         }
     } else {  // depthwise: one input channel per output channel
 #pragma omp parallel for schedule(static)
-        for (long long idx = 0; idx < n; ++idx) {
-            const int o = (int)(idx / T), t = (int)(idx % T);
-            float acc = C.b ? C.b[o] : 0.0f;
-            const float* wr = C.w + (size_t)o * C.k;
+        for (int o = 0; o < C.cout; ++o) {
+            float* yr = y + (size_t)o * T;
             const float* xr = x + (size_t)o * T;
+            const float* wr = C.w + (size_t)o * C.k;
+            const float bias = C.b ? C.b[o] : 0.0f;
+            for (int t = 0; t < T; ++t) yr[t] = bias;
             for (int k = 0; k < C.k; ++k) {
-                const int i = t + k * C.dil - pad;
-                if (i >= 0) acc += wr[k] * xr[i];
+                const int sh = k * C.dil - pad;
+                const float w = wr[k];
+                const int t0 = std::max(0, -sh), t1 = std::min(T, T - sh);
+#pragma omp simd
+                for (int t = t0; t < t1; ++t) yr[t] += w * xr[t + sh];
             }
-            y[(size_t)o * T + t] = acc;
         }
     }
 }
 
 // The transposed convolution of x [cin][T] (weight [cin][cout][k], stride s), trimmed to T * s: y [cout][T * s].
-// Output u sums x[t] * w[j] over the (t, j) with t * s + j = u.
+// Output u sums x[t] * w[j] over the (t, j) with t * s + j = u; per output channel, the inputs' rows are scattered in
+// (the inner loop over t).
 void conv_transpose(const float* x, int T, const Tconv& C, float* y) {
     const int L = T * C.stride;
-    const long long n = (long long)C.cout * L;
 #pragma omp parallel for schedule(static)
-    for (long long idx = 0; idx < n; ++idx) {
-        const int o = (int)(idx / L), u = (int)(idx % L);
-        float acc = C.b ? C.b[o] : 0.0f;
+    for (int o = 0; o < C.cout; ++o) {
+        float* yr = y + (size_t)o * L;
+        const float bias = C.b ? C.b[o] : 0.0f;
+        for (int u = 0; u < L; ++u) yr[u] = bias;
         for (int c = 0; c < C.cin; ++c) {
-            const float* wr = C.w + ((size_t)c * C.cout + o) * C.k;
             const float* xr = x + (size_t)c * T;
+            const float* wr = C.w + ((size_t)c * C.cout + o) * C.k;
             for (int j = 0; j < C.k; ++j) {
-                const int d = u - j;
-                if (d < 0 || d % C.stride != 0) continue;
-                const int t = d / C.stride;
-                if (t < T) acc += xr[t] * wr[j];
+                const float w = wr[j];
+                // (the outputs past T * stride are trimmed: the taps that land there are dropped)
+                const int tmax = std::min(T, (L - j + C.stride - 1) / C.stride);
+                for (int t = 0; t < tmax; ++t) yr[(size_t)t * C.stride + j] += w * xr[t];
             }
         }
-        y[(size_t)o * L + u] = acc;
     }
 }
 

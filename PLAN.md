@@ -298,6 +298,17 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   cache's prefix reuse, as the engine's sequences do for chat).
 - T9 BF16 weights: the talker and the speaker encoder keep the checkpoint's BF16 in the GGUF (mmap, read in place, widened
   inside the dot products): half the bytes of the F32 files, no copy at load.
+  **T9 and U1 done 2026-11-13 (the talker part of U1):** the talker GGUF writes its matrices and tables as BF16 (the
+  checkpoint's own bytes, `raw`; norms, biases and the speaker encoder F32) and the engine reads them in place (`Mat`:
+  F32 or BF16, widened in the dot products; the same numbers). The linear runs parallel over output rows with each row
+  read once for the batch; the reductions vectorize with `#pragma omp simd` and the host engines compile with
+  AVX-512 (`HOST_SIMD` in the Makefile: qwen3tts, codec, speech, mel, audio, whisper). The codec's convolutions run with
+  the time loop innermost (vectorized) and parallel over output channels. Measured on this machine (16 threads):
+  talker forward 31 -> 17.8 ms per token, code predictor 107 -> 8.4 ms per frame, 40 frames of speech 10.0 -> 2.3 s
+  (57 ms per frame incl. the prefill: faster than the 80 ms of audio a frame makes), codec decode of 40 frames 18.1 ->
+  1.2 s. All TTS verifiers pass on the BF16 talker (qwen3tts_verify, speaker_verify, speech verify, the codec's
+  encode and decode). The F32 talker stays at /data/audio-ref/tts/qwen3tts-talker-f32.gguf (3.6 GB). Open: the whisper
+  and vision host kernels still use the old loops (U1), the GPU path (U2).
 - W1 whisper long-form: audio over 30 s is cut at the quietest point before each 30 s window and the texts joined.
 - W2 translate: `task` translate (the `<|translate|>` token in the prompt) through the endpoint.
 - W3 other languages: a French and a Chinese clip (qwen-tts speech, the Whisper reference from transformers) with the

@@ -24,8 +24,53 @@ namespace {
 
 std::string g_error;
 
+// A weight matrix read in place from the GGUF map (UMA: no copy): F32, or BF16 as the checkpoint stores it (the bf16
+// values are widened inside the products: half the bytes of F32, and the same numbers).
+struct Mat {
+    const float* f = nullptr;     // F32 [rows][cols]
+    const uint16_t* h = nullptr;  // BF16 [rows][cols]
+    int rows = 0, cols = 0;
+};
+
+inline float bf16_val(uint16_t v) {
+    const uint32_t u = (uint32_t)v << 16;
+    float f;
+    std::memcpy(&f, &u, sizeof f);
+    return f;
+}
+
+// the dot products (the reductions vectorize with the simd pragma: AVX-512 with the host object's flags)
+inline float dot_f32(const float* a, const float* b, int n) {
+    float acc = 0.0f;
+#pragma omp simd reduction(+ : acc)
+    for (int i = 0; i < n; ++i) acc += a[i] * b[i];
+    return acc;
+}
+
+inline float dot_bf16(const float* a, const uint16_t* b, int n) {
+    float acc = 0.0f;
+#pragma omp simd reduction(+ : acc)
+    for (int i = 0; i < n; ++i) acc += a[i] * bf16_val(b[i]);
+    return acc;
+}
+
+// the dot product of row r of M with x (M.cols values)
+inline float mat_dot(const Mat& M, int r, const float* x) {
+    return M.f ? dot_f32(x, M.f + (size_t)r * M.cols, M.cols) : dot_bf16(x, M.h + (size_t)r * M.cols, M.cols);
+}
+
+// row r of M as floats (the embedding lookups)
+inline void mat_row(const Mat& M, int r, float* out) {
+    if (M.f) {
+        std::memcpy(out, M.f + (size_t)r * M.cols, sizeof(float) * M.cols);
+    } else {
+        const uint16_t* src = M.h + (size_t)r * M.cols;
+        for (int i = 0; i < M.cols; ++i) out[i] = bf16_val(src[i]);
+    }
+}
+
 struct Lin {
-    const float* w = nullptr;  // [out][in], row-major
+    Mat w;                     // [out][in]
     const float* b = nullptr;  // [out] or NULL
     int in = 0, out = 0;
 };
@@ -48,17 +93,39 @@ const float* tensor(const gguf_model_t* g, const std::string& name, size_t count
     return static_cast<const float*>(p);
 }
 
-// y[t][o] = x[t][:] . w[o][:] + b[o], parallel over the (t, o) pairs (a decode step has one row: the outputs are the work)
+// the GGUF type of a tensor by name (-1: absent); the scan is short (a few hundred tensors, read once per model)
+int gguf_type_of(const gguf_model_t* g, const std::string& name) {
+    const int64_t n = gguf_n_tensors(g);
+    for (int64_t i = 0; i < n; ++i)
+        if (name == gguf_tensor_name(g, i)) return gguf_tensor_type(g, i);
+    return -1;
+}
+
+// a [rows][cols] matrix of the GGUF: BF16 read in place, or F32 (tensor())
+Mat mat_of(const gguf_model_t* g, const std::string& name, int rows, int cols) {
+    Mat M;
+    M.rows = rows;
+    M.cols = cols;
+    if (gguf_type_of(g, name) == 30) {  // ggml's BF16
+        size_t bytes = 0;
+        const void* p = gguf_get_tensor_ptr(g, name.c_str(), &bytes);
+        if (!p) throw std::runtime_error("qwen3tts: no tensor " + name);
+        if (bytes != (size_t)rows * cols * 2) throw std::runtime_error("qwen3tts: " + name + " has the wrong size");
+        M.h = static_cast<const uint16_t*>(p);
+    } else {
+        M.f = tensor(g, name, (size_t)rows * cols);
+    }
+    return M;
+}
+
+
+// y[t][o] = x[t][:] . w[o][:] + b[o]: parallel over the output rows o, and each row is read once for all T inputs (a
+// prefill or a code predictor's batch reuses the row from cache; a decode step has one input and the rows are the work)
 void linear(const float* x, int T, const Lin& L, float* y) {
-    const long long n = (long long)T * L.out;
 #pragma omp parallel for schedule(static)
-    for (long long idx = 0; idx < n; ++idx) {
-        const int t = (int)(idx / L.out), o = (int)(idx % L.out);
-        const float* xr = x + (size_t)t * L.in;
-        const float* wr = L.w + (size_t)o * L.in;
-        float acc = L.b ? L.b[o] : 0.0f;
-        for (int i = 0; i < L.in; ++i) acc += xr[i] * wr[i];
-        y[(size_t)t * L.out + o] = acc;
+    for (int o = 0; o < L.out; ++o) {
+        const float bias = L.b ? L.b[o] : 0.0f;
+        for (int t = 0; t < T; ++t) y[(size_t)t * L.out + o] = bias + mat_dot(L.w, o, x + (size_t)t * L.in);
     }
 }
 
@@ -391,13 +458,13 @@ struct qwen3tts_model {
     std::vector<std::string> languages;
     std::unique_ptr<Speaker> spk;       // the speaker encoder (absent in a GGUF without spk.* tensors)
     std::vector<int> language_ids;
-    const float* text_embd = nullptr;   // [text_vocab][text_C]
-    const float* codec_embd = nullptr;  // [codec_vocab][C]
+    Mat text_embd;                      // [text_vocab][text_C]
+    Mat codec_embd;                     // [codec_vocab][C]
     Lin fc1, fc2;                       // the text projection: text_C -> text_C -> C (SiLU between)
     std::vector<Block> blk;
     const float* out_norm = nullptr;
     Lin codec_head;                     // C -> codec_vocab, no bias
-    std::vector<const float*> pred_embd;  // ncb - 1 tables [pvocab][C]
+    std::vector<Mat> pred_embd;         // ncb - 1 tables [pvocab][C]
     std::vector<Block> pblk;
     const float* pred_out_norm = nullptr;
     std::vector<Lin> pred_head;         // ncb - 1 heads [pvocab][pC]
@@ -425,7 +492,7 @@ void text_rows_projected(const qwen3tts_model* m, const std::vector<int>& ids, f
     std::vector<float> raw((size_t)n * m->text_C);
     for (int i = 0; i < n; ++i) {
         if (ids[i] < 0 || ids[i] >= m->text_vocab) throw std::runtime_error("qwen3tts: text id out of range");
-        std::memcpy(&raw[(size_t)i * m->text_C], m->text_embd + (size_t)ids[i] * m->text_C, sizeof(float) * m->text_C);
+        mat_row(m->text_embd, ids[i], &raw[(size_t)i * m->text_C]);
     }
     text_project(m, raw.data(), n, out);
 }
@@ -433,7 +500,7 @@ void text_rows_projected(const qwen3tts_model* m, const std::vector<int>& ids, f
 void codec_rows(const qwen3tts_model* m, const std::vector<int>& ids, float* out) {
     for (size_t i = 0; i < ids.size(); ++i) {
         if (ids[i] < 0 || ids[i] >= m->codec_vocab) throw std::runtime_error("qwen3tts: codec id out of range");
-        std::memcpy(out + i * m->C, m->codec_embd + (size_t)ids[i] * m->C, sizeof(float) * m->C);
+        mat_row(m->codec_embd, ids[i], out + i * m->C);
     }
 }
 
@@ -541,19 +608,19 @@ qwen3tts_model_t* qwen3tts_open(const char* gguf_path) {
                 for (size_t i = 0; i < count; ++i) m->language_ids.push_back((int)static_cast<const uint32_t*>(data)[i]);
         }
 
-        m->text_embd = tensor(m->g, "talker.text_embd.weight", (size_t)m->text_vocab * m->text_C);
-        m->codec_embd = tensor(m->g, "talker.codec_embd.weight", (size_t)m->codec_vocab * m->C);
-        m->fc1 = {tensor(m->g, "talker.text_proj.fc1.weight", (size_t)m->text_C * m->text_C),
+        m->text_embd = mat_of(m->g, "talker.text_embd.weight", m->text_vocab, m->text_C);
+        m->codec_embd = mat_of(m->g, "talker.codec_embd.weight", m->codec_vocab, m->C);
+        m->fc1 = {mat_of(m->g, "talker.text_proj.fc1.weight", m->text_C, m->text_C),
                   tensor(m->g, "talker.text_proj.fc1.bias", m->text_C), m->text_C, m->text_C};
-        m->fc2 = {tensor(m->g, "talker.text_proj.fc2.weight", (size_t)m->C * m->text_C),
+        m->fc2 = {mat_of(m->g, "talker.text_proj.fc2.weight", m->C, m->text_C),
                   tensor(m->g, "talker.text_proj.fc2.bias", m->C), m->text_C, m->C};
         m->out_norm = tensor(m->g, "talker.out_norm.weight", m->C);
-        m->codec_head = {tensor(m->g, "talker.codec_head.weight", (size_t)m->codec_vocab * m->C), nullptr, m->C, m->codec_vocab};
+        m->codec_head = {mat_of(m->g, "talker.codec_head.weight", m->codec_vocab, m->C), nullptr, m->C, m->codec_vocab};
         auto lin = [&](const std::string& base, int in, int out, bool bias) {
             Lin L;
             L.in = in;
             L.out = out;
-            L.w = tensor(m->g, base + ".weight", (size_t)in * out);
+            L.w = mat_of(m->g, base + ".weight", out, in);
             L.b = bias ? tensor(m->g, base + ".bias", out) : nullptr;
             return L;
         };
@@ -574,7 +641,7 @@ qwen3tts_model_t* qwen3tts_open(const char* gguf_path) {
         };
         for (int l = 0; l < m->n_layer; ++l) m->blk.push_back(block_of("talker.blk." + std::to_string(l) + ".", m->C, m->H, m->Hkv, m->D, m->FF));
         for (int i = 0; i < m->ncb - 1; ++i) {
-            m->pred_embd.push_back(tensor(m->g, "pred.embd." + std::to_string(i) + ".weight", (size_t)m->pvocab * m->C));
+            m->pred_embd.push_back(mat_of(m->g, "pred.embd." + std::to_string(i) + ".weight", m->pvocab, m->C));
             m->pred_head.push_back(lin("pred.head." + std::to_string(i), m->pC, m->pvocab, false));
         }
         for (int l = 0; l < m->pn_layer; ++l)
@@ -702,9 +769,10 @@ int qwen3tts_build_prefill(qwen3tts_model_t* m, const int* text_ids, int n_text,
                 for (int gi = 0; gi < m->ncb; ++gi) {
                     const int id = ref_codes[(size_t)r * m->ncb + gi];
                     if (id < 0) throw std::runtime_error("qwen3tts: negative code");
-                    const float* table = gi == 0 ? m->codec_embd : m->pred_embd[gi - 1];
+                    const Mat& table = gi == 0 ? m->codec_embd : m->pred_embd[gi - 1];
                     if (id >= (gi == 0 ? m->codec_vocab : m->pvocab)) throw std::runtime_error("qwen3tts: code out of range");
-                    const float* row = table + (size_t)id * C;
+                    std::vector<float> row(C);
+                    mat_row(table, id, row.data());
                     for (int c = 0; c < C; ++c) dst[c] += row[c];
                 }
             }
@@ -748,9 +816,10 @@ int qwen3tts_frame_input(qwen3tts_model_t* m, const int* codes, const float* tra
     std::fill(out, out + C, 0.0f);
     for (int gi = 0; gi < m->ncb; ++gi) {
         const int id = codes[gi];
-        const float* table = gi == 0 ? m->codec_embd : m->pred_embd[gi - 1];
+        const Mat& table = gi == 0 ? m->codec_embd : m->pred_embd[gi - 1];
         if (id < 0 || id >= (gi == 0 ? m->codec_vocab : m->pvocab)) { g_error = "qwen3tts_frame_input: code out of range"; return -1; }
-        const float* row = table + (size_t)id * C;
+        std::vector<float> row(C);
+        mat_row(table, id, row.data());
         for (int c = 0; c < C; ++c) out[c] += row[c];
     }
     if (trailing)
@@ -788,11 +857,11 @@ int qwen3tts_code_predictor(qwen3tts_model_t* m, const float* H, const int* code
             std::memcpy(x.data(), H + (size_t)t * C, sizeof(float) * C);
             const int* c = codes + (size_t)t * ncb;
             if (c[0] < 0 || c[0] >= m->codec_vocab) { g_error = "qwen3tts_code_predictor: code out of range"; return -1; }
-            std::memcpy(x.data() + C, m->codec_embd + (size_t)c[0] * C, sizeof(float) * C);
+            mat_row(m->codec_embd, c[0], x.data() + C);
             for (int j = 0; j + 2 < rows; ++j) {
                 const int id = c[j + 1];
                 if (id < 0 || id >= m->pvocab) { g_error = "qwen3tts_code_predictor: code out of range"; return -1; }
-                std::memcpy(x.data() + (size_t)(j + 2) * C, m->pred_embd[j] + (size_t)id * C, sizeof(float) * C);
+                mat_row(m->pred_embd[j], id, x.data() + (size_t)(j + 2) * C);
             }
             std::vector<float> kc((size_t)rows * d.Hkv * d.D), vc((size_t)rows * d.Hkv * d.D);
             for (const Block& B : m->pblk) block_step(B, d, x.data(), rows, 0, kc.data(), vc.data());
@@ -803,12 +872,7 @@ int qwen3tts_code_predictor(qwen3tts_model_t* m, const float* H, const int* code
                 const float* hr = hn.data() + (size_t)(k + 1) * C;
                 float* lr = logits + ((size_t)t * (ncb - 1) + k) * m->pvocab;
                 const Lin& hd = m->pred_head[k];
-                for (int o = 0; o < m->pvocab; ++o) {
-                    const float* wr = hd.w + (size_t)o * C;
-                    float acc = 0.0f;
-                    for (int i = 0; i < C; ++i) acc += hr[i] * wr[i];
-                    lr[o] = acc;
-                }
+                for (int o = 0; o < m->pvocab; ++o) lr[o] = mat_dot(hd.w, o, hr);
             }
         }
         return 0;
@@ -913,7 +977,7 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
                     pv(m->pn_layer, std::vector<float>((size_t)(ncb + 1) * pKD));
                 std::vector<float> px((size_t)2 * C), pn((size_t)C);
                 std::memcpy(px.data(), hid.data(), sizeof(float) * C);
-                std::memcpy(px.data() + C, m->codec_embd + (size_t)c0 * C, sizeof(float) * C);
+                mat_row(m->codec_embd, c0, px.data() + C);
                 for (int l = 0; l < m->pn_layer; ++l) block_step(m->pblk[l], pd, px.data(), 2, 0, pk[l].data(), pv[l].data());
                 std::vector<float> row(C);
                 for (int k = 1; k < ncb; ++k) {
@@ -921,17 +985,12 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
                     const float* last = k == 1 ? px.data() + C : row.data();
                     rms_norm(last, 1, C, m->eps, m->pred_out_norm, pn.data());
                     const Lin& hd = m->pred_head[k - 1];
-                    for (int v = 0; v < m->pvocab; ++v) {
-                        const float* wr = hd.w + (size_t)v * C;
-                        float acc = 0.0f;
-                        for (int i = 0; i < C; ++i) acc += pn[i] * wr[i];
-                        lv[v] = acc;
-                    }
+                    for (int v = 0; v < m->pvocab; ++v) lv[v] = mat_dot(hd.w, v, pn.data());
                     const int best = sample_token(lv.data(), m->pvocab, s->sub_temperature, s->sub_top_k, &rng);
                     frame[k] = best;
                     if (k + 1 < ncb) {
                         // the next row: codebook k's embedding in the table k - 1, at position k + 1
-                        std::memcpy(row.data(), m->pred_embd[k - 1] + (size_t)best * C, sizeof(float) * C);
+                        mat_row(m->pred_embd[k - 1], best, row.data());
                         for (int l = 0; l < m->pn_layer; ++l) block_step(m->pblk[l], pd, row.data(), 1, k + 1, pk[l].data(), pv[l].data());
                     }
                 }

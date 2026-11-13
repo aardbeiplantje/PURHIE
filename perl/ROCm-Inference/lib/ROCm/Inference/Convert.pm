@@ -2148,7 +2148,8 @@ sub convert {
 
 
 # Qwen3-TTS (Qwen/Qwen3-TTS-12Hz-0.6B-Base: Qwen3TTSForConditionalGeneration, the talker and its code predictor; phase
-# T2 of PLAN.md). F32, the BF16 checkpoint's values exactly. The speaker encoder (speaker_encoder.*, the voice clone's
+# T2 of PLAN.md). The matrices and tables as BF16 (the checkpoint's bytes: T9 of PLAN.md, the engine reads them in place),
+# the norms F32. The speaker encoder (speaker_encoder.*, the voice clone's
 # x-vector: T5 of PLAN.md) is written as spk.* with the checkpoint's own module names (spk.blocks.N..., spk.mfa, spk.asp...),
 # its architecture in qwen3tts.spk.* keys (the config's defaults: the checkpoint's speaker_encoder_config has only the
 # embedding size). The speech tokenizer (the codec, in its own directory) is a separate GGUF. The names: talker.* (the text
@@ -2290,6 +2291,13 @@ sub convert {
     for my $name (@{$self->st->{order}}) {
         my $g = gname($name) // croak "$name: no qwen3tts tensor name (a tensor the engine does not know)";
         my $t = $self->t($name);
+        if (@{$t->{shape}} >= 2 && $g !~ /^spk\./) {
+            # the matrices and tables as the checkpoint stores them (BF16): the engine reads them in place, the same values
+            push @specs, {name => $g, ne => [reverse @{$t->{shape}}], type => ROCm::Inference::Convert::gguf_type_id('bf16'),
+                          from => lc $t->{dtype}, in_bytes => $t->{bytes}, uses => [$t],
+                          raw => sub { ROCm::Inference::SafeTensors::st_read_rows({}, $t, 0, ROCm::Inference::SafeTensors::st_rows($t)) }};
+            next;
+        }
         push @specs, {name => $g, ne => [reverse @{$t->{shape}}], f32 => 1,
                       type => ROCm::Inference::Convert::gguf_type_id('f32'), from => lc $t->{dtype},
                       in_bytes => $t->{bytes}, uses => [$t], data => sub { pack 'f<*', $self->floats($t) }};

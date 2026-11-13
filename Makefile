@@ -17,6 +17,8 @@ TESTSDIR   := tests
 
 # Host C++ flags (no offloading)
 CXXFLAGS  := -O3 -Wall -I$(ROCM_PATH)/include -I$(SRCDIR) -D__HIP_PLATFORM_AMD__ -D__HIP_ENABLE_AMD_HSA__
+# the host float engines (qwen3tts, the codec, whisper, mel, audio): AVX-512 for the reductions and the convolutions
+HOST_SIMD := -mavx2 -mfma -mavx512f -mavx512vl -mavx512bw -mavx512dq
 
 # Device/HIP kernel flags (with offloading)
 HIPFLAGS  := -Xarch_device -mno-wavefrontsize64 -isystem $(ROCM_PATH)/include --rocm-path=$(ROCM_PATH) -O3 --offload-arch=$(ARCH) --genco -D__HIP_PLATFORM_AMD__ -D__HIP_ENABLE_AMD_HSA__
@@ -203,28 +205,28 @@ $(EXPERT_CPU_BENCH): $(TESTSDIR)/expert_cpu_bench.cpp $(SRCDIR)/expert_cpu.cpp $
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/expert_cpu_bench.cpp $(SRCDIR)/expert_cpu.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -lpthread -o $@
 
 $(MEL_VERIFY): $(TESTSDIR)/mel_verify.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h
-	$(CLANG) $(CXXFLAGS) -fopenmp -I. $(TESTSDIR)/mel_verify.cpp $(SRCDIR)/mel.cpp -o $@
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/mel_verify.cpp $(SRCDIR)/mel.cpp -o $@
 
 $(QWEN3TTS_SPEECH_VERIFY): $(TESTSDIR)/qwen3tts_speech_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h $(SRCDIR)/qwen3tts.h $(SRCDIR)/qwen3tts_speech.cpp $(SRCDIR)/qwen3tts_speech.h $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
-	$(CLANG) $(CXXFLAGS) -fopenmp -I. $(TESTSDIR)/qwen3tts_speech_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/qwen3tts_speech.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/qwen3tts_speech_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/qwen3tts_speech.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
 
 $(SPEAKER_VERIFY): $(TESTSDIR)/speaker_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/qwen3tts.h $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
-	$(CLANG) $(CXXFLAGS) -fopenmp -I. $(TESTSDIR)/speaker_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/speaker_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
 
 $(CODEC_ENCODE_VERIFY): $(TESTSDIR)/codec_encode_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
-	$(CLANG) $(CXXFLAGS) -fopenmp -I. $(TESTSDIR)/codec_encode_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/codec_encode_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
 
 $(QWEN3TTS_CODEC_VERIFY): $(TESTSDIR)/qwen3tts_codec_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
-	$(CLANG) $(CXXFLAGS) -fopenmp -I. $(TESTSDIR)/qwen3tts_codec_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/qwen3tts_codec_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
 
 $(QWEN3TTS_VERIFY): $(TESTSDIR)/qwen3tts_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h $(SRCDIR)/qwen3tts.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
-	$(CLANG) $(CXXFLAGS) -fopenmp -I. $(TESTSDIR)/qwen3tts_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/qwen3tts_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
 
 $(AUDIO_VERIFY): $(TESTSDIR)/audio_verify.cpp $(SRCDIR)/audio.cpp $(SRCDIR)/audio.h
-	$(CLANG) $(CXXFLAGS) -fopenmp -I. $(TESTSDIR)/audio_verify.cpp $(SRCDIR)/audio.cpp -o $@
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/audio_verify.cpp $(SRCDIR)/audio.cpp -o $@
 
 $(WHISPER_VERIFY): $(TESTSDIR)/whisper_verify.cpp $(SRCDIR)/whisper.cpp $(SRCDIR)/whisper.h $(SRCDIR)/audio.cpp $(SRCDIR)/audio.h $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/tokenizer.h $(SRCDIR)/unicode_flags.inc $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
-	$(CLANG) $(CXXFLAGS) -fopenmp -I. $(TESTSDIR)/whisper_verify.cpp $(SRCDIR)/whisper.cpp $(SRCDIR)/audio.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/whisper_verify.cpp $(SRCDIR)/whisper.cpp $(SRCDIR)/audio.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
 
 $(IMAGE_VERIFY): $(TESTSDIR)/image_verify.cpp $(SRCDIR)/image.cpp $(SRCDIR)/image.h $(SRCDIR)/vision.cpp $(SRCDIR)/vision.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/third_party/stb_image.h
 	$(CLANG) $(CXXFLAGS) -fopenmp -I. $(TESTSDIR)/image_verify.cpp $(SRCDIR)/image.cpp $(SRCDIR)/vision.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
@@ -353,12 +355,12 @@ $(QWEN_MODEL_LIB): $(QWEN_SRCS) $(QWEN_HDRS) $(SRCDIR)/inference.h $(SRCDIR)/ggu
 	$(CLANG) $(CXXFLAGS) -fopenmp -I. -fPIC -c $(SRCDIR)/vision.cpp -o $(OBJDIR)/vision.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/image.cpp -o $(OBJDIR)/image.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/mrope.cpp -o $(OBJDIR)/mrope.o
-	$(CLANG) $(CXXFLAGS) -fopenmp -I. -fPIC -c $(SRCDIR)/whisper.cpp -o $(OBJDIR)/whisper.o
-	$(CLANG) $(CXXFLAGS) -fopenmp -I. -fPIC -c $(SRCDIR)/mel.cpp -o $(OBJDIR)/mel.o
-	$(CLANG) $(CXXFLAGS) -fopenmp -I. -fPIC -c $(SRCDIR)/audio.cpp -o $(OBJDIR)/audio.o
-	$(CLANG) $(CXXFLAGS) -fopenmp -I. -fPIC -c $(SRCDIR)/qwen3tts.cpp -o $(OBJDIR)/qwen3tts.o
-	$(CLANG) $(CXXFLAGS) -fopenmp -I. -fPIC -c $(SRCDIR)/qwen3tts_codec.cpp -o $(OBJDIR)/qwen3tts_codec.o
-	$(CLANG) $(CXXFLAGS) -fopenmp -I. -fPIC -c $(SRCDIR)/qwen3tts_speech.cpp -o $(OBJDIR)/qwen3tts_speech.o
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/whisper.cpp -o $(OBJDIR)/whisper.o
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/mel.cpp -o $(OBJDIR)/mel.o
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/audio.cpp -o $(OBJDIR)/audio.o
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/qwen3tts.cpp -o $(OBJDIR)/qwen3tts.o
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/qwen3tts_codec.cpp -o $(OBJDIR)/qwen3tts_codec.o
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/qwen3tts_speech.cpp -o $(OBJDIR)/qwen3tts_speech.o
 	rm -f $@
 	ar rcs $@ $(OBJDIR)/qwen_model.o $(OBJDIR)/qwen_ops.o $(OBJDIR)/qmatvec.o $(OBJDIR)/deltanet.o $(OBJDIR)/attention.o $(OBJDIR)/gpu_ops.o $(OBJDIR)/kernel_loader.o $(OBJDIR)/glm5_ref.o $(OBJDIR)/glm5_gpu.o $(OBJDIR)/expert_cpu.o $(OBJDIR)/vision.o $(OBJDIR)/image.o $(OBJDIR)/mrope.o $(OBJDIR)/whisper.o $(OBJDIR)/mel.o $(OBJDIR)/audio.o $(OBJDIR)/qwen3tts.o $(OBJDIR)/qwen3tts_codec.o $(OBJDIR)/qwen3tts_speech.o $(OBJDIR)/kernels_embed.o
 
