@@ -21,5 +21,6 @@ EMBED(inference_co_attention, attention.co)
 EMBED(inference_co_glm5, glm5_gpu.co)
 EMBED(inference_co_talker, talker_gpu.co)
 EMBED(inference_co_sd, sd_gpu.co)
+EMBED(inference_co_minimax_vae, minimax_vae.co)
 
     .section .note.GNU-stack, "", @progbits

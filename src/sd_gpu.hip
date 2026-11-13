@@ -24,7 +24,8 @@ __device__ __forceinline__ float h2f(uint16_t u) {
 template <typename TA, bool HALF>
 __device__ __forceinline__ void gemm_body(const TA* __restrict__ A, long lda, const float* __restrict__ B, long sbk, long sbn,
                                           float* __restrict__ C, long cs_m, long cs_n, const uint16_t* __restrict__ bias,
-                                          float alpha, float beta, int M, int N, int K, float (*As)[G_BM + 1],
+                                          const float* __restrict__ biasf, float alpha, float beta, int M, int N, int K,
+                                          float (*As)[G_BM + 1],
                                           float (*Bs)[G_BN + 1]) {
     const int tid = threadIdx.x;
     const int tx = tid & 15, ty = tid >> 4;
@@ -75,6 +76,7 @@ __device__ __forceinline__ void gemm_body(const TA* __restrict__ A, long lda, co
             if (m < M && n < N) {
                 float v = alpha * acc[i][j];
                 if (bias) v += h2f(bias[m]);
+                if (biasf) v += biasf[m];
                 const long off = (long)m * cs_m + (long)n * cs_n;
                 if (beta != 0.0f) v += beta * C[off];
                 C[off] = v;
@@ -84,18 +86,18 @@ __device__ __forceinline__ void gemm_body(const TA* __restrict__ A, long lda, co
 
 extern "C" __global__ void __launch_bounds__(SD_THREADS)
 sd_gemm_ah(const uint16_t* A, long lda, const float* B, long sbk, long sbn, float* C, long cs_m, long cs_n, const uint16_t* bias,
-           float alpha, float beta, int M, int N, int K) {
+           const float* biasf, float alpha, float beta, int M, int N, int K) {
     __shared__ float As[G_BK][G_BM + 1];
     __shared__ float Bs[G_BK][G_BN + 1];
-    gemm_body<uint16_t, true>(A, lda, B, sbk, sbn, C, cs_m, cs_n, bias, alpha, beta, M, N, K, As, Bs);
+    gemm_body<uint16_t, true>(A, lda, B, sbk, sbn, C, cs_m, cs_n, bias, biasf, alpha, beta, M, N, K, As, Bs);
 }
 
 extern "C" __global__ void __launch_bounds__(SD_THREADS)
 sd_gemm_af(const float* A, long lda, const float* B, long sbk, long sbn, float* C, long cs_m, long cs_n, const uint16_t* bias,
-           float alpha, float beta, int M, int N, int K) {
+           const float* biasf, float alpha, float beta, int M, int N, int K) {
     __shared__ float As[G_BK][G_BM + 1];
     __shared__ float Bs[G_BK][G_BN + 1];
-    gemm_body<float, false>(A, lda, B, sbk, sbn, C, cs_m, cs_n, bias, alpha, beta, M, N, K, As, Bs);
+    gemm_body<float, false>(A, lda, B, sbk, sbn, C, cs_m, cs_n, bias, biasf, alpha, beta, M, N, K, As, Bs);
 }
 
 // col[r][j] (r < cin k k, j < nc): the input under kernel tap r at output position n0 + j (zero outside the input)

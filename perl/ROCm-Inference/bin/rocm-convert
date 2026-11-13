@@ -10,6 +10,7 @@ use Time::HiRes qw(time);
 
 use ROCm::Inference::Convert ();
 use ROCm::Inference::Convert::Diffusers ();
+use ROCm::Inference::Convert::MiniMaxVAE ();
 use ROCm::Inference::GGUF qw(gguf_type_info);
 use ROCm::Inference::Quant ();
 
@@ -37,6 +38,10 @@ if (-d $in && -f "$in/model_index.json") {
     # a diffusers pipeline (Stable Diffusion: the UNet, the text encoder, the VAE, the CLIP tokenizer): one GGUF, F16 copies
     printf "%s: diffusers pipeline -> %s\n", basename($in), $out unless $o{quiet};
     $res = eval { ROCm::Inference::Convert::Diffusers::convert($in, $out, %a) } or fail($@);
+} elsif (-d $in && ROCm::Inference::Convert::MiniMaxVAE::is_vae_dir($in)) {
+    # MiniMax-H3-Image's VAE (the decoder, F32): one GGUF
+    printf "%s: MiniMax-H3 VAE decoder -> %s\n", basename($in), $out unless $o{quiet};
+    $res = eval { ROCm::Inference::Convert::MiniMaxVAE::convert($in, $out, %a) } or fail($@);
 } elsif (-d $in) {
     my $m = eval { ROCm::Inference::Convert->open_model($in, map { $o{$_} ? ($_ => $o{$_}) : () } qw(arch pre name)) }
         or fail($@);

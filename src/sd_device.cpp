@@ -75,14 +75,15 @@ void sync() { check(hipStreamSynchronize(nullptr), "stream"); }
 // C[m * cs_m + n * cs_n] = alpha * sum_k A(m, k) B(k, n) + bias[m] + beta * C, the strides of gemm_body (sd_gpu.hip)
 template <typename TA>
 void gemm(hipFunction_t f, const TA* A, long lda, const float* B, long sbk, long sbn, float* C, long cs_m, long cs_n,
-          const uint16_t* bias, float alpha, float beta, int M, int N, int K) {
+          const uint16_t* bias, float alpha, float beta, int M, int N, int K, const float* biasf = nullptr) {
     if (M <= 0 || N <= 0) return;
     const TA* a = A;
     const float* b = B;
     float* c = C;
     const uint16_t* bi = bias;
+    const float* bf = biasf;
     void* args[] = {(void*)&a, (void*)&lda, (void*)&b, (void*)&sbk, (void*)&sbn, (void*)&c, (void*)&cs_m, (void*)&cs_n,
-                    (void*)&bi, (void*)&alpha, (void*)&beta, (void*)&M, (void*)&N, (void*)&K};
+                    (void*)&bi, (void*)&bf, (void*)&alpha, (void*)&beta, (void*)&M, (void*)&N, (void*)&K};
     launch(f, dim3((unsigned)((N + 63) / 64), (unsigned)((M + 63) / 64), 1), args);
 }
 
@@ -165,6 +166,11 @@ void conv2d(const float* x, int cin, int H, int W, const uint16_t* w, int cout, 
 
 void linear_tok(const float* x, int T, const uint16_t* W, int in, int out, const uint16_t* b, float* y) {
     gemm<uint16_t>(f_gemm_ah, W, in, x, 1, in, y, 1, out, b, 1.0f, 0.0f, out, T, in);
+    sync();
+}
+
+void linear_f32(const float* x, int T, const float* W, int in, int out, const float* b, float* y) {
+    gemm<float>(f_gemm_af, W, in, x, 1, in, y, 1, out, nullptr, 1.0f, 0.0f, out, T, in, b);
     sync();
 }
 

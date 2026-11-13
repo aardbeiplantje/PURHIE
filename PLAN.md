@@ -473,7 +473,17 @@ DiT and the text encoder, no ROCmFP4 unless the user asks for it):
   (3 x 16 x 16: one output token is a 16 x 16 pixel patch; how the latent positions map to tokens is in the reference). The encoder
   (3-D causal convs, `vae_clip_length` 17) is for edit only. Per-channel latent mean and std from the config. Tiled decode
   (`vae_tile_size` 256, overlap 64) in the reference. Reference: `/data/minimax-ref/diffusers/models/autoencoders/
-  autoencoder_kl_minimax_h3_image.py` (838 lines). Not started.
+  autoencoder_kl_minimax_h3_image.py` (838 lines).
+  **Done 2026-11-13:** `rocm-convert /hf/MiniMax-H3-Image/vae` writes the decoder as F32 (no conversion: the file's own
+  values; `Convert::MiniMaxVAE`, 300 tensors, 1.62 GB, names as the checkpoint's, the latents' mean and std as tensors) at
+  `/data/minimax-h3/vae-decoder-f32.gguf`. The engine: `src/minimax_vae.{h,cpp}` and `src/minimax_vae.hip` (the ViT on the
+  device: `sddev::linear_f32` (the GEMM now takes a float bias too), `mv_rmsnorm`, `mv_layernorm`, the 2-D rotary, the
+  scale-and-add, SwiGLU, the unpatchify); the reference's tiles (`_split_tiles`, `_stitch_tiles`, `_blend`) in the host code.
+  `tests/mm_vae_verify` against diffusers 0.43.0 (`mm_vae_ref.py`; the checkpoint's keys mapped to diffusers' names: the fused
+  `to_qkv` split in thirds, `ff.w1` / `ff.w2` as `ff.net.0.proj` / `ff.net.2`, `x_embedder` as `proj_in`): a 16 x 16 latent
+  (one tile) cosine 1.0000000, max difference 2e-5 of the peak; a 40 x 40 latent (9 tiles, blended) cosine 1.0000000, 5e-5 of
+  the peak. Two seconds for both with the load. The device is required (no host path yet). diffusers 0.43.0 is in
+  `/data/diff43b` (installed without its dependencies; import with `PYTHONPATH=/data/diff43b:/data/diff-site`).
 - M3 DiT: `MiniMaxH3DiTModel` (token refiner, the adaLN blocks, 3-axis RoPE, the GQA-less 56-head attention) on the
   device with the BF16 GEMM path (the GEMM needs a BF16 operand and WMMA for speed: a 4096-token forward of 33B
   parameters is about 0.3 PFLOP per step, six steps, so the plain fp32 tile would take minutes per image). Checked

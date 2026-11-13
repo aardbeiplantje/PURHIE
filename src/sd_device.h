@@ -87,6 +87,8 @@ void conv2d(const float* x, int cin, int H, int W, const uint16_t* w, int cout, 
             int Ho, int Wo);
 void linear_tok(const float* x, int T, const uint16_t* W, int in, int out, const uint16_t* b, float* y);
 void linear_cm(const float* x, int T, const uint16_t* W, int in, int out, const uint16_t* b, float* y);
+// The same with float32 weights and bias (b may be null): y[t][o] = b[o] + sum_i x[t][i] W[o][i]
+void linear_f32(const float* x, int T, const float* W, int in, int out, const float* b, float* y);
 void linear_to_cm(const float* x, int T, const uint16_t* W, int in, int out, const uint16_t* b, float* y, bool accumulate);
 void group_norm(const float* x, int C, int HW, int groups, const uint16_t* gw, const uint16_t* gb, float eps, float* y);
 void silu(float* x, size_t n);

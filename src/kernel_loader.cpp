@@ -15,6 +15,7 @@ extern const char inference_co_attention[], inference_co_attention_end[];
 extern const char inference_co_glm5[], inference_co_glm5_end[];
 extern const char inference_co_talker[], inference_co_talker_end[];
 extern const char inference_co_sd[], inference_co_sd_end[];
+extern const char inference_co_minimax_vae[], inference_co_minimax_vae_end[];
 }
 
 namespace {
@@ -31,6 +32,7 @@ const Embedded kEmbedded[] = {
     {"glm5_gpu.co", inference_co_glm5, inference_co_glm5_end},
     {"talker_gpu.co", inference_co_talker, inference_co_talker_end},
     {"sd_gpu.co", inference_co_sd, inference_co_sd_end},
+    {"minimax_vae.co", inference_co_minimax_vae, inference_co_minimax_vae_end},
 };
 }  // namespace
 
