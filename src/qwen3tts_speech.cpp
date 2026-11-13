@@ -66,3 +66,22 @@ int qwen3tts_speak(qwen3tts_model_t* model, qwen3tts_codec_t* codec, const char*
 }
 
 void qwen3tts_speech_free_wav(float* wav) { std::free(wav); }
+
+int qwen3tts_make_voice(qwen3tts_model_t* model, qwen3tts_codec_t* codec, const float* samples, size_t n, int** codes_out,
+                        int* R_out, float* spk) {
+    if (!model || !codec || !samples || !codes_out || !R_out || !spk) {
+        g_error = "qwen3tts_make_voice: bad arguments";
+        return -1;
+    }
+    if (qwen3tts_codec_encode(codec, samples, n, codes_out, R_out) != 0) {
+        g_error = std::string("qwen3tts_make_voice: ") + qwen3tts_codec_last_error();
+        return -1;
+    }
+    if (qwen3tts_speaker_embedding(model, samples, n, spk) != 0) {
+        qwen3tts_codec_free_codes(*codes_out);
+        *codes_out = nullptr;
+        g_error = std::string("qwen3tts_make_voice: ") + qwen3tts_last_error();
+        return -1;
+    }
+    return 0;
+}

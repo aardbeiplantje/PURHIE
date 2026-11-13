@@ -293,6 +293,15 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   (`enc_codes_ref.i32`, codec_dump.py; the same codes as the T1 reference `ref_codes.npy`).
 - T7 voices from audio: the engine makes a voice from a WAV and its transcript (`qwen3tts_make_voice`); the server
   takes `POST /v1/audio/voices` (multipart: name, file, ref_text), so `tools/qwen3tts_voice.py` is only the reference.
+
+  **Done 2026-11-13:** `qwen3tts_make_voice` (`src/qwen3tts_speech.cpp`: the codec encoder's codes and the speaker
+  embedding of the same samples); the Perl binding (`ROCm::Inference::Speech::make_voice`, `speech_voice_write`,
+  `speech_wav_samples`); the server's `POST /v1/audio/voices` (multipart: `file` a WAV of 0.5 to 60 s, `ref_text`,
+  `name`; 409 when the name exists) and `GET /v1/audio/voices` (names, frames, transcripts). Checks: the Perl test
+  `t/65-speech.t` with ROCM_INFERENCE_TEST_WAV (13 tests pass: the clip's voice has 74 frames, the directory reads
+  back, speech with it). Through the server: the clip-made voice (2.5 s to make, 5.9 s clip) gives speech that Whisper
+  transcribes as "Hello, this is a short test of the speech synthesis." `tools/qwen3tts_voice.py` is the qwen-tts
+  reference of the same voices.
 - T8 prefix KV cache: a voice's prefill (its reference text, codes and speaker embedding) is the same for every request
   in that voice, so its per-layer K/V is computed once and kept with the voice; a request continues from it (the KV
   cache's prefix reuse, as the engine's sequences do for chat).

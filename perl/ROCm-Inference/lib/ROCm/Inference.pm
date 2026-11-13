@@ -25,7 +25,8 @@ our @EXPORT_OK = qw(
     generate last_prompt_stats last_error
     store_open store_close store_set_lazy store_stats store_block_names
     chat_render chat reply_tags
-    vision_load image_prompt set_mm mm_rope_delta whisper_load speech_load speech_wav16 speech_voice
+    vision_load image_prompt set_mm mm_rope_delta whisper_load speech_load speech_wav16 speech_voice speech_voice_write
+    speech_wav_samples
     STOP_NONE STOP_EOG STOP_MAX_TOKENS STOP_STRING STOP_CALLBACK STOP_CONTEXT_FULL
 );
 our %EXPORT_TAGS = (all => \@EXPORT_OK);
@@ -685,6 +686,34 @@ sub speech_voice {
     return { ref_text => $v->{ref_text}, frames => $v->{frames}, codes => $codes, spk => $spk };
 }
 
+# speech_voice_write($dir, $voice): the voice's directory (voice.json, codes.i32, spk.f32) as speech_voice reads it; the
+# directory is created. Returns the directory's path.
+sub speech_voice_write {
+    my ($dir, $v) = @_;
+    mkdir $dir or die "$dir: $!\n" unless -d $dir;
+    my $write = sub {
+        my ($path, $bytes) = @_;
+        my $tmp = "$path.tmp$$";
+        open my $fh, '>:raw', $tmp or die "$tmp: $!\n";
+        print {$fh} $bytes or die "$tmp: $!\n";
+        close $fh or die "$tmp: $!\n";
+        rename $tmp, $path or die "$path: $!\n";
+    };
+    $write->("$dir/codes.i32", $v->{codes});
+    $write->("$dir/spk.f32", $v->{spk});
+    require JSON::PP;
+    my $js = JSON::PP->new->canonical->utf8->encode({ref_text => $v->{ref_text}, frames => $v->{frames}, codebooks => 16,
+                                                    n_embd => length($v->{spk}) / 4}) . "\n";
+    $write->("$dir/voice.json", $js);
+    return $dir;
+}
+
+# speech_wav_samples($wav_bytes, $rate): a WAV file's samples as mono float32 at $rate (packed; the band-limited resampler)
+sub speech_wav_samples {
+    my ($wav, $rate) = @_;
+    return ROCm::Inference::_audio_wav_samples($wav, $rate // 24000);
+}
+
 # speech_wav16($samples, $rate): a mono 16-bit PCM WAV file's bytes of float32 samples (clipped to [-1, 1])
 sub speech_wav16 {
     my ($samples, $rate) = @_;
@@ -706,6 +735,14 @@ sub new {
 
 # ($samples, $frames) = $s->speak($text, voice => $voice, language => 'english', temperature => 0.9, top_k => 50,
 # repetition_penalty => 1.05, sub_temperature => 0.9, sub_top_k => 50, seed => 0, max_frames => 2048)
+# ($codes, $frames, $spk) = $s->make_voice($samples24k): a voice from a clip (packed float32 samples at 24 kHz): the reference's
+# codec frames (packed int32, frames x 16), the frame count, the speaker embedding (packed float32); the caller adds the
+# transcript (ref_text) and writes it with speech_voice_write
+sub make_voice {
+    my ($s, $samples) = @_;
+    return ROCm::Inference::_speech_make_voice($s->{h}, $samples);
+}
+
 sub speak {
     my ($s, $text, %o) = @_;
     my $v = $o{voice} or die "speak: voice => {ref_text, frames, codes, spk}\n";

@@ -22,6 +22,12 @@ int qwen3tts_speak(qwen3tts_model_t* model, qwen3tts_codec_t* codec, const char*
                    int max_frames, float** wav, size_t* n_out, int* n_frames);
 void qwen3tts_speech_free_wav(float* wav);
 
+/* A voice from audio (T7 of PLAN.md): the reference clip at 24 kHz (n samples, at least a few tenths of a second) to its
+ * codec frames (*codes_out: R x n_quantizers ints, free with qwen3tts_codec_free_codes; *R_out frames) and its speaker
+ * embedding (spk: qwen3tts_speaker_dim floats). The transcript is the caller's (ref_text of the voice). Returns 0, or -1. */
+int qwen3tts_make_voice(qwen3tts_model_t* model, qwen3tts_codec_t* codec, const float* samples, size_t n, int** codes_out,
+                        int* R_out, float* spk);
+
 #ifdef __cplusplus
 }
 #endif

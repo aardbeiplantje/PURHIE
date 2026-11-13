@@ -845,6 +845,53 @@ route::post '/v1/audio/speech' => sub {
     return [ 200, [ 'Content-Type' => 'audio/wav' ], $wav ];
 };
 
+# A voice from audio (T7 of PLAN.md): a multipart body with the reference clip in the part "file" (a WAV file, 0.5 to 60 s),
+# its transcript "ref_text" and the voice's name "name" (letters, digits, '-', '_', '.'). The clip is encoded to codec frames
+# and its speaker embedding computed on the host; the voice is written to --voices/NAME (409 when it exists). The voice is
+# then speech's "voice" value.
+route::post '/v1/audio/voices' => sub {
+    my ($req) = @_;
+    error(503, 'no speech model: start the server with --tts TALKER.gguf --tts-codec CODEC.gguf --voices DIR', 'server_error')
+        unless $TTS;
+    error(503, 'no voices directory: start the server with --voices DIR') unless $o{voices};
+    my $ct = $req->{headers}{'content-type'} // '';
+    error(400, 'expected multipart/form-data with the clip in the part "file"') unless $ct =~ m{multipart/form-data}i;
+    my $parts = eval { ROCm::Inference::Multipart::parse($req->{body}, $ct) }
+        or error(400, 'bad multipart body: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r));
+    my $file = $parts->{file} or error(400, "'file' is required (a WAV file)");
+    my $field = sub { my $p = $parts->{$_[0]} or return undef; (my $v = $p->{data}) =~ s/\A\s+|\s+\z//g; $v };
+    my $name = $field->('name') // '';
+    error(400, "name: letters, digits, '-', '_' or '.', not '$name'") unless $name =~ /\A[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}\z/
+        && $name !~ /\.\./;
+    my $ref_text = $field->('ref_text');
+    error(400, "'ref_text' is required: the clip's transcript") unless defined $ref_text && length $ref_text;
+    error(400, 'ref_text: at most 1000 characters') if length $ref_text > 1000;
+    my $dir = "$o{voices}/$name";
+    error(409, "voice '$name' exists") if -e $dir;
+    my $samples = eval { ROCm::Inference::speech_wav_samples($file->{data}, 24000) }
+        or error(400, 'the clip: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r));
+    my $seconds = length($samples) / 4 / 24000;
+    error(400, 'the clip: 0.5 to 60 seconds of speech') if $seconds < 0.5 || $seconds > 60;
+    my ($codes, $frames, $spk) = eval { $TTS->make_voice($samples) };
+    error(400, 'the clip: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r)) if $@;
+    ROCm::Inference::speech_voice_write($dir, { ref_text => $ref_text, frames => $frames, codes => $codes, spk => $spk });
+    $LOG->info('request', event => 'voice', msg => sprintf('%s: %d frames, %.2f s, from a clip of %.2f s', $name, $frames, $seconds, $seconds));
+    return { name => $name, frames => $frames, seconds => $seconds + 0 };
+};
+
+# the voices in --voices: their names, frames and transcripts
+route::get '/v1/audio/voices' => sub {
+    error(503, 'no voices directory: start the server with --voices DIR') unless $o{voices};
+    opendir my $dh, $o{voices} or error(500, "--voices $o{voices}: $!");
+    my @v;
+    for my $n (sort grep { !/\A\./ } readdir $dh) {
+        my $v = eval { ROCm::Inference::speech_voice("$o{voices}/$n") } or next;
+        push @v, { name => $n, frames => $v->{frames}, ref_text => $v->{ref_text} };
+    }
+    closedir $dh;
+    return { data => \@v };
+};
+
 route::post '/v1/chat/completions' => sub {
     my ($req) = @_;
     my $p = $req->{json};

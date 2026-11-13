@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# A voice for the engine's speech (/v1/audio/speech, src/qwen3tts_speech.cpp): the reference clip's codec frames, its
-# transcript and its speaker embedding, computed with the official qwen-tts (0.1.1: the speaker encoder and the speech
-# tokenizer's encoder, which the engine does not have yet). Writes a directory:
+# A voice for the engine's speech, made with the official qwen-tts (0.1.1). The engine makes the same voices from a WAV file
+# itself now (POST /v1/audio/voices of rocm-inference-server; qwen3tts_make_voice), and checks against this tool: the
+# codes and the speaker embedding of a clip agree with qwen-tts's. The directory it writes:
 #   voice.json  {"ref_text", "frames", "codebooks", "n_embd"}
 #   codes.i32   frames x codebooks int32, little-endian (frame-major)
 #   spk.f32     n_embd float32, little-endian

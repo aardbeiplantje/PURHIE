@@ -22,6 +22,7 @@
 #include "mrope.h"
 #include "whisper.h"
 #include "qwen3tts_speech.h"
+#include "audio.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -1470,3 +1471,51 @@ _speech_speak(h, text, ref_text, language, codes, spk, R, temperature, top_k, re
     EXTEND(SP, 2);
     PUSHs(sv_2mortal(out));
     PUSHs(sv_2mortal(newSViv(frames)));
+
+void
+_speech_make_voice(h, samples)
+    IV h
+    SV* samples
+  PPCODE:
+    /* (codes packed int32 [R][16], R, speaker embedding packed float32): a voice from the clip's samples at 24 kHz */
+    speech_handle* s = INT2PTR(speech_handle*, h);
+    STRLEN sl = 0;
+    const char* sb = SvPV(samples, sl);
+    if (sl % 4) croak("ROCm::Inference: the samples: float32 bytes");
+    const size_t n = sl / 4;
+    const int C = qwen3tts_speaker_dim(s->m);
+    if (C <= 0) croak("ROCm::Inference: the talker GGUF has no speaker encoder (spk.* tensors)");
+    float* x = (float*)malloc(sl ? sl : 4);
+    float* spk = (float*)malloc(sizeof(float) * (size_t)C);
+    if (!x || !spk) { free(x); free(spk); croak("ROCm::Inference: out of memory"); }
+    memcpy(x, sb, sl);
+    int* codes = NULL;
+    int R = 0;
+    const int rc = qwen3tts_make_voice(s->m, s->c, x, n, &codes, &R, spk);
+    free(x);
+    if (rc != 0) { free(spk); croak("ROCm::Inference: qwen3tts_make_voice: %s", qwen3tts_last_error()); }
+    const int ncb = qwen3tts_codec_n_quantizers(s->c);
+    SV* cs = newSVpvn((const char*)codes, (STRLEN)R * ncb * 4);
+    SV* ss = newSVpvn((const char*)spk, (STRLEN)C * 4);
+    qwen3tts_codec_free_codes(codes);
+    free(spk);
+    EXTEND(SP, 3);
+    PUSHs(sv_2mortal(cs));
+    PUSHs(sv_2mortal(newSViv(R)));
+    PUSHs(sv_2mortal(ss));
+
+SV*
+_audio_wav_samples(wav, rate)
+    SV* wav
+    int rate
+  CODE:
+    /* a WAV file's bytes as mono float32 at rate (the band-limited resampler), packed */
+    STRLEN len = 0;
+    const unsigned char* data = (const unsigned char*)SvPV(wav, len);
+    float* out = NULL;
+    size_t n = 0;
+    if (audio_decode_wav(data, len, rate, &out, &n) != 0) croak("ROCm::Inference: %s", audio_last_error());
+    RETVAL = newSVpvn((const char*)out, (STRLEN)(n * sizeof(float)));
+    audio_free(out);
+  OUTPUT:
+    RETVAL
