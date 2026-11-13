@@ -457,7 +457,14 @@ Milestones (each verified against the reference before the next; the image quali
 DiT and the text encoder, no ROCmFP4 unless the user asks for it):
 - M1 text encoder: the Qwen3-VL text part converted to GGUF (a `Qwen3VLForConditionalGeneration` converter as a
   subclass of the Qwen3 one, prefix `model.language_model`, the visual tower skipped); the engine's prompt hidden states
-  equal transformers' for the reference prompts (cosine ~1 per layer used). Status: started 2026-11-13.
+  equal transformers' for the reference prompts (cosine ~1 per layer used). **Done 2026-11-13:** `rocm-convert` reads the
+  text encoder from the LFS objects (`ROCm::Inference::Convert::Qwen3VL`, 707 tensors, 65.5 GB BF16 GGUF in 103 s, at
+  `/data/minimax-h3/text-encoder-bf16.gguf`); `tests/mm_te_verify` (`make build/mm_te_verify`) runs the engine's prefill
+  on three reference prompts and compares the residual after layer 50 with transformers' `hidden_states[50]` (reference
+  from `/data/minimax-ref/te/mm_te_ref.py`, CPU bf16): worst row cosine 0.99993 to 0.99994, the largest element 1.1% of the
+  peak (about 170 to 220 of 15000 to 16000): the reference's bf16 residual stream against the engine's fp32, accumulated
+  over 50 layers (not isolated; the cosine is the criterion here). The engine's dense-layer path is qwen3's, so the
+  conditioning is the same code the Qwen3 models run.
 - M2 VAE: `MiniMaxH3ImageVAE` decoder (24 channels, the per-channel mean and std for the latents) in the engine, checked
   against diffusers on a fixed latent (cf. sd_vae_verify).
 - M3 DiT: `MiniMaxH3DiTModel` (token refiner, the adaLN blocks, 3-axis RoPE, the GQA-less 56-head attention) on the

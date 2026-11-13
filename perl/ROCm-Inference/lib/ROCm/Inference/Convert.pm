@@ -1029,6 +1029,16 @@ __PACKAGE__->register(qw(Qwen3ForCausalLM));
 sub arch { 'qwen3' }
 sub tokenizer_pre { 'qwen2' }
 
+# Qwen3-VL's text part (MiniMax-H3-Image's text encoder): the Qwen3 layout under model.language_model. The M-RoPE sections
+# (interleaved) are plain RoPE for text-only positions; the vision tower (model.visual.*) is not converted.
+package ROCm::Inference::Convert::Qwen3VL;
+our @ISA = ('ROCm::Inference::Convert::Decoder');
+__PACKAGE__->register(qw(Qwen3VLForConditionalGeneration));
+sub arch { 'qwen3' }
+sub tokenizer_pre { 'qwen2' }
+sub skipped { qr/^model\.visual\./ }
+sub prefix { 'model.language_model' }
+
 # Llama 3.x (convert_hf_to_gguf.py's LlamaModel): Q and K rows reordered from HF's rotate-half RoPE layout to the
 # interleaved one llama.cpp's "llama" uses; the llama3 RoPE frequency factors as rope_freqs.
 package ROCm::Inference::Convert::Llama;
