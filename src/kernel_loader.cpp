@@ -14,6 +14,7 @@ extern const char inference_co_deltanet[], inference_co_deltanet_end[];
 extern const char inference_co_attention[], inference_co_attention_end[];
 extern const char inference_co_glm5[], inference_co_glm5_end[];
 extern const char inference_co_talker[], inference_co_talker_end[];
+extern const char inference_co_sd[], inference_co_sd_end[];
 }
 
 namespace {
@@ -29,6 +30,7 @@ const Embedded kEmbedded[] = {
     {"attention.co", inference_co_attention, inference_co_attention_end},
     {"glm5_gpu.co", inference_co_glm5, inference_co_glm5_end},
     {"talker_gpu.co", inference_co_talker, inference_co_talker_end},
+    {"sd_gpu.co", inference_co_sd, inference_co_sd_end},
 };
 }  // namespace
 

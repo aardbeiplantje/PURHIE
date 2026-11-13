@@ -20,5 +20,6 @@ EMBED(inference_co_deltanet, deltanet.co)
 EMBED(inference_co_attention, attention.co)
 EMBED(inference_co_glm5, glm5_gpu.co)
 EMBED(inference_co_talker, talker_gpu.co)
+EMBED(inference_co_sd, sd_gpu.co)
 
     .section .note.GNU-stack, "", @progbits

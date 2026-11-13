@@ -40,10 +40,10 @@ llama.cpp-rocm-gfx1151-docker (branch rocm-inference), which builds rocm-hip fro
 new `CACHEBUST` to take new commits). Design: ARCHITECTURE.md; measurements: git history.
 
 6. **Multimodal and audio (section below, 2026-11-13)**: audio done through the voice clone from new audio, long-form
-   and translate; the talker's fused device block is the default (U2: 44 ms per frame against 51 to 55 on the host); open:
-   the device frame's launches and syncs, the image path's speed (the VAE and the UNet on the host: about half a
-   minute per 512 x 512 image; the GPU's job), MiniMax-H3-Image (inspect the checkout, the license) and the vision
-   tower's device path. The ComfyUI safetensors question: converted by rocm-convert as F16/BF16 GGUF (the engine reads
+   and translate; the talker's fused device block is the default (U2: 44 ms per frame against 51 to 55 on the host); the
+   image path is on the GPU (I6: 3.3 s per 512 x 512 image against 28 s on the host; the reference image was noise before,
+   corrected). Open: the device frame's launches and syncs, the VAE's convolutions (the GEMM), MiniMax-H3-Image (inspect
+   the checkout, the license) and the vision tower's device path. The ComfyUI safetensors question: converted by rocm-convert as F16/BF16 GGUF (the engine reads
    them in place; sd-turbo is done that way).
 
 ## Qwen3.8-Flash-Next
@@ -407,7 +407,7 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   schedule at t = 999), the VAE, diffusers' postprocess to 8 bits), the PNG (`sd_encode_png`: zlib, IHDR/IDAT/IEND, CRCs),
   the seeded latents (`sd_random_latents`: a Mersenne Twister and Box-Muller, not torch's sequence). `tests/sd_image_verify.cpp`
   (`make build/sd_image_verify`): the reference image (512 x 512, seed 0 of the pipeline) reproduced: 99.9961% of the bytes
-  equal, the largest step 1, the PNG written by the engine decodes (PIL) to the same pixels. The Perl binding
+  equal (the reference was noise, its latents scaled twice; corrected in I6), the largest step 1, the PNG written by the engine decodes (PIL) to the same pixels. The Perl binding
   (`ROCm::Inference::sd_load($gguf)->generate($prompt, size => '512x512', seed => N)` returns the PNG bytes; `t/67-image.t`,
   env-gated: 7 checks pass) and the server (`--sd FILE.gguf`, `POST /v1/images/generations`: prompt, size (multiples of 8,
   64 to 1024), n (1), seed, response_format b64_json (default; the PNG in data[0].b64_json) or png (image/png); checked:
@@ -415,6 +415,23 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   (text 0.5 s, UNet 8 s, VAE 17 s): the VAE and the UNet's convolutions are the next speed items (the GPU's job: the
   same fp16 weights in place). Not yet: the torch-identical seeded noise (the reference image is the proof of the
   arithmetic, not of the seed), the multi-step samplers (sd-turbo is one step), the server's one image at a time.
+  **I6 done 2026-11-13 (the image path on the GPU, the default; `SD_DEVICE=cpu` is the host):** `src/sd_gpu.hip` (the
+  kernels: one strided GEMM with F16 or float A operands in 64 x 64 tiles, the im2col of the convolutions, the GroupNorm in
+  three passes, the softmax rows, LayerNorm, SiLU, the residual add, GEGLU, the nearest upsampling) and `src/sd_device.{h,cpp}`
+  (the launches, a pool of pinned device-visible memory `sddev::Floats`, the GGUF mapping registered read-only so the F16
+  weights are read in place). The UNet's and the VAE's activations are `Floats`; the primitives dispatch to the device and
+  the channel planes are read by the GEMM's strides (no transposes). The CLIP text encoder stays on the host (`HostOnly`).
+  A device run is serialized (`sddev::run_mutex`). Measured for 512 x 512, one step: UNet 1.3 s (host 10.9 s), VAE 1.9 s
+  (host 17 s), the image 3.3 s (host 28 s). Checks on both paths: `sd_text_verify`, `sd_unet_verify`, `sd_vae_verify`,
+  `sd_image_verify` (99.92% of the bytes equal, the largest step 1), `t/67-image.t` (7 of 7).
+  **The reference was noise, now corrected:** `/data/image-ref/sd-turbo/dump.py` passed the pipeline `noise * init_noise_sigma`,
+  and diffusers' `prepare_latents` scales the given latents by `init_noise_sigma` again (diffusers 0.35.2,
+  pipeline_stable_diffusion.py), so the reference and the engine's check both used noise * sigma^2: their images were noise
+  (the 99.99% match was of two noise images). The dump now passes the noise as it is (one scaling) and writes the raw
+  files the verifiers read; the check starts from noise * sigma. The endpoint (`Inference.xs`, `lat *= sigma` once) was
+  already right: `generate("a photo of a red fox in the snow", seed => 0)` gives a fox. Open: the GEMM is a plain fp32 tile
+  (the VAE's 3 x 3 convolutions are most of its 1.9 s: a WMMA or a larger tile is the next step), the resnets' per-channel
+  time add is a host loop, and the server's one image at a time (see above) still holds.
 
 **MiniMax-H3-Image (requested 2026-11-12: "should be supported too"; `MiniMaxAI/MiniMax-H3-Image` on Hugging Face,
 code at github.com/MiniMax-AI/MiniMax-H3-Image).** Text-to-image and image editing. Config: the transformer is a

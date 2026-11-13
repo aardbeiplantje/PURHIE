@@ -1,8 +1,9 @@
 // sd_image_verify: the Stable Diffusion engine end to end (src/sd.cpp, PLAN.md I5): the reference run's image (diffusers
-// 0.35.2, sd-turbo, one step, seed 0, "a photo of a red fox in the snow", 512 x 512, float32). The pipeline was given the
-// initial latents noise * sigma and scaled them once more inside (its prepare_latents), so the engine gets the same
-// initial latents (noise * sigma * sigma) and must give the same pixels: at most 1 of 255 steps off, and most equal. The
-// PNG the engine writes must decode (checked by the caller: python's PIL against image_u8.bin).
+// 0.35.2, sd-turbo, one step, seed 0, "a photo of a red fox in the snow", 512 x 512, float32). The pipeline gets the noise
+// as its latents and scales them once by the scheduler's init_noise_sigma (its prepare_latents), so the engine's initial
+// latents are noise * sigma, the same, and must give the same pixels: at most 1 of 255 steps off, and most equal. (The
+// earlier reference scaled twice, noise * sigma^2: a noise image, equal to the engine's noise.) The PNG the engine writes
+// must decode (checked by the caller: python's PIL against image_u8.bin).
 //
 //   sd_image_verify <sd.gguf> <reference dir> [out.png]
 #include "sd.h"
@@ -42,7 +43,7 @@ int main(int argc, char** argv) {
     const bool sigma_ok = std::fabs(sigma - 14.614646911621094f) < 1e-3f;
     std::printf("sigma %.6f (the scheduler's 14.614647) %s\n", sigma, sigma_ok ? "ok" : "FAIL");
     std::vector<float> init(noise.size());
-    for (size_t i = 0; i < noise.size(); ++i) init[i] = noise[i] * sigma * sigma;
+    for (size_t i = 0; i < noise.size(); ++i) init[i] = noise[i] * sigma;
     std::vector<uint8_t> got(want.size());
     if (sd_generate(m, "a photo of a red fox in the snow", init.data(), 512, 512, got.data()) != 0) {
         std::fprintf(stderr, "sd_generate: %s\n", sd_last_error());
