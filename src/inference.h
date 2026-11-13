@@ -178,11 +178,14 @@ int inference_n_past(const inference_model_t* model);
 // Returns 0 on success, INFERENCE_ERR_CONTEXT_FULL if they don't fit, negative on error.
 int inference_prefill(inference_model_t* model, const int32_t* tokens, int n);
 
-// Qwen3.5 prompts with images (phase V4): the next inference_prefill of n tokens at the current position takes emb's
-// rows (n x n_embd floats, the image's merged features) where use is set (n bytes), and the M-RoPE positions pos3
-// (n x 3 int64: temporal, height, width; NULL for plain RoPE). After it the decode continues at index + the offset
-// (inference_mm_rope_delta). Call again with n 0 and NULL emb to clear. Returns 0, or -1 (inference_get_last_error).
-int inference_set_mm(inference_model_t* m, int n, const float* emb, const unsigned char* use, const int64_t* pos3);
+// Qwen3.5 prompts with images: the prompt's n tokens sit at sequence positions [base, base + n) (base 0 for a prompt
+// that is the whole sequence: generate with reuse_prefix, or after inference_reset); the rows where use is set
+// (n bytes) take emb's rows (n x n_embd floats, the image's merged features) instead of the token embedding, and every
+// row takes the M-RoPE positions pos3 (n x 3 int64: temporal, height, width; NULL for plain RoPE). The next prefill of
+// those positions applies them (inference_prefill, or generate's), after which the decode continues at index + the
+// offset (inference_mm_rope_delta); generate clears them after its prefill. NULL emb clears. 0, or -1.
+int inference_set_mm(inference_model_t* m, int base, int n, const float* emb, const unsigned char* use,
+                     const int64_t* pos3);
 int inference_mm_rope_delta(const inference_model_t* m);
 // The same, and the logits after every one of the n tokens into logits ([n][vocab_size] floats): row i is the
 // distribution of the token after tokens[i] (perplexity; the LM head runs on all rows, one batched matmul per
@@ -456,6 +459,7 @@ int inference_n_ctx(const inference_model_t* model);
 int inference_batch_size(const inference_model_t* model);  // always 1 for now
 const char* inference_model_name(const inference_model_t* model);
 int inference_vocab_size(const inference_model_t* model);
+int inference_hidden_size(const inference_model_t* model);  // the residual stream's width (n_embd); 0: no model
 
 // Direct tensor access for debugging/analysis
 // Returns pointer to tensor data in mapped memory (valid while model is alive)

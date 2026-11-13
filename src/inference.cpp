@@ -1789,6 +1789,7 @@ void inference_set_seed(inference_model_t* m, unsigned int seed) {
 
 // A new, empty sequence: position 0, no history, no checkpoints (their states belong to the old sequence)
 static void seq_reset(inference_model_t* m) {
+    if (m->qwen) qwen_model_truncate(m->qwen, 0);
     m->n_past = 0;
     m->seq.clear();
     m->ckpts.clear();
@@ -1860,6 +1861,7 @@ static void chain_extend(inference_model_t* m) {
 
 // Rewind the sequence to len tokens; its block hashes and published count follow
 static void seq_truncate(inference_model_t* m, int len) {
+    if (m->qwen) qwen_model_truncate(m->qwen, len);
     m->n_past = len;
     m->seq.resize((size_t)len);
     const size_t full = (size_t)len / (size_t)kv_B(m);
@@ -1961,7 +1963,7 @@ static bool snapshot_boundary(const inference_model_t* m, int k) {
 
 // After a forward pass: publish the blocks it completed, and snapshot the state at a chosen block boundary
 static int store_after_forward(inference_model_t* m) {
-    if (m->store_dirfd < 0) return 0;
+    if (m->store_dirfd < 0 || qwen_model_image_span(m->qwen) > 0) return 0;
     chain_extend(m);
     if (m->published < m->chain.size() && qwen_model_sync(m->qwen) != 0) {
         set_error("sync failed: %s", qwen_model_last_error());
@@ -2164,11 +2166,13 @@ int inference_prefill(inference_model_t* m, const int32_t* tokens, int n) {
     return 0;
 }
 
-int inference_set_mm(inference_model_t* m, int n, const float* emb, const unsigned char* use, const int64_t* pos3) {
+int inference_set_mm(inference_model_t* m, int base, int n, const float* emb, const unsigned char* use,
+                     const int64_t* pos3) {
     clear_error();
     if (!m || !m->qwen) { set_error("Invalid state or arguments"); return -1; }
-    if (!emb) return qwen_model_set_mm(m->qwen, m->n_past, 0, nullptr, nullptr, nullptr) == 0 ? 0 : -1;
-    if (qwen_model_set_mm(m->qwen, m->n_past, n, emb, use, pos3) != 0) {
+    if (!emb) return qwen_model_set_mm(m->qwen, 0, 0, nullptr, nullptr, nullptr) == 0 ? 0 : -1;
+    if (base < 0) { set_error("image rows: base < 0"); return -1; }
+    if (qwen_model_set_mm(m->qwen, base, n, emb, use, pos3) != 0) {
         set_error("image rows: %s", qwen_model_last_error());
         return -1;
     }
@@ -2222,6 +2226,8 @@ const char* inference_model_name(const inference_model_t* m) {
 int inference_vocab_size(const inference_model_t* m) {
     return m ? m->vocab_size : 0;
 }
+
+int inference_hidden_size(const inference_model_t* m) { return m ? m->n_embd : 0; }
 
 const void* inference_get_tensor_ptr(const inference_model_t* m, const char* name, size_t* out_bytes) {
     clear_error();
@@ -2484,6 +2490,12 @@ static int sync_prompt(inference_model_t* m, const int32_t* p, int n, int tail, 
             start = ck >= 0 ? m->ckpts[ck].pos : 0;
         }
     }
+    // a sequence with image rows restarts from the start when the prompt diverges inside them: an image row's KV is
+    // the image's, and the RoPE offset of the text after it does not hold below them
+    if (start < qwen_model_image_span(m->qwen)) {
+        start = 0;
+        ck = -1;
+    }
     // a held prompt-end snapshot (lazy) the prompt leaves, or does not resume from (an earlier start), goes to the
     // store now, so that the lookup below and later requests find it
     if (m->store_held_k > 0) {
@@ -2491,7 +2503,9 @@ static int sync_prompt(inference_model_t* m, const int32_t* p, int n, int tail, 
         if ((L < hb || (size_t)start < hb) && store_flush_held(m) != 0) return -1;
     }
     std::vector<inference_model::Hash> hs;
-    const int from_store = store_lookup(m, p, n, &hs);
+    // (a sequence with image rows neither reads nor writes the store: a block is keyed by its tokens, and an image's
+    // pad tokens are the same for every image)
+    const int from_store = qwen_model_image_span(m->qwen) > 0 ? 0 : store_lookup(m, p, n, &hs);
     if (from_store > start) {
         if (store_attach(m, p, from_store, hs) != 0) return -1;
         start = from_store;
@@ -2729,6 +2743,7 @@ int inference_generate_stream(inference_model_t* m, const int32_t* prompt_ids, i
     }
     if (evt) fire_event(m, INFERENCE_EVT_PREFILL_END, m->last_prefilled, (int)(m->st_attached - store0),
                         ms_since(tp0));  // n0: prefilled (the sync's count), n1: store hits, ms: prefill time
+    qwen_model_set_mm(m->qwen, 0, 0, nullptr, nullptr, nullptr);  // an image prompt's rows: applied by the prefill above
     std::vector<std::string> stops;
     for (int i = 0; i < o.n_stop_strings; ++i)
         if (o.stop_strings && o.stop_strings[i] && o.stop_strings[i][0]) stops.emplace_back(o.stop_strings[i]);

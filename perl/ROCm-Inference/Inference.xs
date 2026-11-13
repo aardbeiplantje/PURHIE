@@ -17,6 +17,9 @@
 #include <unistd.h>
 
 #include "inference.h"
+#include "vision.h"
+#include "image.h"
+#include "mrope.h"
 
 #define HANDLE_CLASS "ROCm::Inference::Model"
 
@@ -756,6 +759,14 @@ vocab_size(h)
     RETVAL
 
 int
+hidden_size(h)
+    SV* h
+  CODE:
+    RETVAL = inference_hidden_size(handle_ptr(aTHX_ h, 0));
+  OUTPUT:
+    RETVAL
+
+int
 embedding_dim(h)
     SV* h
   CODE:
@@ -1142,6 +1153,163 @@ _constant_stop(which)
     case 4: RETVAL = INFERENCE_STOP_CALLBACK; break;
     default: RETVAL = INFERENCE_STOP_CONTEXT_FULL; break;
     }
+  OUTPUT:
+    RETVAL
+
+
+# ---- Images (phase V5): the vision tower, the image processor, the M-RoPE positions, the prompt's overrides
+
+IV
+_vision_open(path)
+    const char* path
+  CODE:
+    vision_model_t* vm = vision_open(path);
+    if (!vm) croak("ROCm::Inference: vision_open: %s", vision_last_error());
+    RETVAL = PTR2IV(vm);
+  OUTPUT:
+    RETVAL
+
+void
+_vision_close(vm)
+    IV vm
+  CODE:
+    vision_close(INT2PTR(vision_model_t*, vm));
+
+void
+_vision_info(vm)
+    IV vm
+  PPCODE:
+    /* (n_out, merge, patch, temporal, mean, std) */
+    vision_model_t* v = INT2PTR(vision_model_t*, vm);
+    float mean = 0.5f, sd = 0.5f;
+    vision_image_norm(v, &mean, &sd);
+    EXTEND(SP, 6);
+    PUSHs(sv_2mortal(newSViv(vision_n_out(v))));
+    PUSHs(sv_2mortal(newSViv(vision_merge(v))));
+    PUSHs(sv_2mortal(newSViv(vision_patch(v))));
+    PUSHs(sv_2mortal(newSViv(vision_temporal(v))));
+    PUSHs(sv_2mortal(newSVnv(mean)));
+    PUSHs(sv_2mortal(newSVnv(sd)));
+
+SV*
+_vision_encode(vm, pixels, h, w)
+    IV vm
+    SV* pixels
+    int h
+    int w
+  CODE:
+    /* pixels: packed floats ([h * w][3 * temporal * patch * patch]); the result: packed floats [(h / m) * (w / m)][n_out] */
+    vision_model_t* v = INT2PTR(vision_model_t*, vm);
+    STRLEN len;
+    const char* px = SvPV(pixels, len);
+    const int m = vision_merge(v), p = vision_patch(v), t = vision_temporal(v), n_out = vision_n_out(v);
+    if (h <= 0 || w <= 0 || m <= 0 || h % m || w % m) croak("ROCm::Inference: vision_encode: grid %d x %d", h, w);
+    const size_t need = (size_t)h * w * 3 * t * p * p * sizeof(float);
+    if (len != need) croak("ROCm::Inference: vision_encode: %lu bytes of pixels, expected %lu", (unsigned long)len, (unsigned long)need);
+    const size_t rows = (size_t)(h / m) * (w / m);
+    SV* out = newSV(rows * n_out * sizeof(float));
+    SvPOK_on(out);
+    if (vision_encode(v, (const float*)px, h, w, (float*)SvPVX(out), NULL, NULL) != 0) {
+        SvREFCNT_dec(out);
+        croak("ROCm::Inference: vision_encode: %s", vision_last_error());
+    }
+    SvCUR_set(out, rows * n_out * sizeof(float));
+    RETVAL = out;
+  OUTPUT:
+    RETVAL
+
+void
+_image_pixels(bytes, patch, merge, temporal, mean, sd, min_px, max_px)
+    SV* bytes
+    int patch
+    int merge
+    int temporal
+    double mean
+    double sd
+    double min_px
+    double max_px
+  PPCODE:
+    /* an image file's bytes -> (packed float pixel rows, grid_h, grid_w) as the processor gives them */
+    STRLEN len;
+    const unsigned char* data = (const unsigned char*)SvPV(bytes, len);
+    unsigned char* rgb = NULL;
+    int w = 0, h = 0, gh = 0, gw = 0;
+    if (image_decode_rgb(data, len, &rgb, &w, &h) != 0) croak("ROCm::Inference: cannot decode the image");
+    float* rows = NULL;
+    const int rc = image_qwen_pixels(rgb, w, h, patch, merge, temporal, (float)mean, (float)sd, (long long)min_px,
+                                     (long long)max_px, &rows, &gh, &gw);
+    image_free(rgb);
+    if (rc != 0) croak("ROCm::Inference: the image (%d x %d) cannot be processed", w, h);
+    const size_t n = (size_t)gh * gw * 3 * temporal * patch * patch * sizeof(float);
+    SV* out = newSVpvn((const char*)rows, n);
+    free(rows);
+    EXTEND(SP, 3);
+    PUSHs(sv_2mortal(out));
+    PUSHs(sv_2mortal(newSViv(gh)));
+    PUSHs(sv_2mortal(newSViv(gw)));
+
+void
+_mrope_positions(ids_ref, hw_ref, merge, image_token)
+    SV* ids_ref
+    SV* hw_ref
+    int merge
+    int image_token
+  PPCODE:
+    /* the prompt's M-RoPE positions: (packed int64 [n][3], the decode delta) */
+    if (!SvROK(ids_ref) || SvTYPE(SvRV(ids_ref)) != SVt_PVAV || !SvROK(hw_ref) || SvTYPE(SvRV(hw_ref)) != SVt_PVAV)
+        croak("ROCm::Inference: mrope_positions: array references expected");
+    AV* ids_av = (AV*)SvRV(ids_ref);
+    AV* hw_av = (AV*)SvRV(hw_ref);
+    const int n = (int)(av_len(ids_av) + 1), nhw = (int)(av_len(hw_av) + 1);
+    if (n <= 0 || nhw % 2) croak("ROCm::Inference: mrope_positions: empty prompt or odd grid list");
+    int32_t* ids;
+    int32_t* hw;
+    int64_t* pos;
+    Newx(ids, n, int32_t);
+    Newx(hw, nhw ? nhw : 1, int32_t);
+    Newx(pos, 3 * (size_t)n, int64_t);
+    for (int i = 0; i < n; ++i) { SV** e = av_fetch(ids_av, i, 0); ids[i] = e ? (int32_t)SvIV(*e) : 0; }
+    for (int i = 0; i < nhw; ++i) { SV** e = av_fetch(hw_av, i, 0); hw[i] = e ? (int32_t)SvIV(*e) : 0; }
+    int64_t delta = 0;
+    const int rc = mrope_positions(ids, n, hw, nhw / 2, merge, image_token, pos, &delta);
+    Safefree(ids);
+    Safefree(hw);
+    if (rc != 0) { Safefree(pos); croak("ROCm::Inference: mrope_positions: the image pad runs do not match the grids"); }
+    SV* out = newSVpvn((const char*)pos, 3 * (size_t)n * sizeof(int64_t));
+    Safefree(pos);
+    EXTEND(SP, 2);
+    PUSHs(sv_2mortal(out));
+    PUSHs(sv_2mortal(newSViv((IV)delta)));
+
+void
+set_mm(h, base, n, emb, use, pos3)
+    SV* h
+    int base
+    int n
+    SV* emb
+    SV* use
+    SV* pos3
+  CODE:
+    /* the prompt's overrides for its next prefill (inference_set_mm; the engine copies the buffers); emb undef clears */
+    inference_model_t* m = handle_ptr(aTHX_ h, 0);
+    if (!SvOK(emb)) {
+        if (inference_set_mm(m, 0, 0, NULL, NULL, NULL) != 0) croak_last(aTHX_ "set_mm", -1);
+        XSRETURN_EMPTY;
+    }
+    STRLEN el, ul, pl = 0;
+    const char* ep = SvPV(emb, el);
+    const char* up = SvPV(use, ul);
+    const char* pp = SvOK(pos3) ? SvPV(pos3, pl) : NULL;
+    if (n <= 0 || ul != (STRLEN)n || el % ((size_t)n * sizeof(float)) != 0 || (pp && pl != (STRLEN)n * 3 * sizeof(int64_t)))
+        croak("ROCm::Inference: set_mm: %d rows, %lu embedding bytes, %lu use bytes", n, (unsigned long)el, (unsigned long)ul);
+    if (inference_set_mm(m, base, n, (const float*)ep, (const unsigned char*)up, pp ? (const int64_t*)pp : NULL) != 0)
+        croak_last(aTHX_ "set_mm", -1);
+
+int
+mm_rope_delta(h)
+    SV* h
+  CODE:
+    RETVAL = inference_mm_rope_delta(handle_ptr(aTHX_ h, 0));
   OUTPUT:
     RETVAL
 

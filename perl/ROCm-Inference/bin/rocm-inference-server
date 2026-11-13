@@ -10,7 +10,7 @@ use List::Util qw(max);
 use File::Basename qw(basename);
 use B ();
 use JSON::PP ();
-use MIME::Base64 qw(encode_base64);
+use MIME::Base64 qw(encode_base64 decode_base64);
 use Pod::Usage qw(pod2usage);
 use Time::HiRes ();
 use ROCm::Inference qw(:all);
@@ -24,7 +24,7 @@ GetOptions(\%o, 'model=s', 'models-dir=s', 'models-max=i', 'models-margin=f', 'k
            'name=s', 'draft=s', 'store=s', 'max_tokens=i', 'swa-ring=i', 'stage=s', 'recache', 'kv-type=s',
            'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'preserve-thinking!', 'log!', 'log-level=s', 'log-format=s', 'log-color=s',
            'thinking-low=i', 'thinking-medium=i', 'thinking-high=i',
-           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'help')
+           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'mmproj=s', 'help')
     or pod2usage(2);
 # The log: --nolog is level none; --log-level, --log-format, --log-color are checked by the formatter
 our $LOG = eval { ROCm::Inference::Log->new(level => ($o{log} // 1) ? ($o{'log-level'} // 'info') : 'none',
@@ -44,6 +44,7 @@ $o{'store-snapshots'} //= 'lazy';
 die "--store-snapshots: lazy or eager\n" unless $o{'store-snapshots'} =~ /\A(?:lazy|eager)\z/;
 die "--store-snapshot-every N: 0 or more\n" if ($o{'store-snapshot-every'} // 4) < 0;
 die "--parallel: not with --draft (speculative decoding is single-sequence)\n" if $parallel > 1 && $o{draft};
+die "--mmproj: no file $o{mmproj}\n" if $o{mmproj} && !-f $o{mmproj};
 my $kv_type = $o{'kv-type'} // 'auto';
 die "--kv-type: auto, f16, q8_0 or q4_0\n" unless $kv_type =~ /\A(?:auto|f16|q8_0|q4_0)\z/;
 my $created = time;
@@ -149,6 +150,7 @@ sub unload {
     @$r{qw(pool queue running)} = ([], [], []);
     delete $default{ $r->{info}{kind} } if ($default{ $r->{info}{kind} } // 0) == $r && $r->{dir};
     undef $r->{m};  # (the only reference: unmapped and unpinned now)
+    delete $r->{vision};
     $LOG->info('model', model => $r->{id}, event => 'unload', msg => 'unloaded');
 }
 
@@ -232,6 +234,20 @@ sub load {
     }
     # --parallel N: N sequences (conversations at once), each a KV cache of the context; sequence 0 and N - 1 more
     $r->{pool} = [ map { { seq => $_, job => undef, prompt => [] } } 0, $emb ? () : map { seq_new($m) } 2 .. $parallel ];
+    if ($o{mmproj} && !$emb) {
+        # --mmproj: the vision tower (images in chat requests); its output must be the model's width
+        my $v = eval { vision_load($o{mmproj}) };
+        if (!$v) {
+            $LOG->warn_(model => $r->{id}, event => 'load', msg => "--mmproj $o{mmproj}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r));
+        } elsif ($v->n_out != hidden_size($m)) {
+            $LOG->warn_(model => $r->{id}, event => 'load',
+                        msg => sprintf('--mmproj %s: its output is %d wide, the model %d: no images for this model',
+                                       $o{mmproj}, $v->n_out, hidden_size($m)));
+        } else {
+            $r->{vision} = $v;
+            $LOG->info('model', model => $r->{id}, event => 'vision', msg => "vision tower $o{mmproj}");
+        }
+    }
     @$r{qw(m ctx kvt)} = ($m, $ctx, $kvt);
     memory_check($r, $m);
     return $r;
@@ -381,10 +397,22 @@ route::post '/models/unload' => sub {
     { success => JSON::PP::true, model => model_entry($r) };
 };
 
+# An image part's bytes: a data: URL (base64) in the request; the server does not fetch URLs
+sub image_bytes {
+    my ($part) = @_;
+    my $url = ref $part->{image_url} eq 'HASH' ? $part->{image_url}{url} : $part->{image_url};
+    error(400, 'image_url: a data: URL (data:image/...;base64,...) is needed; the server does not fetch URLs')
+        unless defined $url && !ref $url && $url =~ m{\Adata:image/[^;,]+;base64,(.*)\z}s;
+    my $bytes = decode_base64($1);
+    error(400, 'image_url: empty image') unless length $bytes;
+    return $bytes;
+}
+
 # OpenAI messages as the chat template wants them: text parts joined, tool call arguments as hashes,
-# 'developer' as 'system'
+# 'developer' as 'system'. An image part (image_url) becomes an image placeholder in its message's content, and its
+# bytes go to $images in order (the chat's images); a message with none keeps its text as one string.
 sub messages {
-    my ($in) = @_;
+    my ($in, $images) = @_;
     ref $in eq 'ARRAY' && @$in or error(400, "'messages' must be a non-empty array");
     my @out;
     for my $msg (@$in) {
@@ -392,9 +420,19 @@ sub messages {
         my %m = %$msg;
         $m{role} = 'system' if $m{role} eq 'developer';
         if (ref $m{content} eq 'ARRAY') {
-            my @types = grep { ($_->{type} // '') ne 'text' } @{ $m{content} };
-            error(400, "content parts of type '$types[0]{type}' are not supported") if @types;
-            $m{content} = join '', map { $_->{text} // '' } @{ $m{content} };
+            for (@{ $m{content} }) {
+                my $t = $_->{type} // '';
+                error(400, "content parts of type '$t' are not supported") unless $t eq 'text' || $t eq 'image_url';
+            }
+            if (grep { $_->{type} eq 'image_url' } @{ $m{content} }) {
+                error(400, 'images: the server needs --mmproj (the vision tower of the model)') unless $images;
+                $m{content} = [ map {
+                    if ($_->{type} eq 'image_url') { push @$images, image_bytes($_); { type => 'image' } }
+                    else { { type => 'text', text => $_->{text} // '' } }
+                } @{ $m{content} } ];
+            } else {
+                $m{content} = join '', map { $_->{text} // '' } @{ $m{content} };
+            }
         }
         $m{content} //= '';
         if (ref $m{tool_calls} eq 'ARRAY') {
@@ -733,7 +771,14 @@ route::post '/v1/chat/completions' => sub {
     my ($m, $name) = @$r{qw(m id)};
     my $q = request_ctx($req, $r);
     my $id = $q->{req};
-    my ($messages, $opts) = (messages($p->{messages}), options($p, $r));
+    my @images;
+    my ($messages, $opts) = (messages($p->{messages}, \@images), options($p, $r));
+    if (@images) {
+        # the images go to chat with the model's vision tower: its own prefill (no prefix reuse, no store)
+        error(400, "$name has no vision tower: start the server with --mmproj") unless $r->{vision};
+        error(400, 'images: not with --parallel > 1 (one conversation at a time: start with --parallel 1)') if $parallel > 1;
+        @$opts{qw(images vision)} = (\@images, $r->{vision});
+    }
     start_line($q, $p, $opts);
     my ($prompt_tokens, $completion_tokens, $prefill) = (undef, 0, undef);
     # the prompt's length is the sequence length when the first token comes; every token emitted counts
@@ -1318,6 +1363,12 @@ needs it). At 128k context about 3 GB instead of 31 GB for Gemma-4 26B-A4B.
 
 The model id in the API (default: the file name without F<.gguf>).
 
+=item --mmproj F<mmproj.gguf>
+
+The vision tower (C<rocm-convert --mmproj> of a Qwen3.5 checkpoint) for images in chat requests: a message's content
+parts of type C<image_url> take a C<data:image/...;base64,...> URL (the server does not fetch URLs). Its output must be
+the model's width (else the model answers without images, with a warning). Not with C<--parallel> above 1.
+
 =item --draft F<file.gguf> | none
 
 An MTP draft head for speculative decoding (Qwen3.8-Flash-Next). Without it (and without C<--parallel>), a model
@@ -1412,7 +1463,8 @@ X-LLamaCPP-Id-slot header of the opencode fixups). See L<ROCm::Inference::Log>.
 =head1 API
 
 C<GET /health>, C<GET /v1/models>, C<GET /v1/models/{id}> and C<POST /v1/chat/completions>, as OpenAI's:
-C<messages> (text content; tool calls and tool results), C<tools>, C<tool_choice> (C<none> drops the tools),
+C<messages> (text content, images as C<image_url> parts with a data: URL with C<--mmproj>; tool calls and tool
+results), C<tools>, C<tool_choice> (C<none> drops the tools),
 C<max_tokens> / C<max_completion_tokens>, C<temperature>, C<top_p>, C<seed>, C<stop>, C<stream> and
 C<stream_options.include_usage>. A reply's reasoning comes as C<reasoning_content> (in C<message> or in the
 streamed C<delta>s), its tool calls as C<tool_calls> (with arguments as a JSON string) and C<finish_reason>

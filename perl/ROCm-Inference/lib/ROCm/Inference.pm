@@ -19,12 +19,13 @@ our @EXPORT_OK = qw(
     model_info quantize quant_row_size quant_can_encode load_model free_model kv_cache_init set_lm_head_q8 set_draft_model set_draft_tokens set_prefill_batch set_event_handler
     set_swa_ring swa_ring stage_info set_kv_type
     seq_new seq_select seq_current seq_free stream_begin chat_start step_streams step_chats
-    embedding_dim embed
+    embedding_dim embed hidden_size
     tokenize detokenize chat_template bos_id eos_id token_is_eog vocab_size
     n_ctx n_past reset prefill decode_token get_logits
     generate last_prompt_stats last_error
     store_open store_close store_set_lazy store_stats store_block_names
     chat_render chat reply_tags
+    vision_load image_prompt set_mm mm_rope_delta
     STOP_NONE STOP_EOG STOP_MAX_TOKENS STOP_STRING STOP_CALLBACK STOP_CONTEXT_FULL
 );
 our %EXPORT_TAGS = (all => \@EXPORT_OK);
@@ -378,6 +379,7 @@ sub chat {
     my %o = %{ $opts // {} };
     my %vars = %{ delete $o{vars} // {} };
     my ($on_delta, $budget, $on_token) = delete @o{qw(on_delta max_thinking_tokens on_token)};
+    my ($images, $vision) = delete @o{qw(images vision)};
     my $text = chat_render($m, $messages, %vars);
     # Does the generation prompt open the reasoning (Qwen3.5+ with thinking on ends it with "<think>\n")?
     my $tags = reply_tags($m);
@@ -390,6 +392,14 @@ sub chat {
     my ($max, $thinking, @ids, $reason) = ($o{max_new_tokens} // 256, 0);
     my %g = (reuse_prefix => 1, %o);
     my $prompt = tokenize($m, $text);
+    if ($images && @$images) {
+        # an image chat: the prompt is prefilled whole from a reset (its pad tokens must not match a cached prefix of
+        # another image), with the images' features and M-RoPE positions as its overrides
+        croak 'ROCm::Inference::chat: images need a vision model (vision => vision_load($mmproj))' unless $vision;
+        $prompt = image_prompt($m, $vision, $prompt, $images);
+        ROCm::Inference::reset($m);
+        $g{reuse_prefix} = 0;
+    }
     while (1) {
         my ($stopped, $budget_hit) = (0, 0);
         $g{max_new_tokens} = $max - @ids;
@@ -432,6 +442,82 @@ sub stream_begin {
     my $p = _stream_begin($m, $prompt, $opts);
     return bless { p => $p, m => $m }, 'ROCm::Inference::Stream';
 }
+
+# vision_load($mmproj): the vision tower (rocm-convert --mmproj) as a ROCm::Inference::Vision object; $v->info is
+# (n_out, merge, patch, temporal, mean, std); $v->pixels($bytes) runs the image processor on an image file's bytes and
+# returns (packed float rows, grid_h, grid_w); $v->encode($rows, $h, $w) the merged features (packed floats).
+sub vision_load {
+    my ($path) = @_;
+    return ROCm::Inference::Vision->new($path);
+}
+
+# image_prompt($m, $vision, \@ids, \@images): the prompt's token ids with each <|image_pad|> expanded to its image's
+# token count, the images (file bytes, in the order of their pads) encoded and registered with set_mm for the next
+# prefill at position 0, with the M-RoPE positions. Returns the expanded ids.
+sub image_prompt {
+    my ($m, $v, $ids, $images) = @_;
+    my $pad = tokenize($m, '<|image_pad|>');
+    croak 'ROCm::Inference::image_prompt: the tokenizer has no <|image_pad|>' unless @$pad == 1;
+    $pad = $pad->[0];
+    my @pads = grep { $ids->[$_] == $pad } 0 .. $#$ids;
+    croak sprintf('ROCm::Inference::image_prompt: %d image pads in the prompt, %d images', scalar @pads, scalar @$images)
+        unless @pads == @$images;
+    my ($n_out, $merge, $patch, $temporal, $mean, $sd) = $v->info;
+    my $E = hidden_size($m);
+    croak "ROCm::Inference::image_prompt: the vision tower's output ($n_out) is not the model's width ($E)" unless $n_out == $E;
+    my (@out, @hw, @emb, @use);
+    my $last = 0;
+    for my $i (0 .. $#pads) {
+        my ($rows, $gh, $gw) = $v->pixels($images->[$i]);
+        my $feat = $v->encode($rows, $gh, $gw);
+        my $n = ($gh / $merge) * ($gw / $merge);
+        push @out, @$ids[$last .. $pads[$i] - 1], ($pad) x $n;
+        push @use, (0) x ($pads[$i] - $last), (1) x $n;
+        push @emb, pack('f<*', (0) x ($E * ($pads[$i] - $last))), $feat;
+        push @hw, $gh, $gw;
+        $last = $pads[$i] + 1;
+    }
+    push @out, @$ids[$last .. $#$ids];
+    push @use, (0) x (@$ids - $last);
+    push @emb, pack('f<*', (0) x ($E * (@$ids - $last)));
+    my ($pos3) = _mrope_positions(\@out, \@hw, $merge, $pad);
+    set_mm($m, 0, scalar @out, join('', @emb), pack('C*', @use), $pos3);
+    return \@out;
+}
+
+package ROCm::Inference::Vision;
+
+sub new {
+    my ($class, $path) = @_;
+    my $p = ROCm::Inference::_vision_open($path);
+    my @info = ROCm::Inference::_vision_info($p);
+    return bless { p => $p, path => $path, info => \@info }, $class;
+}
+
+sub info { @{ $_[0]{info} } }
+sub n_out { $_[0]{info}[0] }
+
+# the image processor: ($rows, $grid_h, $grid_w) for an image file's bytes (the pixel bounds are the processor's
+# defaults: 65536 .. 16777216 pixels)
+sub pixels {
+    my ($v, $bytes, %o) = @_;
+    my ($n_out, $merge, $patch, $temporal, $mean, $sd) = @{ $v->{info} };
+    return ROCm::Inference::_image_pixels($bytes, $patch, $merge, $temporal, $mean, $sd, $o{min_pixels} // 65536,
+                                          $o{max_pixels} // 16777216);
+}
+
+sub encode {
+    my ($v, $rows, $h, $w) = @_;
+    return ROCm::Inference::_vision_encode($v->{p}, $rows, $h, $w);
+}
+
+sub DESTROY {
+    my ($v) = @_;
+    ROCm::Inference::_vision_close($v->{p}) if $v->{p};
+    $v->{p} = 0;
+}
+
+package ROCm::Inference;
 
 # chat_start($m, \@messages, \%options): chat one token per step on the current sequence. Options as chat's but
 # on_delta / on_token. $c->step returns (\@deltas, $going): the reply's new pieces as [$text, $kind] (reasoning,
@@ -792,7 +878,18 @@ longest input, at most 2048 tokens): C<embedding_dim> is the embedding's length 
 returns the embedding of one input's token ids (C<tokenize>'s, with BOS and EOS) as an array reference, scaled to
 length 1 unless C<$normalize> is 0. Dies when the input is longer than the KV cache.
 
-=item chat_template($m [, $name]), bos_id, eos_id, token_is_eog, vocab_size, n_ctx, n_past, reset,
+=item vision_load($mmproj), image_prompt($m, $vision, \@ids, \@images), set_mm, mm_rope_delta
+
+Qwen3.5 with images (the vision tower of C<rocm-convert --mmproj>). C<vision_load> opens the tower as a
+C<ROCm::Inference::Vision>: C<< $v->info >> is (n_out, merge, patch, temporal, mean, std), C<< $v->pixels($bytes) >>
+the image processor on an image file's bytes (PNG, JPEG: rows, grid height, grid width) and C<< $v->encode($rows, $h,
+$w) >> the merged features. A chat takes the images with C<< chat($m, \@messages, { images => [$bytes, ...], vision =>
+$v }) >>: the prompt's C<image_pad> tokens are expanded to the images' token counts, and the prompt is prefilled whole
+from a reset, with the features and the M-RoPE positions (C<image_prompt>; C<set_mm> is the engine's override for the
+next prefill, C<mm_rope_delta> its decode offset). Images need the vision tower's width to be the model's
+(C<hidden_size>). The KV block store and the prefix reuse are not used for a sequence with image rows.
+
+=item chat_template($m [, $name]), bos_id, eos_id, token_is_eog, vocab_size, hidden_size, n_ctx, n_past, reset,
 prefill, decode_token, get_logits, last_prompt_stats, set_lm_head_q8, set_draft_model, set_draft_tokens,
 set_prefill_batch, set_swa_ring, swa_ring, set_kv_type, last_error
 

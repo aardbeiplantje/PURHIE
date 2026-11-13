@@ -37,6 +37,7 @@ struct vision_model {
     int depth = 0, n_embd = 0, n_ff = 0, n_head = 0, patch = 0, tpatch = 0, merge = 0, n_out = 0, n_pos = 0, n_side = 0;
     int in_dim = 0;  // C * T * P * P: a pixel row
     float eps = 1e-6f;
+    float img_mean = 0.5f, img_std = 0.5f;
     bool gelu_tanh = true;  // the blocks' MLP (config.hidden_act); the merger's GELU is exact
     const float *patch_w = nullptr, *patch_b = nullptr, *pos = nullptr;
     const float *post_w = nullptr, *post_b = nullptr, *fc1_w = nullptr, *fc1_b = nullptr, *fc2_w = nullptr, *fc2_b = nullptr;
@@ -130,6 +131,15 @@ vision_model_t* vision_open(const char* path) {
         vm->n_out = (int)gguf_arch_int(vm->g, "projection_dim", 0);
         vm->n_pos = (int)gguf_arch_int(vm->g, "num_position_embeddings", 0);
         vm->eps = gguf_arch_float(vm->g, "layer_norm_epsilon", 1e-6f);
+        {
+            int32_t type = 0;
+            const void* data = nullptr;
+            size_t count = 0;
+            if (gguf_kv_get_array(vm->g, "qwen3_5_vision.image_mean", &type, &data, &count) == 0 && count > 0 && type == 6)
+                vm->img_mean = static_cast<const float*>(data)[0];
+            if (gguf_kv_get_array(vm->g, "qwen3_5_vision.image_std", &type, &data, &count) == 0 && count > 0 && type == 6)
+                vm->img_std = static_cast<const float*>(data)[0];
+        }
         if (vm->depth <= 0 || vm->n_embd <= 0 || vm->n_ff <= 0 || vm->n_head <= 0 || vm->patch <= 0 || vm->tpatch <= 0 ||
             vm->merge <= 0 || vm->n_out <= 0 || vm->n_pos <= 0 || vm->n_embd % vm->n_head != 0)
             throw std::runtime_error("mmproj: missing or bad qwen3_5_vision hyperparameters");
@@ -175,6 +185,11 @@ void vision_close(vision_model_t* vm) { delete vm; }
 int vision_n_out(const vision_model_t* vm) { return vm ? vm->n_out : 0; }
 int vision_merge(const vision_model_t* vm) { return vm ? vm->merge : 0; }
 int vision_patch(const vision_model_t* vm) { return vm ? vm->patch : 0; }
+int vision_temporal(const vision_model_t* vm) { return vm ? vm->tpatch : 0; }
+void vision_image_norm(const vision_model_t* vm, float* mean, float* stdev) {
+    if (mean) *mean = vm ? vm->img_mean : 0.5f;
+    if (stdev) *stdev = vm ? vm->img_std : 0.5f;
+}
 
 int vision_encode(vision_model_t* vm, const float* pixels, int h, int w, float* out, vision_stage_fn stage, void* ud) {
     if (!vm || !pixels || !out) { set_err("vision_encode: NULL argument"); return -1; }

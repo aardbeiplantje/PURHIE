@@ -21,6 +21,9 @@ const char*     vision_last_error(void);
 int vision_n_out(const vision_model_t* vm);
 int vision_merge(const vision_model_t* vm);
 int vision_patch(const vision_model_t* vm);
+int vision_temporal(const vision_model_t* vm);
+/* The image processor's normalization (the mmproj's image_mean / image_std, the first channel's; Qwen: all 0.5). */
+void vision_image_norm(const vision_model_t* vm, float* mean, float* stdev);
 
 /* A stage's values for checks, called once per stage of vision_encode: "patch_embed" (the patch embedding, before
  * the position embedding), "block0" (the first block's output), "merged" (the LM's image tokens). */

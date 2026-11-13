@@ -197,8 +197,8 @@ $(EXPERT_CPU_BENCH): $(TESTSDIR)/expert_cpu_bench.cpp $(SRCDIR)/expert_cpu.cpp $
 $(IMAGE_VERIFY): $(TESTSDIR)/image_verify.cpp $(SRCDIR)/image.cpp $(SRCDIR)/image.h $(SRCDIR)/vision.cpp $(SRCDIR)/vision.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/third_party/stb_image.h
 	$(CLANG) $(CXXFLAGS) -fopenmp -I. $(TESTSDIR)/image_verify.cpp $(SRCDIR)/image.cpp $(SRCDIR)/vision.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
 
-$(MM_VERIFY): $(TESTSDIR)/mm_verify.cpp $(SRCDIR)/vision.cpp $(SRCDIR)/vision.h $(SRCDIR)/mrope.cpp $(SRCDIR)/mrope.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
-	$(CLANG) $(CXXFLAGS) -fopenmp -I. $(TESTSDIR)/mm_verify.cpp $(SRCDIR)/vision.cpp $(SRCDIR)/mrope.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -fopenmp -o $@
+$(MM_VERIFY): $(TESTSDIR)/mm_verify.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) -fopenmp -I. $(TESTSDIR)/mm_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -fopenmp -o $@
 
 $(MROPE_VERIFY): $(TESTSDIR)/mrope_verify.cpp $(SRCDIR)/mrope.cpp $(SRCDIR)/mrope.h
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/mrope_verify.cpp $(SRCDIR)/mrope.cpp -o $@
@@ -246,7 +246,7 @@ INFERENCE_SO    = $(BUILDDIR)/libinference.so.1
 INFERENCE_SO_1  = $(BUILDDIR)/libinference.so.1.0
 $(INFERENCE_SO_1): $(INFERENCE_LIB) $(QWEN_MODEL_LIB) $(SRCDIR)/libinference.map
 	$(CLANG) -shared -Wl,-soname,libinference.so.1 -Wl,--version-script=$(SRCDIR)/libinference.map -o $@ \
-		-Wl,--whole-archive $(INFERENCE_LIB) $(QWEN_MODEL_LIB) -Wl,--no-whole-archive $(LDFLAGS)
+		-Wl,--whole-archive $(INFERENCE_LIB) $(QWEN_MODEL_LIB) -Wl,--no-whole-archive $(LDFLAGS) -fopenmp
 $(INFERENCE_SO): $(INFERENCE_SO_1)
 	ln -sf libinference.so.1.0 $@
 	ln -sf libinference.so.1 $(BUILDDIR)/libinference.so
@@ -290,17 +290,17 @@ install: $(INFERENCE_SO) $(INFERENCE_LIB) $(PKGCONFIG)
 	cp -f $(INFERENCE_SO_1) $(DESTDIR)$(INSTALL_LIBDIR)/
 	ln -sf libinference.so.1.0 $(DESTDIR)$(INSTALL_LIBDIR)/libinference.so.1
 	ln -sf libinference.so.1 $(DESTDIR)$(INSTALL_LIBDIR)/libinference.so
-	cp -f $(SRCDIR)/inference.h $(SRCDIR)/sampler.h $(SRCDIR)/tokenizer.h $(DESTDIR)$(INSTALL_INCDIR)/
+	cp -f $(SRCDIR)/inference.h $(SRCDIR)/sampler.h $(SRCDIR)/tokenizer.h $(SRCDIR)/vision.h $(SRCDIR)/image.h $(SRCDIR)/mrope.h $(DESTDIR)$(INSTALL_INCDIR)/
 	sed 's|^prefix=.*|prefix=$(PREFIX)|' $(PKGCONFIG) > $(DESTDIR)$(INSTALL_PKGCONFIGDIR)/rocm-inference.pc
 
 uninstall:
 	rm -f $(INSTALL_LIBDIR)/libinference.so $(INSTALL_LIBDIR)/libinference.so.1 $(INSTALL_LIBDIR)/libinference.so.1.0
-	rm -f $(INSTALL_INCDIR)/inference.h $(INSTALL_INCDIR)/sampler.h $(INSTALL_INCDIR)/tokenizer.h
+	rm -f $(INSTALL_INCDIR)/inference.h $(INSTALL_INCDIR)/sampler.h $(INSTALL_INCDIR)/tokenizer.h $(INSTALL_INCDIR)/vision.h $(INSTALL_INCDIR)/image.h $(INSTALL_INCDIR)/mrope.h
 	rm -f $(INSTALL_PKGCONFIGDIR)/rocm-inference.pc
 
 # Phase 4: Qwen 3 model static library
-QWEN_SRCS = $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_ops.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/deltanet.cpp $(SRCDIR)/attention.cpp $(SRCDIR)/gpu_ops.cpp $(SRCDIR)/kernel_loader.cpp $(SRCDIR)/glm5_ref.cpp $(SRCDIR)/glm5_gpu.cpp $(SRCDIR)/expert_cpu.cpp
-QWEN_HDRS = $(SRCDIR)/expert_pager.h $(SRCDIR)/expert_cpu.h $(SRCDIR)/qwen_model.h $(SRCDIR)/qwen_ops.h $(SRCDIR)/qmatvec.h $(SRCDIR)/deltanet.h $(SRCDIR)/attention.h $(SRCDIR)/gpu_ops.h $(SRCDIR)/inference_internal.h $(SRCDIR)/kernel_loader.h $(SRCDIR)/inference_log.h $(SRCDIR)/glm5_ref.h $(SRCDIR)/glm5_gpu.h
+QWEN_SRCS = $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_ops.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/deltanet.cpp $(SRCDIR)/attention.cpp $(SRCDIR)/gpu_ops.cpp $(SRCDIR)/kernel_loader.cpp $(SRCDIR)/glm5_ref.cpp $(SRCDIR)/glm5_gpu.cpp $(SRCDIR)/expert_cpu.cpp $(SRCDIR)/vision.cpp $(SRCDIR)/image.cpp $(SRCDIR)/mrope.cpp
+QWEN_HDRS = $(SRCDIR)/vision.h $(SRCDIR)/image.h $(SRCDIR)/mrope.h $(SRCDIR)/third_party/stb_image.h $(SRCDIR)/expert_pager.h $(SRCDIR)/expert_cpu.h $(SRCDIR)/qwen_model.h $(SRCDIR)/qwen_ops.h $(SRCDIR)/qmatvec.h $(SRCDIR)/deltanet.h $(SRCDIR)/attention.h $(SRCDIR)/gpu_ops.h $(SRCDIR)/inference_internal.h $(SRCDIR)/kernel_loader.h $(SRCDIR)/inference_log.h $(SRCDIR)/glm5_ref.h $(SRCDIR)/glm5_gpu.h
 # The engine's code objects, embedded in the library (kernels_embed.S, loaded by kernel_loader.cpp)
 ENGINE_COS = $(CODIR)/matvec_q.co $(CODIR)/gpu_ops.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/glm5_gpu.co
 
@@ -318,8 +318,11 @@ $(QWEN_MODEL_LIB): $(QWEN_SRCS) $(QWEN_HDRS) $(SRCDIR)/inference.h $(SRCDIR)/ggu
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/glm5_ref.cpp -o $(OBJDIR)/glm5_ref.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/glm5_gpu.cpp -o $(OBJDIR)/glm5_gpu.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/expert_cpu.cpp -o $(OBJDIR)/expert_cpu.o
+	$(CLANG) $(CXXFLAGS) -fopenmp -I. -fPIC -c $(SRCDIR)/vision.cpp -o $(OBJDIR)/vision.o
+	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/image.cpp -o $(OBJDIR)/image.o
+	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/mrope.cpp -o $(OBJDIR)/mrope.o
 	rm -f $@
-	ar rcs $@ $(OBJDIR)/qwen_model.o $(OBJDIR)/qwen_ops.o $(OBJDIR)/qmatvec.o $(OBJDIR)/deltanet.o $(OBJDIR)/attention.o $(OBJDIR)/gpu_ops.o $(OBJDIR)/kernel_loader.o $(OBJDIR)/glm5_ref.o $(OBJDIR)/glm5_gpu.o $(OBJDIR)/expert_cpu.o $(OBJDIR)/kernels_embed.o
+	ar rcs $@ $(OBJDIR)/qwen_model.o $(OBJDIR)/qwen_ops.o $(OBJDIR)/qmatvec.o $(OBJDIR)/deltanet.o $(OBJDIR)/attention.o $(OBJDIR)/gpu_ops.o $(OBJDIR)/kernel_loader.o $(OBJDIR)/glm5_ref.o $(OBJDIR)/glm5_gpu.o $(OBJDIR)/expert_cpu.o $(OBJDIR)/vision.o $(OBJDIR)/image.o $(OBJDIR)/mrope.o $(OBJDIR)/kernels_embed.o
 
 # Phase 4: Qwen 3 demo binary
 $(QWEN_DEMO): $(SRCDIR)/demo_qwen.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/matvec_q.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/gpu_ops.co

@@ -513,6 +513,7 @@ struct QwenModel {
         rs.free();
         glm.free();
         s.mem.free();
+        if (mpos_dev) (void)hipFree(mpos_dev);
         for (size_t j = 1; j < seqs.size(); ++j) {
             seqs[j].rs.free();
             seqs[j].logits_mem.free();
@@ -843,7 +844,7 @@ struct QwenModel {
                 if (!K || !V) { qwen_set_error("no KV cache for KV layer %d", L.kv_slot); return false; }
                 attention_opts o = {};
                 o.part_slots = s.part_slots;
-                o.mpos = mpos_dev;
+                o.mpos = mpos_active && !bat ? mpos_dev : nullptr;  // (a batch's rows are one token each: no per-row positions)
                 o.rope_delta = rope_delta;
                 o.mh_end = mh_end;
                 o.mw_end = mw_end;
@@ -1103,20 +1104,22 @@ struct QwenModel {
         // a prompt's overrides (qwen_model_set_mm): the image rows' embeddings and this batch's M-RoPE positions
         const int64_t g0 = (int64_t)pos0 - mm_base;
         const bool mm_on = mm_emb && mm_n > 0 && g0 >= 0 && g0 + T <= mm_n;
-        mpos_dev = nullptr;
-        if (mm_on && !mm_pos.empty()) {
+        mpos_active = mm_on && !mm_pos.empty();
+        if (mpos_active) {
             if (mpos_cap < 3 * T) {
-                if (mpos_dev) hipFree(mpos_dev);
+                if (mpos_dev) (void)hipFree(mpos_dev);
                 mpos_dev = nullptr;
                 mpos_cap = 0;
-                if (hipMalloc((void**)&mpos_dev, sizeof(int) * 3 * (size_t)s.B) != hipSuccess) {
+                if (hipMalloc((void**)&mpos_dev, sizeof(int) * 3 * (size_t)T) != hipSuccess) {
                     qwen_set_error("no memory for the M-RoPE positions");
                     return -1;
                 }
-                mpos_cap = 3 * s.B;
+                mpos_cap = 3 * T;
             }
-            if (hipMemcpy(mpos_dev, mm_pos.data() + 3 * g0, sizeof(int) * 3 * (size_t)T, hipMemcpyHostToDevice) != hipSuccess) {
-                qwen_set_error("cannot upload the M-RoPE positions");
+            const hipError_t e = hipMemcpy(mpos_dev, mm_pos.data() + 3 * g0, sizeof(int) * 3 * (size_t)T, hipMemcpyHostToDevice);
+            if (e != hipSuccess) {
+                qwen_set_error("cannot upload the M-RoPE positions (%d tokens, g0 %lld, %zu values): %s", T, (long long)g0,
+                               mm_pos.size(), hipGetErrorString(e));
                 return -1;
             }
         }
@@ -1233,12 +1236,16 @@ struct QwenModel {
     // mm_emb's row where mm_use says (an image's merged features), and mm_pos ([mm_n][3]) as their M-RoPE positions.
     // rope_delta is added to every RoPE position (a prompt with an image continues its decode at index + delta).
     int mm_base = 0, mm_n = 0;
-    const float* mm_emb = nullptr;
-    const unsigned char* mm_use = nullptr;
+    const float* mm_emb = nullptr;         // (into mm_emb_v: the caller's buffers are copied)
+    const unsigned char* mm_use = nullptr;  // (into mm_use_v)
+    std::vector<float> mm_emb_v;
+    std::vector<unsigned char> mm_use_v;
     std::vector<int32_t> mm_pos;
     int rope_delta = 0;
+    int mm_span = 0;  // the positions that hold image rows (the end of the longest image prompt; 0: none)
     int mh_end = 0, mw_end = 0;  // M-RoPE sections as frequency pairs (3 x height, 3 x width), from the GGUF
-    int* mpos_dev = nullptr;     // the current forward's M-RoPE positions on the device ([T][3]); NULL: plain
+    int* mpos_dev = nullptr;     // the M-RoPE positions on the device ([T][3] of the current forward, if mpos_active)
+    bool mpos_active = false;    // this forward takes mpos_dev (a prompt's image rows); else plain RoPE
     int mpos_cap = 0;            // ints it holds
     int lm_head_all(int T, float* logits_out) {
         const int V = eng->vocab_size;
@@ -2612,7 +2619,6 @@ struct QwenModel {
     // Leaves the logits of the last token in s.logits (and logits_out, if given).
     int prefill(const int* tokens, int n, int pos0, float* logits_out) {
         if (n <= 0) { qwen_set_error("empty prefill"); return -1; }
-        if (!mm_emb && mm_pos.empty()) rope_delta = 0;  // a plain prompt: plain RoPE from here on
         // the prefill modes (see inv) for these forward passes only
         struct Mode {
             QwenModel* m;
@@ -2756,8 +2762,11 @@ int qwen_model_set_mm(qwen_model_t* model, int base, int n, const float* emb, co
     if (!use || base < 0 || n <= 0) { qwen_set_error("set_mm: rows, base and the use mask"); return -1; }
     m->mm_base = base;
     m->mm_n = n;
-    m->mm_emb = emb;
-    m->mm_use = use;
+    m->mm_emb_v.assign(emb, emb + (size_t)n * m->eng->n_embd);
+    m->mm_use_v.assign(use, use + n);
+    m->mm_emb = m->mm_emb_v.data();
+    m->mm_span = std::max(m->mm_span, base + n);
+    m->mm_use = m->mm_use_v.data();
     m->mm_pos.clear();
     if (pos3) {
         m->mm_pos.resize((size_t)3 * n);
@@ -2772,6 +2781,15 @@ int qwen_model_set_mm(qwen_model_t* model, int base, int n, const float* emb, co
 }
 
 int qwen_model_rope_delta(const qwen_model_t* model) { return model ? model->rope_delta : 0; }
+
+int qwen_model_image_span(const qwen_model_t* model) { return model ? model->mm_span : 0; }
+
+void qwen_model_truncate(qwen_model_t* model, int len) {
+    if (model && len < model->mm_span) {  // the sequence loses its image rows: plain RoPE from here on
+        model->mm_span = 0;
+        model->rope_delta = 0;
+    }
+}
 
 int qwen_model_run_layers(qwen_model_t* model, const int* tokens, int n, const float* res_in, int l0, int l1) {
     if (!model || !tokens || !res_in || (model->eng->n_hc <= 0 && !model->eng->gemma4 && !model->eng->nemotron && !model->eng->glm5) || l0 < 0 ||

@@ -49,6 +49,11 @@ void qwen_model_set_all_logits(qwen_model_t* model, float* logits);
 int qwen_model_set_mm(qwen_model_t* model, int base, int n, const float* emb, const unsigned char* use,
                       const int64_t* pos3);
 int qwen_model_rope_delta(const qwen_model_t* model);
+// The sequence holds image rows (a set_mm prompt, not yet truncated below its end): their KV is not the token's, so
+// the block store must not share it. truncate(len): the sequence keeps its first len positions; below its image rows
+// the RoPE offset and the image state go (plain RoPE again).
+int qwen_model_image_span(const qwen_model_t* model);  // the positions that hold image rows (0: none)
+void qwen_model_truncate(qwen_model_t* model, int len);
 
 // Tests, hyper-connection models only: run layers [l0, l1) on n tokens from position 0 (fresh state), starting from
 // the residual streams res_in [n][n_hc * n_embd] instead of the embeddings; the layer callback sees each layer's

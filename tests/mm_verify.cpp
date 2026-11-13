@@ -128,12 +128,11 @@ int main(int argc, char** argv) {
     if (!m) { std::fprintf(stderr, "load: %s\n", inference_get_last_error()); return 1; }
     if (inference_kv_cache_init(m, 1024) != 0) { std::fprintf(stderr, "kv: %s\n", inference_get_last_error()); return 1; }
     const int V = inference_vocab_size(m);
-    if (inference_set_mm(m, n, emb.data(), use.data(), pos3.data()) != 0) {
+    if (inference_set_mm(m, 0, n, emb.data(), use.data(), pos3.data()) != 0) {
         std::fprintf(stderr, "set_mm: %s\n", inference_get_last_error());
         return 1;
     }
     if (inference_prefill(m, ids32.data(), n) != 0) { std::fprintf(stderr, "prefill: %s\n", inference_get_last_error()); return 1; }
-    inference_set_mm(m, 0, nullptr, nullptr, nullptr);
     if (inference_mm_rope_delta(m) != (int)delta) {
         std::fprintf(stderr, "rope delta %d, transformers %lld\n", inference_mm_rope_delta(m), (long long)delta);
         return 1;

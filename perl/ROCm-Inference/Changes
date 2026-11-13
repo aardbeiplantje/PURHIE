@@ -1,6 +1,10 @@
 Revision history for ROCm-Inference
 
 0.01  unreleased
+    - images in chat (Qwen3.5 with its vision tower): ROCm::Inference::vision_load, the image processor and the
+      features (ROCm::Inference::Vision), chat(..., images => [...], vision => $v) with the M-RoPE positions
+      (image_prompt, set_mm, mm_rope_delta, hidden_size); rocm-inference-server --mmproj and image_url content parts
+      (data: URLs). A sequence with image rows does not use the KV block store or the prefix reuse.
     - rocm-convert --mmproj: a Qwen3.5 checkpoint's vision tower as an mmproj GGUF (F32, v.* tensors, qwen3_5_vision.*
       keys), checked bit for bit against the checkpoint (tests/mmproj_verify.py).
     - rocm-inference-server: POST /v1/completions, OpenAI's raw completion (the prompt text as it is, no chat template;
