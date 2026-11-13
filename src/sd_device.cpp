@@ -30,7 +30,7 @@ int g_state = -1;  // -1: not tried, 0: host only, 1: device
 hipModule_t g_mod = nullptr;
 hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn_sum = nullptr, f_gn_sq = nullptr,
               f_gn_apply = nullptr, f_silu = nullptr, f_add = nullptr, f_upsample2 = nullptr, f_softmax = nullptr,
-              f_layer_norm = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr,
+              f_layer_norm = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
               f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr;
 
 constexpr int kThreads = 256;
@@ -56,8 +56,8 @@ bool init() {
         const char* name;
     };
     const Entry entries[] = {
-        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_to_bf16, "sd_to_bf16"},
-        {&f_transpose_pad, "sd_transpose_pad"}, {&f_softmax_bf16, "sd_softmax_bf16"},
+        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"},
+        {&f_transpose_pad, "sd_transpose_pad"}, {&f_softmax_bf16, "sd_softmax_bf16"}, {&f_softmax_bf16w, "sd_softmax_bf16_w"},
         {&f_gn_sum, "sd_gn_sum"},       {&f_gn_sq, "sd_gn_sq"},         {&f_gn_apply, "sd_gn_apply"},
         {&f_silu, "sd_silu"},           {&f_add, "sd_add"},             {&f_upsample2, "sd_upsample2"},
         {&f_softmax, "sd_softmax"},     {&f_layer_norm, "sd_layer_norm"}, {&f_geglu, "sd_geglu"},
@@ -178,8 +178,10 @@ void linear_f32(const float* x, int T, const float* W, int in, int out, const fl
 
 void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, const float* b, float* y) {
     if (out <= 0 || T <= 0) return;
-    // the tensor-core tile (sd_gemm_wmma) when its shape rules hold (K a multiple of 64), else the plain tile
+    // the tensor-core tile (sd_gemm_wmma, 128 x 128 when the output has the rows for it; the F32 activations rounded on load:
+    // measured faster than converting them once, see PLAN.md)
     if (in % 64 == 0) {
+        const bool big = out >= 128;
         const uint16_t* A = W;
         const float* B = x;
         float* C = y;
@@ -191,7 +193,8 @@ void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, cons
         void* args[] = {(void*)&A, (void*)&lda, (void*)&B, (void*)&sbn, (void*)&C, (void*)&cs_m, (void*)&cs_n,
                         (void*)&bf, (void*)&alpha, (void*)&beta, (void*)&M, (void*)&N, (void*)&K, (void*)&bs0, (void*)&bs0,
                         (void*)&bs0};
-        check(hipModuleLaunchKernel(f_gemm_wmma, (unsigned)((N + 63) / 64), (unsigned)((M + 63) / 64), 1, 128, 1, 1, 0, nullptr,
+        check(hipModuleLaunchKernel(big ? f_gemm_wmma128 : f_gemm_wmma, (unsigned)((N + (big ? 127 : 63)) / (big ? 128 : 64)),
+                                    (unsigned)((M + (big ? 127 : 63)) / (big ? 128 : 64)), 1, big ? 256 : 128, 1, 1, 0, nullptr,
                                     args, nullptr),
               "wmma gemm");
         sync();
@@ -310,7 +313,9 @@ void wmma_batched(const uint16_t* A, long lda, long bsA, const float* B, long sb
     const float beta = 0.0f;
     void* args[] = {(void*)&a, (void*)&lda, (void*)&b, (void*)&sbn, (void*)&c, (void*)&cs_m, (void*)&cs_n, (void*)&bi,
                     (void*)&alpha, (void*)&beta, (void*)&M, (void*)&N, (void*)&K, (void*)&bsA, (void*)&bsB, (void*)&bsC};
-    check(hipModuleLaunchKernel(f_gemm_wmma, (unsigned)((N + 63) / 64), (unsigned)((M + 63) / 64), (unsigned)batches, 128, 1, 1, 0,
+    const bool big = M >= 128;
+    check(hipModuleLaunchKernel(big ? f_gemm_wmma128 : f_gemm_wmma, (unsigned)((N + (big ? 127 : 63)) / (big ? 128 : 64)),
+                                (unsigned)((M + (big ? 127 : 63)) / (big ? 128 : 64)), (unsigned)batches, big ? 256 : 128, 1, 1, 0,
                                 nullptr, args, nullptr),
           "wmma batched");
 }
@@ -345,8 +350,11 @@ void attention_tc(const float* q, int Tq, const float* k, const float* v, int Tk
         const float* sp = sc;
         uint16_t* pp = pb;
         void* a3[] = {(void*)&sp, (void*)&pp, (void*)&tq, (void*)&tk, (void*)&tkp};
-        check(hipModuleLaunchKernel(f_softmax_bf16, (unsigned)((long)heads * Tq), 1, 1, 256, 1, 1, 0, nullptr, a3, nullptr),
-              "softmax_bf16");
+        const long rows = (long)heads * Tq;
+        void* a3w[] = {(void*)&sp, (void*)&pp, (void*)&tq, (void*)&tk, (void*)&tkp, (void*)&rows};
+        check(hipModuleLaunchKernel(f_softmax_bf16w, (unsigned)((rows + 7) / 8), 1, 1, 256, 1, 1, 0, nullptr, a3w, nullptr),
+              "softmax_bf16_w");
+        (void)a3;
     }
     // out[m][h d] = sum_n P[h][m][n] V[n][h d]
     wmma_batched(pb, Tkp, (long)Tq * Tkp, vt, Tkp, (long)D * Tkp, out, C, 1, D, 1.0f, Tq, D, Tkp, heads);

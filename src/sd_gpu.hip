@@ -396,3 +396,176 @@ sd_softmax_bf16(const float* S, uint16_t* P, int Tq, int Tk, int Tkp) {
     const float inv = 1.0f / block_sum(sum, red);
     for (int j = threadIdx.x; j < Tkp; j += 256) p[j] = j < Tk ? f2bf(expf(s[j] - mx) * inv) : (uint16_t)0;
 }
+
+// The 128 x 128 tile of sd_gemm_wmma: eight waves in a 4 x 2 arrangement, each a 32 x 64 region (2 x 4 WMMA tiles). Same operands,
+// strides, batches and tails as sd_gemm_wmma; blocks of 256 threads. A k-tile of 64, LDS 2 x 18 KB.
+extern "C" __global__ void __launch_bounds__(256)
+sd_gemm_wmma128(const uint16_t* __restrict__ A0, long lda, const float* __restrict__ B0, long sbn, float* __restrict__ C0, long cs_m,
+                long cs_n, const float* __restrict__ biasf, float alpha, float beta, int M, int N, int K, long bsA, long bsB,
+                long bsC) {
+    const uint16_t* A = A0 + blockIdx.z * bsA;
+    const float* B = B0 + blockIdx.z * bsB;
+    float* C = C0 + blockIdx.z * bsC;
+    __shared__ __attribute__((aligned(16))) uint16_t As[128][72];
+    __shared__ __attribute__((aligned(16))) uint16_t Bs[128][72];
+    const int t = threadIdx.x, w = t >> 5, l = t & 31;
+    const int wm = w >> 1, wn = w & 1;  // wm 0..3 (32 rows each), wn 0..1 (64 columns each)
+    const int bm = blockIdx.y * 128, bn = blockIdx.x * 128;
+    f32x8_t acc[2][4];
+    for (int a = 0; a < 2; ++a)
+        for (int b = 0; b < 4; ++b)
+            for (int i = 0; i < 8; ++i) acc[a][b][i] = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += 64) {
+        {  // A: thread t loads 32 values of row t / 2 at k0 + 32 * (t & 1)
+            const int r = t >> 1, h = (t & 1) * 32, gm = bm + r;
+            uint4 v[4];
+            for (int j = 0; j < 4; ++j) {
+                v[j] = {0u, 0u, 0u, 0u};
+                if (gm < M) v[j] = *reinterpret_cast<const uint4*>(A + (long)gm * lda + k0 + h + 8 * j);
+            }
+            for (int j = 0; j < 4; ++j) *reinterpret_cast<uint4*>(&As[r][h + 8 * j]) = v[j];
+        }
+        {  // B: thread t converts 32 values of column t / 2 at k0 + 32 * (t & 1)
+            const int n = t >> 1, h = (t & 1) * 32, gn = bn + n;
+            uint16_t q[32];
+            for (int j = 0; j < 8; ++j) {
+                float4 x = {0.0f, 0.0f, 0.0f, 0.0f};
+                if (gn < N) x = *reinterpret_cast<const float4*>(B + (long)gn * sbn + k0 + h + 4 * j);
+                q[4 * j] = f2bf(x.x);
+                q[4 * j + 1] = f2bf(x.y);
+                q[4 * j + 2] = f2bf(x.z);
+                q[4 * j + 3] = f2bf(x.w);
+            }
+            for (int j = 0; j < 4; ++j) {
+                uint4 v;
+                __builtin_memcpy(&v, &q[8 * j], sizeof v);
+                *reinterpret_cast<uint4*>(&Bs[n][h + 8 * j]) = v;
+            }
+        }
+        __syncthreads();
+        for (int ks = 0; ks < 4; ++ks) {
+            bf16x16_t af[2], bfr[4];
+            for (int mt = 0; mt < 2; ++mt) {
+                const int row = wm * 32 + mt * 16 + (l & 15);
+                __builtin_memcpy(&af[mt], &As[row][ks * 16], sizeof(bf16x16_t));
+            }
+            for (int nt = 0; nt < 4; ++nt) {
+                const int col = wn * 64 + nt * 16 + (l & 15);
+                __builtin_memcpy(&bfr[nt], &Bs[col][ks * 16], sizeof(bf16x16_t));
+            }
+            for (int mt = 0; mt < 2; ++mt)
+                for (int nt = 0; nt < 4; ++nt)
+                    acc[mt][nt] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af[mt], bfr[nt], acc[mt][nt]);
+        }
+        __syncthreads();
+    }
+    for (int mt = 0; mt < 2; ++mt)
+        for (int nt = 0; nt < 4; ++nt)
+            for (int i = 0; i < 8; ++i) {
+                const int gm = bm + wm * 32 + mt * 16 + 2 * i + (l >> 4);
+                const int gn = bn + wn * 64 + nt * 16 + (l & 15);
+                if (gm < M && gn < N) {
+                    float v = alpha * acc[mt][nt][i];
+                    if (biasf) v += biasf[gm];
+                    const long off = (long)gm * cs_m + (long)gn * cs_n;
+                    if (beta != 0.0f) v += beta * C[off];
+                    C[off] = v;
+                }
+            }
+}
+
+// The 128 x 128 tile of sd_gemm_wmma with BF16 B too (sd_gemm_wmma128bb): the activations converted once, read as 16-byte vectors.
+// The 128 x 128 tile of sd_gemm_wmma: eight waves in a 4 x 2 arrangement, each a 32 x 64 region (2 x 4 WMMA tiles). Same operands,
+// strides, batches and tails as sd_gemm_wmma; blocks of 256 threads. A k-tile of 64, LDS 2 x 18 KB.
+extern "C" __global__ void __launch_bounds__(256)
+sd_gemm_wmma128bb(const uint16_t* __restrict__ A0, long lda, const uint16_t* __restrict__ B0, long sbn, float* __restrict__ C0, long cs_m,
+                long cs_n, const float* __restrict__ biasf, float alpha, float beta, int M, int N, int K, long bsA, long bsB,
+                long bsC) {
+    const uint16_t* A = A0 + blockIdx.z * bsA;
+    const uint16_t* B = B0 + blockIdx.z * bsB;
+    float* C = C0 + blockIdx.z * bsC;
+    __shared__ __attribute__((aligned(16))) uint16_t As[128][72];
+    __shared__ __attribute__((aligned(16))) uint16_t Bs[128][72];
+    const int t = threadIdx.x, w = t >> 5, l = t & 31;
+    const int wm = w >> 1, wn = w & 1;  // wm 0..3 (32 rows each), wn 0..1 (64 columns each)
+    const int bm = blockIdx.y * 128, bn = blockIdx.x * 128;
+    f32x8_t acc[2][4];
+    for (int a = 0; a < 2; ++a)
+        for (int b = 0; b < 4; ++b)
+            for (int i = 0; i < 8; ++i) acc[a][b][i] = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += 64) {
+        {  // A: thread t loads 32 values of row t / 2 at k0 + 32 * (t & 1)
+            const int r = t >> 1, h = (t & 1) * 32, gm = bm + r;
+            uint4 v[4];
+            for (int j = 0; j < 4; ++j) {
+                v[j] = {0u, 0u, 0u, 0u};
+                if (gm < M) v[j] = *reinterpret_cast<const uint4*>(A + (long)gm * lda + k0 + h + 8 * j);
+            }
+            for (int j = 0; j < 4; ++j) *reinterpret_cast<uint4*>(&As[r][h + 8 * j]) = v[j];
+        }
+        {  // B: thread t copies 32 BF16 values of column t / 2 at k0 + 32 * (t & 1)
+            const int n = t >> 1, h = (t & 1) * 32, gn = bn + n;
+            for (int j = 0; j < 4; ++j) {
+                uint4 v = {0u, 0u, 0u, 0u};
+                if (gn < N) v = *reinterpret_cast<const uint4*>(B + (long)gn * sbn + k0 + h + 8 * j);
+                *reinterpret_cast<uint4*>(&Bs[n][h + 8 * j]) = v;
+            }
+        }
+        __syncthreads();
+        for (int ks = 0; ks < 4; ++ks) {
+            bf16x16_t af[2], bfr[4];
+            for (int mt = 0; mt < 2; ++mt) {
+                const int row = wm * 32 + mt * 16 + (l & 15);
+                __builtin_memcpy(&af[mt], &As[row][ks * 16], sizeof(bf16x16_t));
+            }
+            for (int nt = 0; nt < 4; ++nt) {
+                const int col = wn * 64 + nt * 16 + (l & 15);
+                __builtin_memcpy(&bfr[nt], &Bs[col][ks * 16], sizeof(bf16x16_t));
+            }
+            for (int mt = 0; mt < 2; ++mt)
+                for (int nt = 0; nt < 4; ++nt)
+                    acc[mt][nt] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af[mt], bfr[nt], acc[mt][nt]);
+        }
+        __syncthreads();
+    }
+    for (int mt = 0; mt < 2; ++mt)
+        for (int nt = 0; nt < 4; ++nt)
+            for (int i = 0; i < 8; ++i) {
+                const int gm = bm + wm * 32 + mt * 16 + 2 * i + (l >> 4);
+                const int gn = bn + wn * 64 + nt * 16 + (l & 15);
+                if (gm < M && gn < N) {
+                    float v = alpha * acc[mt][nt][i];
+                    if (biasf) v += biasf[gm];
+                    const long off = (long)gm * cs_m + (long)gn * cs_n;
+                    if (beta != 0.0f) v += beta * C[off];
+                    C[off] = v;
+                }
+            }
+}
+
+// Vt[c * Tkp + j] = V[j * C + c] in BF16 (zero for Tk <= j < Tkp): the attention's values for the batched GEMM
+extern "C" __global__ void __launch_bounds__(256) sd_transpose_pad_bf16(const float* V, int Tk, int Tkp, int C, uint16_t* Vt) {
+    const long i = (long)blockIdx.x * 256 + threadIdx.x;
+    if (i >= (long)C * Tkp) return;
+    const int c = (int)(i / Tkp), j = (int)(i % Tkp);
+    Vt[i] = j < Tk ? f2bf(V[(long)j * C + c]) : (uint16_t)0;
+}
+
+// The same softmax with one wave (32 lanes) per row, eight rows per 256-thread block: the reductions are wave shuffles, no block
+// barriers (the rows are ~1000 long, so a block per row spent most of its time in barriers).
+extern "C" __global__ void __launch_bounds__(256)
+sd_softmax_bf16_w(const float* S, uint16_t* P, int Tq, int Tk, int Tkp, long rows) {
+    const long row = (long)blockIdx.x * 8 + (threadIdx.x >> 5);
+    const int l = threadIdx.x & 31;
+    if (row >= rows) return;
+    const float* s = S + row * Tk;
+    uint16_t* p = P + row * Tkp;
+    float mx = -INFINITY;
+    for (int j = l; j < Tk; j += 32) mx = fmaxf(mx, s[j]);
+    for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off, 32));
+    float sum = 0.0f;
+    for (int j = l; j < Tk; j += 32) sum += expf(s[j] - mx);
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor(sum, off, 32);
+    const float inv = 1.0f / sum;
+    for (int j = l; j < Tkp; j += 32) p[j] = j < Tk ? f2bf(expf(s[j] - mx) * inv) : (uint16_t)0;
+}

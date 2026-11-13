@@ -535,7 +535,12 @@ DiT and the text encoder, no ROCmFP4 unless the user asks for it):
     activations rounded to BF16 on load, F32 accumulate; a 64 x 64 tile, a 64-wide k-tile, 4 waves of 2 x 2 WMMA 16 x 16 x 16
     tiles; the same cosines, 0.99995): the linears 6.2 s (about 7 TFLOPS). The attention on the tensor cores too (head width
     128: BF16 scores and values as batches over the heads, the softmax in F32 written as BF16 with zero pads): 2.7 s (was 4.4
-    s), the whole forward **9.7 s** at 1024 px. The six-step sampler (`mmdit_sample`) against the reference's six steps from the
+    s), the whole forward **9.7 s** at 1024 px. Tuning (2026-11-13): a 128 x 128 tile, eight waves of 32 x 64 (2 x 4 WMMA
+    tiles): the linears 6.1 s to 3.7 s (about 11 TFLOPS), the forward **7.2 s**. Tried and not kept: the activations converted
+    to BF16 once and read as 16-byte vectors (`sd_gemm_wmma128bb`, kept in the source): 5.9 s for the linears, slower (the
+    per-call temporaries and their syncs); a wave per softmax row (`sd_softmax_bf16_w`): 3% of the attention. Attention 2.6 s
+    is the two K = 128 batched GEMMs and the F32 score buffer (240 MB per layer): a fused flash-style kernel is the next
+    step for it. The six-step sampler (`mmdit_sample`) against the reference's six steps from the
     same noise: cosine 0.999993 (`tests/mm_dit_verify`, `tests/mm_dit_ref.py`). Still open: a larger BF16 tile, the
     attention's softmax passes, and the server's wiring for the DiT.
     (The earlier line: the sampler (`mmdit_sample`) is written but not yet
