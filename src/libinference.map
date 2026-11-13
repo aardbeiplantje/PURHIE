@@ -13,6 +13,7 @@ LIBINFERENCE_1 {
         mel_*;
         audio_*;
         qwen3tts_*;
+        sd_*;
     local:
         *;
 };

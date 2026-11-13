@@ -368,9 +368,15 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   CLIPTextModel (1024 wide, 23 layers, 16 heads, FFN 4096, GELU, 77 tokens), AutoencoderKL (latents 4, scale 0.18215,
   128/256/512/512), EulerDiscreteScheduler (trailing spacing, epsilon). The fp16 weights (`*.fp16.safetensors`) are
   the files read: the converter writes them as F16 copies (the checkpoint's values), the engine reads them in place.
-  Next: I2 the converter (`rocm-convert` of a diffusers folder: one GGUF, tensor names as a KV name table because
-  diffusers' names exceed a GGUF's 63 bytes) and the CLIP text encoder; then I3 the VAE decoder from the reference
-  latents, I4 the UNet's one step, I5 the sampler, PNG, `POST /v1/images/generations` and its Perl binding.
+  **I2 done 2026-11-13:** the converter (`rocm-convert` of a diffusers folder: `Convert::Diffusers`, one GGUF of 1306
+  F16 tensors named `te/un/va` + index, the checkpoint's names as KV arrays `sd.names.*`, the component configs as
+  `sd.te/unet/vae/sched.*`, the CLIP vocabulary and merges as `sd.tok.*`, the pad and bounds as `sd.te.pad/bos/eos`; 2.58
+  GB, `/data/image-ref/sd-turbo/sd-turbo-f16.gguf`). `src/sd.{h,cpp}`: the CLIP tokenizer (byte-level BPE, the word-end
+  marker; the reference's fast tokenizer splits each "!" as a word of its own without the marker: reproduced) and the
+  23-layer causal text encoder (F16 read in place, F16C conversion, exact GELU, the final layer norm).
+  `tests/sd_text_verify.cpp` (`make build/sd_text_verify`): the reference prompt's 77 ids equal transformers' CLIPTokenizer,
+  three more prompts with capitals, contractions and punctuation equal too; the embeddings equal diffusers' encode_prompt
+  at worst row cosine 1.0000000 (1.3e-6 of the peak 13.0). Next: I3 the VAE decoder from the reference latents.
 
 **MiniMax-H3-Image (requested 2026-11-12: "should be supported too"; `MiniMaxAI/MiniMax-H3-Image` on Hugging Face,
 code at github.com/MiniMax-AI/MiniMax-H3-Image).** Text-to-image and image editing. Config: the transformer is a

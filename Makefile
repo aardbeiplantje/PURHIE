@@ -18,7 +18,7 @@ TESTSDIR   := tests
 # Host C++ flags (no offloading)
 CXXFLAGS  := -O3 -Wall -I$(ROCM_PATH)/include -I$(SRCDIR) -D__HIP_PLATFORM_AMD__ -D__HIP_ENABLE_AMD_HSA__
 # the host float engines (qwen3tts, the codec, whisper, mel, audio): AVX-512 for the reductions and the convolutions
-HOST_SIMD := -mavx2 -mfma -mavx512f -mavx512vl -mavx512bw -mavx512dq
+HOST_SIMD := -mavx2 -mfma -mf16c -mavx512f -mavx512vl -mavx512bw -mavx512dq
 
 # Device/HIP kernel flags (with offloading)
 HIPFLAGS  := -Xarch_device -mno-wavefrontsize64 -isystem $(ROCM_PATH)/include --rocm-path=$(ROCM_PATH) -O3 --offload-arch=$(ARCH) --genco -D__HIP_PLATFORM_AMD__ -D__HIP_ENABLE_AMD_HSA__
@@ -97,6 +97,7 @@ MM_VERIFY      = $(BINDIR)/mm_verify  # an image chat through the engine vs tran
 MEL_VERIFY     = $(BINDIR)/mel_verify  # whisper's log-mel features vs transformers' WhisperFeatureExtractor (tests/mel_verify.cpp)
 WHISPER_VERIFY = $(BINDIR)/whisper_verify  # whisper's encoder and greedy decoder vs transformers (tests/whisper_verify.cpp)
 CODEC_ENCODE_VERIFY = $(BINDIR)/codec_encode_verify  # the speech tokenizer encoder vs qwen-tts (tests/codec_encode_verify.cpp)
+SD_TEXT_VERIFY = $(BINDIR)/sd_text_verify  # the image engine's CLIP tokenizer and text encoder vs transformers (tests/sd_text_verify.cpp)
 SPEAKER_VERIFY = $(BINDIR)/speaker_verify  # the TTS speaker encoder and the speaker mel vs qwen-tts (tests/speaker_verify.cpp)
 AUDIO_VERIFY = $(BINDIR)/audio_verify  # the band-limited resampler and the WAV decode vs librosa's soxr_hq (tests/audio_verify.cpp)
 QWEN3TTS_VERIFY = $(BINDIR)/qwen3tts_verify  # the TTS talker and code predictor vs qwen-tts (tests/qwen3tts_verify.cpp)
@@ -209,6 +210,9 @@ $(MEL_VERIFY): $(TESTSDIR)/mel_verify.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h
 
 $(QWEN3TTS_SPEECH_VERIFY): $(TESTSDIR)/qwen3tts_speech_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h $(SRCDIR)/qwen3tts.h $(SRCDIR)/qwen3tts_speech.cpp $(SRCDIR)/qwen3tts_speech.h $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/qwen3tts_speech_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
+
+$(SD_TEXT_VERIFY): $(TESTSDIR)/sd_text_verify.cpp $(SRCDIR)/sd.cpp $(SRCDIR)/sd.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/sd_text_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
 
 $(SPEAKER_VERIFY): $(TESTSDIR)/speaker_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/qwen3tts.h $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/speaker_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
@@ -333,7 +337,7 @@ uninstall:
 	rm -f $(INSTALL_PKGCONFIGDIR)/rocm-inference.pc
 
 # Phase 4: Qwen 3 model static library
-QWEN_SRCS = $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_ops.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/deltanet.cpp $(SRCDIR)/attention.cpp $(SRCDIR)/gpu_ops.cpp $(SRCDIR)/kernel_loader.cpp $(SRCDIR)/glm5_ref.cpp $(SRCDIR)/glm5_gpu.cpp $(SRCDIR)/expert_cpu.cpp $(SRCDIR)/vision.cpp $(SRCDIR)/image.cpp $(SRCDIR)/mrope.cpp $(SRCDIR)/whisper.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/audio.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_speech.cpp
+QWEN_SRCS = $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_ops.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/deltanet.cpp $(SRCDIR)/attention.cpp $(SRCDIR)/gpu_ops.cpp $(SRCDIR)/kernel_loader.cpp $(SRCDIR)/glm5_ref.cpp $(SRCDIR)/glm5_gpu.cpp $(SRCDIR)/expert_cpu.cpp $(SRCDIR)/vision.cpp $(SRCDIR)/image.cpp $(SRCDIR)/mrope.cpp $(SRCDIR)/whisper.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/audio.cpp $(SRCDIR)/sd.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_speech.cpp
 QWEN_HDRS = $(SRCDIR)/whisper.h $(SRCDIR)/mel.h $(SRCDIR)/qwen3tts.h $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/qwen3tts_speech.h $(SRCDIR)/vision.h $(SRCDIR)/image.h $(SRCDIR)/mrope.h $(SRCDIR)/third_party/stb_image.h $(SRCDIR)/expert_pager.h $(SRCDIR)/expert_cpu.h $(SRCDIR)/qwen_model.h $(SRCDIR)/qwen_ops.h $(SRCDIR)/qmatvec.h $(SRCDIR)/deltanet.h $(SRCDIR)/attention.h $(SRCDIR)/gpu_ops.h $(SRCDIR)/inference_internal.h $(SRCDIR)/kernel_loader.h $(SRCDIR)/inference_log.h $(SRCDIR)/glm5_ref.h $(SRCDIR)/glm5_gpu.h
 # The engine's code objects, embedded in the library (kernels_embed.S, loaded by kernel_loader.cpp)
 ENGINE_COS = $(CODIR)/matvec_q.co $(CODIR)/gpu_ops.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/glm5_gpu.co
@@ -359,10 +363,11 @@ $(QWEN_MODEL_LIB): $(QWEN_SRCS) $(QWEN_HDRS) $(SRCDIR)/inference.h $(SRCDIR)/ggu
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/mel.cpp -o $(OBJDIR)/mel.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/audio.cpp -o $(OBJDIR)/audio.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/qwen3tts.cpp -o $(OBJDIR)/qwen3tts.o
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/sd.cpp -o $(OBJDIR)/sd.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/qwen3tts_codec.cpp -o $(OBJDIR)/qwen3tts_codec.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/qwen3tts_speech.cpp -o $(OBJDIR)/qwen3tts_speech.o
 	rm -f $@
-	ar rcs $@ $(OBJDIR)/qwen_model.o $(OBJDIR)/qwen_ops.o $(OBJDIR)/qmatvec.o $(OBJDIR)/deltanet.o $(OBJDIR)/attention.o $(OBJDIR)/gpu_ops.o $(OBJDIR)/kernel_loader.o $(OBJDIR)/glm5_ref.o $(OBJDIR)/glm5_gpu.o $(OBJDIR)/expert_cpu.o $(OBJDIR)/vision.o $(OBJDIR)/image.o $(OBJDIR)/mrope.o $(OBJDIR)/whisper.o $(OBJDIR)/mel.o $(OBJDIR)/audio.o $(OBJDIR)/qwen3tts.o $(OBJDIR)/qwen3tts_codec.o $(OBJDIR)/qwen3tts_speech.o $(OBJDIR)/kernels_embed.o
+	ar rcs $@ $(OBJDIR)/qwen_model.o $(OBJDIR)/qwen_ops.o $(OBJDIR)/qmatvec.o $(OBJDIR)/deltanet.o $(OBJDIR)/attention.o $(OBJDIR)/gpu_ops.o $(OBJDIR)/kernel_loader.o $(OBJDIR)/glm5_ref.o $(OBJDIR)/glm5_gpu.o $(OBJDIR)/expert_cpu.o $(OBJDIR)/vision.o $(OBJDIR)/image.o $(OBJDIR)/mrope.o $(OBJDIR)/whisper.o $(OBJDIR)/mel.o $(OBJDIR)/audio.o $(OBJDIR)/sd.o $(OBJDIR)/qwen3tts.o $(OBJDIR)/qwen3tts_codec.o $(OBJDIR)/qwen3tts_speech.o $(OBJDIR)/kernels_embed.o
 
 # Phase 4: Qwen 3 demo binary
 $(QWEN_DEMO): $(SRCDIR)/demo_qwen.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/matvec_q.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/gpu_ops.co
@@ -512,4 +517,4 @@ verify_minimal: $(TEST_TARGET)
 	./$(TEST_TARGET) 2>&1 || echo "Test exited with code $?"
 
 # Last, so that every variable above is defined when its prerequisites are expanded
-all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(EXPERT_CPU_BENCH) $(VISION_VERIFY) $(MROPE_VERIFY) $(MM_VERIFY) $(IMAGE_VERIFY) $(MEL_VERIFY) $(WHISPER_VERIFY) $(AUDIO_VERIFY) $(QWEN3TTS_VERIFY) $(QWEN3TTS_CODEC_VERIFY) $(QWEN3TTS_SPEECH_VERIFY) $(SPEAKER_VERIFY) $(CODEC_ENCODE_VERIFY) $(HEAD_Q8_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(ATTN_DECODE_VERIFY) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(PERPLEXITY) $(PASSKEY) $(GENERATE_VERIFY) $(EVENTS_TEST) $(GEMMA4_VERIFY) $(SEQ_VERIFY) $(EMBED_VERIFY) $(QWEN4EXP_VERIFY) $(GLM5NEXT_VERIFY) $(MTP_VERIFY) $(MTP_OWN_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY) $(CAPI_SMOKE) $(STORE_VERIFY) $(SPLIT_VERIFY) $(ATTN_SPLIT_VERIFY) $(ATTN_BENCH)
+all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(EXPERT_CPU_BENCH) $(VISION_VERIFY) $(MROPE_VERIFY) $(MM_VERIFY) $(IMAGE_VERIFY) $(MEL_VERIFY) $(WHISPER_VERIFY) $(AUDIO_VERIFY) $(QWEN3TTS_VERIFY) $(QWEN3TTS_CODEC_VERIFY) $(QWEN3TTS_SPEECH_VERIFY) $(SPEAKER_VERIFY) $(SD_TEXT_VERIFY) $(CODEC_ENCODE_VERIFY) $(HEAD_Q8_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(ATTN_DECODE_VERIFY) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(PERPLEXITY) $(PASSKEY) $(GENERATE_VERIFY) $(EVENTS_TEST) $(GEMMA4_VERIFY) $(SEQ_VERIFY) $(EMBED_VERIFY) $(QWEN4EXP_VERIFY) $(GLM5NEXT_VERIFY) $(MTP_VERIFY) $(MTP_OWN_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY) $(CAPI_SMOKE) $(STORE_VERIFY) $(SPLIT_VERIFY) $(ATTN_SPLIT_VERIFY) $(ATTN_BENCH)

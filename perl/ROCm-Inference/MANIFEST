@@ -9,6 +9,7 @@ bin/rocm-inference-server
 bin/rocm-convert
 lib/ROCm/Inference.pm
 lib/ROCm/Inference/Convert.pm
+lib/ROCm/Inference/Convert/Diffusers.pm
 lib/ROCm/Inference/GGUF.pm
 lib/ROCm/Inference/Quant.pm
 lib/ROCm/Inference/SafeTensors.pm
