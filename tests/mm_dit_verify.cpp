@@ -79,6 +79,30 @@ int main(int argc, char** argv) {
         std::printf("velocity step %d: cosine %.7f, max |diff| %.3e of the peak %.3f  %s\n", step, cos, worst, peak,
                     ok ? "ok" : "FAIL");
     }
+    {  // the whole sampler: six steps from the same noise against the reference's sample_final
+        std::vector<float> want, got(x.size());
+        if (!read_f32(dir + "/sample_final.f32", want)) {
+            std::fprintf(stderr, "cannot read sample_final in %s\n", dir.c_str());
+            return 2;
+        }
+        if (mmdit_sample(m, text.data(), T, x.data(), h, w, got.data()) != 0) {
+            std::fprintf(stderr, "sample failed: %s\n", mmdit_last_error());
+            return 1;
+        }
+        double dot = 0, na = 0, nb = 0, peak = 0, worst = 0;
+        for (size_t i = 0; i < want.size(); ++i) {
+            dot += (double)got[i] * want[i];
+            na += (double)got[i] * got[i];
+            nb += (double)want[i] * want[i];
+            if (std::fabs(want[i]) > peak) peak = std::fabs(want[i]);
+            const double d = std::fabs((double)got[i] - want[i]);
+            if (d > worst) worst = d;
+        }
+        const double cos = dot / std::sqrt(na * nb);
+        const bool ok = cos > 0.999;
+        if (!ok) ++failures;
+        std::printf("sampler (6 steps): cosine %.7f, max |diff| %.3e of the peak %.3f  %s\n", cos, worst, peak, ok ? "ok" : "FAIL");
+    }
     if (std::getenv("MM_DIT_TIME")) {  // a 1024 x 1024 canvas (latent 64 x 64: 1024 image tokens), one velocity and the sampler
         const int H2 = 64, W2 = 64;
         std::vector<float> big((size_t)24 * H2 * W2, 0.1f), v((size_t)24 * H2 * W2);

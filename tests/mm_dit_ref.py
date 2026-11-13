@@ -144,5 +144,19 @@ for step in (0, 5):
     vol = v.reshape(hp, wp, 24, 2, 2).permute(2, 0, 3, 1, 4).reshape(24, h, w).numpy().astype(np.float32)
     vol.tofile(f'{OUT}/velocity_step{step}.f32')
     print('step', step, 'velocity', vol.shape, 'norm', float(np.linalg.norm(vol)), flush=True)
+# the whole sampler: the six Euler velocity steps from the noise (x += (sigma_i - sigma_{i+1}) * v), the pipeline's rule
+xs = x.clone().float()
+with torch.inference_mode():
+    for step in range(6):
+        tok_s = xs.reshape(24, hp, 2, wp, 2).permute(1, 3, 0, 2, 4).reshape(N, 96)
+        t = torch.tensor([1.0 - sigmas[step]], dtype=torch.float32, device='cuda')
+        out = model(hidden_states=tok_s.to('cuda', torch.bfloat16)[None], encoder_hidden_states=enc, timestep=t,
+                    timestep_indices=torch.zeros(S, dtype=torch.long, device='cuda'), token_tags=tags,
+                    position_ids=torch.tensor(pos, dtype=torch.float64, device='cuda'), image_indices=image_idx,
+                    text_indices=text_idx, pdd_step_index=step, return_dict=False)[0]
+        vol = out[0].float().cpu().reshape(hp, wp, 24, 2, 2).permute(2, 0, 3, 1, 4).reshape(24, h, w)
+        xs = xs + (sigmas[step] - sigmas[step + 1]) * vol
+xs.numpy().astype(np.float32).tofile(f'{OUT}/sample_final.f32')
+print('sampler final', tuple(xs.shape), 'norm', float(xs.norm()), flush=True)
 np.save(f'{OUT}/meta.npy', np.array([h, w, T], dtype=np.int64))
 print('done', flush=True)

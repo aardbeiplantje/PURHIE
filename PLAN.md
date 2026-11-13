@@ -533,8 +533,11 @@ DiT and the text encoder, no ROCmFP4 unless the user asks for it):
     (inner width 7168, not 5376: the QKV rows are 21504, `out_proj` is 5376 x 7168). The cost at 1024 x 1024 (1024 image
     tokens): **11.4 s per forward** (was 40 s) since the linears run on the tensor cores (`sd_gemm_wmma`: BF16 weights, the
     activations rounded to BF16 on load, F32 accumulate; a 64 x 64 tile, a 64-wide k-tile, 4 waves of 2 x 2 WMMA 16 x 16 x 16
-    tiles; the same cosines, 0.99995): the linears 6.2 s (about 7 TFLOPS), the attention 4.4 s (fp32 scores, one head at a
-    time), the rest 0.8 s. Still open: a larger BF16 tile and the attention on the tensor cores, and the sampler end to end.
+    tiles; the same cosines, 0.99995): the linears 6.2 s (about 7 TFLOPS). The attention on the tensor cores too (head width
+    128: BF16 scores and values as batches over the heads, the softmax in F32 written as BF16 with zero pads): 2.7 s (was 4.4
+    s), the whole forward **9.7 s** at 1024 px. The six-step sampler (`mmdit_sample`) against the reference's six steps from the
+    same noise: cosine 0.999993 (`tests/mm_dit_verify`, `tests/mm_dit_ref.py`). Still open: a larger BF16 tile, the
+    attention's softmax passes, and the server's wiring for the DiT.
     (The earlier line: the sampler (`mmdit_sample`) is written but not yet
     compared end to end.
   - Plan (as written before the engine): (a) the engine's BF16 A operand in the GEMM (the bf16 weight's high half in a float, as the F16 path does);

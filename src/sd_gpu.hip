@@ -291,8 +291,13 @@ __device__ __forceinline__ uint16_t f2bf(float f) {  // round to nearest, ties t
 }
 
 extern "C" __global__ void __launch_bounds__(128)
-sd_gemm_wmma(const uint16_t* __restrict__ A, long lda, const float* __restrict__ B, long sbn, float* __restrict__ C, long cs_m,
-             long cs_n, const float* __restrict__ biasf, float alpha, float beta, int M, int N, int K) {
+sd_gemm_wmma(const uint16_t* __restrict__ A0, long lda, const float* __restrict__ B0, long sbn, float* __restrict__ C0, long cs_m,
+             long cs_n, const float* __restrict__ biasf, float alpha, float beta, int M, int N, int K, long bsA, long bsB,
+             long bsC) {
+    // a batch (blockIdx.z): the operands and the output offset by the batch strides (the attention's heads)
+    const uint16_t* A = A0 + blockIdx.z * bsA;
+    const float* B = B0 + blockIdx.z * bsB;
+    float* C = C0 + blockIdx.z * bsC;
     __shared__ __attribute__((aligned(16))) uint16_t As[64][72];  // 144-byte rows: 16-byte aligned
     __shared__ __attribute__((aligned(16))) uint16_t Bs[64][72];
     const int t = threadIdx.x, w = t >> 5, l = t & 31;
@@ -359,4 +364,35 @@ sd_gemm_wmma(const uint16_t* __restrict__ A, long lda, const float* __restrict__
                     C[off] = v;
                 }
             }
+}
+
+// fp32 -> bf16 (round to nearest even), n values
+extern "C" __global__ void __launch_bounds__(256) sd_to_bf16(const float* x, uint16_t* y, long n) {
+    const long i = (long)blockIdx.x * 256 + threadIdx.x;
+    if (i < n) y[i] = f2bf(x[i]);
+}
+
+// Vt[c * Tkp + j] = V[j * C + c] for j < Tk, zero for Tk <= j < Tkp (the attention's values, transposed and padded)
+extern "C" __global__ void __launch_bounds__(256) sd_transpose_pad(const float* V, int Tk, int Tkp, int C, float* Vt) {
+    const long i = (long)blockIdx.x * 256 + threadIdx.x;
+    if (i >= (long)C * Tkp) return;
+    const int c = (int)(i / Tkp), j = (int)(i % Tkp);
+    Vt[i] = j < Tk ? V[(long)j * C + c] : 0.0f;
+}
+
+// Each row of the scores S [heads][Tq][Tk] (f32): softmax, written as bf16 P [heads][Tq][Tkp] with zeros in the pad columns.
+// One block per row (grid = heads * Tq).
+extern "C" __global__ void __launch_bounds__(256)
+sd_softmax_bf16(const float* S, uint16_t* P, int Tq, int Tk, int Tkp) {
+    __shared__ float red[256];
+    const long row = blockIdx.x;
+    const float* s = S + row * Tk;
+    uint16_t* p = P + row * Tkp;
+    float mx = -INFINITY;
+    for (int j = threadIdx.x; j < Tk; j += 256) mx = fmaxf(mx, s[j]);
+    mx = block_max(mx, red);
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < Tk; j += 256) sum += expf(s[j] - mx);
+    const float inv = 1.0f / block_sum(sum, red);
+    for (int j = threadIdx.x; j < Tkp; j += 256) p[j] = j < Tk ? f2bf(expf(s[j] - mx) * inv) : (uint16_t)0;
 }

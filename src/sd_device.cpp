@@ -30,7 +30,8 @@ int g_state = -1;  // -1: not tried, 0: host only, 1: device
 hipModule_t g_mod = nullptr;
 hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn_sum = nullptr, f_gn_sq = nullptr,
               f_gn_apply = nullptr, f_silu = nullptr, f_add = nullptr, f_upsample2 = nullptr, f_softmax = nullptr,
-              f_layer_norm = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr;
+              f_layer_norm = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr,
+              f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr;
 
 constexpr int kThreads = 256;
 constexpr int kGroupSplit = 16;  // the group norm's partial sums per group
@@ -55,7 +56,8 @@ bool init() {
         const char* name;
     };
     const Entry entries[] = {
-        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"},
+        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_to_bf16, "sd_to_bf16"},
+        {&f_transpose_pad, "sd_transpose_pad"}, {&f_softmax_bf16, "sd_softmax_bf16"},
         {&f_gn_sum, "sd_gn_sum"},       {&f_gn_sq, "sd_gn_sq"},         {&f_gn_apply, "sd_gn_apply"},
         {&f_silu, "sd_silu"},           {&f_add, "sd_add"},             {&f_upsample2, "sd_upsample2"},
         {&f_softmax, "sd_softmax"},     {&f_layer_norm, "sd_layer_norm"}, {&f_geglu, "sd_geglu"},
@@ -185,8 +187,10 @@ void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, cons
         const float* bf = b;
         const float alpha = 1.0f, beta = 0.0f;
         const int M = out, N = T, K = in;
+        const long bs0 = 0;
         void* args[] = {(void*)&A, (void*)&lda, (void*)&B, (void*)&sbn, (void*)&C, (void*)&cs_m, (void*)&cs_n,
-                        (void*)&bf, (void*)&alpha, (void*)&beta, (void*)&M, (void*)&N, (void*)&K};
+                        (void*)&bf, (void*)&alpha, (void*)&beta, (void*)&M, (void*)&N, (void*)&K, (void*)&bs0, (void*)&bs0,
+                        (void*)&bs0};
         check(hipModuleLaunchKernel(f_gemm_wmma, (unsigned)((N + 63) / 64), (unsigned)((M + 63) / 64), 1, 128, 1, 1, 0, nullptr,
                                     args, nullptr),
               "wmma gemm");
@@ -275,7 +279,7 @@ void geglu(const float* pj, long rows, int ff, float* g) {
     sync();
 }
 
-void attention(const float* q, int Tq, const float* k, const float* v, int Tk, int C, int heads, float* out) {
+void attention_f32(const float* q, int Tq, const float* k, const float* v, int Tk, int C, int heads, float* out) {
     const int D = C / heads;
     const float scale = 1.0f / std::sqrt((float)D);
     if (Tq <= 0 || Tk <= 0) return;
@@ -293,6 +297,70 @@ void attention(const float* q, int Tq, const float* k, const float* v, int Tk, i
         }
     sync();
     release(S, sizeof(float) * (size_t)R * Tk);
+}
+
+// A batch of BF16 WMMA GEMMs (sd_gemm_wmma): C[z] = alpha * A[z] B[z] for z < batches; the operands are offset by the batch
+// strides bsA, bsB, bsC (elements); A has row stride lda (k contiguous), B has n stride sbn (k contiguous)
+void wmma_batched(const uint16_t* A, long lda, long bsA, const float* B, long sbn, long bsB, float* C, long cs_m, long cs_n,
+                  long bsC, float alpha, int M, int N, int K, int batches) {
+    const uint16_t* a = A;
+    const float* b = B;
+    float* c = C;
+    const float* bi = nullptr;
+    const float beta = 0.0f;
+    void* args[] = {(void*)&a, (void*)&lda, (void*)&b, (void*)&sbn, (void*)&c, (void*)&cs_m, (void*)&cs_n, (void*)&bi,
+                    (void*)&alpha, (void*)&beta, (void*)&M, (void*)&N, (void*)&K, (void*)&bsA, (void*)&bsB, (void*)&bsC};
+    check(hipModuleLaunchKernel(f_gemm_wmma, (unsigned)((N + 63) / 64), (unsigned)((M + 63) / 64), (unsigned)batches, 128, 1, 1, 0,
+                                nullptr, args, nullptr),
+          "wmma batched");
+}
+
+// The attention on the tensor cores (head width 128): the scores and the weighted values are BF16 WMMA batches over the heads
+// (sd_gemm_wmma with the head as the batch), the softmax in F32 and written as BF16 with zero pads (the value's rows are padded
+// to a multiple of 64 with the transposed values). Matches the reference's bf16 attention in precision.
+void attention_tc(const float* q, int Tq, const float* k, const float* v, int Tk, int C, int heads, float* out) {
+    const int D = C / heads;
+    const float scale = 1.0f / std::sqrt((float)D);
+    const int Tkp = (Tk + 63) / 64 * 64;
+    uint16_t* qb = static_cast<uint16_t*>(alloc(sizeof(uint16_t) * (size_t)Tq * C));
+    float* vt = static_cast<float*>(alloc(sizeof(float) * (size_t)C * Tkp));
+    float* sc = static_cast<float*>(alloc(sizeof(float) * (size_t)heads * Tq * Tk));
+    uint16_t* pb = static_cast<uint16_t*>(alloc(sizeof(uint16_t) * (size_t)heads * Tq * Tkp));
+    {
+        long n = (long)Tq * C;
+        void* a1[] = {(void*)&q, (void*)&qb, (void*)&n};
+        launch(f_to_bf16, n, a1);
+    }
+    {
+        int tk = Tk, tkp = Tkp, c = C;
+        const float* vp = v;
+        float* vtp = vt;
+        void* a2[] = {(void*)&vp, (void*)&tk, (void*)&tkp, (void*)&c, (void*)&vtp};
+        launch(f_transpose_pad, (long)C * Tkp, a2);
+    }
+    // scores: S[h][m][n] = scale * sum_d Q[m][h d] K[n][h d]
+    wmma_batched(qb, C, D, k, C, D, sc, Tk, 1, (long)Tq * Tk, scale, Tq, Tk, D, heads);
+    {
+        int tq = Tq, tk = Tk, tkp = Tkp;
+        const float* sp = sc;
+        uint16_t* pp = pb;
+        void* a3[] = {(void*)&sp, (void*)&pp, (void*)&tq, (void*)&tk, (void*)&tkp};
+        check(hipModuleLaunchKernel(f_softmax_bf16, (unsigned)((long)heads * Tq), 1, 1, 256, 1, 1, 0, nullptr, a3, nullptr),
+              "softmax_bf16");
+    }
+    // out[m][h d] = sum_n P[h][m][n] V[n][h d]
+    wmma_batched(pb, Tkp, (long)Tq * Tkp, vt, Tkp, (long)D * Tkp, out, C, 1, D, 1.0f, Tq, D, Tkp, heads);
+    check(hipStreamSynchronize(nullptr), "stream");
+    release(qb, sizeof(uint16_t) * (size_t)Tq * C);
+    release(vt, sizeof(float) * (size_t)C * Tkp);
+    release(sc, sizeof(float) * (size_t)heads * Tq * Tk);
+    release(pb, sizeof(uint16_t) * (size_t)heads * Tq * Tkp);
+}
+
+void attention(const float* q, int Tq, const float* k, const float* v, int Tk, int C, int heads, float* out) {
+    if (Tq <= 0 || Tk <= 0) return;
+    if (C / heads == 128) attention_tc(q, Tq, k, v, Tk, C, heads, out);
+    else attention_f32(q, Tq, k, v, Tk, C, heads, out);
 }
 
 }  // namespace sddev
