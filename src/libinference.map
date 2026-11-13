@@ -1,5 +1,5 @@
 /* libinference.so: export the public C API only (inference.h, tokenizer.h, sampler.h, vision.h, image.h, mrope.h, whisper.h, mel.h,
-   qwen3tts*.h); the engine's internals
+   qwen3tts*.h, minimax_pipe.h); the engine's internals
    (qwen_model_*, qmatvec_*, kernels) stay hidden. */
 LIBINFERENCE_1 {
     global:
@@ -14,6 +14,8 @@ LIBINFERENCE_1 {
         audio_*;
         qwen3tts_*;
         sd_*;
+        mm_*;
+        minimax_*;
     local:
         *;
 };

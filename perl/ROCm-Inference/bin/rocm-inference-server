@@ -25,14 +25,14 @@ GetOptions(\%o, 'model=s', 'models-dir=s', 'models-max=i', 'models-margin=f', 'k
            'name=s', 'draft=s', 'store=s', 'max_tokens=i', 'swa-ring=i', 'stage=s', 'recache', 'kv-type=s',
            'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'preserve-thinking!', 'log!', 'log-level=s', 'log-format=s', 'log-color=s',
            'thinking-low=i', 'thinking-medium=i', 'thinking-high=i',
-           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'mmproj=s', 'whisper=s', 'tts=s', 'tts-codec=s', 'voices=s', 'sd=s', 'help')
+           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'mmproj=s', 'whisper=s', 'tts=s', 'tts-codec=s', 'voices=s', 'sd=s', 'minimax=s', 'help')
     or pod2usage(2);
 # The log: --nolog is level none; --log-level, --log-format, --log-color are checked by the formatter
 our $LOG = eval { ROCm::Inference::Log->new(level => ($o{log} // 1) ? ($o{'log-level'} // 'info') : 'none',
                                               format => $o{'log-format'} // 'text', color => $o{'log-color'} // 'auto') }
     or die "--log-level, --log-format, --log-color: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n";
 pod2usage(-verbose => 2, -exitval => 0) if $o{help};
-pod2usage("--model, --models-dir, --whisper, --tts or --sd is required\n") unless $o{model} || $o{'models-dir'} || $o{whisper} || $o{tts} || $o{sd};
+pod2usage("--model, --models-dir, --whisper, --tts, --sd or --minimax is required\n") unless $o{model} || $o{'models-dir'} || $o{whisper} || $o{tts} || $o{sd} || $o{minimax};
 ROCm::Inference::_require_minijinja()
     or die "rocm-inference-server needs the Minijinja module $ROCm::Inference::MINIJINJA_VERSION\n";
 my $no_draft = ($o{draft} // '') eq 'none';  # (no draft head, not even a model's own MTP block)
@@ -65,6 +65,10 @@ die "--sd: no file $o{sd}\n" if $o{sd} && !-f $o{sd};
 my $IMAGE = $o{sd} ? eval { sd_load($o{sd}) } : undef;
 die "--sd $o{sd}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" if $o{sd} && !$IMAGE;
 my $sd_name = $o{sd} ? basename($o{sd}) =~ s/\.gguf\z//r : undef;
+# the MiniMax-H3-Image pipeline (--minimax DIR: the four GGUFs of ROCm::Inference::MiniMaxImage); its name is "minimax-h3-image"
+die "--minimax $o{minimax}: not a directory\n" if $o{minimax} && !-d $o{minimax};
+my $MINIMAX = $o{minimax} ? eval { ROCm::Inference::MiniMaxImage->new($o{minimax}) } : undef;
+die "--minimax $o{minimax}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" if $o{minimax} && !$MINIMAX;
 my $kv_type = $o{'kv-type'} // 'auto';
 die "--kv-type: auto, f16, q8_0 or q4_0\n" unless $kv_type =~ /\A(?:auto|f16|q8_0|q4_0)\z/;
 my $created = time;
@@ -905,23 +909,31 @@ route::get '/v1/audio/voices' => sub {
 # minute at 512 x 512 with sd-turbo's one step).
 route::post '/v1/images/generations' => sub {
     my ($req) = @_;
-    error(503, 'no image model: start the server with --sd FILE.gguf', 'server_error') unless $IMAGE;
     my $p = $req->{json};
     ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
+    # the model: minimax-h3-image (--minimax) or the sd-turbo file's name (--sd); with no model given, the first one started
+    my $model = $p->{model} // ($MINIMAX ? 'minimax-h3-image' : $sd_name);
+    my $backend;
+    if ($MINIMAX && $model eq 'minimax-h3-image') { $backend = $MINIMAX; $model = 'minimax-h3-image' }
+    elsif ($IMAGE && $model eq $sd_name)         { $backend = $IMAGE }
+    else {
+        error(503, 'no image model: start the server with --sd FILE.gguf or --minimax DIR', 'server_error') unless $IMAGE || $MINIMAX;
+        error(400, "model: '$model' is not served (this server has " . join(' and ', grep { defined } ($sd_name, $MINIMAX ? 'minimax-h3-image' : undef)) . ')');
+    }
     my $prompt = $p->{prompt};
     error(400, "'prompt' is required") unless defined $prompt && !ref $prompt && length $prompt;
     error(400, 'prompt: at most 1000 characters') if length $prompt > 1000;
     my $n = $p->{n} // 1;
     error(400, 'n: 1 (one image per request)') unless $n =~ /\A1\z/;
-    my $size = $p->{size} // '512x512';
+    my $size = $p->{size} // ($backend == $MINIMAX ? '1024x1024' : '512x512');
     error(400, "size: WIDTHxHEIGHT, not '$size'") unless $size =~ /\A\d+x\d+\z/;
     my $fmt = $p->{response_format} // 'b64_json';
     error(400, "response_format: b64_json or png, not '$fmt'") unless $fmt =~ /\A(?:b64_json|png)\z/;
     my $seed = $p->{seed} // 0;
     error(400, 'seed: a whole number') unless $seed =~ /\A\d+\z/;
-    my $png = eval { $IMAGE->generate($prompt, size => $size, seed => $seed) };
+    my $png = eval { $backend->generate($prompt, size => $size, seed => $seed) };
     error(400, $@ =~ s/ at \S+ line \d+\.?\n?\z//r) if $@;
-    $LOG->info('request', event => 'image', msg => sprintf('%s: %s, seed %d, %d bytes of PNG', $sd_name, $size, $seed, length $png));
+    $LOG->info('request', event => 'image', msg => sprintf('%s: %s, seed %d, %d bytes of PNG', $model, $size, $seed, length $png));
     return [200, ['Content-Type' => 'image/png'], $png] if $fmt eq 'png';
     require MIME::Base64;
     return { created => time, data => [{ b64_json => MIME::Base64::encode_base64($png, '') }] };

@@ -760,6 +760,36 @@ sub DESTROY {
     $img->{h} = 0;
 }
 
+# MiniMax-H3-Image (text to image): the four GGUFs of a directory (text-encoder-bf16.gguf, dit-bf16.gguf, pdd-heads.gguf,
+# vae-decoder-f32.gguf: rocm-convert of /hf/MiniMax-H3-Image). The released pipeline generates on a canvas of at least 2048 x 2048
+# and resizes to the request; a request is WIDTH x HEIGHT, multiples of 32 from 256 to 2048.
+package ROCm::Inference::MiniMaxImage;
+
+sub new {
+    my ($class, $dir) = @_;
+    my %f = map { $_ => "$dir/$_" } qw(text-encoder-bf16.gguf dit-bf16.gguf pdd-heads.gguf vae-decoder-f32.gguf);
+    for my $file (values %f) { die "minimax: no file $file\n" unless -f $file }
+    my $h = ROCm::Inference::_mm_open(@f{qw(text-encoder-bf16.gguf dit-bf16.gguf pdd-heads.gguf vae-decoder-f32.gguf)});
+    return bless { h => $h, dir => $dir }, $class;
+}
+
+sub generate {
+    my ($img, $prompt, %o) = @_;
+    my ($w, $h) = (1024, 1024);
+    if (defined $o{size}) {
+        ($w, $h) = $o{size} =~ /\A(\d+)x(\d+)\z/ or die "size: WIDTHxHEIGHT, not '$o{size}'\n";
+    }
+    die "size: multiples of 32 between 256 and 2048\n"
+        unless $w % 32 == 0 && $h % 32 == 0 && $w >= 256 && $h >= 256 && $w <= 2048 && $h <= 2048;
+    return ROCm::Inference::_mm_generate_png($img->{h}, $prompt, $o{seed} // 0, $w, $h);
+}
+
+sub DESTROY {
+    my ($img) = @_;
+    ROCm::Inference::_mm_close($img->{h}) if $img->{h};
+    $img->{h} = 0;
+}
+
 package ROCm::Inference::Speech;
 
 sub new {

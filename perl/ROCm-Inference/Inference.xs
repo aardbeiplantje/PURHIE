@@ -24,6 +24,7 @@
 #include "qwen3tts_speech.h"
 #include "audio.h"
 #include "sd.h"
+#include "minimax_pipe.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -1544,6 +1545,52 @@ _sd_close(h)
     IV h
   CODE:
     sd_close(INT2PTR(sd_model_t*, h));
+
+IV
+_mm_open(text, dit, pdd, vae)
+    const char* text
+    const char* dit
+    const char* pdd
+    const char* vae
+  CODE:
+    mm_pipe_t* p = mm_open(text, dit, pdd, vae);
+    if (!p) croak("ROCm::Inference: mm_open: %s", mm_last_error());
+    RETVAL = PTR2IV(p);
+  OUTPUT:
+    RETVAL
+
+void
+_mm_close(h)
+    IV h
+  CODE:
+    mm_close(INT2PTR(mm_pipe_t*, h));
+
+SV*
+_mm_generate_png(h, prompt, seed, width, height)
+    IV h
+    SV* prompt
+    UV seed
+    int width
+    int height
+  CODE:
+    /* one image of the MiniMax-H3-Image pipeline (the text encoder, the DiT, the VAE), as PNG bytes */
+    unsigned char* rgb = (unsigned char*)malloc((size_t)3 * width * height);
+    uint8_t* png = NULL;
+    size_t n = 0;
+    if (!rgb) croak("ROCm::Inference: out of memory");
+    if (mm_generate(INT2PTR(mm_pipe_t*, h), SvPV_nolen(prompt), height, width, (unsigned long long)seed, rgb) != 0) {
+        free(rgb);
+        croak("ROCm::Inference: mm_generate: %s", mm_last_error());
+    }
+    if (sd_encode_png(rgb, width, height, &png, &n) != 0) {
+        free(rgb);
+        croak("ROCm::Inference: sd_encode_png: %s", sd_last_error());
+    }
+    free(rgb);
+    RETVAL = newSVpvn((const char*)png, (STRLEN)n);
+    sd_free_png(png);
+  OUTPUT:
+    RETVAL
 
 SV*
 _sd_generate_png(h, prompt, seed, width, height)
