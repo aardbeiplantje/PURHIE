@@ -2148,10 +2148,12 @@ sub convert {
 
 
 # Qwen3-TTS (Qwen/Qwen3-TTS-12Hz-0.6B-Base: Qwen3TTSForConditionalGeneration, the talker and its code predictor; phase
-# T2 of PLAN.md). F32, the BF16 checkpoint's values exactly. The speaker encoder (speaker_encoder.*: the voice clone's
-# x-vector) and the speech tokenizer (the codec, in its own directory) are not converted yet: skipped on purpose, named
-# here. The names: talker.* (the text embedding and projection, the codec embedding and head, blk.N) and pred.* (the
-# code predictor's embeddings, blocks and heads), llama.cpp's block names. The engine (src/qwen3tts.cpp) reads them.
+# T2 of PLAN.md). F32, the BF16 checkpoint's values exactly. The speaker encoder (speaker_encoder.*, the voice clone's
+# x-vector: T5 of PLAN.md) is written as spk.* with the checkpoint's own module names (spk.blocks.N..., spk.mfa, spk.asp...),
+# its architecture in qwen3tts.spk.* keys (the config's defaults: the checkpoint's speaker_encoder_config has only the
+# embedding size). The speech tokenizer (the codec, in its own directory) is a separate GGUF. The names: talker.* (the text
+# embedding and projection, the codec embedding and head, blk.N) and pred.* (the code predictor's embeddings, blocks and
+# heads), llama.cpp's block names. The engine (src/qwen3tts.cpp) reads them.
 package ROCm::Inference::Convert::Qwen3TTS;
 use strict;
 use warnings;
@@ -2173,7 +2175,7 @@ my %TALKER_BLOCK = (
 # The GGUF name of a checkpoint tensor (undef: one the engine does not know)
 sub gname {
     my ($hf) = @_;
-    return undef if $hf =~ /^speaker_encoder\./;  # skipped on purpose (see above)
+    return 'spk.' . substr($hf, length 'speaker_encoder.') if $hf =~ /^speaker_encoder\./;  # (the speaker encoder: spk.*)
     if ($hf =~ /^talker\.model\.layers\.(\d+)\.(.+)\.weight$/) {
         my $g = $TALKER_BLOCK{$2} // return undef;
         return "talker.blk.$1.$g.weight";
@@ -2273,14 +2275,20 @@ sub convert {
     $self->vocab_gpt2(pre => 'qwen2', n => $n_vocab);
     push @kv, @{$self->{kv}};
     my @specs;
-    my %skipped;
+    # the speaker encoder's architecture (the config's defaults: the checkpoint's speaker_encoder_config has the embedding size)
+    my $sc = $self->{config}{speaker_encoder_config} // {};
+    push @kv, (
+        ['qwen3tts.spk.mel_dim', $U32, $sc->{mel_dim} // 128],
+        ['qwen3tts.spk.enc_dim', $U32, $sc->{enc_dim} // 1024],
+        ['qwen3tts.spk.channels', $ARR, [$U32, [@{$sc->{enc_channels} // [512, 512, 512, 512, 1536]}]]],
+        ['qwen3tts.spk.kernels', $ARR, [$U32, [@{$sc->{enc_kernel_sizes} // [5, 3, 3, 3, 1]}]]],
+        ['qwen3tts.spk.dilations', $ARR, [$U32, [@{$sc->{enc_dilations} // [1, 2, 3, 4, 1]}]]],
+        ['qwen3tts.spk.attention_channels', $U32, $sc->{enc_attention_channels} // 128],
+        ['qwen3tts.spk.res2net_scale', $U32, $sc->{enc_res2net_scale} // 8],
+        ['qwen3tts.spk.se_channels', $U32, $sc->{enc_se_channels} // 128],
+    );
     for my $name (@{$self->st->{order}}) {
-        my $g = gname($name);
-        if (!defined $g) {
-            croak "$name: no qwen3tts tensor name (a tensor the engine does not know)" unless $name =~ /^speaker_encoder\./;
-            $skipped{speaker_encoder}++;
-            next;
-        }
+        my $g = gname($name) // croak "$name: no qwen3tts tensor name (a tensor the engine does not know)";
         my $t = $self->t($name);
         push @specs, {name => $g, ne => [reverse @{$t->{shape}}], f32 => 1,
                       type => ROCm::Inference::Convert::gguf_type_id('f32'), from => lc $t->{dtype},
@@ -2348,6 +2356,42 @@ sub gname {
     return undef;
 }
 
+# The GGUF name of a checkpoint encoder tensor (undef: unknown). Short names: a GGUF tensor name holds 63 bytes.
+#   enc.ds.*           the downsample convolution (C -> C, stride 2, no bias)
+#   enc.sea0.*         the SEANet's first convolution; enc.sealast.* the last one
+#   enc.resS.c1/c2.*   stage S's residual block (the k-conv, the 1x1 conv); enc.downS.* its strided convolution
+#   enc.tfL.*          transformer layer L (attn_q/k/v/o, ffn_up/down, attn_norm/ffn_norm, attn_scale/ffn_scale)
+#   enc.qs.proj.*, enc.qa.proj.*   the semantic and acoustic input projections (no bias)
+#   enc.qs.N.sum / .usage, enc.qa.N.sum / .usage   codebook N's embedding_sum and cluster_usage
+sub enc_gname {
+    my ($hf) = @_;
+    my $n = $hf;
+    return 'enc.ds.weight' if $n eq 'encoder.downsample.conv.weight';
+    if ($n =~ /^encoder\.encoder\.layers\.0\.conv\.(weight|bias)$/) { return "enc.sea0.$1" }
+    if ($n =~ /^encoder\.encoder\.layers\.14\.conv\.(weight|bias)$/) { return "enc.sealast.$1" }
+    if ($n =~ /^encoder\.encoder\.layers\.(\d+)\.block\.([13])\.conv\.(weight|bias)$/) {
+        my ($l, $b, $suf) = ($1, $2, $3);
+        return "enc.res" . (($l - 1) / 3) . ($b == 1 ? '.c1' : '.c2') . ".$suf";
+    }
+    if ($n =~ /^encoder\.encoder\.layers\.(\d+)\.conv\.(weight|bias)$/) { return "enc.down" . (($1 - 3) / 3) . ".$2" }
+    if ($n =~ /^encoder\.encoder_transformer\.layers\.(\d+)\.(.+?)(\.weight|\.bias|\.scale)$/) {
+        my ($l, $part, $suf) = ($1, $2, $3);
+        my %g = ('input_layernorm' => 'attn_norm', 'post_attention_layernorm' => 'ffn_norm', 'self_attn.q_proj' => 'attn_q',
+                 'self_attn.k_proj' => 'attn_k', 'self_attn.v_proj' => 'attn_v', 'self_attn.o_proj' => 'attn_o',
+                 'mlp.fc1' => 'ffn_up', 'mlp.fc2' => 'ffn_down', 'self_attn_layer_scale' => 'attn_scale',
+                 'mlp_layer_scale' => 'ffn_scale');
+        my $gn = $g{$part} // return undef;
+        return "enc.tf$l.$gn" . ($suf eq '.scale' ? '' : $suf);
+    }
+    if ($n =~ /^encoder\.quantizer\.(semantic|acoustic)_residual_vector_quantizer\.input_proj\.weight$/) {
+        return 'enc.' . ($1 eq 'semantic' ? 'qs' : 'qa') . '.proj.weight';
+    }
+    if ($n =~ /^encoder\.quantizer\.(semantic|acoustic)_residual_vector_quantizer\.layers\.(\d+)\.codebook\.(embed_sum|cluster_usage)$/) {
+        return 'enc.' . ($1 eq 'semantic' ? 'qs' : 'qa') . ".$2." . ($3 eq 'embed_sum' ? 'sum' : 'usage');
+    }
+    return undef;
+}
+
 sub convert {
     my ($self, $out, %a) = @_;
     croak 'qwen3tts_codec: F32 only (the codec is small and its values are checked)' if $a{quant};
@@ -2378,9 +2422,52 @@ sub convert {
         ['qwen3tts_codec.upsampling_ratios', $ARR, [$U32, [map { int $_ } @{$dc->{upsampling_ratios}}]]],
         ['qwen3tts_codec.sample_rate', $U32, $self->{config}{output_sample_rate} // 24000],
     );
+    # the encoder (T6 of PLAN.md): its hyperparameters (the config's encoder_config: SEANet, the transformer, the RVQ)
+    my $ec = $self->{config}{encoder_config} // croak 'config: no encoder_config';
+    # transformers' MimiModel: the encodec frame rate (sampling rate over the SEANet's total stride) over the codec's frame
+    # rate, twice: the downsample convolution's kernel (stride 2)
+    my $prod = 1;
+    $prod *= $_ for @{$ec->{upsampling_ratios}};
+    my $enc_down = 2 * int(($ec->{sampling_rate} / $prod) / $ec->{_frame_rate});
+    push @kv, (
+        ['qwen3tts_codec.enc.n_filters', $U32, $ec->{num_filters}],
+        ['qwen3tts_codec.enc.ratios', $ARR, [$U32, [map { int $_ } @{$ec->{upsampling_ratios}}]]],
+        ['qwen3tts_codec.enc.kernel', $U32, $ec->{kernel_size}],
+        ['qwen3tts_codec.enc.last_kernel', $U32, $ec->{last_kernel_size}],
+        ['qwen3tts_codec.enc.residual_kernel', $U32, $ec->{residual_kernel_size}],
+        ['qwen3tts_codec.enc.compress', $U32, $ec->{compress}],
+        ['qwen3tts_codec.enc.dilation_growth', $U32, $ec->{dilation_growth_rate}],
+        ['qwen3tts_codec.enc.n_residual', $U32, $ec->{num_residual_layers}],
+        ['qwen3tts_codec.enc.n_channels', $U32, $ec->{audio_channels}],
+        ['qwen3tts_codec.enc.n_layer', $U32, $ec->{num_hidden_layers}],
+        ['qwen3tts_codec.enc.n_embd', $U32, $ec->{hidden_size}],
+        ['qwen3tts_codec.enc.n_head', $U32, $ec->{num_attention_heads}],
+        ['qwen3tts_codec.enc.n_ff', $U32, $ec->{intermediate_size}],
+        ['qwen3tts_codec.enc.sliding_window', $U32, $ec->{sliding_window}],
+        ['qwen3tts_codec.enc.rope_theta', $F32, 0 + $ec->{rope_theta}],
+        ['qwen3tts_codec.enc.norm_eps', $F32, 0 + $ec->{norm_eps}],
+        ['qwen3tts_codec.enc.total_quantizers', $U32, $ec->{num_quantizers}],
+        ['qwen3tts_codec.enc.semantic_quantizers', $U32, $ec->{num_semantic_quantizers}],
+        ['qwen3tts_codec.enc.valid_quantizers', $U32, $self->{config}{encoder_valid_num_quantizers} // $ec->{num_quantizers}],
+        ['qwen3tts_codec.enc.codebook_size', $U32, $ec->{codebook_size}],
+        ['qwen3tts_codec.enc.codebook_dim', $U32, $ec->{codebook_dim}],
+        ['qwen3tts_codec.enc.samples_per_frame', $U32, $self->{config}{encode_downsample_rate} // 1920],
+        ['qwen3tts_codec.enc.downsample_kernel', $U32, $enc_down],
+    );
     my @specs;
     my %skipped;
     for my $name (@{$self->st->{order}}) {
+        if ($name =~ /^encoder\./) {
+            # the encoder's tensors under short enc.* names (a GGUF name holds 63 bytes); the initialized flags are not used
+            if ($name =~ /\.initialized$/) { $skipped{initialized}++; next }
+            my $g = enc_gname($name);
+            if (!defined $g) { $skipped{encoder_unused}++; next }  # (the quantizers' output projections: the decoder's)
+            my $t = $self->t($name);
+            push @specs, {name => $g, ne => [reverse @{$t->{shape}}], f32 => 1,
+                          type => ROCm::Inference::Convert::gguf_type_id('f32'), from => lc $t->{dtype},
+                          in_bytes => $t->{bytes}, uses => [$t], data => sub { pack 'f<*', $self->floats($t) }};
+            next;
+        }
         if ($name !~ /^decoder\./) { $skipped{$name =~ /^(\w+)/ ? $1 : $name}++; next }
         if ($name =~ /^decoder\.quantizer\.rvq_\w+\.input_proj\.weight$/) { $skipped{encode}++; next }  # (the encoder's path)
         my $g = gname($name) // croak "$name: no codec tensor name (a decoder tensor the engine does not know)";

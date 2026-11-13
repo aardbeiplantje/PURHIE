@@ -25,6 +25,12 @@ int qwen3tts_codec_vocab(const qwen3tts_model_t* model);  /* 3072 */
 int qwen3tts_pred_vocab(const qwen3tts_model_t* model);   /* 2048 */
 int qwen3tts_language_id(const qwen3tts_model_t* model, const char* name); /* e.g. "english" -> 2050, or -1 */
 
+/* The speaker encoder (T5 of PLAN.md): the x-vector of a reference clip (float samples at 24 kHz, n of them, at least 257) as
+ * the talker's speaker embedding (qwen-tts's extract_speaker_embedding). spk receives qwen3tts_speaker_dim floats (1024).
+ * Needs the GGUF's spk.* tensors (rocm-convert of the checkpoint has them). Returns 0, or -1. */
+int qwen3tts_speaker_dim(const qwen3tts_model_t* model);  /* 0 when the GGUF has no speaker encoder */
+int qwen3tts_speaker_embedding(qwen3tts_model_t* model, const float* samples, size_t n, float* spk);
+
 /* The in-context voice clone's prefill (qwen-tts's generate with non-streaming off, one sequence): text_ids (the assistant
  * text's ids: <|im_start|>assistant\n TEXT <|im_end|>\n<|im_start|>assistant\n, n_text of them), ref_ids (the reference
  * text's ids, the same template, n_ref), ref_codes (R x 16 codec frames of the reference clip), spk (the speaker

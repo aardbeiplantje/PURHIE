@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
+#include <cstdlib>
 #include <vector>
 
 namespace {
@@ -35,6 +37,30 @@ inline float reflect_at(const float* x, long long len, long long i) {
     if (i < 0) i = -i;
     if (i >= len) i = 2 * (len - 1) - i;
     return x[i];
+}
+
+// An in-place radix-2 complex FFT (n a power of two)
+void fft_radix2(std::vector<std::complex<double>>& a) {
+    const size_t n = a.size();
+    for (size_t i = 1, j = 0; i < n; ++i) {
+        size_t bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap(a[i], a[j]);
+    }
+    for (size_t len = 2; len <= n; len <<= 1) {
+        const double ang = -2.0 * M_PI / (double)len;
+        const std::complex<double> wl(std::cos(ang), std::sin(ang));
+        for (size_t i = 0; i < n; i += len) {
+            std::complex<double> w(1.0, 0.0);
+            for (size_t k = 0; k < len / 2; ++k) {
+                const std::complex<double> u = a[i + k], v = a[i + k + len / 2] * w;
+                a[i + k] = u + v;
+                a[i + k + len / 2] = u - v;
+                w *= wl;
+            }
+        }
+    }
 }
 
 }  // namespace
@@ -124,3 +150,46 @@ int whisper_log_mel(const float* samples, int n, int n_mels, float* out) {
 }
 
 }  // extern "C"
+
+// (the speaker encoder's mel, qwen-tts's mel_spectrogram at 24 kHz: 1024-point Hann frames, hop 256, the signal reflect-padded
+// by (1024 - 256) / 2 on each side and not centred, the magnitude sqrt(|X|^2 + 1e-9), the Slaney filters from 0 to 12 kHz,
+// log(max(x, 1e-5)): out[128][frames] row-major, frames = (n - 256) / 256 + 1; the samples are float in [-1, 1])
+int speaker_log_mel(const float* samples, size_t n, float** out, int* frames) {
+    if (!out || !frames || (n && !samples)) return -1;
+    *out = nullptr;
+    *frames = 0;
+    const int n_fft = 1024, hop = 256, n_mels = 128, pad = (n_fft - hop) / 2;
+    if (n < (size_t)pad + 1) return -1;
+    const long long len = (long long)n + 2 * pad;  // the padded signal
+    const int T = (int)((len - n_fft) / hop + 1);
+    if (T < 1) return -1;
+    const int bins = n_fft / 2 + 1;
+    std::vector<float> filters((size_t)n_mels * bins);
+    if (mel_filter_bank(n_mels, n_fft, 24000, 0.0, 12000.0, filters.data()) != 0) return -1;
+    std::vector<double> win;
+    hann_periodic(n_fft, win);
+    float* mel = static_cast<float*>(std::malloc(sizeof(float) * (size_t)n_mels * T));
+    if (!mel) return -1;
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < T; ++t) {
+        std::vector<std::complex<double>> a(n_fft);
+        for (int i = 0; i < n_fft; ++i) {
+            const double v = reflect_at(samples, (long long)n, (long long)t * hop + i - pad);
+            a[i] = std::complex<double>(v * win[i], 0.0);
+        }
+        fft_radix2(a);
+        std::vector<double> mag(bins);
+        for (int k = 0; k < bins; ++k) mag[k] = std::sqrt(std::norm(a[k]) + 1e-9);
+        for (int m = 0; m < n_mels; ++m) {
+            const float* f = &filters[(size_t)m * bins];
+            double acc = 0.0;
+            for (int k = 0; k < bins; ++k) acc += (double)f[k] * mag[k];
+            mel[(size_t)m * T + t] = (float)std::log(std::max(acc, 1e-5));
+        }
+    }
+    *out = mel;
+    *frames = T;
+    return 0;
+}
+
+void speaker_free_mel(float* mel) { std::free(mel); }

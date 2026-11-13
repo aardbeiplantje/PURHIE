@@ -271,9 +271,26 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
 - T5 speaker encoder in the engine (the ECAPA-TDNN of qwen-tts's `Qwen3TTSSpeakerEncoder`, the 24 kHz log-mel of its
   `mel_spectrogram`): converter writes `speaker_encoder.*` into the talker GGUF; checked against qwen-tts's
   `extract_speaker_embedding` on the reference clip.
+  **Done 2026-11-13:** `ROCm::Inference::Convert::Qwen3TTS` writes the 76 `speaker_encoder.*` tensors as `spk.*` (F32 of the
+  checkpoint's BF16) and the architecture as `qwen3tts.spk.*` keys; `speaker_log_mel` (`src/mel.cpp`: the radix-2 FFT, the
+  Slaney filters as `mel_filter_bank`, reflect-padded uncentred frames) and `qwen3tts_speaker_embedding` (`src/qwen3tts.cpp`:
+  the ECAPA-TDNN with reflect-padded 'same' convolutions, SE-Res2Net blocks, the multi-layer aggregation, attentive statistics
+  pooling). `tests/speaker_verify.cpp` (`make build/speaker_verify`) against qwen-tts's `mel_spectrogram` and
+  `extract_speaker_embedding` on the clip at 24 kHz (/data/audio-ref/speaker, dump.py): the filter bank equal to 1e-7 of its
+  peak, the log-mel at cosine 1.0000000 (1.1e-5 of the peak), the 1024-dim embedding at cosine 1.0000000 (5.7e-7 of the peak).
 - T6 codec encoder in the engine (the speech tokenizer's SEANet encoder, its 8-layer transformer, the downsample and
   the residual VQ encode): converter writes `encoder.*` and the quantizer's encode tensors into the codec GGUF; checked
   against qwen-tts's `encode` (the reference clip's codes, exact integers).
+  **Done 2026-11-13:** `ROCm::Inference::Convert::Qwen3TTSTokenizer12` writes the encoder (the 496 tensors of the checkpoint
+  less the unused output projections; `enc_gname`: the short names `enc.sea0`, `enc.resS.c1/c2`, `enc.downS`, `enc.sealast`,
+  `enc.tfL.*`, `enc.ds`, `enc.qs/qa.proj`, `enc.qs/qa.N.sum/usage`, because a GGUF tensor name holds 63 bytes: the long
+  checkpoint names were cut to 63 and the engine could not find them) and the `qwen3tts_codec.enc.*` keys. The engine
+  (`src/qwen3tts_codec.cpp`): the SEANet with Mimi's causal padding arithmetic (zero padding; the downsample replicate), the
+  8-layer causal transformer with the sliding window (250), half-rotation RoPE, GELU MLPs and layer scales, the downsample,
+  the split residual VQ encode (nearest entry by L2 over `embed_sum / max(usage, 1e-5)`, the semantic codebook, then 15
+  acoustic), `qwen3tts_codec_encode` (T = ceil(n / 1920) frames). `tests/codec_encode_verify.cpp` (`make
+  build/codec_encode_verify`, 1.4 s): the 74 x 16 codes of the reference clip equal qwen-tts's `encode` on every integer
+  (`enc_codes_ref.i32`, codec_dump.py; the same codes as the T1 reference `ref_codes.npy`).
 - T7 voices from audio: the engine makes a voice from a WAV and its transcript (`qwen3tts_make_voice`); the server
   takes `POST /v1/audio/voices` (multipart: name, file, ref_text), so `tools/qwen3tts_voice.py` is only the reference.
 - T8 prefix KV cache: a voice's prefill (its reference text, codes and speaker embedding) is the same for every request

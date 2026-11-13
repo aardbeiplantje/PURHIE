@@ -5,6 +5,8 @@
 #ifndef ROCM_INFERENCE_MEL_H
 #define ROCM_INFERENCE_MEL_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -22,6 +24,12 @@ int mel_filter_bank(int n_mels, int n_fft, int sample_rate, double fmin, double 
 // transformers' (1, 80, 3000)). Samples past 30 s are truncated (the extractor's default); shorter audio is zero-padded.
 // Returns 0, or -1 on bad arguments.
 int whisper_log_mel(const float* samples, int n, int n_mels, float* out);
+
+// The speaker encoder's log-mel of 24 kHz samples (qwen-tts's mel_spectrogram: 128 bins, 1024-point frames, hop 256, Slaney
+// filters to 12 kHz; the reflect-padded, uncentred frames): out[128][frames] row-major, malloc'd (speaker_free_mel). Returns 0,
+// or -1 on bad arguments (fewer than 257 samples).
+int speaker_log_mel(const float* samples, size_t n, float** out, int* frames);
+void speaker_free_mel(float* mel);
 
 #ifdef __cplusplus
 }

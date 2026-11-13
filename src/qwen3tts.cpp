@@ -6,12 +6,13 @@
 #include "qwen3tts.h"
 
 #include "gguf_mmap.h"
+#include "mel.h"
 #include "tokenizer.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
-#include <cmath>
+#include <functional>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -165,6 +166,219 @@ void block_step(const Block& B, const Dims& d, float* x, int n, int pos0, float*
 
 }  // namespace
 
+// The speaker encoder (qwen-tts's Qwen3TTSSpeakerEncoder: an ECAPA-TDNN, T5 of PLAN.md). 1-D convolutions over [channels][time]
+// with 'same' padding by reflection (dilation * (k - 1) in total, the left half the smaller), the SE-Res2Net blocks, the
+// multi-layer feature aggregation, the attentive statistics pooling (weights from a TDNN over the frame, the frame's
+// statistics appended) and the final 1x1 convolution. Host float32; the checkpoint's module names as spk.* tensors.
+struct Conv1 {
+    const float *w = nullptr, *b = nullptr;  // w [cout][cin][k], b [cout]
+    int cin = 0, cout = 0, k = 1, dil = 1;
+};
+
+Conv1 conv1_of(const gguf_model_t* g, const std::string& base, int cin, int cout, int k, int dil) {
+    Conv1 c;
+    c.cin = cin;
+    c.cout = cout;
+    c.k = k;
+    c.dil = dil;
+    c.w = tensor(g, base + ".weight", (size_t)cout * cin * k);
+    c.b = tensor(g, base + ".bias", (size_t)cout);
+    return c;
+}
+
+struct SERes2 {
+    int C = 0, scale = 0, k = 1, dil = 1;
+    Conv1 tdnn1, tdnn2, se1, se2;
+    std::vector<Conv1> res;  // the Res2Net's scale - 1 convolutions, C / scale channels each
+};
+
+struct Speaker {
+    int mel = 0, enc = 0, att = 0, scale = 0, se = 0;
+    std::vector<int> ch, ks, dl;  // the encoder's channels, kernels and dilations (the first TDNN, then the SE-Res2Nets)
+    Conv1 first, mfa, asp_tdnn, asp_conv, fc;
+    std::vector<SERes2> blk;
+};
+
+void conv_same(const Conv1& c, const float* x, int T, float* y) {
+    const int total = c.dil * (c.k - 1), left = total / 2;
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < c.cout; ++o) {
+        for (int t = 0; t < T; ++t) {
+            float acc = c.b[o];
+            for (int i = 0; i < c.cin; ++i) {
+                const float* wr = c.w + ((size_t)o * c.cin + i) * c.k;
+                const float* xr = x + (size_t)i * T;
+                for (int j = 0; j < c.k; ++j) {
+                    int idx = t - left + j * c.dil;
+                    if (idx < 0) idx = -idx;                    // reflection: the edge is not repeated
+                    if (idx >= T) idx = 2 * (T - 1) - idx;
+                    acc += wr[j] * xr[idx];
+                }
+            }
+            y[(size_t)o * T + t] = acc;
+        }
+    }
+}
+
+void relu_in(float* x, size_t n) {
+    for (size_t i = 0; i < n; ++i) x[i] = x[i] > 0.0f ? x[i] : 0.0f;
+}
+
+// the speaker embedding of a log-mel [mel][T] (the mel's channels first, as the encoder's input)
+void speaker_forward(const Speaker& sp, const float* mel, int T, float* emb) {
+    std::vector<std::vector<float>> outs;
+    std::vector<float> x((size_t)sp.ch[0] * T);
+    conv_same(sp.first, mel, T, x.data());
+    relu_in(x.data(), x.size());
+    outs.push_back(x);
+    for (const SERes2& b : sp.blk) {
+        const int C = b.C, sub = C / b.scale;
+        const std::vector<float> residual = x;
+        std::vector<float> t1((size_t)C * T);
+        conv_same(b.tdnn1, x.data(), T, t1.data());
+        relu_in(t1.data(), t1.size());
+        // the Res2Net: the first part passes, the second goes through its convolution, each later one takes its own part
+        // plus the previous part's output
+        std::vector<float> r2((size_t)C * T), prev((size_t)sub * T), in((size_t)sub * T), o((size_t)sub * T);
+        for (int i = 0; i < b.scale; ++i) {
+            const float* part = t1.data() + (size_t)i * sub * T;
+            if (i == 0) {
+                o.assign(part, part + (size_t)sub * T);
+            } else {
+                if (i == 1) {
+                    in.assign(part, part + (size_t)sub * T);
+                } else {
+                    for (size_t q = 0; q < in.size(); ++q) in[q] = part[q] + prev[q];
+                }
+                conv_same(b.res[i - 1], in.data(), T, o.data());
+                relu_in(o.data(), o.size());
+            }
+            std::memcpy(&r2[(size_t)i * sub * T], o.data(), sizeof(float) * (size_t)sub * T);
+            prev = o;
+        }
+        std::vector<float> t2((size_t)C * T);
+        conv_same(b.tdnn2, r2.data(), T, t2.data());
+        relu_in(t2.data(), t2.size());
+        // squeeze-excitation: the channel means over time, a bottleneck, a sigmoid gate
+        std::vector<float> mean(C), s1(b.se1.cout), s2(C);
+        for (int c = 0; c < C; ++c) {
+            double acc = 0.0;
+            for (int t = 0; t < T; ++t) acc += t2[(size_t)c * T + t];
+            mean[c] = (float)(acc / T);
+        }
+        conv_same(b.se1, mean.data(), 1, s1.data());
+        relu_in(s1.data(), s1.size());
+        conv_same(b.se2, s1.data(), 1, s2.data());
+        for (int c = 0; c < C; ++c) {
+            const float g = 1.0f / (1.0f + std::exp(-s2[c]));
+            for (int t = 0; t < T; ++t) x[(size_t)c * T + t] = t2[(size_t)c * T + t] * g + residual[(size_t)c * T + t];
+        }
+        outs.push_back(x);
+    }
+    // the multi-layer aggregation: the blocks after the first, channel-wise
+    size_t Ctot = 0;
+    for (size_t i = 1; i < outs.size(); ++i) Ctot += outs[i].size() / T;
+    std::vector<float> cat((size_t)Ctot * T), h((size_t)Ctot * T);
+    size_t off = 0;
+    for (size_t i = 1; i < outs.size(); ++i) {
+        std::memcpy(&cat[off], outs[i].data(), sizeof(float) * outs[i].size());
+        off += outs[i].size();
+    }
+    conv_same(sp.mfa, cat.data(), T, h.data());
+    relu_in(h.data(), h.size());
+    // attentive statistics pooling: the frame weights from [h, mean, std] (each of the mean and std over the frames, uniform
+    // weights 1/T), a tanh TDNN and a 1x1 convolution, softmax over time, the weighted mean and std
+    const int L = (int)Ctot;
+    std::vector<float> a((size_t)3 * L * T), mu(L), sd(L);
+    for (int c = 0; c < L; ++c) {
+        double m = 0.0, v = 0.0;
+        for (int t = 0; t < T; ++t) m += h[(size_t)c * T + t];
+        m /= T;
+        for (int t = 0; t < T; ++t) {
+            const double d = h[(size_t)c * T + t] - m;
+            v += d * d;
+        }
+        mu[c] = (float)m;
+        sd[c] = (float)std::sqrt(std::max(v / T, 1e-12));
+    }
+    for (int c = 0; c < L; ++c)
+        for (int t = 0; t < T; ++t) {
+            a[(size_t)c * T + t] = h[(size_t)c * T + t];
+            a[((size_t)(L + c)) * T + t] = mu[c];
+            a[((size_t)(2 * L + c)) * T + t] = sd[c];
+        }
+    std::vector<float> a1((size_t)sp.att * T), logit((size_t)L * T);
+    conv_same(sp.asp_tdnn, a.data(), T, a1.data());
+    relu_in(a1.data(), a1.size());
+    for (float& v : a1) v = std::tanh(v);
+    conv_same(sp.asp_conv, a1.data(), T, logit.data());
+    for (int c = 0; c < L; ++c) {
+        float* lr = &logit[(size_t)c * T];
+        const float mx = *std::max_element(lr, lr + T);
+        double z = 0.0;
+        for (int t = 0; t < T; ++t) {
+            lr[t] = std::exp(lr[t] - mx);
+            z += lr[t];
+        }
+        for (int t = 0; t < T; ++t) lr[t] = (float)(lr[t] / z);
+    }
+    std::vector<float> pooled((size_t)2 * L);
+    for (int c = 0; c < L; ++c) {
+        const float* wr = &logit[(size_t)c * T];
+        const float* hr = &h[(size_t)c * T];
+        double m = 0.0, v = 0.0;
+        for (int t = 0; t < T; ++t) m += (double)wr[t] * hr[t];
+        for (int t = 0; t < T; ++t) {
+            const double d = hr[t] - m;
+            v += (double)wr[t] * d * d;
+        }
+        pooled[c] = (float)m;
+        pooled[L + c] = (float)std::sqrt(std::max(v, 1e-12));
+    }
+    conv_same(sp.fc, pooled.data(), 1, emb);
+}
+
+std::unique_ptr<Speaker> load_speaker(gguf_model_t* g, const std::function<int(const char*)>& kv,
+                                      const std::function<std::vector<int>(const char*)>& arr) {
+    std::unique_ptr<Speaker> sp(new Speaker());
+    sp->mel = kv("spk.mel_dim");
+    sp->enc = kv("spk.enc_dim");
+    sp->att = kv("spk.attention_channels");
+    sp->scale = kv("spk.res2net_scale");
+    sp->se = kv("spk.se_channels");
+    sp->ch = arr("spk.channels");
+    sp->ks = arr("spk.kernels");
+    sp->dl = arr("spk.dilations");
+    const int n = (int)sp->ch.size();
+    if (n < 3 || (int)sp->ks.size() != n || (int)sp->dl.size() != n) throw std::runtime_error("qwen3tts: the speaker encoder's arrays");
+    sp->first = conv1_of(g, "spk.blocks.0.conv", sp->mel, sp->ch[0], sp->ks[0], sp->dl[0]);
+    for (int i = 1; i < n - 1; ++i) {
+        SERes2 b;
+        const std::string base = "spk.blocks." + std::to_string(i);
+        const int in = sp->ch[i - 1], C = sp->ch[i];
+        b.C = C;
+        b.scale = sp->scale;
+        b.k = sp->ks[i];
+        b.dil = sp->dl[i];
+        if (C % b.scale) throw std::runtime_error("qwen3tts: the speaker encoder's channels");
+        b.tdnn1 = conv1_of(g, base + ".tdnn1.conv", in, C, 1, 1);
+        for (int r = 0; r < b.scale - 1; ++r)
+            b.res.push_back(conv1_of(g, base + ".res2net_block.blocks." + std::to_string(r) + ".conv", C / b.scale, C / b.scale,
+                                     b.k, b.dil));
+        b.tdnn2 = conv1_of(g, base + ".tdnn2.conv", C, C, 1, 1);
+        b.se1 = conv1_of(g, base + ".se_block.conv1", C, sp->se, 1, 1);
+        b.se2 = conv1_of(g, base + ".se_block.conv2", sp->se, C, 1, 1);
+        sp->blk.push_back(std::move(b));
+    }
+    int cat = 0;
+    for (int i = 1; i < n - 1; ++i) cat += sp->ch[i];
+    sp->mfa = conv1_of(g, "spk.mfa.conv", cat, sp->ch[n - 1], sp->ks[n - 1], sp->dl[n - 1]);
+    sp->asp_tdnn = conv1_of(g, "spk.asp.tdnn.conv", 3 * sp->ch[n - 1], sp->att, 1, 1);
+    sp->asp_conv = conv1_of(g, "spk.asp.conv", sp->att, sp->ch[n - 1], 1, 1);
+    sp->fc = conv1_of(g, "spk.fc", 2 * sp->ch[n - 1], sp->enc, 1, 1);
+    return sp;
+}
+
 struct qwen3tts_model {
     gguf_model_t* g = nullptr;
     tokenizer_t* tok = nullptr;  // the GGUF's vocabulary (NULL: none)
@@ -175,6 +389,7 @@ struct qwen3tts_model {
     int tts_bos = 0, tts_eos = 0, tts_pad = 0, codec_pad = 0, codec_bos = 0, codec_eos = 0, codec_think = 0,
         codec_nothink = 0, codec_think_bos = 0, codec_think_eos = 0;
     std::vector<std::string> languages;
+    std::unique_ptr<Speaker> spk;       // the speaker encoder (absent in a GGUF without spk.* tensors)
     std::vector<int> language_ids;
     const float* text_embd = nullptr;   // [text_vocab][text_C]
     const float* codec_embd = nullptr;  // [codec_vocab][C]
@@ -366,6 +581,21 @@ qwen3tts_model_t* qwen3tts_open(const char* gguf_path) {
             m->pblk.push_back(block_of("pred.blk." + std::to_string(l) + ".", m->pC, m->pH, m->pHkv, m->pD, m->pFF));
         m->pred_out_norm = tensor(m->g, "pred.out_norm.weight", m->pC);
         m->tok = tokenizer_load_from_gguf(m->g);  // (NULL when the GGUF has no vocabulary)
+        // the speaker encoder, when the GGUF has it (spk.* tensors; a talker-only GGUF has none)
+        size_t spk_bytes = 0;
+        if (gguf_get_tensor_ptr(m->g, "spk.blocks.0.conv.weight", &spk_bytes)) {
+            auto arr = [&](const char* suffix) {
+                const std::string key = std::string("qwen3tts.") + suffix;
+                int32_t type = 0;
+                const void* data = nullptr;
+                size_t count = 0;
+                if (gguf_kv_get_array(m->g, key.c_str(), &type, &data, &count) != 0) throw std::runtime_error("qwen3tts: no " + key);
+                std::vector<int> v(count);
+                for (size_t i = 0; i < count; ++i) v[i] = (int)static_cast<const uint32_t*>(data)[i];
+                return v;
+            };
+            m->spk = load_speaker(m->g, kv, arr);
+        }
         return m.release();
     } catch (const std::exception& e) {
         g_error = e.what();
@@ -385,6 +615,28 @@ int qwen3tts_n_embd(const qwen3tts_model_t* m) { return m ? m->C : 0; }
 int qwen3tts_n_codebooks(const qwen3tts_model_t* m) { return m ? m->ncb : 0; }
 int qwen3tts_codec_vocab(const qwen3tts_model_t* m) { return m ? m->codec_vocab : 0; }
 int qwen3tts_pred_vocab(const qwen3tts_model_t* m) { return m ? m->pvocab : 0; }
+
+int qwen3tts_speaker_dim(const qwen3tts_model_t* m) { return m && m->spk ? m->spk->enc : 0; }
+
+int qwen3tts_speaker_embedding(qwen3tts_model_t* m, const float* samples, size_t n, float* spk) {
+    if (!m || !samples || !spk) { g_error = "qwen3tts_speaker_embedding: null argument"; return -1; }
+    if (!m->spk) { g_error = "qwen3tts_speaker_embedding: the GGUF has no speaker encoder (spk.* tensors)"; return -1; }
+    float* mel = nullptr;
+    int T = 0;
+    if (speaker_log_mel(samples, n, &mel, &T) != 0) {
+        g_error = "qwen3tts_speaker_embedding: the clip is too short (at least 257 samples at 24 kHz)";
+        return -1;
+    }
+    try {
+        speaker_forward(*m->spk, mel, T, spk);
+    } catch (const std::exception& e) {
+        speaker_free_mel(mel);
+        g_error = e.what();
+        return -1;
+    }
+    speaker_free_mel(mel);
+    return 0;
+}
 
 int qwen3tts_language_id(const qwen3tts_model_t* m, const char* name) {
     if (!m || !name) return -1;

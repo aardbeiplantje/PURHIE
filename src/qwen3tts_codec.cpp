@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -199,6 +200,42 @@ void convnext(float* x, int T, const CNX& B) {
         for (int c = 0; c < D; ++c) x[(size_t)c * T + t] += o[(size_t)t * D + c] * B.gamma[c];
 }
 
+// The encoder (T6 of PLAN.md; qwen-tts's Qwen3TTSTokenizerV2Encoder, a MimiModel with the 12 Hz config): the SEANet (causal
+// convolutions, zero-padded; the downsample replicate-padded), the 8-layer causal transformer with a sliding window and
+// layer scales, the downsample to the codec's frame rate, and the split residual quantizer's encode (nearest codebook
+// entry, residual by residual; the semantic codebook first, then the acoustic ones).
+struct EConv {  // weight [cout][cin][k], bias [cout] or NULL
+    const float *w = nullptr, *b = nullptr;
+    int cin = 0, cout = 0, k = 1, stride = 1, dil = 1;
+    bool replicate = false;  // the padding repeats the edge samples (the downsample); zero otherwise
+};
+
+struct ERes {  // the SEANet residual block: ELU, a k-conv (dilated), ELU, a 1x1 conv, the residual added
+    EConv c1, c2;
+};
+
+struct ETf {
+    const float *ln1_w = nullptr, *ln1_b = nullptr, *ln2_w = nullptr, *ln2_b = nullptr;
+    const float *attn_scale = nullptr, *ffn_scale = nullptr;
+    Lin q, k, v, o, fc1, fc2;
+};
+
+struct Enc {
+    int filters = 0, kernel = 0, last_kernel = 0, res_kernel = 0, C = 0, L = 0, H = 0, D = 0, FF = 0, sw = 0;
+    int valid_q = 0, sem_q = 0, cb = 0, cb_dim = 0, spf = 0, down_k = 0;
+    float theta = 1e4f, eps = 1e-5f;
+    std::vector<int> ratios;                        // the SEANet's strides, as the config lists them (encoding runs them reversed)
+    EConv sea0;                                     // the first convolution (1 -> filters, k 7)
+    std::vector<ERes> res;                          // one per stage (the first residual of each stage)
+    std::vector<EConv> down;                        // one per stage (strided)
+    EConv sea_last;                                 // the last convolution (-> C)
+    std::vector<ETf> tf;
+    EConv downsample;                               // C -> C, k down_k, stride 2, replicate padding
+    Lin proj_sem, proj_ac;                          // the quantizers' input projections (C -> cb_dim), no bias
+    std::vector<std::vector<float>> emb_sem, emb_ac;  // per codebook: [cb][cb_dim] = embed_sum / max(usage, 1e-5)
+    std::vector<std::vector<float>> emb_sem_norm, emb_ac_norm;  // |e|^2 per entry
+};
+
 }  // namespace
 
 struct qwen3tts_codec {
@@ -216,10 +253,352 @@ struct qwen3tts_codec {
     DecBlock dec[4];
     Snake out_snake;
     Conv out_conv;
+    std::unique_ptr<Enc> enc;  // the encoder (absent in a GGUF without enc.* tensors)
     ~qwen3tts_codec() {
         if (g) gguf_mmap_close(g);
     }
 };
+
+namespace {
+
+EConv conv_of(const gguf_model_t* g, const std::string& base, int cin, int cout, int k, int stride, int dil, bool replicate) {
+    EConv c;
+    c.cin = cin;
+    c.cout = cout;
+    c.k = k;
+    c.stride = stride;
+    c.dil = dil;
+    c.replicate = replicate;
+    c.w = tensor(g, base + ".weight", (size_t)cout * cin * k);
+    c.b = tensor(g, base + ".bias", (size_t)cout, true);  // (the downsample has none)
+    return c;
+}
+
+Lin lin_of(const gguf_model_t* g, const std::string& base, int in, int out, bool bias = false) {
+    Lin L;
+    L.in = in;
+    L.out = out;
+    L.w = tensor(g, base + ".weight", (size_t)out * in);
+    L.b = bias ? tensor(g, base + ".bias", (size_t)out) : nullptr;
+    return L;
+}
+
+// Mimi's MimiConv1d arithmetic: the effective kernel, the total padding (kernel - stride), the extra padding on the right
+// that makes the frames whole. Returns the output length; left and right receive the padding.
+long conv_geometry(const EConv& c, long L, long* left, long* right) {
+    const long keff = (long)(c.k - 1) * c.dil + 1, pt = keff - c.stride;
+    const long num = L - keff + pt;
+    const long nf = num >= 0 ? (num + c.stride - 1) / c.stride : -((-num) / c.stride);  // ceil(num / stride)
+    const long ideal = nf * c.stride + keff - pt;
+    *left = pt;
+    *right = ideal - L;
+    return (L + *left + *right - keff) / c.stride + 1;
+}
+
+// the convolution of x [cin][L] with the padding of MimiConv1d (causal: left the total, right the extra): [cout][Lout]
+std::vector<float> econv(const EConv& c, const std::vector<float>& x, long L, long* Lout) {
+    long left = 0, right = 0;
+    const long lo = conv_geometry(c, L, &left, &right);
+    *Lout = lo;
+    const long Lp = L + left + right;
+    std::vector<float> xp((size_t)c.cin * Lp);
+    for (int i = 0; i < c.cin; ++i) {
+        const float* xr = x.data() + (size_t)i * L;
+        float* pr = xp.data() + (size_t)i * Lp;
+        for (long t = 0; t < Lp; ++t) {
+            long src = t - left;
+            if (src < 0) src = c.replicate ? 0 : -1;
+            else if (src >= L) src = c.replicate ? L - 1 : -1;
+            pr[t] = src < 0 ? 0.0f : xr[src];
+        }
+    }
+    std::vector<float> y((size_t)c.cout * lo);
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < c.cout; ++o) {
+        for (long t = 0; t < lo; ++t) {
+            float acc = c.b ? c.b[o] : 0.0f;
+            for (int i = 0; i < c.cin; ++i) {
+                const float* wr = c.w + ((size_t)o * c.cin + i) * c.k;
+                const float* pr = xp.data() + (size_t)i * Lp + t * c.stride;
+                for (int j = 0; j < c.k; ++j) acc += wr[j] * pr[(long)j * c.dil];
+            }
+            y[(size_t)o * lo + t] = acc;
+        }
+    }
+    return y;
+}
+
+void elu_in(std::vector<float>& x) {
+    for (float& v : x) v = v > 0.0f ? v : std::exp(v) - 1.0f;
+}
+
+// the encoder's transformer over h [L][C] (time-major), causal with the sliding window, RoPE (half rotation), GELU MLPs
+void enc_transformer(const Enc& e, std::vector<float>& h, long L) {
+    const int C = e.C, H = e.H, D = e.D, half = D / 2;
+    std::vector<float> cosv((size_t)L * half), sinv((size_t)L * half);
+    for (long p = 0; p < L; ++p)
+        for (int i = 0; i < half; ++i) {
+            const double f = (double)p * std::pow((double)e.theta, -2.0 * i / D);
+            cosv[(size_t)p * half + i] = (float)std::cos(f);
+            sinv[(size_t)p * half + i] = (float)std::sin(f);
+        }
+    auto layer_norm = [&](const float* x, const float* w, const float* b, float* y) {
+        double m = 0.0, v = 0.0;
+        for (int i = 0; i < C; ++i) m += x[i];
+        m /= C;
+        for (int i = 0; i < C; ++i) v += (x[i] - m) * (x[i] - m);
+        v /= C;
+        const double inv = 1.0 / std::sqrt(v + e.eps);
+        for (int i = 0; i < C; ++i) y[i] = (float)((x[i] - m) * inv * w[i] + b[i]);
+    };
+    std::vector<float> n((size_t)L * C), q((size_t)L * C), k((size_t)L * C), v((size_t)L * C), att((size_t)L * C);
+    std::vector<float> ff((size_t)L * e.FF);
+    for (const ETf& B : e.tf) {
+        #pragma omp parallel for schedule(static)
+        for (long t = 0; t < L; ++t) layer_norm(&h[(size_t)t * C], B.ln1_w, B.ln1_b, &n[(size_t)t * C]);
+        linear(n.data(), (int)L, B.q, q.data());
+        linear(n.data(), (int)L, B.k, k.data());
+        linear(n.data(), (int)L, B.v, v.data());
+        // rotary on q and k: (x1, x2) = (first half, second half) of each head, rotated by the position's angle
+        #pragma omp parallel for schedule(static)
+        for (long t = 0; t < L; ++t)
+            for (int hd = 0; hd < H; ++hd)
+                for (int i = 0; i < half; ++i) {
+                    const float c = cosv[(size_t)t * half + i], sn = sinv[(size_t)t * half + i];
+                    float* qa = &q[(size_t)t * C + hd * D];
+                    float* ka = &k[(size_t)t * C + hd * D];
+                    const float q1 = qa[i], q2 = qa[i + half], k1 = ka[i], k2 = ka[i + half];
+                    qa[i] = q1 * c - q2 * sn;
+                    qa[i + half] = q2 * c + q1 * sn;
+                    ka[i] = k1 * c - k2 * sn;
+                    ka[i + half] = k2 * c + k1 * sn;
+                }
+        // causal attention over the last sw positions (the sliding window: t - s < sw)
+        #pragma omp parallel for schedule(static)
+        for (long t = 0; t < L; ++t) {
+            const long s0 = std::max<long>(0, t - e.sw + 1);
+            std::vector<float> sc((size_t)(t - s0 + 1));
+            for (int hd = 0; hd < H; ++hd) {
+                const float* qr = &q[(size_t)t * C + hd * D];
+                float mx = -INFINITY;
+                for (long s = s0; s <= t; ++s) {
+                    const float* kr = &k[(size_t)s * C + hd * D];
+                    float d = 0.0f;
+                    for (int i = 0; i < D; ++i) d += qr[i] * kr[i];
+                    sc[(size_t)(s - s0)] = d / std::sqrt((float)D);
+                    mx = std::max(mx, sc[(size_t)(s - s0)]);
+                }
+                double z = 0.0;
+                for (float& x : sc) {
+                    x = std::exp(x - mx);
+                    z += x;
+                }
+                float* out = &att[(size_t)t * C + hd * D];
+                for (int i = 0; i < D; ++i) out[i] = 0.0f;
+                for (long s = s0; s <= t; ++s) {
+                    const float pw = (float)(sc[(size_t)(s - s0)] / z);
+                    const float* vr = &v[(size_t)s * C + hd * D];
+                    for (int i = 0; i < D; ++i) out[i] += pw * vr[i];
+                }
+            }
+        }
+        std::vector<float> o((size_t)L * C);
+        linear(att.data(), (int)L, B.o, o.data());
+        for (long t = 0; t < L; ++t)
+            for (int c = 0; c < C; ++c) h[(size_t)t * C + c] += B.attn_scale[c] * o[(size_t)t * C + c];
+        #pragma omp parallel for schedule(static)
+        for (long t = 0; t < L; ++t) layer_norm(&h[(size_t)t * C], B.ln2_w, B.ln2_b, &n[(size_t)t * C]);
+        linear(n.data(), (int)L, B.fc1, ff.data());
+        for (float& x : ff) x = 0.5f * x * (1.0f + std::erf(x / std::sqrt(2.0f)));  // GELU (exact)
+        std::vector<float> m2((size_t)L * C);
+        linear(ff.data(), (int)L, B.fc2, m2.data());
+        for (long t = 0; t < L; ++t)
+            for (int c = 0; c < C; ++c) h[(size_t)t * C + c] += B.ffn_scale[c] * m2[(size_t)t * C + c];
+    }
+}
+
+// the nearest entry of a codebook (L2) to r [cb_dim]: the entries' squared norms precomputed (the same argmin)
+int nearest(const std::vector<float>& emb, const std::vector<float>& norms, const float* r, int cb, int dim) {
+    int best = 0;
+    float bv = INFINITY;
+    for (int c = 0; c < cb; ++c) {
+        const float* e = &emb[(size_t)c * dim];
+        float d = 0.0f;
+        for (int i = 0; i < dim; ++i) d += r[i] * e[i];
+        const float v = norms[c] - 2.0f * d;
+        if (v < bv) {
+            bv = v;
+            best = c;
+        }
+    }
+    return best;
+}
+
+std::unique_ptr<Enc> load_encoder(gguf_model_t* g, const std::function<int(const char*)>& kv) {
+    std::unique_ptr<Enc> e(new Enc());
+    e->filters = kv("enc.n_filters");
+    e->kernel = kv("enc.kernel");
+    e->last_kernel = kv("enc.last_kernel");
+    e->res_kernel = kv("enc.residual_kernel");
+    e->C = kv("enc.n_embd");
+    e->H = kv("enc.n_head");
+    e->D = kv("enc.n_embd") / e->H;
+    e->FF = kv("enc.n_ff");
+    e->sw = kv("enc.sliding_window");
+    e->theta = gguf_arch_float(g, "enc.rope_theta", 1e4f);
+    e->eps = gguf_arch_float(g, "enc.norm_eps", 1e-5f);
+    e->valid_q = kv("enc.valid_quantizers");
+    e->sem_q = kv("enc.semantic_quantizers");
+    e->cb = kv("enc.codebook_size");
+    e->cb_dim = kv("enc.codebook_dim");
+    e->spf = kv("enc.samples_per_frame");
+    e->down_k = kv("enc.downsample_kernel");
+    const int n_layer = kv("enc.n_layer"), n_stage = 4;
+    const int compress = kv("enc.compress");
+    if (e->filters <= 0 || e->C <= 0 || e->H <= 0 || e->FF <= 0 || e->sw <= 0 || e->valid_q <= 0 || e->cb <= 0 || e->cb_dim <= 0 ||
+        e->spf <= 0 || e->down_k <= 0 || n_layer <= 0 || compress <= 0)
+        throw std::runtime_error("qwen3tts_codec: missing or bad encoder hyperparameters");
+    {
+        int32_t type = 0;
+        const void* data = nullptr;
+        size_t count = 0;
+        if (gguf_kv_get_array(g, "qwen3tts_codec.enc.ratios", &type, &data, &count) != 0)
+            throw std::runtime_error("qwen3tts_codec: no enc.ratios");
+        for (size_t i = 0; i < count; ++i) e->ratios.push_back((int)static_cast<const uint32_t*>(data)[i]);
+    }
+    if (e->ratios.size() != (size_t)n_stage) throw std::runtime_error("qwen3tts_codec: the encoder's stages are not four");
+    const int F = e->filters;
+    // the SEANet's layers as transformers names them: layers.0 the first convolution; each stage s (encoding runs the
+    // strides reversed) has its residual at layers.(3s+1).block.1 / block.3, its strided convolution at layers.(3s+3); the
+    // last convolution at layers.14
+    e->sea0 = conv_of(g, "enc.sea0", 1, F, 7, 1, 1, false);
+    for (int s = 0; s < n_stage; ++s) {
+        const int ratio = e->ratios[n_stage - 1 - s];
+        const int cur = F << s, nxt = F << (s + 1);
+        const std::string base = "enc.res" + std::to_string(s);
+        ERes r;
+        r.c1 = conv_of(g, base + ".c1", cur, cur / compress, e->res_kernel, 1, 1, false);
+        r.c2 = conv_of(g, base + ".c2", cur / compress, cur, 1, 1, 1, false);
+        e->res.push_back(r);
+        e->down.push_back(conv_of(g, "enc.down" + std::to_string(s), cur, nxt, 2 * ratio, ratio, 1, false));
+    }
+    e->sea_last = conv_of(g, "enc.sealast", F << n_stage, e->C, e->last_kernel, 1, 1, false);
+    for (int l = 0; l < n_layer; ++l) {
+        const std::string base = "enc.tf" + std::to_string(l) + ".";
+        ETf B;
+        B.ln1_w = tensor(g, base + "attn_norm.weight", e->C);
+        B.ln1_b = tensor(g, base + "attn_norm.bias", e->C);
+        B.ln2_w = tensor(g, base + "ffn_norm.weight", e->C);
+        B.ln2_b = tensor(g, base + "ffn_norm.bias", e->C);
+        B.attn_scale = tensor(g, base + "attn_scale", e->C);
+        B.ffn_scale = tensor(g, base + "ffn_scale", e->C);
+        B.q = lin_of(g, base + "attn_q", e->C, e->C);
+        B.k = lin_of(g, base + "attn_k", e->C, e->C);
+        B.v = lin_of(g, base + "attn_v", e->C, e->C);
+        B.o = lin_of(g, base + "attn_o", e->C, e->C);
+        B.fc1 = lin_of(g, base + "ffn_up", e->C, e->FF);
+        B.fc2 = lin_of(g, base + "ffn_down", e->FF, e->C);
+        e->tf.push_back(B);
+    }
+    e->downsample = conv_of(g, "enc.ds", e->C, e->C, e->down_k, 2, 1, true);
+    // the quantizers: the semantic one (input projection, codebooks) and the acoustic one
+    e->proj_sem = lin_of(g, "enc.qs.proj", e->C, e->cb_dim);
+    e->proj_ac = lin_of(g, "enc.qa.proj", e->C, e->cb_dim);
+    const int n_ac = e->valid_q - e->sem_q;
+    auto codebooks = [&](const std::string& quant, int n, std::vector<std::vector<float>>& emb, std::vector<std::vector<float>>& norms) {
+        for (int q = 0; q < n; ++q) {
+            const std::string base = "enc.q" + quant + "." + std::to_string(q) + ".";
+            const float* sum = tensor(g, base + "sum", (size_t)e->cb * e->cb_dim);
+            const float* usage = tensor(g, base + "usage", (size_t)e->cb);
+            std::vector<float> table((size_t)e->cb * e->cb_dim), nn((size_t)e->cb);
+            for (int c = 0; c < e->cb; ++c) {
+                const float u = std::max(usage[c], 1e-5f);
+                float sq = 0.0f;
+                for (int d = 0; d < e->cb_dim; ++d) {
+                    table[(size_t)c * e->cb_dim + d] = sum[(size_t)c * e->cb_dim + d] / u;
+                    sq += table[(size_t)c * e->cb_dim + d] * table[(size_t)c * e->cb_dim + d];
+                }
+                nn[c] = sq;
+            }
+            emb.push_back(std::move(table));
+            norms.push_back(std::move(nn));
+        }
+    };
+    codebooks("s", e->sem_q, e->emb_sem, e->emb_sem_norm);
+    codebooks("a", n_ac, e->emb_ac, e->emb_ac_norm);
+    return e;
+}
+
+// the codes [T][valid_q] of the samples (24 kHz): the encoder's frames, the first ceil(n / samples_per_frame) of them
+std::vector<int> enc_encode(const Enc& e, const float* x, size_t n, long* T_out) {
+    long L = (long)n;
+    std::vector<float> cur(x, x + n);  // [1][L]
+    // the SEANet: the first convolution, then the stages (a residual block, ELU, the strided convolution), ELU, the last one
+    cur = econv(e.sea0, cur, L, &L);
+    for (size_t st = 0; st < e.res.size(); ++st) {
+        const ERes& r = e.res[st];
+        std::vector<float> a = cur;
+        elu_in(a);
+        long La = 0;
+        a = econv(r.c1, a, L, &La);
+        elu_in(a);
+        a = econv(r.c2, a, La, &La);
+        for (size_t i = 0; i < cur.size(); ++i) cur[i] += a[i];
+        elu_in(cur);
+        cur = econv(e.down[st], cur, L, &L);
+    }
+    elu_in(cur);
+    cur = econv(e.sea_last, cur, L, &L);
+    // the transformer over the frames (time-major), then the downsample (channel-major again)
+    const int C = e.C;
+    std::vector<float> tm((size_t)L * C);
+    for (int c = 0; c < C; ++c)
+        for (long t = 0; t < L; ++t) tm[(size_t)t * C + c] = cur[(size_t)c * L + t];
+    enc_transformer(e, tm, L);
+    std::vector<float> cm((size_t)C * L);
+    for (int c = 0; c < C; ++c)
+        for (long t = 0; t < L; ++t) cm[(size_t)c * L + t] = tm[(size_t)t * C + c];
+    long Ld = 0;
+    cm = econv(e.downsample, cm, L, &Ld);
+    // the quantizers, frame by frame: the projected frame, its residual through each codebook's nearest entries
+    const long T = std::min<long>(Ld, (long)((n + e.spf - 1) / e.spf));
+    if (T <= 0) throw std::runtime_error("qwen3tts_codec_encode: the clip is too short");
+    *T_out = T;
+    const int V = e.valid_q, n_ac = V - e.sem_q;
+    std::vector<int> codes((size_t)T * V);
+    #pragma omp parallel for schedule(static)
+    for (long t = 0; t < T; ++t) {
+        std::vector<float> x0(C), r(e.cb_dim);
+        for (int c = 0; c < C; ++c) x0[c] = cm[(size_t)c * Ld + t];
+        // the semantic codebook, on its projection of the frame
+        for (int d = 0; d < e.cb_dim; ++d) {
+            float acc = 0.0f;
+            for (int i = 0; i < C; ++i) acc += e.proj_sem.w[(size_t)d * C + i] * x0[i];
+            r[d] = acc;
+        }
+        for (int q = 0; q < e.sem_q; ++q) {
+            const int idx = nearest(e.emb_sem[q], e.emb_sem_norm[q], r.data(), e.cb, e.cb_dim);
+            codes[(size_t)t * V + q] = idx;
+            const float* em = &e.emb_sem[q][(size_t)idx * e.cb_dim];
+            for (int d = 0; d < e.cb_dim; ++d) r[d] -= em[d];
+        }
+        // the acoustic codebooks, on the acoustic projection of the same frame
+        for (int d = 0; d < e.cb_dim; ++d) {
+            float acc = 0.0f;
+            for (int i = 0; i < C; ++i) acc += e.proj_ac.w[(size_t)d * C + i] * x0[i];
+            r[d] = acc;
+        }
+        for (int q = 0; q < n_ac; ++q) {
+            const int idx = nearest(e.emb_ac[q], e.emb_ac_norm[q], r.data(), e.cb, e.cb_dim);
+            codes[(size_t)t * V + e.sem_q + q] = idx;
+            const float* em = &e.emb_ac[q][(size_t)idx * e.cb_dim];
+            for (int d = 0; d < e.cb_dim; ++d) r[d] -= em[d];
+        }
+    }
+    return codes;
+}
+
+}  // namespace
 
 namespace {
 
@@ -533,6 +912,9 @@ qwen3tts_codec_t* qwen3tts_codec_open(const char* gguf_path) {
         m->out_snake.alpha = tensor(m->g, "codec.dec.out_snake.alpha", in_ch);
         m->out_snake.beta = tensor(m->g, "codec.dec.out_snake.beta", in_ch);
         m->out_conv = conv("codec.dec.out", in_ch, 1, 7, 1, 1, true);
+        // the encoder, when the GGUF has it (enc.* tensors; a decoder-only GGUF has none)
+        size_t enc_bytes = 0;
+        if (gguf_get_tensor_ptr(m->g, "enc.sea0.weight", &enc_bytes)) m->enc = load_encoder(m->g, kv);
         return m.release();
     } catch (const std::exception& e) {
         g_error = e.what();
@@ -583,5 +965,30 @@ int qwen3tts_codec_decode(qwen3tts_codec_t* m, const int* codes, int T, float** 
 }
 
 void qwen3tts_codec_free_wav(float* wav) { std::free(wav); }
+
+int qwen3tts_codec_encode_frame_samples(const qwen3tts_codec_t* m) { return m && m->enc ? m->enc->spf : 0; }
+
+int qwen3tts_codec_encode(qwen3tts_codec_t* m, const float* samples, size_t n, int** codes, int* T_out) {
+    if (!m || !samples || !codes || !T_out) { g_error = "qwen3tts_codec_encode: bad arguments"; return -1; }
+    if (!m->enc) { g_error = "the GGUF has no encoder (enc.* tensors)"; return -1; }
+    *codes = nullptr;
+    *T_out = 0;
+    try {
+        long T = 0;
+        std::vector<int> c = enc_encode(*m->enc, samples, n, &T);
+        const size_t count = (size_t)T * m->enc->valid_q;
+        int* out = static_cast<int*>(std::malloc(sizeof(int) * std::max<size_t>(count, 1)));
+        if (!out) throw std::runtime_error("qwen3tts_codec_encode: no memory");
+        std::memcpy(out, c.data(), sizeof(int) * count);
+        *codes = out;
+        *T_out = (int)T;
+        return 0;
+    } catch (const std::exception& e) {
+        g_error = e.what();
+        return -1;
+    }
+}
+
+void qwen3tts_codec_free_codes(int* codes) { std::free(codes); }
 
 }  // extern "C"

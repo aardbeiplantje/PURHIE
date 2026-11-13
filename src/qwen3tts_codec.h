@@ -28,6 +28,13 @@ int qwen3tts_codec_sample_rate(const qwen3tts_codec_t* codec); /* 24000 */
 int qwen3tts_codec_decode(qwen3tts_codec_t* codec, const int* codes, int T, float** wav, size_t* n_out);
 void qwen3tts_codec_free_wav(float* wav);
 
+/* The encoder (T6 of PLAN.md; qwen-tts's speech tokenizer encode): the codes of samples at 24 kHz (n of them, float in [-1, 1]):
+ * *codes receives T x n_quantizers ints, frame-major (free with qwen3tts_codec_free_codes), T = ceil(n / samples_per_frame)
+ * frames (the encoder's, cut to that count, as qwen-tts does). Needs the GGUF's enc.* tensors. Returns 0, or -1. */
+int qwen3tts_codec_encode(qwen3tts_codec_t* codec, const float* samples, size_t n, int** codes, int* T_out);
+void qwen3tts_codec_free_codes(int* codes);
+int qwen3tts_codec_encode_frame_samples(const qwen3tts_codec_t* codec);  /* the encoder's samples per frame: 1920, or 0 */
+
 #ifdef __cplusplus
 }
 #endif
