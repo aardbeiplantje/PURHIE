@@ -500,7 +500,8 @@ DiT and the text encoder, no ROCmFP4 unless the user asks for it):
     t = 0..T-1, h = w = 0. Image rows: t = T, and (h, w) on the grid `2 * sqrt(area)`-normalized of
     `np.linspace(left, left + ratio, n, endpoint=False) * 32` with ratio = n / sqrt(area), left = (1 - ratio) / 2
     (`_spatial_position_grid`, float64): for a square canvas, the centres of 32 cells over [0, 32).
-  - Timestep: one value per step, t = 1 - sigma (the six sigmas of `pdd_config.json`, t from 0 to 0.9675..0.768), unscaled.
+  - Timestep: one value per step, t = 1 - sigma (the sigmas of `pdd_config.json` 1, 0.9675, 0.8875, 0.75, 0.5328, 0.2320 give t = 0, 0.0325, 0.1125, 0.25,
+    0.4672, 0.768 for the six steps), unscaled.
     `time_proj`: sinusoid of 256 with `flip_sin_to_cos` (cos first), downscale shift 0; then `time_embedder`
     (linear 256 -> 5376, SiLU, linear 5376 -> 2688; the checkpoint's `proj_in` / `proj_out`).
   - AdaLN, per block: `adaln_proj.linear` (2688 -> 6 x 5376 x 3, bias) on SiLU(temb); the 6 chunks are shift, scale, gate
