@@ -64,6 +64,7 @@ sub open_model {
         or croak "$hf_arch is not supported (supported: " . join(', ', sort keys %ARCH) . ")";
     my %hp = %$cfg;
     %hp = (%hp, %{$cfg->{text_config}}) if ref $cfg->{text_config} eq 'HASH';
+    %hp = (%hp, %{$cfg->{talker_config}}) if ref $cfg->{talker_config} eq 'HASH';  # (Qwen3-TTS: the layers are there)
     my $self = bless {dir => $dir, config => $cfg, hp => \%hp, hf_arch => $hf_arch, kv => [], kv_at => {},
                       opt => \%opt}, $pkg;
     $self->{st} = st_open($dir);
@@ -2141,6 +2142,131 @@ sub convert {
                       in_bytes => $t->{bytes}, uses => [$t], data => sub { pack 'f<*', $self->floats($t) }};
     }
     croak 'no tensors in ' . $self->{dir} unless @specs;
+    return ROCm::Inference::Convert::write_file($out, \@kv, \@specs, 32, %a, reader => $self);
+}
+
+
+# Qwen3-TTS (Qwen/Qwen3-TTS-12Hz-0.6B-Base: Qwen3TTSForConditionalGeneration, the talker and its code predictor; phase
+# T2 of PLAN.md). F32, the BF16 checkpoint's values exactly. The speaker encoder (speaker_encoder.*: the voice clone's
+# x-vector) and the speech tokenizer (the codec, in its own directory) are not converted yet: skipped on purpose, named
+# here. The names: talker.* (the text embedding and projection, the codec embedding and head, blk.N) and pred.* (the
+# code predictor's embeddings, blocks and heads), llama.cpp's block names. The engine (src/qwen3tts.cpp) reads them.
+package ROCm::Inference::Convert::Qwen3TTS;
+use strict;
+use warnings;
+use Carp qw(croak);
+use File::Basename qw(basename);
+use File::Spec;
+our @ISA = ('ROCm::Inference::Convert');
+__PACKAGE__->register('Qwen3TTSForConditionalGeneration');
+
+sub arch { 'qwen3tts' }
+
+my %TALKER_BLOCK = (
+    'self_attn.q_proj' => 'attn_q', 'self_attn.k_proj' => 'attn_k', 'self_attn.v_proj' => 'attn_v',
+    'self_attn.o_proj' => 'attn_o', 'self_attn.q_norm' => 'attn_q_norm', 'self_attn.k_norm' => 'attn_k_norm',
+    'input_layernorm' => 'attn_norm', 'post_attention_layernorm' => 'ffn_norm',
+    'mlp.gate_proj' => 'ffn_gate', 'mlp.up_proj' => 'ffn_up', 'mlp.down_proj' => 'ffn_down',
+);
+
+# The GGUF name of a checkpoint tensor (undef: one the engine does not know)
+sub gname {
+    my ($hf) = @_;
+    return undef if $hf =~ /^speaker_encoder\./;  # skipped on purpose (see above)
+    if ($hf =~ /^talker\.model\.layers\.(\d+)\.(.+)\.weight$/) {
+        my $g = $TALKER_BLOCK{$2} // return undef;
+        return "talker.blk.$1.$g.weight";
+    }
+    if ($hf =~ /^talker\.model\.layers\.(\d+)\.(.+)$/) {  # (norms are weights only; the rest are matched above)
+        my $g = $TALKER_BLOCK{$2} // return undef;
+        return "talker.blk.$1.$g";
+    }
+    return 'talker.text_embd.weight' if $hf eq 'talker.model.text_embedding.weight';
+    return 'talker.codec_embd.weight' if $hf eq 'talker.model.codec_embedding.weight';
+    return 'talker.out_norm.weight' if $hf eq 'talker.model.norm.weight';
+    return 'talker.codec_head.weight' if $hf eq 'talker.codec_head.weight';
+    if ($hf =~ /^talker\.text_projection\.(linear_fc[12])\.(weight|bias)$/) {
+        return 'talker.text_proj.' . ($1 eq 'linear_fc1' ? 'fc1' : 'fc2') . ".$2";
+    }
+    if ($hf =~ /^talker\.code_predictor\.model\.codec_embedding\.(\d+)\.weight$/) { return "pred.embd.$1.weight" }
+    if ($hf =~ /^talker\.code_predictor\.lm_head\.(\d+)\.weight$/) { return "pred.head.$1.weight" }
+    return 'pred.out_norm.weight' if $hf eq 'talker.code_predictor.model.norm.weight';
+    if ($hf =~ /^talker\.code_predictor\.model\.layers\.(\d+)\.(.+)\.weight$/) {
+        my $g = $TALKER_BLOCK{$2} // return undef;
+        return "pred.blk.$1.$g.weight";
+    }
+    if ($hf =~ /^talker\.code_predictor\.model\.layers\.(\d+)\.(.+)$/) {
+        my $g = $TALKER_BLOCK{$2} // return undef;
+        return "pred.blk.$1.$g";
+    }
+    return undef;
+}
+
+sub convert {
+    my ($self, $out, %a) = @_;
+    croak 'qwen3tts: F32 only for now (the engine checks the values against the reference)' if $a{quant};
+    my $tc = $self->{config}{talker_config} // croak 'config: no talker_config';
+    my $cp = $tc->{code_predictor_config} // croak 'talker_config: no code_predictor_config';
+    my $rope = $tc->{rope_scaling} // {};
+    my $U32 = ROCm::Inference::Convert::U32;
+    my $STR = ROCm::Inference::Convert::STR;
+    my $F32 = ROCm::Inference::Convert::F32;
+    my $ARR = ROCm::Inference::Convert::ARR;
+    my $lang = $tc->{codec_language_id} // {};
+    my @langs = sort keys %$lang;
+    my @kv = (
+        ['general.architecture', $STR, 'qwen3tts'],
+        ['general.type', $STR, 'model'],
+        ['general.name', $STR, $a{name} // ROCm::Inference::Convert::_model_name(basename($self->{dir}))],
+        ['general.file_type', $U32, 0],
+        ['qwen3tts.talker.n_layer', $U32, $tc->{num_hidden_layers}],
+        ['qwen3tts.talker.n_embd', $U32, $tc->{hidden_size}],
+        ['qwen3tts.talker.n_head', $U32, $tc->{num_attention_heads}],
+        ['qwen3tts.talker.n_head_kv', $U32, $tc->{num_key_value_heads}],
+        ['qwen3tts.talker.head_dim', $U32, $tc->{head_dim}],
+        ['qwen3tts.talker.n_ff', $U32, $tc->{intermediate_size}],
+        ['qwen3tts.talker.rope_theta', $F32, 0 + $tc->{rope_theta}],
+        ['qwen3tts.talker.rms_eps', $F32, 0 + $tc->{rms_norm_eps}],
+        ['qwen3tts.talker.mrope_section', $ARR, [$U32, [map { int $_ } @{$rope->{mrope_section} // [24, 20, 20]}]]],
+        ['qwen3tts.talker.text_vocab', $U32, $tc->{text_vocab_size}],
+        ['qwen3tts.talker.text_n_embd', $U32, $tc->{text_hidden_size}],
+        ['qwen3tts.talker.codec_vocab', $U32, $tc->{vocab_size}],
+        ['qwen3tts.n_codebooks', $U32, $tc->{num_code_groups}],
+        ['qwen3tts.pred.n_layer', $U32, $cp->{num_hidden_layers}],
+        ['qwen3tts.pred.n_embd', $U32, $cp->{hidden_size}],
+        ['qwen3tts.pred.n_head', $U32, $cp->{num_attention_heads}],
+        ['qwen3tts.pred.n_head_kv', $U32, $cp->{num_key_value_heads}],
+        ['qwen3tts.pred.head_dim', $U32, $cp->{head_dim}],
+        ['qwen3tts.pred.n_ff', $U32, $cp->{intermediate_size}],
+        ['qwen3tts.pred.vocab', $U32, $cp->{vocab_size}],
+        ['qwen3tts.tts_bos_token', $U32, $self->{config}{tts_bos_token_id}],
+        ['qwen3tts.tts_eos_token', $U32, $self->{config}{tts_eos_token_id}],
+        ['qwen3tts.tts_pad_token', $U32, $self->{config}{tts_pad_token_id}],
+        ['qwen3tts.codec_pad_id', $U32, $tc->{codec_pad_id}],
+        ['qwen3tts.codec_bos_id', $U32, $tc->{codec_bos_id}],
+        ['qwen3tts.codec_eos_id', $U32, $tc->{codec_eos_token_id}],
+        ['qwen3tts.codec_think_id', $U32, $tc->{codec_think_id}],
+        ['qwen3tts.codec_nothink_id', $U32, $tc->{codec_nothink_id}],
+        ['qwen3tts.codec_think_bos_id', $U32, $tc->{codec_think_bos_id}],
+        ['qwen3tts.codec_think_eos_id', $U32, $tc->{codec_think_eos_id}],
+        ['qwen3tts.languages', $ARR, [$STR, [@langs]]],
+        ['qwen3tts.language_ids', $ARR, [$U32, [map { int $lang->{$_} } @langs]]],
+    );
+    my @specs;
+    my %skipped;
+    for my $name (@{$self->st->{order}}) {
+        my $g = gname($name);
+        if (!defined $g) {
+            croak "$name: no qwen3tts tensor name (a tensor the engine does not know)" unless $name =~ /^speaker_encoder\./;
+            $skipped{speaker_encoder}++;
+            next;
+        }
+        my $t = $self->t($name);
+        push @specs, {name => $g, ne => [reverse @{$t->{shape}}], f32 => 1,
+                      type => ROCm::Inference::Convert::gguf_type_id('f32'), from => lc $t->{dtype},
+                      in_bytes => $t->{bytes}, uses => [$t], data => sub { pack 'f<*', $self->floats($t) }};
+    }
+    croak 'no talker tensors in ' . $self->{dir} unless @specs;
     return ROCm::Inference::Convert::write_file($out, \@kv, \@specs, 32, %a, reader => $self);
 }
 

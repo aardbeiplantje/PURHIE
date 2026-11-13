@@ -224,7 +224,18 @@ transformers 5.5.1, Pillow; no torchvision in that venv). A phase is done when i
   the reference Whisper transcribes the wave as "Hello, this is a short test of the speech synthesis.". The codec
   decodes the reference clip's own codes to speech (RMS 0.058). T2 checks teacher-forced logits and codes (torch's
   sampling cannot be reproduced token for token).
-- T2 talker as an engine architecture: decoder LM plus its code predictor; check the codes.
+- T2 talker as an engine architecture (done 2026-11-13, host float32): the converter (`ROCm::Inference::Convert::Qwen3TTS`,
+  F32 of the BF16 checkpoint, `talker.*` / `pred.*` tensors and `qwen3tts.*` keys; the speaker encoder and the codec are
+  skipped on purpose) writes `/data/audio-ref/tts/qwen3tts-talker.gguf` (3.6 GB). `src/qwen3tts.{h,cpp}`: the in-context
+  voice clone's prefill (the codec prefix with the speaker embedding, the reference text and frames, the trailing text),
+  the 28-layer talker (Qwen3 blocks, per-head q/k norms, GQA; the M-RoPE with its three axes equal is plain RoPE here),
+  the 15-codebook code predictor, a KV-cached greedy generation (repetition penalty once per distinct token, the codec
+  range suppressed except EOS, EOS not before frame 2). `tests/qwen3tts_verify.cpp` (`make build/qwen3tts_verify`, 44 s):
+  the prefill, the talker's hidden states and logits over 133 positions and the predictor's logits match qwen-tts's
+  teacher-forced values at cosine 1.0000000 (within 1e-5 of the scale); the greedy generation reproduces qwen-tts's greedy
+  codes frame for frame (199 frames; the engine returns 200 because the reference's max count drops one). Not yet: the
+  sampling loop (top-k, temperature 0.9, the sub-talker's sampling: torch's RNG is not reproduced), the speaker encoder
+  (the x-vector for the speaker embedding, an input here), the BF16 weights, and a Perl binding.
 - T3 codec decoder (`Qwen3-TTS-Tokenizer-12Hz`): convolutions and transformer blocks in the engine; check the samples.
 - T4 `/v1/audio/speech` returning WAV.
 
