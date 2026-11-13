@@ -6,6 +6,14 @@
 
 ## ▶ Next (2026-11-12)
 
+0. **MiniMax-H3-Image: check the image structure against the released pipeline** (action item, 2026-11-13). The engine
+   reproduces the diffusers reference chain, and both produce a grid of independent 16 px patches with no composition
+   (`/data/minimax-ref/dit/reference_sample_256.png`; the engine's outputs in `mm_pipe_verify`). Open: whether the released
+   model does this too. Ways in: run the released `ModularPipeline` with components loaded one at a time (memory: the text
+   encoder and the transformer together exceed 124 GB, so load, encode, release, then the DiT), or find a convention in the
+   released code that the reference modules don't show. Until this is settled the MiniMax route stays out of
+   `/v1/images/generations` (the `--sd` route serves sd-turbo only).
+
 1. **Qwen3.8-Flash-Next in the deployment** (section below): the model's own MTP block as draft head and the parallel
    PLE reads are in; both are to be measured there (the user).
 2. **Concurrent runs** (section below): the deployment runs `--parallel` now; watch the store's resume (the `kv`
