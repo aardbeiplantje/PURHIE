@@ -12,6 +12,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +26,17 @@
 namespace {
 
 std::string g_error;
+
+// per-operation wall time (MMDIT_PROF set: printed at each velocity's end): the linears, the attention, the rest
+struct Prof {
+    double lin = 0, att = 0, rest = 0;
+    bool on = std::getenv("MMDIT_PROF") != nullptr;
+};
+Prof g_prof;
+double now_s() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 
 constexpr int kH = 5376;        // hidden size (the sequence's width)
 constexpr int kInner = 7168;    // heads * head_dim (QKV's output width)
@@ -130,8 +142,10 @@ mmdit::Lin lin_of(gguf_model_t* g, const std::string& prefix, int in, int out, b
 
 // y = x W^T + b for the linear L (its weight in place, BF16 or F32), T token rows
 void lin_apply(const mmdit::Lin& L, const float* x, int T, float* y) {
+    const double t0 = g_prof.on ? now_s() : 0;
     if (L.wf) sddev::linear_f32(x, T, L.wf, L.in, L.out, L.b.data(), y);
     else sddev::linear_bf16(x, T, L.w, L.in, L.out, L.b.data(), y);
+    if (g_prof.on) g_prof.lin += now_s() - t0;
 }
 
 // y = RMS norm of each of `rows` rows of n values (w: the affine weight, or null), eps
@@ -184,25 +198,33 @@ void block(const mmdit::BlockW& B, sddev::Floats& hid, int S, const sddev::Float
         g((size_t)S * kFF), f((size_t)S * H);
     rms(hid.data(), S, H, B.norm1.data(), n1.data());
     if (mod) mod_rows(n1.data(), rows->data(), mod->data(), S, 0, 1, n1.data());  // shift_msa, scale_msa
+    double tl = g_prof.on ? now_s() : 0;
     sddev::linear_bf16(n1.data(), S, B.qkv, H, C, nullptr, q.data());
     sddev::linear_bf16(n1.data(), S, B.qkv + (size_t)C * H, H, C, nullptr, k.data());
     sddev::linear_bf16(n1.data(), S, B.qkv + (size_t)2 * C * H, H, C, nullptr, v.data());
+    if (g_prof.on) g_prof.lin += now_s() - tl;
     rms(q.data(), (long)S * kHeads, kD, B.qn.data(), qn.data());
     rms(k.data(), (long)S * kHeads, kD, B.kn.data(), kn.data());
     if (cs) {
         rope(qn.data(), S, cs, sn);
         rope(kn.data(), S, cs, sn);
     }
+    double t0 = g_prof.on ? now_s() : 0;
     sddev::attention(qn.data(), S, kn.data(), v.data(), S, C, kHeads, a.data());
+    if (g_prof.on) g_prof.att += now_s() - t0;
+    tl = g_prof.on ? now_s() : 0;
     sddev::linear_bf16(a.data(), S, B.out, C, H, nullptr, o.data());
+    if (g_prof.on) g_prof.lin += now_s() - tl;
     if (mod) gate_rows(hid.data(), o.data(), rows->data(), mod->data(), S, 2);  // gate_msa
     else
         for (size_t i = 0; i < (size_t)S * H; ++i) hid[i] += o[i];
     rms(hid.data(), S, H, B.norm2.data(), n2.data());
     if (mod) mod_rows(n2.data(), rows->data(), mod->data(), S, 3, 4, n2.data());  // shift_mlp, scale_mlp
+    tl = g_prof.on ? now_s() : 0;
     sddev::linear_bf16(n2.data(), S, B.fc1, H, 2 * kFF, nullptr, pj.data());
     swiglu(pj.data(), S, g.data());
     sddev::linear_bf16(g.data(), S, B.fc2, kFF, H, nullptr, f.data());
+    if (g_prof.on) g_prof.lin += now_s() - tl;
     if (mod) gate_rows(hid.data(), f.data(), rows->data(), mod->data(), S, 5);  // gate_mlp
     else
         for (size_t i = 0; i < (size_t)S * H; ++i) hid[i] += f[i];
@@ -407,6 +429,12 @@ int mmdit_velocity(mmdit_t* m, const float* text, int T, const float* sample, in
         sddev::linear_bf16(sil.data(), 1, m->fadaln.w, kTemb, 2 * kH, m->fadaln.b.data(), fm.data());
         mod_cols(n.data(), fm.data() + kH, fm.data(), S, n2.data());
         dbg("norm_out", n2.data(), (size_t)S * kH);
+        if (g_prof.on) {
+            std::fprintf(stderr, "MMDIT_PROF linears %.2f s, attention %.2f s (of which the velocity's total is measured by the caller)\n",
+                         g_prof.lin, g_prof.att);
+            g_prof = Prof{};
+            g_prof.on = true;
+        }
         // the step's PDD head on the image rows, then the unpatchify (the inverse of the patchify)
         sddev::Floats velo((size_t)N * kPatch);
         sddev::linear_f32(n2.data() + (size_t)T * kH, N, m->pdd_w.data() + (size_t)step * kPatch * kH, kH, kPatch,

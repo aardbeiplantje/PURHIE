@@ -30,7 +30,7 @@ int g_state = -1;  // -1: not tried, 0: host only, 1: device
 hipModule_t g_mod = nullptr;
 hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn_sum = nullptr, f_gn_sq = nullptr,
               f_gn_apply = nullptr, f_silu = nullptr, f_add = nullptr, f_upsample2 = nullptr, f_softmax = nullptr,
-              f_layer_norm = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr;
+              f_layer_norm = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr;
 
 constexpr int kThreads = 256;
 constexpr int kGroupSplit = 16;  // the group norm's partial sums per group
@@ -55,7 +55,7 @@ bool init() {
         const char* name;
     };
     const Entry entries[] = {
-        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"},
+        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"},
         {&f_gn_sum, "sd_gn_sum"},       {&f_gn_sq, "sd_gn_sq"},         {&f_gn_apply, "sd_gn_apply"},
         {&f_silu, "sd_silu"},           {&f_add, "sd_add"},             {&f_upsample2, "sd_upsample2"},
         {&f_softmax, "sd_softmax"},     {&f_layer_norm, "sd_layer_norm"}, {&f_geglu, "sd_geglu"},
@@ -175,6 +175,24 @@ void linear_f32(const float* x, int T, const float* W, int in, int out, const fl
 }
 
 void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, const float* b, float* y) {
+    if (out <= 0 || T <= 0) return;
+    // the tensor-core tile (sd_gemm_wmma) when its shape rules hold (K a multiple of 64), else the plain tile
+    if (in % 64 == 0) {
+        const uint16_t* A = W;
+        const float* B = x;
+        float* C = y;
+        const long lda = in, sbn = in, cs_m = 1, cs_n = out;
+        const float* bf = b;
+        const float alpha = 1.0f, beta = 0.0f;
+        const int M = out, N = T, K = in;
+        void* args[] = {(void*)&A, (void*)&lda, (void*)&B, (void*)&sbn, (void*)&C, (void*)&cs_m, (void*)&cs_n,
+                        (void*)&bf, (void*)&alpha, (void*)&beta, (void*)&M, (void*)&N, (void*)&K};
+        check(hipModuleLaunchKernel(f_gemm_wmma, (unsigned)((N + 63) / 64), (unsigned)((M + 63) / 64), 1, 128, 1, 1, 0, nullptr,
+                                    args, nullptr),
+              "wmma gemm");
+        sync();
+        return;
+    }
     gemm<uint16_t>(f_gemm_bf, W, in, x, 1, in, y, 1, out, nullptr, 1.0f, 0.0f, out, T, in, b);
     sync();
 }

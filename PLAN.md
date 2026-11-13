@@ -531,8 +531,11 @@ DiT and the text encoder, no ROCmFP4 unless the user asks for it):
     RMS-norm launch (one block per row, not one per 256 elements), the prompt's host copy passed to the device, and the
     checkpoint's F32 linears (`video_patch_proj`, the time embedder: read as F32 in place). The attention is 56 heads of 128
     (inner width 7168, not 5376: the QKV rows are 21504, `out_proj` is 5376 x 7168). The cost at 1024 x 1024 (1024 image
-    tokens): **40 s per forward** with the fp32-accumulate tile on the BF16 weights, so a six-step image is about four
-    minutes. A tensor-core BF16 GEMM (WMMA) is the next speed item; the sampler (`mmdit_sample`) is written but not yet
+    tokens): **11.4 s per forward** (was 40 s) since the linears run on the tensor cores (`sd_gemm_wmma`: BF16 weights, the
+    activations rounded to BF16 on load, F32 accumulate; a 64 x 64 tile, a 64-wide k-tile, 4 waves of 2 x 2 WMMA 16 x 16 x 16
+    tiles; the same cosines, 0.99995): the linears 6.2 s (about 7 TFLOPS), the attention 4.4 s (fp32 scores, one head at a
+    time), the rest 0.8 s. Still open: a larger BF16 tile and the attention on the tensor cores, and the sampler end to end.
+    (The earlier line: the sampler (`mmdit_sample`) is written but not yet
     compared end to end.
   - Plan (as written before the engine): (a) the engine's BF16 A operand in the GEMM (the bf16 weight's high half in a float, as the F16 path does);
     (b) `src/minimax_dit.{h,cpp}` with the token refiner, the blocks, the output, the sampler; (c) the verifiers:

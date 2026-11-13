@@ -270,3 +270,93 @@ sd_gemm_bf(const uint16_t* A, long lda, const float* B, long sbk, long sbn, floa
     __shared__ float Bs[G_BK][G_BN + 1];
     gemm_body<uint16_t, 2>(A, lda, B, sbk, sbn, C, cs_m, cs_n, bias, biasf, alpha, beta, M, N, K, As, Bs);
 }
+
+// ---- the tensor-core GEMM for BF16 weights (the DiT's linears): C[m * cs_m + n * cs_n] = alpha * sum_k A(m, k) B(k, n) +
+// biasf[m] + beta * C, A(m, k) = A[m * lda + k] (BF16, k contiguous), B(k, n) = B[n * sbn + k] (F32, k contiguous: sbk 1; rounded
+// to BF16 on load: the reference runs its activations in BF16 too). A 64 x 64 tile per block of 4 waves (wave32), a k-tile of 64
+// (four 16-wide WMMA steps), each wave a 2 x 2 grid of 16 x 16 x 16 WMMA tiles. Fragment layout (RDNA3, wave32): a lane holds one
+// row of A (lane & 15) and the same row again in the other half-wave; likewise one column of B; the accumulator's lane holds
+// rows 2 i + (lane >> 4), column lane & 15. Requires K a multiple of 64, lda a multiple of 8, sbk 1 (the host checks).
+typedef __bf16 bf16x16_t __attribute__((ext_vector_type(16)));
+typedef float f32x8_t __attribute__((ext_vector_type(8)));
+
+__device__ __forceinline__ uint16_t f2bf(float f) {  // round to nearest, ties to even (the inputs are finite)
+    union {
+        float f;
+        uint32_t u;
+    } v;
+    v.f = f;
+    const uint32_t r = v.u + 0x7FFFu + ((v.u >> 16) & 1u);
+    return (uint16_t)(r >> 16);
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+sd_gemm_wmma(const uint16_t* __restrict__ A, long lda, const float* __restrict__ B, long sbn, float* __restrict__ C, long cs_m,
+             long cs_n, const float* __restrict__ biasf, float alpha, float beta, int M, int N, int K) {
+    __shared__ __attribute__((aligned(16))) uint16_t As[64][72];  // 144-byte rows: 16-byte aligned
+    __shared__ __attribute__((aligned(16))) uint16_t Bs[64][72];
+    const int t = threadIdx.x, w = t >> 5, l = t & 31;
+    const int wm = w >> 1, wn = w & 1;
+    const int bm = blockIdx.y * 64, bn = blockIdx.x * 64;
+    f32x8_t acc[2][2];
+    for (int a = 0; a < 2; ++a)
+        for (int b = 0; b < 2; ++b)
+            for (int i = 0; i < 8; ++i) acc[a][b][i] = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += 64) {
+        {  // A: thread t loads 32 values of row t / 2 at k0 + 32 * (t & 1)
+            const int r = t >> 1, h = (t & 1) * 32, gm = bm + r;
+            uint4 v[4];
+            for (int j = 0; j < 4; ++j) {
+                v[j] = {0u, 0u, 0u, 0u};
+                if (gm < M) v[j] = *reinterpret_cast<const uint4*>(A + (long)gm * lda + k0 + h + 8 * j);
+            }
+            for (int j = 0; j < 4; ++j) *reinterpret_cast<uint4*>(&As[r][h + 8 * j]) = v[j];
+        }
+        {  // B: thread t converts 32 values of column t / 2 at k0 + 32 * (t & 1): eight float4 loads
+            const int n = t >> 1, h = (t & 1) * 32, gn = bn + n;
+            uint16_t q[32];
+            for (int j = 0; j < 8; ++j) {
+                float4 x = {0.0f, 0.0f, 0.0f, 0.0f};
+                if (gn < N) x = *reinterpret_cast<const float4*>(B + (long)gn * sbn + k0 + h + 4 * j);
+                q[4 * j] = f2bf(x.x);
+                q[4 * j + 1] = f2bf(x.y);
+                q[4 * j + 2] = f2bf(x.z);
+                q[4 * j + 3] = f2bf(x.w);
+            }
+            for (int j = 0; j < 4; ++j) {
+                uint4 v;
+                __builtin_memcpy(&v, &q[8 * j], sizeof v);
+                *reinterpret_cast<uint4*>(&Bs[n][h + 8 * j]) = v;
+            }
+        }
+        __syncthreads();
+        for (int ks = 0; ks < 4; ++ks) {
+            bf16x16_t af[2], bfr[2];
+            for (int mt = 0; mt < 2; ++mt) {
+                const int row = wm * 32 + mt * 16 + (l & 15);
+                __builtin_memcpy(&af[mt], &As[row][ks * 16], sizeof(bf16x16_t));
+            }
+            for (int nt = 0; nt < 2; ++nt) {
+                const int col = wn * 32 + nt * 16 + (l & 15);
+                __builtin_memcpy(&bfr[nt], &Bs[col][ks * 16], sizeof(bf16x16_t));
+            }
+            for (int mt = 0; mt < 2; ++mt)
+                for (int nt = 0; nt < 2; ++nt)
+                    acc[mt][nt] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af[mt], bfr[nt], acc[mt][nt]);
+        }
+        __syncthreads();
+    }
+    for (int mt = 0; mt < 2; ++mt)
+        for (int nt = 0; nt < 2; ++nt)
+            for (int i = 0; i < 8; ++i) {
+                const int gm = bm + wm * 32 + mt * 16 + 2 * i + (l >> 4);
+                const int gn = bn + wn * 32 + nt * 16 + (l & 15);
+                if (gm < M && gn < N) {
+                    float v = alpha * acc[mt][nt][i];
+                    if (biasf) v += biasf[gm];
+                    const long off = (long)gm * cs_m + (long)gn * cs_n;
+                    if (beta != 0.0f) v += beta * C[off];
+                    C[off] = v;
+                }
+            }
+}
