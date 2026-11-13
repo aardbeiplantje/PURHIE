@@ -2,28 +2,15 @@
 # The pipeline's decoders.py: latents = z * latents_std + latents_mean, then vae.decode (tiled by default).
 import numpy as np, torch
 from diffusers.models.autoencoders.autoencoder_kl_minimax_h3_image import AutoencoderKLMiniMaxH3Image
-D = '/data/minimax-ref/vae'
+D = '/data/minimax-ref/vae_diffusers'
 OUT = '/data/minimax-ref/vae'
 from safetensors.torch import load_file
-vae = AutoencoderKLMiniMaxH3Image.from_config(D).float().eval()   # the encoder stays unloaded (decode only)
-ck = load_file(D + '/diffusion_pytorch_model.safetensors')
-sd = {}
-for k, v in ck.items():
-    if k.startswith('decoder.x_embedder.'): sd[k.replace('x_embedder', 'proj_in')] = v
-    elif k.startswith('post_quant_conv.'): sd[k] = v
-    elif '.attn.to_qkv.' in k:
-        q, kk, vv = v.chunk(3, dim=0)
-        base = k[:k.index('to_qkv')]
-        suffix = k.rsplit('.', 1)[1]
-        sd[base + 'to_q.' + suffix], sd[base + 'to_k.' + suffix], sd[base + 'to_v.' + suffix] = q, kk, vv
-    elif '.attn.to_out.' in k: sd[k.replace('to_out.', 'to_out.0.')] = v
-    elif '.ff.w1.' in k: sd[k.replace('ff.w1.', 'ff.net.0.proj.')] = v
-    elif '.ff.w2.' in k: sd[k.replace('ff.w2.', 'ff.net.2.')] = v
-    elif k.startswith('decoder.') and 'mask_token' not in k: sd[k] = v
-dec_sd = {k[len('decoder.'):]: v for k, v in sd.items() if k.startswith('decoder.')}
-vae.decoder.load_state_dict(dec_sd, strict=True)
-vae.post_quant_conv.load_state_dict({k[len('post_quant_conv.'):]: v for k, v in sd.items() if k.startswith('post_quant_conv.')}, strict=True)
-print('loaded decoder strictly:', len(dec_sd), 'tensors', flush=True)
+# the RELEASED diffusers-format VAE (vae_diffusers: the class's own key names, no mapping); the encoder stays unloaded
+vae = AutoencoderKLMiniMaxH3Image.from_config(D).float().eval()
+ck = load_file('/data/minimax-ref/vae_diffusers/diffusion_pytorch_model.safetensors')
+vae.decoder.load_state_dict({k[len('decoder.'):]: v for k, v in ck.items() if k.startswith('decoder.')}, strict=True)
+vae.post_quant_conv.load_state_dict({k[len('post_quant_conv.'):]: v for k, v in ck.items() if k.startswith('post_quant_conv.')}, strict=True)
+print('loaded the released decoder strictly', flush=True)
 mean = torch.tensor(vae.config.latents_mean).view(1, -1, 1, 1)
 std = torch.tensor(vae.config.latents_std).view(1, -1, 1, 1)
 print('use_tiling', vae.use_tiling, 'tile', vae.tile_sample_min_height, vae.tile_sample_min_overlap_height, 'ratio', vae.spatial_compression_ratio, flush=True)

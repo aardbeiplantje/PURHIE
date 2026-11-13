@@ -10,6 +10,7 @@
 #include "minimax_vae.h"
 #include "qwen_model.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -99,13 +100,46 @@ void mm_close(mm_pipe_t* pipe) { delete pipe; }
 
 const char* mm_last_error(void) { return g_error.c_str(); }
 
+// The canvas the released pipeline generates on (get_image_canvas_size): a request below 2048 x 2048 pixels is generated on a
+// canvas scaled up to that area at the same aspect ratio, each side rounded to a multiple of 32; the result is then resized back.
+void canvas_size(int height, int width, int* ch, int* cw) {
+    const double scale = std::fmax(1.0, std::sqrt(2048.0 * 2048.0 / ((double)width * height)));
+    *ch = std::fmax(32.0, std::nearbyint(height * scale / 32.0) * 32.0);
+    *cw = std::fmax(32.0, std::nearbyint(width * scale / 32.0) * 32.0);
+}
+
+// Area-averaging resize of 8-bit RGB (each output pixel averages its source footprint, fractional at the edges)
+void resize_area(const unsigned char* src, int sh, int sw, unsigned char* dst, int dh, int dw) {
+    const double sy = (double)sh / dh, sx = (double)sw / dw;
+    for (int y = 0; y < dh; ++y) {
+        const double y0 = y * sy, y1 = (y + 1) * sy;
+        for (int x = 0; x < dw; ++x) {
+            const double x0 = x * sx, x1 = (x + 1) * sx;
+            double acc[3] = {0, 0, 0}, wsum = 0;
+            for (int iy = (int)y0; iy < (int)std::ceil(y1) && iy < sh; ++iy) {
+                const double wy = std::fmin(y1, iy + 1.0) - std::fmax(y0, (double)iy);
+                for (int ix = (int)x0; ix < (int)std::ceil(x1) && ix < sw; ++ix) {
+                    const double wx = std::fmin(x1, ix + 1.0) - std::fmax(x0, (double)ix);
+                    const double wt = wy * wx;
+                    for (int c = 0; c < 3; ++c) acc[c] += wt * src[((size_t)iy * sw + ix) * 3 + c];
+                    wsum += wt;
+                }
+            }
+            for (int c = 0; c < 3; ++c)
+                dst[((size_t)y * dw + x) * 3 + c] = (unsigned char)std::fmin(255.0, std::nearbyint(acc[c] / wsum));
+        }
+    }
+}
+
 int mm_generate(mm_pipe_t* p, const char* prompt, int height, int width, unsigned long long seed, unsigned char* rgb) {
     if (!p || !prompt || !rgb || height <= 0 || width <= 0 || height % 32 || width % 32) {
         g_error = "mm_generate: bad arguments (height and width: multiples of 32)";
         return -1;
     }
     try {
-        const int h = height / 16, w = width / 16;  // the latent grid (16 px per cell)
+        int canvas_h = 0, canvas_w = 0;
+        canvas_size(height, width, &canvas_h, &canvas_w);
+        const int h = canvas_h / 16, w = canvas_w / 16;  // the latent grid (16 px per cell)
         // 1. the prompt's conditioning, then the encoder is released (it and the DiT are not resident together)
         int T = 0;
         std::vector<float> text = encode_prompt(p->text.c_str(), prompt, &T);
@@ -121,7 +155,7 @@ int mm_generate(mm_pipe_t* p, const char* prompt, int height, int width, unsigne
             if (rc != 0) throw std::runtime_error("sampler: " + err);
         }
         // 3. the VAE decoder (the latents' normalization is applied inside), then the pixels
-        std::vector<float> planes((size_t)3 * height * width);
+        std::vector<float> planes((size_t)3 * canvas_h * canvas_w);
         {
             mmvae_t* vae = mmvae_open(p->vae.c_str());
             if (!vae) throw std::runtime_error(std::string("vae: ") + mmvae_last_error());
@@ -130,15 +164,19 @@ int mm_generate(mm_pipe_t* p, const char* prompt, int height, int width, unsigne
             mmvae_close(vae);
             if (rc != 0) throw std::runtime_error("vae: " + err);
         }
-        // the pipeline's output: decoded * std + mean (ImageNet's), clamped to [0, 1], truncated to 8 bits
+        // the pipeline's output: decoded * std + mean (ImageNet's), clamped to [0, 1], truncated to 8 bits on the canvas, then
+        // resized back to the requested size
         static const float kMean[3] = {0.485f, 0.456f, 0.406f}, kStd[3] = {0.229f, 0.224f, 0.225f};
-        for (int y = 0; y < height; ++y)
-            for (int x = 0; x < width; ++x)
+        std::vector<unsigned char> canvas((size_t)canvas_h * canvas_w * 3);
+        for (int y = 0; y < canvas_h; ++y)
+            for (int x = 0; x < canvas_w; ++x)
                 for (int c = 0; c < 3; ++c) {
-                    float v = planes[((size_t)c * height + y) * width + x] * kStd[c] + kMean[c];
+                    float v = planes[((size_t)c * canvas_h + y) * canvas_w + x] * kStd[c] + kMean[c];
                     v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-                    rgb[((size_t)y * width + x) * 3 + c] = (unsigned char)(v * 255.0f);
+                    canvas[((size_t)y * canvas_w + x) * 3 + c] = (unsigned char)(v * 255.0f);
                 }
+        if (canvas_h == height && canvas_w == width) std::memcpy(rgb, canvas.data(), canvas.size());
+        else resize_area(canvas.data(), canvas_h, canvas_w, rgb, height, width);
         return 0;
     } catch (const std::exception& e) {
         g_error = e.what();

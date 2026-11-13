@@ -6,14 +6,22 @@
 
 ## ▶ Next (2026-11-12)
 
-0. **MiniMax-H3-Image: check the image structure against the released pipeline** (action item, 2026-11-13). The engine
-   reproduces the diffusers reference chain, and both produce a grid of independent 16 px patches with no composition
-   (`/data/minimax-ref/dit/reference_sample_256.png`; the engine's outputs in `mm_pipe_verify`). Open: whether the released
-   model does this too. Ways in: run the released `ModularPipeline` with components loaded one at a time (memory: the text
-   encoder and the transformer together exceed 124 GB, so load, encode, release, then the DiT), or find a convention in the
-   released code that the reference modules don't show. Until this is settled the MiniMax route stays out of
-   `/v1/images/generations` (the `--sd` route serves sd-turbo only).
-
+0. **MiniMax-H3-Image: DONE 2026-11-13 (was: check the image structure against the released pipeline).** Three causes:
+   (a) two layout errors in the native checkpoint, shared by the engine and my reference (so their agreement hid them): the
+   fused QKV rows are grouped per head (q, k, v of D rows each per head: rows `(h * 3 + part) * D`), not `[all q | all k | all
+   v]`; the FFN's projection holds the GATE first and the VALUE second (the released diffusers-format weights have the halves
+   swapped: `ff.net.0.proj` is the native `fc1` with its halves exchanged). The VAE has both (qkv per head of 64; `ff.w1`
+   halves). Checked against `transformer_diffusers` / `vae_diffusers` (the released format, the diffusers class's own names).
+   (b) the released pipeline generates on a canvas of at least 2048 x 2048 pixels (`min_generation_area` default, the canvas
+   rule `get_image_canvas_size`), then resizes to the request: a 256 request runs as 128 x 128 latents. The engine now does the
+   same (`canvas_size`, `resize_area`; the released resize is diffusers' image processor, ours is area averaging: a small
+   difference, not checked). (c) the reference scripts now use the released weights and the released text stage.
+   Results: the released text stage's embeddings equal ours (max difference 0.0); the engine's sampler on the released
+   pipeline's own inputs (text, torch seed-0 noise at 128 x 128, the released final latent): cosine 0.993865; the VAE vs the
+   released VAE: cosine 1.0000000; the released pipeline's fox at 256 (`/data/minimax-ref/released/released_fox_256.png`).
+   Runs: `tests/mm_canvas_verify` (the sampler on the released inputs), `tests/mm_dit_ref.py` (now released weights),
+   `tests/mm_vae_ref.py` (released VAE). Note the default request in the released pipeline is 2048 x 2048: a 2048 image is
+   four times the DiT's tokens and the attention is quadratic in them (speed: item 2).
 1. **Qwen3.8-Flash-Next in the deployment** (section below): the model's own MTP block as draft head and the parallel
    PLE reads are in; both are to be measured there (the user).
 2. **Concurrent runs** (section below): the deployment runs `--parallel` now; watch the store's resume (the `kv`

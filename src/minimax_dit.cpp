@@ -51,7 +51,7 @@ constexpr int kThreads = 256;
 struct Kernels {
     hipModule_t mod = nullptr;
     hipFunction_t rmsnorm = nullptr, rope = nullptr, swiglu = nullptr, mod_rows = nullptr, gate_rows = nullptr,
-                  mod_cols = nullptr;
+                  mod_cols = nullptr, split_qkv = nullptr;
 };
 Kernels g_k;
 
@@ -62,9 +62,9 @@ void check(hipError_t e, const char* what) {
 void load_kernels() {
     if (g_k.mod) return;
     if (kernel_module_load(&g_k.mod, "minimax_vae.co") != hipSuccess) throw std::runtime_error("minimax dit: minimax_vae.co does not load");
-    hipFunction_t* fs[] = {&g_k.rmsnorm, &g_k.rope, &g_k.swiglu, &g_k.mod_rows, &g_k.gate_rows, &g_k.mod_cols};
-    const char* names[] = {"mv_rmsnorm", "mv_rope", "mv_swiglu", "mm_mod_rows", "mm_gate_rows", "mm_mod_cols"};
-    for (int i = 0; i < 6; ++i) check(hipModuleGetFunction(fs[i], g_k.mod, names[i]), names[i]);
+    hipFunction_t* fs[] = {&g_k.rmsnorm, &g_k.rope, &g_k.swiglu, &g_k.mod_rows, &g_k.gate_rows, &g_k.mod_cols, &g_k.split_qkv};
+    const char* names[] = {"mv_rmsnorm", "mv_rope", "mm_swiglu_native", "mm_mod_rows", "mm_gate_rows", "mm_mod_cols", "mm_split_qkv"};
+    for (int i = 0; i < 7; ++i) check(hipModuleGetFunction(fs[i], g_k.mod, names[i]), names[i]);
 }
 
 void launch(hipFunction_t f, long n, void** args) {
@@ -170,6 +170,13 @@ void swiglu(const float* pj, int S, float* g) {
     launch(g_k.swiglu, (long)S * kFF, args);
 }
 
+// the head-grouped QKV rows [S][heads * 3 * D] into q, k, v [S][heads * D]
+void split_qkv(const float* in, int S, float* q, float* k, float* v) {
+    const int heads = kHeads, D = kD;
+    void* args[] = {(void*)&in, (void*)&S, (void*)&heads, (void*)&D, (void*)&q, (void*)&k, (void*)&v};
+    launch(g_k.split_qkv, (long)S * kInner, args);
+}
+
 void mod_rows(const float* x, const float* rows, const float* m, int S, int jsh, int js, float* y) {
     const int H = kH;
     void* args[] = {(void*)&x, (void*)&rows, (void*)&m, (void*)&S, (void*)&H, (void*)&jsh, (void*)&js, (void*)&y};
@@ -193,15 +200,14 @@ void mod_cols(const float* x, const float* sc, const float* sh, int S, float* y)
 void block(const mmdit::BlockW& B, sddev::Floats& hid, int S, const sddev::Floats* mod, const sddev::Floats* rows,
            const float* cs, const float* sn) {
     const int C = kInner, H = kH;
-    sddev::Floats n1((size_t)S * H), q((size_t)S * C), k((size_t)S * C), v((size_t)S * C), qn((size_t)S * C),
+    sddev::Floats n1((size_t)S * H), qkv((size_t)S * 3 * C), q((size_t)S * C), k((size_t)S * C), v((size_t)S * C), qn((size_t)S * C),
         kn((size_t)S * C), a((size_t)S * C), o((size_t)S * H), n2((size_t)S * H), pj((size_t)S * 2 * kFF),
         g((size_t)S * kFF), f((size_t)S * H);
     rms(hid.data(), S, H, B.norm1.data(), n1.data());
     if (mod) mod_rows(n1.data(), rows->data(), mod->data(), S, 0, 1, n1.data());  // shift_msa, scale_msa
     double tl = g_prof.on ? now_s() : 0;
-    sddev::linear_bf16(n1.data(), S, B.qkv, H, C, nullptr, q.data());
-    sddev::linear_bf16(n1.data(), S, B.qkv + (size_t)C * H, H, C, nullptr, k.data());
-    sddev::linear_bf16(n1.data(), S, B.qkv + (size_t)2 * C * H, H, C, nullptr, v.data());
+    sddev::linear_bf16(n1.data(), S, B.qkv, H, 3 * C, nullptr, qkv.data());  // head-grouped rows: (q, k, v) per head
+    split_qkv(qkv.data(), S, q.data(), k.data(), v.data());
     if (g_prof.on) g_prof.lin += now_s() - tl;
     rms(q.data(), (long)S * kHeads, kD, B.qn.data(), qn.data());
     rms(k.data(), (long)S * kHeads, kD, B.kn.data(), kn.data());
@@ -231,9 +237,10 @@ void block(const mmdit::BlockW& B, sddev::Floats& hid, int S, const sddev::Float
 }
 
 // (debugging: MMDIT_DEBUG=<dir> writes the activations to <dir>/dbg_<name>.f32, as mm_dit_ref.py's hooks do)
+bool g_dbg_step0 = false;  // the dumps are of the first step only
 void dbg(const char* name, const float* p, size_t n) {
     const char* dir = std::getenv("MMDIT_DEBUG");
-    if (!dir) return;
+    if (!dir || !g_dbg_step0) return;
     if (FILE* f = std::fopen((std::string(dir) + "/dbg_" + name + ".f32").c_str(), "wb")) {
         std::fwrite(p, sizeof(float), n, f);
         std::fclose(f);
@@ -345,6 +352,7 @@ int mmdit_velocity(mmdit_t* m, const float* text, int T, const float* sample, in
     }
     try {
         std::lock_guard<std::recursive_mutex> lock(sddev::run_mutex());
+        g_dbg_step0 = step == 0;
         const int hp = h / 2, wp = w / 2, N = hp * wp, S = T + N;
         // the image rows: the latent patchified (token row-major over the patch grid; (c, ph, pw) per token)
         sddev::Floats patches((size_t)N * kPatch);

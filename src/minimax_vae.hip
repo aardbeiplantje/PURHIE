@@ -130,3 +130,31 @@ mm_mod_cols(const float* x, const float* sc, const float* sh, int S, int H, floa
     const int c = (int)(i % H);
     y[i] = x[i] * (1.0f + sc[c]) + sh[c];
 }
+
+// ---- the checkpoint's own layouts (the diffusers-format release, checked 2026-11-13): the FFN's projection rows hold the GATE
+// first and the VALUE second, so g = pj[F + j] * silu(pj[j]); the fused QKV rows are grouped per head: head h holds q, k, v of D
+// rows each at (h * 3 + part) * D.
+
+// SwiGLU of the checkpoint's projection rows pj [T][2F] (gate first, value second): g[t][j] = pj[t][F + j] * silu(pj[t][j])
+extern "C" __global__ void __launch_bounds__(MV_THREADS) mm_swiglu_native(const float* pj, int T, int F, float* g) {
+    const long i = (long)blockIdx.x * MV_THREADS + threadIdx.x;
+    if (i >= (long)T * F) return;
+    const long t = i / F;
+    const int j = (int)(i % F);
+    const float gate = pj[t * 2 * F + j];
+    g[i] = pj[t * 2 * F + F + j] * (gate / (1.0f + expf(-gate)));
+}
+
+// Split the head-grouped QKV rows in [T][heads * 3 * D] into q, k, v [T][heads * D]
+extern "C" __global__ void __launch_bounds__(MV_THREADS)
+mm_split_qkv(const float* in, int T, int heads, int D, float* q, float* k, float* v) {
+    const long i = (long)blockIdx.x * MV_THREADS + threadIdx.x;  // over T * heads * D
+    if (i >= (long)T * heads * D) return;
+    const long t = i / ((long)heads * D);
+    const int r = (int)(i % ((long)heads * D));
+    const int h = r / D, d = r % D;
+    const float* row = in + t * (long)heads * 3 * D + (long)h * 3 * D;
+    q[i] = row[d];
+    k[i] = row[D + d];
+    v[i] = row[2 * D + d];
+}

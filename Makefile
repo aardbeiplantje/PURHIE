@@ -408,6 +408,10 @@ MM_PIPE_VERIFY = $(BINDIR)/mm_pipe_verify  # MiniMax-H3-Image end to end: one PN
 $(MM_PIPE_VERIFY): $(TESTSDIR)/mm_pipe_verify.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(SRCDIR)/minimax_pipe.h
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/mm_pipe_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -fopenmp -lz -o $@
 
+MM_CANVAS_VERIFY = $(BINDIR)/mm_canvas_verify  # the DiT sampler on the released pipeline's inputs (tests/mm_canvas_verify.cpp)
+$(MM_CANVAS_VERIFY): $(TESTSDIR)/mm_canvas_verify.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/mm_canvas_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -fopenmp -lz -o $@
+
 $(FORWARD_VERIFY): $(TESTSDIR)/forward_verify.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/matvec_q.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/gpu_ops.co
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/forward_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
 

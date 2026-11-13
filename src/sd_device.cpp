@@ -334,14 +334,14 @@ void attention_tc(const float* q, int Tq, const float* k, const float* v, int Tk
     {
         long n = (long)Tq * C;
         void* a1[] = {(void*)&q, (void*)&qb, (void*)&n};
-        launch(f_to_bf16, n, a1);
+        launch(f_to_bf16, dim3((unsigned)((n + kThreads - 1) / kThreads)), a1);
     }
     {
         int tk = Tk, tkp = Tkp, c = C;
         const float* vp = v;
         float* vtp = vt;
         void* a2[] = {(void*)&vp, (void*)&tk, (void*)&tkp, (void*)&c, (void*)&vtp};
-        launch(f_transpose_pad, (long)C * Tkp, a2);
+        launch(f_transpose_pad, dim3((unsigned)(((long)C * Tkp + kThreads - 1) / kThreads)), a2);
     }
     // scores: S[h][m][n] = scale * sum_d Q[m][h d] K[n][h d]
     wmma_batched(qb, C, D, k, C, D, sc, Tk, 1, (long)Tq * Tk, scale, Tq, Tk, D, heads);

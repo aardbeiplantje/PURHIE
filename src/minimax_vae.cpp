@@ -32,7 +32,7 @@ constexpr double kTheta = 100.0;
 struct Kernels {
     hipModule_t mod = nullptr;
     hipFunction_t rmsnorm = nullptr, layernorm = nullptr, rope = nullptr, scale_add = nullptr, swiglu = nullptr,
-                  unpatch = nullptr;
+                  unpatch = nullptr, split_qkv = nullptr;
 };
 Kernels g_k;
 
@@ -43,9 +43,9 @@ void check(hipError_t e, const char* what) {
 void load_kernels() {
     if (g_k.mod) return;
     if (kernel_module_load(&g_k.mod, "minimax_vae.co") != hipSuccess) throw std::runtime_error("minimax vae: minimax_vae.co does not load");
-    hipFunction_t* fs[] = {&g_k.rmsnorm, &g_k.layernorm, &g_k.rope, &g_k.scale_add, &g_k.swiglu, &g_k.unpatch};
-    const char* names[] = {"mv_rmsnorm", "mv_layernorm", "mv_rope", "mv_scale_add", "mv_swiglu", "mv_unpatch"};
-    for (int i = 0; i < 6; ++i) check(hipModuleGetFunction(fs[i], g_k.mod, names[i]), names[i]);
+    hipFunction_t* fs[] = {&g_k.rmsnorm, &g_k.layernorm, &g_k.rope, &g_k.scale_add, &g_k.swiglu, &g_k.unpatch, &g_k.split_qkv};
+    const char* names[] = {"mv_rmsnorm", "mv_layernorm", "mv_rope", "mv_scale_add", "mm_swiglu_native", "mv_unpatch", "mm_split_qkv"};
+    for (int i = 0; i < 7; ++i) check(hipModuleGetFunction(fs[i], g_k.mod, names[i]), names[i]);
 }
 
 void launch(hipFunction_t f, unsigned blocks, void** args) {
@@ -222,7 +222,7 @@ void decode_tile(const mmvae* m, const float* zd, int H, int W, Planes& out) {
             cs[(size_t)t * rd + d] = (float)std::cos(ang);
             sn[(size_t)t * rd + d] = (float)std::sin(ang);
         }
-    sddev::Floats n1((size_t)T * kC), q((size_t)T * kC), k((size_t)T * kC), v((size_t)T * kC), qn((size_t)T * kC),
+    sddev::Floats n1((size_t)T * kC), qkv((size_t)T * 3 * kC), q((size_t)T * kC), k((size_t)T * kC), v((size_t)T * kC), qn((size_t)T * kC),
         kn((size_t)T * kC), a((size_t)T * kC), o((size_t)T * kC), pj((size_t)T * 2 * kFF), g((size_t)T * kFF),
         f((size_t)T * kC);
     for (int l = 0; l < m->layers; ++l) {
@@ -234,10 +234,17 @@ void decode_tile(const mmvae* m, const float* zd, int H, int W, Planes& out) {
             launch(g_k.rmsnorm, (unsigned)rows, args);
         };
         rms(x.data(), kC, B.norm1, n1.data(), T);
-        // fused QKV: the rows of to_qkv are q, k, v (the thirds of the output)
-        sddev::linear_f32(n1.data(), T, B.qkv_w, kC, kC, B.qkv_b, q.data());
-        sddev::linear_f32(n1.data(), T, B.qkv_w + (size_t)kC * kC, kC, kC, B.qkv_b + kC, k.data());
-        sddev::linear_f32(n1.data(), T, B.qkv_w + (size_t)2 * kC * kC, kC, kC, B.qkv_b + 2 * kC, v.data());
+        // fused QKV: the rows are grouped per head (q, k, v of 64 rows each per head), split by the kernel
+        sddev::linear_f32(n1.data(), T, B.qkv_w, kC, 3 * kC, B.qkv_b, qkv.data());
+        {
+            const int heads = kHeads, D = kHeadDim;
+            float* qkvp = qkv.data();
+            float* qp = q.data();
+            float* kp = k.data();
+            float* vp = v.data();
+            void* args[] = {(void*)&qkvp, (void*)&T, (void*)&heads, (void*)&D, (void*)&qp, (void*)&kp, (void*)&vp};
+            launch(g_k.split_qkv, blocks_for((long)T * kC), args);
+        }
         // RMS norm of each head's q and k (no affine), rows of one head are contiguous: T * heads rows of head_dim
         {
             const float ee = kEps;
