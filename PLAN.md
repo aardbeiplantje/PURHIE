@@ -215,8 +215,15 @@ transformers 5.5.1, Pillow; no torchvision in that venv). A phase is done when i
   token table (the test is English), translate, the GPU path, and resampling is linear (not band-limited).
 
 **Speech generation (Qwen3-TTS 0.6B, `/data/hf-small/Qwen3-TTS-12Hz-0.6B-Base` and its tokenizer):**
-- T1 reference: the talker's codes and the waveform for a fixed text (transformers 5.5.1 may not have this model:
-  check, else the official package).
+- T1 reference (done 2026-11-13): transformers 5.5.1 has no Qwen3-TTS, so the official `qwen-tts` 0.1.1 runs from
+  `/data/tts-site` (its pinned transformers 4.57.3, librosa, sox, a torchaudio stub: the CUDA torchaudio does not load on
+  the CPU torch; the stub is only the speaker encoder's kaldi fbank). The venv is untouched. `/data/audio-ref/tts_dump.py`
+  writes `/data/audio-ref/tts/`: the in-context voice clone (the LibriSpeech clip with its transcript), the text ids
+  (20), the reference text ids (34), the reference codec frames (74 x 16), the talker's codes (50 x 16) and the 24 kHz
+  wave (4 s). Greedy decoding loops into near silence (RMS 3e-5), so the reference samples with `torch.manual_seed(0)`;
+  the reference Whisper transcribes the wave as "Hello, this is a short test of the speech synthesis.". The codec
+  decodes the reference clip's own codes to speech (RMS 0.058). T2 checks teacher-forced logits and codes (torch's
+  sampling cannot be reproduced token for token).
 - T2 talker as an engine architecture: decoder LM plus its code predictor; check the codes.
 - T3 codec decoder (`Qwen3-TTS-Tokenizer-12Hz`): convolutions and transformer blocks in the engine; check the samples.
 - T4 `/v1/audio/speech` returning WAV.
