@@ -93,6 +93,7 @@ EXPERT_CPU_BENCH = $(BINDIR)/expert_cpu_bench
 IMAGE_VERIFY   = $(BINDIR)/image_verify  # an image file through the processor and the vision tower vs transformers (tests/image_verify.cpp)
 MM_VERIFY      = $(BINDIR)/mm_verify  # an image chat through the engine vs transformers (tests/mm_verify.cpp; run from build/co)
 MEL_VERIFY     = $(BINDIR)/mel_verify  # whisper's log-mel features vs transformers' WhisperFeatureExtractor (tests/mel_verify.cpp)
+WHISPER_VERIFY = $(BINDIR)/whisper_verify  # whisper's encoder and greedy decoder vs transformers (tests/whisper_verify.cpp)
 MROPE_VERIFY    = $(BINDIR)/mrope_verify  # Qwen3.5's M-RoPE positions vs transformers (tests/mrope_verify.cpp)
 VISION_VERIFY   = $(BINDIR)/vision_verify  # the vision tower vs transformers (tests/vision_verify.cpp; reference: /data/vision-ref)
 MATVEC_VERIFY    = $(BINDIR)/matvec_verify
@@ -197,6 +198,9 @@ $(EXPERT_CPU_BENCH): $(TESTSDIR)/expert_cpu_bench.cpp $(SRCDIR)/expert_cpu.cpp $
 
 $(MEL_VERIFY): $(TESTSDIR)/mel_verify.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h
 	$(CLANG) $(CXXFLAGS) -fopenmp -I. $(TESTSDIR)/mel_verify.cpp $(SRCDIR)/mel.cpp -o $@
+
+$(WHISPER_VERIFY): $(TESTSDIR)/whisper_verify.cpp $(SRCDIR)/whisper.cpp $(SRCDIR)/whisper.h $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
+	$(CLANG) $(CXXFLAGS) -fopenmp -I. $(TESTSDIR)/whisper_verify.cpp $(SRCDIR)/whisper.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
 
 $(IMAGE_VERIFY): $(TESTSDIR)/image_verify.cpp $(SRCDIR)/image.cpp $(SRCDIR)/image.h $(SRCDIR)/vision.cpp $(SRCDIR)/vision.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/third_party/stb_image.h
 	$(CLANG) $(CXXFLAGS) -fopenmp -I. $(TESTSDIR)/image_verify.cpp $(SRCDIR)/image.cpp $(SRCDIR)/vision.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
@@ -476,4 +480,4 @@ verify_minimal: $(TEST_TARGET)
 	./$(TEST_TARGET) 2>&1 || echo "Test exited with code $?"
 
 # Last, so that every variable above is defined when its prerequisites are expanded
-all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(EXPERT_CPU_BENCH) $(VISION_VERIFY) $(MROPE_VERIFY) $(MM_VERIFY) $(IMAGE_VERIFY) $(MEL_VERIFY) $(HEAD_Q8_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(ATTN_DECODE_VERIFY) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(PERPLEXITY) $(PASSKEY) $(GENERATE_VERIFY) $(EVENTS_TEST) $(GEMMA4_VERIFY) $(SEQ_VERIFY) $(EMBED_VERIFY) $(QWEN4EXP_VERIFY) $(GLM5NEXT_VERIFY) $(MTP_VERIFY) $(MTP_OWN_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY) $(CAPI_SMOKE) $(STORE_VERIFY) $(SPLIT_VERIFY) $(ATTN_SPLIT_VERIFY) $(ATTN_BENCH)
+all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(EXPERT_CPU_BENCH) $(VISION_VERIFY) $(MROPE_VERIFY) $(MM_VERIFY) $(IMAGE_VERIFY) $(MEL_VERIFY) $(WHISPER_VERIFY) $(HEAD_Q8_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(ATTN_DECODE_VERIFY) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(PERPLEXITY) $(PASSKEY) $(GENERATE_VERIFY) $(EVENTS_TEST) $(GEMMA4_VERIFY) $(SEQ_VERIFY) $(EMBED_VERIFY) $(QWEN4EXP_VERIFY) $(GLM5NEXT_VERIFY) $(MTP_VERIFY) $(MTP_OWN_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY) $(CAPI_SMOKE) $(STORE_VERIFY) $(SPLIT_VERIFY) $(ATTN_SPLIT_VERIFY) $(ATTN_BENCH)

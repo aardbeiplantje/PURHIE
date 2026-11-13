@@ -196,8 +196,13 @@ transformers 5.5.1, Pillow; no torchvision in that venv). A phase is done when i
   (`make build/mel_verify`): the filter bank equals the extractor's exactly; the features equal the double replica to
   1.2e-7; against the float32 torch reference the largest difference is 1.15e-5 (the reference's float32 rounding,
   which transformers itself puts at about 1e-5). Direct DFT over the 400-point frames, OpenMP over frames.
-- A3 whisper in the engine: a converter package (GGUF of the encoder-decoder), the conv stem, the encoder (non-causal),
-  the decoder with self- and cross-attention (the encoder output cached once per request); check the greedy tokens.
+- A3 whisper in the engine (done 2026-11-13, host float32): the converter (`ROCm::Inference::Convert::Whisper`, F32:
+  `rocm-convert <dir> <out.gguf> bf16-ref`; whisper.* keys with the suppression lists; llama.cpp's whisper tensor names
+  where they exist) writes `/data/audio-ref/whisper-tiny.gguf` (151 MB). `src/whisper.{h,cpp}`: the conv stem, the
+  non-causal encoder, the decoder with the self-attention cache and cross-attention over the encoder's keys and values
+  (computed once), the tied head, greedy with the generation config's suppressions. `tests/whisper_verify.cpp` (`make
+  build/whisper_verify`): the encoder from the mel (A2) at worst row cosine 1.0000000, max difference 7e-5 of the largest
+  value; the 21 greedy tokens equal the reference's, EOT 50257; 1.9 s on 16 threads. One clip only so far.
 - A4 `/v1/audio/transcriptions`: multipart/form-data upload (Web::Route parses JSON only: add it), the JSON reply.
 
 **Speech generation (Qwen3-TTS 0.6B, `/data/hf-small/Qwen3-TTS-12Hz-0.6B-Base` and its tokenizer):**

@@ -1,6 +1,9 @@
 Revision history for ROCm-Inference
 
 0.01  unreleased
+    - rocm-convert: Whisper (WhisperForConditionalGeneration) as an F32 GGUF of the encoder-decoder (whisper.* keys,
+      the suppression lists, llama.cpp's whisper tensor names where they exist); the engine reads it on the host
+      (src/whisper.{h,cpp}, checked against transformers: encoder and greedy tokens).
     - images in chat (Qwen3.5 with its vision tower): ROCm::Inference::vision_load, the image processor and the
       features (ROCm::Inference::Vision), chat(..., images => [...], vision => $v) with the M-RoPE positions
       (image_prompt, set_mm, mm_rope_delta, hidden_size); rocm-inference-server --mmproj and image_url content parts

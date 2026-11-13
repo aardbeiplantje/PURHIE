@@ -2048,6 +2048,94 @@ sub tensors {
     return @s;
 }
 
+
+# Whisper (openai/whisper-*: WhisperForConditionalGeneration), the speech recognizer's encoder-decoder (phase A3 of
+# PLAN.md). F32 only: the checkpoints are F32 and small (tiny: 151 MB). The tensors keep their values and row-major
+# layout (GGUF's shape is the PyTorch shape reversed); the names are llama.cpp's whisper names where they exist
+# (encoder.blk.N.attn_q, ...), the rest are the engine's (src/whisper.cpp). The generation settings the engine applies
+# (suppress_tokens, begin_suppress_tokens, the decoder start and end tokens) are stored as whisper.* keys.
+package ROCm::Inference::Convert::Whisper;
+use strict;
+use warnings;
+use Carp qw(croak);
+use File::Basename qw(basename);
+use File::Spec;
+our @ISA = ('ROCm::Inference::Convert');
+__PACKAGE__->register('WhisperForConditionalGeneration');
+
+sub arch { 'whisper' }
+
+my %BLOCK = (
+    'self_attn.q_proj' => 'attn_q', 'self_attn.k_proj' => 'attn_k', 'self_attn.v_proj' => 'attn_v',
+    'self_attn.out_proj' => 'attn_out', 'self_attn_layer_norm' => 'attn_ln',
+    'encoder_attn.q_proj' => 'cross_attn_q', 'encoder_attn.k_proj' => 'cross_attn_k',
+    'encoder_attn.v_proj' => 'cross_attn_v', 'encoder_attn.out_proj' => 'cross_attn_out',
+    'encoder_attn_layer_norm' => 'cross_attn_ln', 'fc1' => 'mlp_fc1', 'fc2' => 'mlp_fc2', 'final_layer_norm' => 'mlp_ln',
+);
+
+# The GGUF name of a checkpoint tensor (undef: a tensor the engine does not know)
+sub gname {
+    my ($hf) = @_;
+    my $n = $hf =~ s/^model\.//r;
+    return "encoder.$1.$2" if $n =~ /^encoder\.(conv[12])\.(weight|bias)$/;
+    return 'encoder.positional_embedding' if $n eq 'encoder.embed_positions.weight';
+    return "encoder.ln_post.$1" if $n =~ /^encoder\.layer_norm\.(weight|bias)$/;
+    return 'decoder.token_embd.weight' if $n eq 'decoder.embed_tokens.weight';
+    return 'decoder.positional_embedding' if $n eq 'decoder.embed_positions.weight';
+    return "decoder.ln.$1" if $n =~ /^decoder\.layer_norm\.(weight|bias)$/;
+    if ($n =~ /^(encoder|decoder)\.layers\.(\d+)\.(.+)\.(weight|bias)$/) {
+        my ($side, $l, $part, $p) = ($1, $2, $3, $4);
+        my $g = $BLOCK{$part} // return undef;
+        return "$side.blk.$l.$g.$p";
+    }
+    return undef;
+}
+
+sub convert {
+    my ($self, $out, %a) = @_;
+    croak 'whisper: F32 only (the checkpoints are small; no quantization policy)' if $a{quant};
+    my $cfg = $self->{config};
+    my $gc = ROCm::Inference::Convert::json_file(File::Spec->catfile($self->{dir}, 'generation_config.json')) // {};
+    my $U32 = ROCm::Inference::Convert::U32;
+    my $STR = ROCm::Inference::Convert::STR;
+    my $F32 = ROCm::Inference::Convert::F32;
+    my $ARR = ROCm::Inference::Convert::ARR;
+    my $ids = sub { map { int $_ } @{$_[0] // []} };
+    my @kv = (
+        ['general.architecture', $STR, 'whisper'],
+        ['general.type', $STR, 'model'],
+        ['general.name', $STR, $a{name} // ROCm::Inference::Convert::_model_name(basename($self->{dir}))],
+        ['general.file_type', $U32, 0],
+        ['whisper.n_mels', $U32, $cfg->{num_mel_bins} // croak 'config: no num_mel_bins'],
+        ['whisper.n_audio_ctx', $U32, $cfg->{max_source_positions} // croak 'config: no max_source_positions'],
+        ['whisper.n_audio_state', $U32, $cfg->{d_model} // croak 'config: no d_model'],
+        ['whisper.n_audio_head', $U32, $cfg->{encoder_attention_heads} // croak 'config: no encoder_attention_heads'],
+        ['whisper.n_audio_layer', $U32, $cfg->{encoder_layers} // croak 'config: no encoder_layers'],
+        ['whisper.n_audio_ffn', $U32, $cfg->{encoder_ffn_dim} // croak 'config: no encoder_ffn_dim'],
+        ['whisper.n_text_ctx', $U32, $cfg->{max_target_positions} // croak 'config: no max_target_positions'],
+        ['whisper.n_text_state', $U32, $cfg->{d_model}],
+        ['whisper.n_text_head', $U32, $cfg->{decoder_attention_heads} // croak 'config: no decoder_attention_heads'],
+        ['whisper.n_text_layer', $U32, $cfg->{decoder_layers} // croak 'config: no decoder_layers'],
+        ['whisper.n_text_ffn', $U32, $cfg->{decoder_ffn_dim} // croak 'config: no decoder_ffn_dim'],
+        ['whisper.n_vocab', $U32, $cfg->{vocab_size} // croak 'config: no vocab_size'],
+        ['whisper.layer_norm_epsilon', $F32, 1e-5],  # torch's LayerNorm default (the config has none)
+        ['whisper.decoder_start_token', $U32, $gc->{decoder_start_token_id} // $cfg->{decoder_start_token_id} // croak 'no decoder_start_token_id'],
+        ['whisper.eot_token', $U32, $cfg->{eos_token_id} // croak 'config: no eos_token_id'],
+        ['whisper.suppress_tokens', $ARR, [$U32, [$ids->($gc->{suppress_tokens})]]],
+        ['whisper.begin_suppress_tokens', $ARR, [$U32, [$ids->($gc->{begin_suppress_tokens})]]],
+    );
+    my @specs;
+    for my $name (@{$self->st->{order}}) {
+        my $g = gname($name) // croak "$name: no whisper tensor name (a tensor the engine does not know)";
+        my $t = $self->t($name);
+        push @specs, {name => $g, ne => [reverse @{$t->{shape}}], f32 => 1,
+                      type => ROCm::Inference::Convert::gguf_type_id('f32'), from => lc $t->{dtype},
+                      in_bytes => $t->{bytes}, uses => [$t], data => sub { pack 'f<*', $self->floats($t) }};
+    }
+    croak 'no tensors in ' . $self->{dir} unless @specs;
+    return ROCm::Inference::Convert::write_file($out, \@kv, \@specs, 32, %a, reader => $self);
+}
+
 1;
 
 __END__
