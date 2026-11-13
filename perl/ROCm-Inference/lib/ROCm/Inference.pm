@@ -4,6 +4,7 @@ use strict;
 use warnings;
 
 use Carp qw(croak);
+use POSIX ();
 use Exporter 'import';
 
 our $VERSION;
@@ -771,6 +772,16 @@ sub new {
     for my $file (values %f) { die "minimax: no file $file\n" unless -f $file }
     my $h = ROCm::Inference::_mm_open(@f{qw(text-encoder-bf16.gguf dit-bf16.gguf pdd-heads.gguf vae-decoder-f32.gguf)});
     return bless { h => $h, dir => $dir }, $class;
+}
+
+# The canvas the released pipeline generates a request on (get_image_canvas_size): scaled up to 2048 x 2048 pixels at the
+# same aspect ratio, each side rounded to a multiple of 32 (the engine's canvas_size; the result is resized back).
+sub canvas {
+    my ($w, $h) = @_;
+    my $scale = 1;
+    $scale = sqrt(2048 * 2048 / ($w * $h)) if $w * $h < 2048 * 2048;
+    my $r = sub { my $v = POSIX::lrint($_[0] / 32) * 32; $v < 32 ? 32 : $v };  # (round half to even, as nearbyint)
+    return ($r->($w * $scale), $r->($h * $scale));
 }
 
 sub generate {

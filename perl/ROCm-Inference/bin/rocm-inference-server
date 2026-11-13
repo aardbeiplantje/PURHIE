@@ -931,9 +931,14 @@ route::post '/v1/images/generations' => sub {
     error(400, "response_format: b64_json or png, not '$fmt'") unless $fmt =~ /\A(?:b64_json|png)\z/;
     my $seed = $p->{seed} // 0;
     error(400, 'seed: a whole number') unless $seed =~ /\A\d+\z/;
+    # one image at a time: the loop is busy while it is generated, so other requests wait in the socket queue (no 503)
+    my $t0 = Time::HiRes::time();
     my $png = eval { $backend->generate($prompt, size => $size, seed => $seed) };
     error(400, $@ =~ s/ at \S+ line \d+\.?\n?\z//r) if $@;
-    $LOG->info('request', event => 'image', msg => sprintf('%s: %s, seed %d, %d bytes of PNG', $model, $size, $seed, length $png));
+    my $secs = Time::HiRes::time() - $t0;
+    my $canvas = '';
+    if ($backend == $MINIMAX) { my ($cw, $ch) = ROCm::Inference::MiniMaxImage::canvas(split /x/, $size); $canvas = ", canvas ${cw}x$ch" }
+    $LOG->info('request', event => 'image', msg => sprintf('%s: %s%s, seed %d, %.1f s, %d bytes of PNG', $model, $size, $canvas, $seed, $secs, length $png));
     return [200, ['Content-Type' => 'image/png'], $png] if $fmt eq 'png';
     require MIME::Base64;
     return { created => time, data => [{ b64_json => MIME::Base64::encode_base64($png, '') }] };

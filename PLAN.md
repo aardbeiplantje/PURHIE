@@ -9,11 +9,17 @@
 1. **MiniMax-H3-Image speed** (2026-11-13): a 256 request takes 222 s on the 2048 canvas. The linears run at about 9 TFLOPS
    (17.7 s per forward at 4105 tokens): a wider LDS stage or a 256 x 256 tile. The flash attention runs at about 2.5 TFLOPS
    (4.6 s per forward): a wider key tile, two query waves per key stage. Measure with `MM_PIPE_DEBUG=1` and `MMDIT_PROF=1`.
-2. **MiniMax server behaviour** (2026-11-13): one image at a time, and the default canvas is 2048². Check the resize filter
-   (ours: area averaging) against diffusers' image processor. Decide whether to queue or reject requests while one runs.
+2. **MiniMax server behaviour** (done 2026-11-13, see the record below): images queue, one at a time (no 503).
 3. **MiniMax quantization** (later, the user): FP8 or ROCmFP4 for the DiT (66 GB BF16 now). Measure the quality cost first;
    BF16 stays the default until that is known.
 4. **ComfyUI backend** (backlog, planned 2026-11-13, see Later): the component API first, then the node package.
+- (done) **MiniMax server and resize (item 2, 2026-11-13).** The released pipeline resizes the 2048 canvas to the request
+   with diffusers' `VaeImageProcessor.resize`, which is PIL's LANCZOS (the processor's default `resample`). Our area
+   averaging differed from it (mean 1.15 levels, max 26 on the 256 fox); the engine now uses a Lanczos resize with PIL's
+   two-pass structure (`resize_lanczos`): max 1 level, 99.96% of values exact. Requests queue: the server loop is single
+   threaded and an image runs inside its route, so other requests wait in the socket queue (a 503 would need a
+   non-blocking loop; not done). Each image's log line gives its size, the canvas and the seconds it took. The canvas
+   helper `ROCm::Inference::MiniMaxImage::canvas` matches the engine's `canvas_size` (round half to even).
 - (done) **MiniMax-H3-Image: DONE 2026-11-13 (was: check the image structure against the released pipeline).** Three causes:
    (a) two layout errors in the native checkpoint, shared by the engine and my reference (so their agreement hid them): the
    fused QKV rows are grouped per head (q, k, v of D rows each per head: rows `(h * 3 + part) * D`), not `[all q | all k | all
@@ -29,7 +35,7 @@
    released VAE: cosine 1.0000000; the released pipeline's fox at 256 (`/data/minimax-ref/released/released_fox_256.png`).
    Runs: `tests/mm_canvas_verify` (the sampler on the released inputs), `tests/mm_dit_ref.py` (now released weights),
    `tests/mm_vae_ref.py` (released VAE). Note the default request in the released pipeline is 2048 x 2048: a 2048 image is
-   four times the DiT's tokens and the attention is quadratic in them (speed: item 2).
+   four times the DiT's tokens and the attention is quadratic in them (speed: item 1).
 5. **Qwen3.8-Flash-Next in the deployment** (section below): the model's own MTP block as draft head and the parallel
    PLE reads are in; both are to be measured there (the user).
 6. **Concurrent runs** (section below): the deployment runs `--parallel` now; watch the store's resume (the `kv`

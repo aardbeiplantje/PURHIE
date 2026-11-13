@@ -102,34 +102,73 @@ void mm_close(mm_pipe_t* pipe) { delete pipe; }
 const char* mm_last_error(void) { return g_error.c_str(); }
 
 // The canvas the released pipeline generates on (get_image_canvas_size): a request below 2048 x 2048 pixels is generated on a
-// canvas scaled up to that area at the same aspect ratio, each side rounded to a multiple of 32; the result is then resized back.
+// canvas scaled up to that area at the same aspect ratio, each side rounded to a multiple of 32; the result is then resized back (Lanczos, below).
 void canvas_size(int height, int width, int* ch, int* cw) {
     const double scale = std::fmax(1.0, std::sqrt(2048.0 * 2048.0 / ((double)width * height)));
     *ch = std::fmax(32.0, std::nearbyint(height * scale / 32.0) * 32.0);
     *cw = std::fmax(32.0, std::nearbyint(width * scale / 32.0) * 32.0);
 }
 
-// Area-averaging resize of 8-bit RGB (each output pixel averages its source footprint, fractional at the edges)
-void resize_area(const unsigned char* src, int sh, int sw, unsigned char* dst, int dh, int dw) {
-    const double sy = (double)sh / dh, sx = (double)sw / dw;
-    for (int y = 0; y < dh; ++y) {
-        const double y0 = y * sy, y1 = (y + 1) * sy;
-        for (int x = 0; x < dw; ++x) {
-            const double x0 = x * sx, x1 = (x + 1) * sx;
-            double acc[3] = {0, 0, 0}, wsum = 0;
-            for (int iy = (int)y0; iy < (int)std::ceil(y1) && iy < sh; ++iy) {
-                const double wy = std::fmin(y1, iy + 1.0) - std::fmax(y0, (double)iy);
-                for (int ix = (int)x0; ix < (int)std::ceil(x1) && ix < sw; ++ix) {
-                    const double wx = std::fmin(x1, ix + 1.0) - std::fmax(x0, (double)ix);
-                    const double wt = wy * wx;
-                    for (int c = 0; c < 3; ++c) acc[c] += wt * src[((size_t)iy * sw + ix) * 3 + c];
-                    wsum += wt;
-                }
-            }
-            for (int c = 0; c < 3; ++c)
-                dst[((size_t)y * dw + x) * 3 + c] = (unsigned char)std::fmin(255.0, std::nearbyint(acc[c] / wsum));
+// Lanczos resize of 8-bit RGB, as the released pipeline does it: diffusers' VaeImageProcessor.resize, which is PIL's
+// Image.resize with LANCZOS (the filter's support scales with the reduction; a horizontal pass, then a vertical pass, each
+// rounded to 8 bits). Measured against the released 256 px fox: largest difference 1 level (area averaging: 26).
+namespace {
+double lanczos3(double x) {
+    x = std::fabs(x);
+    if (x >= 3.0) return 0.0;
+    if (x < 1e-12) return 1.0;
+    const double px = M_PI * x, px3 = px / 3.0;
+    return std::sin(px) / px * std::sin(px3) / px3;
+}
+
+// The taps of one output position: the first source index, and normalized weights
+struct Taps {
+    int first;
+    std::vector<double> w;
+};
+
+std::vector<Taps> lanczos_taps(int in, int out) {
+    const double scale = (double)in / out, fscale = std::fmax(1.0, scale), support = 3.0 * fscale;
+    std::vector<Taps> taps(out);
+    for (int o = 0; o < out; ++o) {
+        const double center = (o + 0.5) * scale;
+        const int lo = std::max(0, (int)(center - support + 0.5)), hi = std::min(in, (int)(center + support + 0.5));
+        taps[o].first = lo;
+        double sum = 0;
+        for (int i = lo; i < hi; ++i) {
+            const double wt = lanczos3((i - center + 0.5) / fscale);
+            taps[o].w.push_back(wt);
+            sum += wt;
         }
+        for (double& wt : taps[o].w) wt /= sum;
     }
+    return taps;
+}
+
+unsigned char clip8(double v) { return (unsigned char)std::fmin(255.0, std::fmax(0.0, std::nearbyint(v))); }
+}  // namespace
+
+void resize_lanczos(const unsigned char* src, int sh, int sw, unsigned char* dst, int dh, int dw) {
+    const std::vector<Taps> tx = lanczos_taps(sw, dw), ty = lanczos_taps(sh, dh);
+    // horizontal pass: sh rows of dw pixels (8 bits, as PIL keeps it)
+    std::vector<unsigned char> mid((size_t)sh * dw * 3);
+    for (int y = 0; y < sh; ++y)
+        for (int x = 0; x < dw; ++x)
+            for (int c = 0; c < 3; ++c) {
+                double acc = 0;
+                for (size_t k = 0; k < tx[x].w.size(); ++k)
+                    acc += tx[x].w[k] * src[((size_t)y * sw + tx[x].first + k) * 3 + c];
+                mid[((size_t)y * dw + x) * 3 + c] = clip8(acc);
+            }
+    // vertical pass
+    for (int y = 0; y < dh; ++y)
+        for (int x = 0; x < dw; ++x)
+            for (int c = 0; c < 3; ++c) {
+                double acc = 0;
+                for (size_t k = 0; k < ty[y].w.size(); ++k)
+                    acc += ty[y].w[k] * mid[((size_t)(ty[y].first + k) * dw + x) * 3 + c];
+                dst[((size_t)y * dw + x) * 3 + c] = clip8(acc);
+            }
 }
 
 // phase timing (MM_PIPE_DEBUG set: printed to stderr)
@@ -194,7 +233,7 @@ int mm_generate(mm_pipe_t* p, const char* prompt, int height, int width, unsigne
                     canvas[((size_t)y * canvas_w + x) * 3 + c] = (unsigned char)(v * 255.0f);
                 }
         if (canvas_h == height && canvas_w == width) std::memcpy(rgb, canvas.data(), canvas.size());
-        else resize_area(canvas.data(), canvas_h, canvas_w, rgb, height, width);
+        else resize_lanczos(canvas.data(), canvas_h, canvas_w, rgb, height, width);
         return 0;
     } catch (const std::exception& e) {
         g_error = e.what();
