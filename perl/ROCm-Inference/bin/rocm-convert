@@ -35,7 +35,11 @@ my %a = (quant => $q, threads => $o{threads}, dry_run => $o{'dry-run'}, keep_cac
          progress => sub { report(@_) unless $o{quiet} });
 my $t0 = time;
 my $res;
-if (-d $in && -f "$in/model_index.json") {
+if (-d $in && -f "$in/pdd_fused_heads.safetensors" && -f "$in/pdd_config.json") {
+    # MiniMax-H3-Image's PDD heads and sigmas: one small F32 GGUF (the DiT's sampling heads)
+    printf "%s: MiniMax-H3 PDD heads -> %s\n", basename($in), $out unless $o{quiet};
+    $res = eval { ROCm::Inference::Convert::MiniMaxDiT::convert_pdd($in, $out, %a) } or fail($@);
+} elsif (-d $in && -f "$in/model_index.json") {
     # a diffusers pipeline (Stable Diffusion: the UNet, the text encoder, the VAE, the CLIP tokenizer): one GGUF, F16 copies
     printf "%s: diffusers pipeline -> %s\n", basename($in), $out unless $o{quiet};
     $res = eval { ROCm::Inference::Convert::Diffusers::convert($in, $out, %a) } or fail($@);

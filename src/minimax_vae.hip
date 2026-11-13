@@ -97,3 +97,36 @@ mv_unpatch(const float* tok, int H, int W, int p, float* img) {
     const int h = yh / p, ii = yh % p, w = xw / p, jj = xw % p;
     img[i] = tok[((long)h * W + w) * (3L * p * p) + (long)c * p * p + ii * p + jj];
 }
+
+// ---- the DiT's AdaLN (minimax_dit.cpp). The modulation table m holds, per modality row r (0 image, 1 text), six chunks of
+// H values: m[r * 6H + j * H + c] for j = shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp (0..5).
+
+// y[t][c] = x[t][c] * (1 + m[r_t][js][c]) + m[r_t][jsh][c], r_t = rows[t] (0 or 1)
+extern "C" __global__ void __launch_bounds__(MV_THREADS)
+mm_mod_rows(const float* x, const float* rows, const float* m, int S, int H, int jsh, int js, float* y) {
+    const long i = (long)blockIdx.x * MV_THREADS + threadIdx.x;
+    if (i >= (long)S * H) return;
+    const int t = (int)(i / H), c = (int)(i % H);
+    const long r = (long)rows[t];
+    const float* mr = m + r * 6L * H;
+    y[i] = x[i] * (1.0f + mr[js * H + c]) + mr[jsh * H + c];
+}
+
+// x[t][c] += o[t][c] * m[r_t][jg][c]
+extern "C" __global__ void __launch_bounds__(MV_THREADS)
+mm_gate_rows(float* x, const float* o, const float* rows, const float* m, int S, int H, int jg) {
+    const long i = (long)blockIdx.x * MV_THREADS + threadIdx.x;
+    if (i >= (long)S * H) return;
+    const int t = (int)(i / H), c = (int)(i % H);
+    const long r = (long)rows[t];
+    x[i] += o[i] * m[r * 6L * H + jg * H + c];
+}
+
+// y[t][c] = x[t][c] * (1 + sc[c]) + sh[c] for every row (the final layer, one timestep)
+extern "C" __global__ void __launch_bounds__(MV_THREADS)
+mm_mod_cols(const float* x, const float* sc, const float* sh, int S, int H, float* y) {
+    const long i = (long)blockIdx.x * MV_THREADS + threadIdx.x;
+    if (i >= (long)S * H) return;
+    const int c = (int)(i % H);
+    y[i] = x[i] * (1.0f + sc[c]) + sh[c];
+}

@@ -97,4 +97,43 @@ sub convert {
     return ROCm::Inference::Convert::write_file($out, \@kv, \@specs, 32, %a);
 }
 
+
+# The PDD heads (pdd_fused_heads.safetensors: video_out.weight [6, 96, 5376] and video_out.bias [6, 96], F32, one output head
+# per sampling step) and the sampler's sigmas (pdd_config.json): one small GGUF, minimax_h3_pdd.* (sigmas as an F32 array).
+sub convert_pdd {
+    my ($dir, $out, %a) = @_;
+    my $cfg = _json(File::Spec->catfile($dir, 'pdd_config.json'));
+    my $sig = $cfg->{sigmas} // croak 'pdd_config.json: no sigmas';
+    my $file = lfs_path(File::Spec->catfile($dir, 'pdd_fused_heads.safetensors'));
+    my $h = ROCm::Inference::Convert::Diffusers::safetensors_header($file);
+    my $F32 = ROCm::Inference::Convert::F32;
+    my $STR = ROCm::Inference::Convert::STR;
+    my $ARR = ROCm::Inference::Convert::ARR;
+    my @kv = (
+        ['general.architecture', $STR, 'minimax_h3_pdd'],
+        ['general.type', $STR, 'model'],
+    );
+    my @specs;
+    # the sigmas (7 values, the last 0): a tensor, read like the others
+    my $sbuf = pack('f<*', map { 0 + $_ } @$sig);
+    push @specs, {name => 'sigmas', ne => [scalar @$sig], type => ROCm::Inference::Convert::gguf_type_id('f32'), from => 'f32',
+                  in_bytes => length $sbuf, why => "the config's sigmas", raw => sub { $sbuf }};
+    for my $name (qw(video_out.weight video_out.bias)) {
+        my $t = $h->{$name} // croak "$name not in the PDD heads";
+        croak "$name: " . uc($t->{dtype}) . ' (the heads are F32)' unless uc($t->{dtype}) eq 'F32';
+        my @shape = @{$t->{shape}};
+        my $bytes = $t->{end} - $t->{start};
+        my $start = $t->{start};
+        push @specs, {name => $name, ne => [reverse @shape], type => ROCm::Inference::Convert::gguf_type_id('f32'),
+                      from => 'f32', in_bytes => $bytes, why => "the PDD heads' $name",
+                      raw => sub {
+                          open my $fh, '<:raw', $file or croak "$file: $!";
+                          seek($fh, $start, 0) or croak "$file: seek";
+                          read($fh, my $buf, $bytes) == $bytes or croak "$file: short read";
+                          $buf;
+                      }};
+    }
+    return ROCm::Inference::Convert::write_file($out, \@kv, \@specs, 32, %a);
+}
+
 1;

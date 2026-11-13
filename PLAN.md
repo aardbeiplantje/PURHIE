@@ -519,11 +519,22 @@ DiT and the text encoder, no ROCmFP4 unless the user asks for it):
     Velocity of the image rows only.
   - Sampler (`MiniMaxH3Scheduler`, euler velocity form, no guidance: it is baked in, so one forward per step, six
     forwards per image): x_{i+1} = x_i + (sigma_i - sigma_{i+1}) * v_i. Initial x: noise (N(0, 1), 24 x H/16 x W/16).
-  - Cost: about 0.35 GMAC per token per block (qkv + out + fc1 + fc2), 50 blocks: 17 GMAC per token, 1100 tokens: 19 TMAC
-    per forward (38 TFLOP), six forwards per image: about 230 TFLOP at 1024 x 1024. The adaLN projections are per timestep
+  - Cost (corrected with the inner width 7168): about 0.39 GMAC per token per block (qkv 115M, out 38M, fc1 154M, fc2 77M),
+    50 blocks: 19 GMAC per token, 1100 tokens: 21 TMAC per forward (42 TFLOP), six forwards per image: about 250 TFLOP at
+    1024 x 1024. The adaLN projections are per timestep
     (13 GB of the 66 GB, applied once per block per step). At the fp32 tile's 3 TFLOPS that is a minute and a half per
     image: BF16 operands in a tensor-core GEMM are needed for a usable speed (M3's second half).
-  - Plan: (a) the engine's BF16 A operand in the GEMM (the bf16 weight's high half in a float, as the F16 path does);
+  - **Engine done 2026-11-13 (`src/minimax_dit.{h,cpp}`, the BF16 GEMM mode in `sd_gpu.hip`, the AdaLN kernels in
+    `minimax_vae.hip`), verified:** `tests/mm_dit_verify` against `tests/mm_dit_ref.py` (diffusers 0.43.0 in bf16 on the
+    GPU, the checkpoint's values, a 16 x 16 latent with the 9-token prompt): the velocity cosine 0.99995 at step 0 and
+    0.99995 at step 5 (max difference 2e-2 of the peak 1.8). Three things were wrong on the way and are fixed: the
+    RMS-norm launch (one block per row, not one per 256 elements), the prompt's host copy passed to the device, and the
+    checkpoint's F32 linears (`video_patch_proj`, the time embedder: read as F32 in place). The attention is 56 heads of 128
+    (inner width 7168, not 5376: the QKV rows are 21504, `out_proj` is 5376 x 7168). The cost at 1024 x 1024 (1024 image
+    tokens): **40 s per forward** with the fp32-accumulate tile on the BF16 weights, so a six-step image is about four
+    minutes. A tensor-core BF16 GEMM (WMMA) is the next speed item; the sampler (`mmdit_sample`) is written but not yet
+    compared end to end.
+  - Plan (as written before the engine): (a) the engine's BF16 A operand in the GEMM (the bf16 weight's high half in a float, as the F16 path does);
     (b) `src/minimax_dit.{h,cpp}` with the token refiner, the blocks, the output, the sampler; (c) the verifiers:
     per-block against diffusers (block 0 with the real weights, fp32 reference from the same BF16 values; the modules
     built from the reference classes, the checkpoint's keys mapped: `attn.qkv_proj` to `attn.to_qkv` fused, `blocks.N` to
