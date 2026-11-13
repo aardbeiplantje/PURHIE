@@ -551,6 +551,17 @@ DiT and the text encoder, no ROCmFP4 unless the user asks for it):
     built from the reference classes, the checkpoint's keys mapped: `attn.qkv_proj` to `attn.to_qkv` fused, `blocks.N` to
     `transformer_blocks.N`), then the whole forward on a small canvas (256 x 256) against a torch BF16 run on the GPU
     (the full model fits the UMA as a device model; the CPU reference cannot hold 132 GB as fp32).
+- M4/M5 pipeline (2026-11-13): `src/minimax_pipe.{h,cpp}` runs prompt -> text encoder (layer 50, the M1 path; the prompt's ids
+  match the reference's: 9 tokens for the fox prompt) -> the encoder released -> the DiT sampler (6 steps, seeded noise) -> the
+  VAE decoder -> pixels (decoded * ImageNet std + mean, clamped, truncated to 8 bits). `tests/mm_pipe_verify` writes a PNG:
+  256 x 256 in 56 s, 1024 x 1024 in 85 s. **Open, and the reason the server is not wired yet:** the images have no global
+  structure: a grid of independent 16 px blocks with texture but no composition (a fox is not visible at either size). Every
+  stage matches the diffusers model code (the DiT velocity 0.99995, the sampler 0.999993, the VAE 1.0000000, the text ids), so
+  the gap is in what the reference pipeline does around those modules, or in what the reference would produce for these
+  latents. Candidates to check against the released pipeline, not yet verified: the timestep convention (t = 1 - sigma), the
+  rotary's spatial scale (32) and the frame clock, the velocity update's sign convention, the adaLN row selection for the
+  text rows, and whether the released checkpoint expects guidance or a prompt template that the modular pipeline adds. The
+  server's `/v1/images/generations` (`--sd`) is unchanged: the MiniMax route waits for the quality check.
 - M4 sampler and PDD: the six-sigma euler velocity loop, the fused heads from `pdd_fused_heads.safetensors` (check
   what they replace), t2i end to end against the diffusers pipeline (same seed, the same initial noise).
 - M5 server: the image endpoint's model choice (the request's `model` field; today there is one `--sd` file), the
