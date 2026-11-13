@@ -186,8 +186,16 @@ transformers 5.5.1, Pillow; no torchvision in that venv). A phase is done when i
   from the 0.8B; the regex is too strict, not changed here).
 
 **Audio transcription (whisper-tiny, `/data/hf-small/whisper-tiny`):**
-- A1 reference: log-mel features (WhisperFeatureExtractor), the encoder output, and greedy tokens for a test WAV.
-- A2 mel in C: STFT (400-point window, 160 hop), 80 mel filters, log scale; check against A1's features.
+- A1 reference (done 2026-11-13): `/data/audio-ref/dump.py` writes `/data/audio-ref/whisper-tiny/`: the clip (5.9 s of
+  LibriSpeech dev-clean from hf-internal-testing/librispeech_asr_dummy, `clip.wav` and `samples.npy`), the features
+  (`input_features.npy`, 1 x 80 x 3000, the extractor's torch path, float32), the encoder output (1 x 1500 x 384), the
+  greedy tokens (`tokens.npy`, 21, after the prompt `50258 50259 50359 50363`, ending before EOT 50257), the filters
+  (`mel_filters.npy`, 201 x 80) and `input_features_f64.npy` (the same steps in numpy double). The text: "Mr. Quilter
+  is the apostle of the middle classes and we are glad to welcome his gospel."
+- A2 mel in C (done 2026-11-13): `src/mel.{h,cpp}` (`whisper_log_mel`, `mel_filter_bank`), `tests/mel_verify.cpp`
+  (`make build/mel_verify`): the filter bank equals the extractor's exactly; the features equal the double replica to
+  1.2e-7; against the float32 torch reference the largest difference is 1.15e-5 (the reference's float32 rounding,
+  which transformers itself puts at about 1e-5). Direct DFT over the 400-point frames, OpenMP over frames.
 - A3 whisper in the engine: a converter package (GGUF of the encoder-decoder), the conv stem, the encoder (non-causal),
   the decoder with self- and cross-attention (the encoder output cached once per request); check the greedy tokens.
 - A4 `/v1/audio/transcriptions`: multipart/form-data upload (Web::Route parses JSON only: add it), the JSON reply.
