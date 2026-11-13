@@ -434,19 +434,45 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   time add is a host loop, and the server's one image at a time (see above) still holds.
 
 **MiniMax-H3-Image (requested 2026-11-12: "should be supported too"; `MiniMaxAI/MiniMax-H3-Image` on Hugging Face,
-code at github.com/MiniMax-AI/MiniMax-H3-Image).** Text-to-image and image editing. Config: the transformer is a
-`MiniMaxH3DiTModel` (50 layers, hidden 5376, 56 heads of 128, FFN 14336, 2 token-refiner layers, text width 5120,
-24 latent channels, patch 1 x 2 x 2, adaLN); the text encoder is a Qwen3-VL (64 layers, hidden 5120, FFN 25600,
-M-RoPE, GQA 64 / 8); the VAE has 24 latent channels with per-channel mean and std. Size: 204 GB of bf16 across
-diffusers and native copies; the needed parts (transformer 65 GB, text encoder 67 GB, one VAE 2.3 GB) are 134 GB,
-against 158 GB free on /data, and as FAST about a quarter of that for the 124 GB host. Blockers: its library code
-is not in the checkout either: `MiniMax-H3-Image/` (the user's clone) has the README, examples and a skill, but its
-`python/` package is missing. The modeling code is in diffusers 0.43.0 (PyPI, Apache-2.0 code):
-`transformer_minimax_h3_image.py`, `autoencoder_kl_minimax_h3_image.py`, `modular_pipelines/minimax_h3_image/`,
-extracted to `/data/minimax-ref/diffusers/` (outside the repo). The weights are under the MiniMax community license
-(to check before use). It is the largest item here: a new DiT (50 layers, hidden 5376, adaLN, token refiner), a
-64-layer text encoder (Qwen3-VL's text part, after V4), the 24-channel VAE, and the sampler. Order: after sd-turbo's
-pipeline (I1-I5) proves the image path on a small model.
+code at github.com/MiniMax-AI/MiniMax-H3-Image; the user confirmed the license is fine for this project, 2026-11-12).**
+Text-to-image and image editing. Checkout: `/hf/MiniMax-H3-Image` (its git LFS objects are complete: 55 of 55 match
+their pointers' sizes, 204 GB; the working tree holds pointer files, so rocm-convert reads the objects through
+`lfs_path`, no checkout needed; checked 2026-11-13). Config: the transformer is a `MiniMaxH3DiTModel` (50 layers, hidden
+5376, 56 heads of 128, FFN 14336, 2 token-refiner layers, text width 5120, 24 latent channels, patch 1 x 2 x 2, adaLN,
+time embed 2688); the text encoder is `Qwen3VLForConditionalGeneration` (64 layers, hidden 5120, 64 heads / 8 KV of 128,
+FFN 25600, rope theta 5e6, M-RoPE interleaved sections 24/20/20: text-only positions reduce to plain RoPE; its
+`model.visual.*` tower is not needed for t2i); the VAE `MiniMaxH3ImageVAE` has 24 latent channels with per-channel mean
+and std; the sampler is `MiniMaxH3Scheduler` (euler, velocity form) with 6 sigmas (`model_index.json` task list t2i, edit);
+`pdd_fused_heads.safetensors` (12 MB) and `pdd_config.json` (the 6-step sigma schedule) come with it. Reference code (the
+modeling and pipeline of diffusers 0.43): `/data/minimax-ref/diffusers` (outside the repo; the `python/` package of the
+clone is still absent). Sizes: transformer 65 GB and text encoder 67 GB in BF16, the VAE 2.3 GB; /data had 147 GB free
+on 2026-11-13.
+
+Memory: the two large parts together (134 GB of BF16) do not fit the 128 GB UMA resident at once, and a registered
+mapping stays pinned. So the text encoder runs first (the prompt's embeddings, a few MB), is released (unregistered and
+unmapped), and only then the DiT is registered. Text encoding is one call per prompt, so the cost is the load (the page
+cache is cold again for each).
+
+Milestones (each verified against the reference before the next; the image quality is the constraint, so BF16 for the
+DiT and the text encoder, no ROCmFP4 unless the user asks for it):
+- M1 text encoder: the Qwen3-VL text part converted to GGUF (a `Qwen3VLForConditionalGeneration` converter as a
+  subclass of the Qwen3 one, prefix `model.language_model`, the visual tower skipped); the engine's prompt hidden states
+  equal transformers' for the reference prompts (cosine ~1 per layer used). Status: started 2026-11-13.
+- M2 VAE: `MiniMaxH3ImageVAE` decoder (24 channels, the per-channel mean and std for the latents) in the engine, checked
+  against diffusers on a fixed latent (cf. sd_vae_verify).
+- M3 DiT: `MiniMaxH3DiTModel` (token refiner, the adaLN blocks, 3-axis RoPE, the GQA-less 56-head attention) on the
+  device with the BF16 GEMM path (the GEMM needs a BF16 operand and WMMA for speed: a 4096-token forward of 33B
+  parameters is about 0.3 PFLOP per step, six steps, so the plain fp32 tile would take minutes per image). Checked
+  block by block against diffusers with the real weights (one block at a time, the input random).
+- M4 sampler and PDD: the six-sigma euler velocity loop, the fused heads from `pdd_fused_heads.safetensors` (check
+  what they replace), t2i end to end against the diffusers pipeline (same seed, the same initial noise).
+- M5 server: the image endpoint's model choice (the request's `model` field; today there is one `--sd` file), the
+  size limits (up to 16 MP per the card), the edit task (`/v1/images/edits`) after t2i.
+
+Open: the license check (the user's confirmation covers the project; the community license terms are the upstream's),
+the PDD heads' role (not read yet), and the throughput target (the card's 6 steps at 1024 x 1024 is the reference).
+
+**ComfyUI backend (backlog, planned 2026-11-13; see "ComfyUI backend" under Later).**
 
 Dependencies: V5 and A4 / T4 / I5 need the server's API work (multipart, binary responses); the decoders for PNG, WAV
 and the codec are small C files. Order: V1-V5 first (the Qwen3.5 checkpoints are local and the test is the same
@@ -499,6 +525,56 @@ must add); item 3 Qwen3-TTS 0.6B with its tokenizer; item 4 sd-turbo. Still open
 (item 1) or takes decoded pixels; the paths of the user's own local models, if they should be tested on this host.
 
 ## Later
+
+### ComfyUI backend (backlog, planned 2026-11-13)
+
+Asked for: use the engine as a backend for ComfyUI (`/comfyui` on this machine: the user's model library). Decided with the
+user: option 1 (a ComfyUI custom-node package that calls our HTTP server), models converted to GGUF by rocm-convert (one
+format, mapped in place), and the image models kept at BF16 (safetensors is BF16 or F32 for most of them; a GGUF quant
+down to 4 bits reduces image quality more than it saves, so ROCmFP4 only as an explicit choice, and FP8 sources stay
+FP8 in the engine's FP8 operand path, not re-quantized). The priority is the MiniMax-H3-Image work above.
+
+Inventory of `/comfyui` (178 GB of safetensors, 28 files, all valid with exact sizes on 2026-11-13; 17 GB free):
+- Z-Image-Turbo (`diffusion_models/z_image_turbo_bf16`, S3-DiT, 30 blocks, dim 3840, FFN 10240, text dim 2560 = Qwen3-4B,
+  which the engine runs as `qwen3`; VAE `vae/ae.safetensors`, 16 channels, flow matching).
+- SD1.5 family: `checkpoints/DreamShaper_8_pruned` (LDM key names, 768-wide CLIP-L, 8 heads, 1x1 conv proj_in),
+  `vae/vae-ft-mse-840000-ema-pruned`, `diffusion_models/lotus-depth-d-v1-1` (depth output), `loras/nlc_pink`.
+  The sd engine is SD2.x (linear proj_in, heads of 64, 1024 context): needs a config-driven UNet and an LDM key converter.
+- Qwen-Image (`diffusion_models/qwen_image_fp8_e4m3fn`, MMDiT, 60 blocks, dim 3072, plain E4M3 without scales; edit
+  variant `qwen_image_edit_2509_fp8`; text `text_encoders/qwen_2.5_vl_7b_fp8_scaled` (text part, hidden 3584); VAE
+  `vae/qwen_image_vae` (3D causal VAE, used on single images); LoRAs Lightning 4/8 steps, Edit Lightning.
+- Flux.2 dev (`diffusion_models/flux2_dev_fp8mixed`: BF16 and FP8 layers with `weight_scale`/`input_scale` and a
+  `_quantization_metadata` table; double and single blocks, dim 6144; text `text_encoders/mistral_3_small_flux2_bf16`
+  (Mistral-3-Small, hidden 5120, the text stack of three layers concatenated into 15360); VAE `vae/flux2-vae` (32
+  channels); LoRA `Flux_2-Turbo-LoRA`).
+- Utility models: BiRefNet (`background_removal/birefnet`, background removal), MoGe-2 (`geometry_estimation/moge_2_vitl_normal`,
+  normals and depth), DINOv3 (`clip_vision/dino_v3_L_naf_fp32`, the image encoder TRELLIS uses).
+- 3D: TRELLIS.2 (`diffusion_models/trellis_2_int8_convrot`, shape and texture VAEs) and Pixal3D (multiview): sparse
+  transformers and sparse-conv decoders with mesh extraction; not planned yet.
+
+Milestones (after MiniMax M1-M5; each verified against a reference: diffusers where it has the pipeline, otherwise
+ComfyUI on CPU):
+1. Component API and image pipeline abstraction: handles for the text encoder, the diffusion model and the VAE that stay
+   mapped in the server process; a scheduler interface (discrete SD and flow matching); a model registry with load and
+   unload (UMA budget: Flux.2 alone is about 70 GB). Verified on sd-turbo, which has a reference.
+2. The ComfyUI node package (`comfyui-rocm-inference`): `EngineLoad`, `EngineTextEncode`, `EngineSample`,
+   `EngineVAEDecode`, `EngineSaveImage`, calling the server; ComfyUI keeps the graph, LoRA and ControlNet nodes and its
+   upscalers. Installed by the user into `/comfyui/custom_nodes`.
+3. SD1.5 family (DreamShaper, vae-ft-mse, Lotus depth, the nlc LoRA): the config-driven UNet, the LDM converter, the
+   quick-GELU CLIP-L. The smallest model change for the most checkpoints.
+4. Z-Image-Turbo: the S3-DiT (3-axis RoPE, qk-norm, adaLN) with the `ae` VAE; its text encoder already works.
+5. Runtime LoRA (the Lightning and Turbo LoRAs; y += B(A x) on the device, weights untouched).
+6. Qwen-Image (the FP8 E4M3 operand in the GEMM, the 3D VAE's single-image path, Qwen2.5-VL text), then the edit variant.
+7. Flux.2 (FP8 layers with their scales, the Mistral-3 text stack with the three concatenated layers, the 32-channel VAE).
+8. Utility models (BiRefNet, MoGe-2, DINOv3) as the nodes need them. 3D (TRELLIS.2, Pixal3D): deferred.
+
+OpenAI API mapping: `/v1/images/generations` for every text-to-image model (with a `model` field), `/v1/images/edits` for
+Qwen-Image edit and Flux.2 references. Depth, background removal and 3D have no OpenAI equivalent: our own endpoints, or
+ComfyUI only.
+
+Open questions: the node package's server API (one endpoint per component handle, or a single `/v1/images/workflow` taking
+ComfyUI's node JSON); the UMA budget policy (load per request or keep the last model); diffusers 0.35.2 has no Z-Image or
+Flux.2 pipeline, so those references need a newer diffusers or ComfyUI on CPU.
 
 - **Converter follow-ups**: an importance matrix (the weighted ROCmFP4 search; collected on the GPU by the
   engine), and a faster encoder (AVX-512 across 16 blocks keeps each block's summation order, so the bytes stay the
