@@ -11,6 +11,7 @@
 #include "qwen_model.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -131,6 +132,17 @@ void resize_area(const unsigned char* src, int sh, int sw, unsigned char* dst, i
     }
 }
 
+// phase timing (MM_PIPE_DEBUG set: printed to stderr)
+static double phase_now() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static void phase(const char* name, double& t) {
+    if (!std::getenv("MM_PIPE_DEBUG")) return;
+    const double now = phase_now();
+    std::fprintf(stderr, "phase %-16s %7.2f s\n", name, now - t);
+    t = now;
+}
+
 int mm_generate(mm_pipe_t* p, const char* prompt, int height, int width, unsigned long long seed, unsigned char* rgb) {
     if (!p || !prompt || !rgb || height <= 0 || width <= 0 || height % 32 || width % 32) {
         g_error = "mm_generate: bad arguments (height and width: multiples of 32)";
@@ -141,27 +153,33 @@ int mm_generate(mm_pipe_t* p, const char* prompt, int height, int width, unsigne
         canvas_size(height, width, &canvas_h, &canvas_w);
         const int h = canvas_h / 16, w = canvas_w / 16;  // the latent grid (16 px per cell)
         // 1. the prompt's conditioning, then the encoder is released (it and the DiT are not resident together)
+        double tp = phase_now();
         int T = 0;
         std::vector<float> text = encode_prompt(p->text.c_str(), prompt, &T);
+        phase("text encoder", tp);
         // 2. the initial noise and the six-step sampler
         std::vector<float> noise, lat((size_t)24 * h * w);
         seeded_normal(seed, (size_t)24 * h * w, noise);
         {
             mmdit_t* dit = mmdit_open(p->dit.c_str(), p->pdd.c_str());
+            phase("dit open", tp);
             if (!dit) throw std::runtime_error(std::string("dit: ") + mmdit_last_error());
             const int rc = mmdit_sample(dit, text.data(), T, noise.data(), h, w, lat.data());
             const std::string err = rc != 0 ? mmdit_last_error() : "";
             mmdit_close(dit);
+            phase("sampler", tp);
             if (rc != 0) throw std::runtime_error("sampler: " + err);
         }
         // 3. the VAE decoder (the latents' normalization is applied inside), then the pixels
         std::vector<float> planes((size_t)3 * canvas_h * canvas_w);
         {
             mmvae_t* vae = mmvae_open(p->vae.c_str());
+            phase("dit close", tp);
             if (!vae) throw std::runtime_error(std::string("vae: ") + mmvae_last_error());
             const int rc = mmvae_decode(vae, lat.data(), h, w, planes.data());
             const std::string err = rc != 0 ? mmvae_last_error() : "";
             mmvae_close(vae);
+            phase("vae decode", tp);
             if (rc != 0) throw std::runtime_error("vae: " + err);
         }
         // the pipeline's output: decoded * std + mean (ImageNet's), clamped to [0, 1], truncated to 8 bits on the canvas, then

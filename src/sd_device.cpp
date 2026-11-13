@@ -30,7 +30,7 @@ int g_state = -1;  // -1: not tried, 0: host only, 1: device
 hipModule_t g_mod = nullptr;
 hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn_sum = nullptr, f_gn_sq = nullptr,
               f_gn_apply = nullptr, f_silu = nullptr, f_add = nullptr, f_upsample2 = nullptr, f_softmax = nullptr,
-              f_layer_norm = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
+              f_layer_norm = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
               f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr;
 
 constexpr int kThreads = 256;
@@ -56,7 +56,7 @@ bool init() {
         const char* name;
     };
     const Entry entries[] = {
-        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"},
+        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_gemm_wmma256, "sd_gemm_wmma256"}, {&f_flash, "sd_flash_attn"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"},
         {&f_transpose_pad, "sd_transpose_pad"}, {&f_softmax_bf16, "sd_softmax_bf16"}, {&f_softmax_bf16w, "sd_softmax_bf16_w"},
         {&f_gn_sum, "sd_gn_sum"},       {&f_gn_sq, "sd_gn_sq"},         {&f_gn_apply, "sd_gn_apply"},
         {&f_silu, "sd_silu"},           {&f_add, "sd_add"},             {&f_upsample2, "sd_upsample2"},
@@ -182,6 +182,7 @@ void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, cons
     // measured faster than converting them once, see PLAN.md)
     if (in % 64 == 0) {
         const bool big = out >= 128;
+        const bool huge = out >= 256 && T >= 1024;  // the 256 x 128 tile for the large token counts
         const uint16_t* A = W;
         const float* B = x;
         float* C = y;
@@ -193,10 +194,15 @@ void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, cons
         void* args[] = {(void*)&A, (void*)&lda, (void*)&B, (void*)&sbn, (void*)&C, (void*)&cs_m, (void*)&cs_n,
                         (void*)&bf, (void*)&alpha, (void*)&beta, (void*)&M, (void*)&N, (void*)&K, (void*)&bs0, (void*)&bs0,
                         (void*)&bs0};
-        check(hipModuleLaunchKernel(big ? f_gemm_wmma128 : f_gemm_wmma, (unsigned)((N + (big ? 127 : 63)) / (big ? 128 : 64)),
-                                    (unsigned)((M + (big ? 127 : 63)) / (big ? 128 : 64)), 1, big ? 256 : 128, 1, 1, 0, nullptr,
-                                    args, nullptr),
-              "wmma gemm");
+        if (huge)
+            check(hipModuleLaunchKernel(f_gemm_wmma256, (unsigned)((N + 127) / 128), (unsigned)((M + 255) / 256), 1, 256, 1, 1, 0,
+                                        nullptr, args, nullptr),
+                  "wmma gemm 256");
+        else
+            check(hipModuleLaunchKernel(big ? f_gemm_wmma128 : f_gemm_wmma, (unsigned)((N + (big ? 127 : 63)) / (big ? 128 : 64)),
+                                        (unsigned)((M + (big ? 127 : 63)) / (big ? 128 : 64)), 1, big ? 256 : 128, 1, 1, 0, nullptr,
+                                        args, nullptr),
+                  "wmma gemm");
         sync();
         return;
     }
@@ -365,9 +371,44 @@ void attention_tc(const float* q, int Tq, const float* k, const float* v, int Tk
     release(pb, sizeof(uint16_t) * (size_t)heads * Tq * Tkp);
 }
 
+// The flash attention (sd_flash_attn): Q, K BF16 row-major, the values transposed and padded to a multiple of 64 keys (BF16)
+void attention_flash(const float* q, int Tq, const float* k, const float* v, int Tk, int C, int heads, float* out) {
+    const int Tkp = (Tk + 63) / 64 * 64;
+    uint16_t* qb = static_cast<uint16_t*>(alloc(sizeof(uint16_t) * (size_t)Tq * C));
+    uint16_t* kb = static_cast<uint16_t*>(alloc(sizeof(uint16_t) * (size_t)Tk * C));
+    uint16_t* vt = static_cast<uint16_t*>(alloc(sizeof(uint16_t) * (size_t)C * Tkp));
+    {
+        long n = (long)Tq * C;
+        void* a1[] = {(void*)&q, (void*)&qb, (void*)&n};
+        launch(f_to_bf16, dim3((unsigned)((n + kThreads - 1) / kThreads)), a1);
+        n = (long)Tk * C;
+        const float* kp = k;
+        void* a2[] = {(void*)&kp, (void*)&kb, (void*)&n};
+        launch(f_to_bf16, dim3((unsigned)((n + kThreads - 1) / kThreads)), a2);
+    }
+    {
+        int tk = Tk, tkp = Tkp, c = C;
+        const float* vp = v;
+        uint16_t* vtp = vt;
+        void* a3[] = {(void*)&vp, (void*)&tk, (void*)&tkp, (void*)&c, (void*)&vtp};
+        launch(f_transpose_pad_bf16, dim3((unsigned)(((long)C * Tkp + kThreads - 1) / kThreads)), a3);
+    }
+    {
+        const float scale = 1.0f / std::sqrt((float)(C / heads));
+        int tq = Tq, tk = Tk, tkp = Tkp, c = C;
+        void* a4[] = {(void*)&qb, (void*)&kb, (void*)&vt, (void*)&out, (void*)&tq, (void*)&tk, (void*)&tkp, (void*)&c, (void*)&scale};
+        check(hipModuleLaunchKernel(f_flash, (unsigned)((Tq + 63) / 64), (unsigned)heads, 1, 128, 1, 1, 0, nullptr, a4, nullptr),
+              "flash attention");
+    }
+    check(hipStreamSynchronize(nullptr), "stream");
+    release(qb, sizeof(uint16_t) * (size_t)Tq * C);
+    release(kb, sizeof(uint16_t) * (size_t)Tk * C);
+    release(vt, sizeof(uint16_t) * (size_t)C * Tkp);
+}
+
 void attention(const float* q, int Tq, const float* k, const float* v, int Tk, int C, int heads, float* out) {
     if (Tq <= 0 || Tk <= 0) return;
-    if (C / heads == 128) attention_tc(q, Tq, k, v, Tk, C, heads, out);
+    if (C / heads == 128) attention_flash(q, Tq, k, v, Tk, C, heads, out);
     else attention_f32(q, Tq, k, v, Tk, C, heads, out);
 }
 
