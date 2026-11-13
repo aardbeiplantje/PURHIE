@@ -376,7 +376,12 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   23-layer causal text encoder (F16 read in place, F16C conversion, exact GELU, the final layer norm).
   `tests/sd_text_verify.cpp` (`make build/sd_text_verify`): the reference prompt's 77 ids equal transformers' CLIPTokenizer,
   three more prompts with capitals, contractions and punctuation equal too; the embeddings equal diffusers' encode_prompt
-  at worst row cosine 1.0000000 (1.3e-6 of the peak 13.0). Next: I3 the VAE decoder from the reference latents.
+  at worst row cosine 1.0000000 (1.3e-6 of the peak 13.0).
+  **I3 done 2026-11-13:** the VAE decoder (`sd_vae_decode`: the post-quant 1x1 conv, conv_in, the mid block's two resnets
+  with one attention head over the positions, four up blocks of three resnets with nearest upsampling and a 3x3 conv,
+  GroupNorm 32 (eps 1e-6), SiLU, conv_out; direct convolution along the rows, OpenMP over the channels). `tests/sd_vae_verify`
+  (`make build/sd_vae_verify`): the float decode of the reference latents at cosine 1.0000000 and 1.7e-6 of the peak 9.85
+  against diffusers' decode (16.7 s on 16 threads: unoptimized; the GPU's job). Next: I4 the UNet's one step.
 
 **MiniMax-H3-Image (requested 2026-11-12: "should be supported too"; `MiniMaxAI/MiniMax-H3-Image` on Hugging Face,
 code at github.com/MiniMax-AI/MiniMax-H3-Image).** Text-to-image and image editing. Config: the transformer is a

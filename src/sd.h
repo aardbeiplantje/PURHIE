@@ -28,6 +28,10 @@ int sd_tokenize(sd_model_t* model, const char* prompt, int* ids);
  * classifier-free guidance). Returns 0, or -1. */
 int sd_encode_prompt(sd_model_t* model, const char* prompt, float* out);
 
+/* The VAE decoder: latents [4][h][w] (the UNet's output, before the scaling factor's division) to the image planes
+ * [3][8h][8w] (float, not clamped: diffusers' decode output, in about [-1, 1]). Returns 0, or -1. */
+int sd_vae_decode(sd_model_t* model, const float* latents, int h, int w, float* image);
+
 #ifdef __cplusplus
 }
 #endif
