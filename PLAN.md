@@ -360,6 +360,18 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   step's output.
 - I5 scheduler, the one-step sampler, PNG encoding (zlib), and `/v1/images/generations`.
 
+  **Status 2026-11-13:** I1 done: `/data/image-ref/sd-turbo/dump.py` (diffusers 0.35.2 isolated in `/data/diff-site`, the
+  pip install with its small dependencies only: no numpy or torch there) writes the one-step reference (seed 0, "a photo of
+  a red fox in the snow", float32): `prompt_embeds.npy` (1 x 77 x 1024), `noise.npy` (1 x 4 x 64 x 64), `unet_out.npy` (the
+  UNet at t = 999), `latents_after_step.npy`, `image_u8.npy` and `image.png` (512 x 512). The components: UNet2DConditionModel
+  (SD 2.x: channels 320/640/1280/1280, layers 2, heads 5/10/20/20, cross-attention 1024, linear projections, GroupNorm 32),
+  CLIPTextModel (1024 wide, 23 layers, 16 heads, FFN 4096, GELU, 77 tokens), AutoencoderKL (latents 4, scale 0.18215,
+  128/256/512/512), EulerDiscreteScheduler (trailing spacing, epsilon). The fp16 weights (`*.fp16.safetensors`) are
+  the files read: the converter writes them as F16 copies (the checkpoint's values), the engine reads them in place.
+  Next: I2 the converter (`rocm-convert` of a diffusers folder: one GGUF, tensor names as a KV name table because
+  diffusers' names exceed a GGUF's 63 bytes) and the CLIP text encoder; then I3 the VAE decoder from the reference
+  latents, I4 the UNet's one step, I5 the sampler, PNG, `POST /v1/images/generations` and its Perl binding.
+
 **MiniMax-H3-Image (requested 2026-11-12: "should be supported too"; `MiniMaxAI/MiniMax-H3-Image` on Hugging Face,
 code at github.com/MiniMax-AI/MiniMax-H3-Image).** Text-to-image and image editing. Config: the transformer is a
 `MiniMaxH3DiTModel` (50 layers, hidden 5376, 56 heads of 128, FFN 14336, 2 token-refiner layers, text width 5120,
