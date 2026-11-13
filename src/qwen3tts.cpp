@@ -7,7 +7,10 @@
 
 #include "gguf_mmap.h"
 #include "mel.h"
+#include "qmatvec.h"
 #include "tokenizer.h"
+
+#include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <cctype>
@@ -16,8 +19,10 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -68,6 +73,66 @@ inline void mat_row(const Mat& M, int r, float* out) {
         for (int i = 0; i < M.cols; ++i) out[i] = bf16_val(src[i]);
     }
 }
+
+// The device path of the BF16 matrices (UMA: the GPU reads the registered GGUF mapping in place; the activations pass through
+// two pinned buffers, a few KB per call against MB of weights). Off unless QWEN3TTS_DEVICE=gpu. The buffers are
+// shared by the process: one talker runs on the device at a time (the mutex).
+namespace gpu {
+std::mutex mu;
+std::vector<std::pair<const void*, size_t>> mapped;  // the registered GGUF mappings (read-only)
+float* stage_in = nullptr;
+float* stage_out = nullptr;
+size_t stage_cap = 0;  // floats
+int state = -1;        // -1: not tried, 0: host only, 1: device
+
+// The device path is on when a device is present, the kernels load and the staging buffers are pinned.
+bool ready() {
+    std::lock_guard<std::mutex> lk(mu);
+    if (state >= 0) return state == 1;
+    state = 0;
+    // opt-in: QWEN3TTS_DEVICE=gpu (measured: one synchronized launch per linear is slower than the host's SIMD path on
+    // this machine, 77 ms against 52 ms per frame; the device path needs fused blocks, see PLAN.md U2)
+    const char* dev = getenv("QWEN3TTS_DEVICE");
+    if (!dev || std::string(dev) != "gpu") return false;
+    int n = 0;
+    if (hipGetDeviceCount(&n) != hipSuccess || n < 1) return false;
+    if (qmatvec_init("matvec_q.co") != 0) return false;
+    stage_cap = (size_t)1 << 20;  // 4 MB each: a prefill's 84 rows of the widest input or output fit many times over
+    if (hipHostMalloc(reinterpret_cast<void**>(&stage_in), sizeof(float) * stage_cap, hipHostMallocDefault) != hipSuccess) return false;
+    if (hipHostMalloc(reinterpret_cast<void**>(&stage_out), sizeof(float) * stage_cap, hipHostMallocDefault) != hipSuccess) return false;
+    state = 1;
+    return true;
+}
+
+// Register a GGUF mapping for the device (read-only, GPU-cacheable: the weights are read once per token, the cache holds
+// the rows of one matvec). Returns 1 when registered.
+int map(const void* base, size_t size) {
+    if (!ready() || !base) return 0;
+    if (hipHostRegister(const_cast<void*>(base), size, hipHostRegisterReadOnly | hipExtHostRegisterCoarseGrained) != hipSuccess)
+        return 0;
+    std::lock_guard<std::mutex> lk(mu);
+    mapped.emplace_back(base, size);
+    return 1;
+}
+
+void unmap(const void* base) {
+    if (!base) return;
+    std::lock_guard<std::mutex> lk(mu);
+    for (size_t i = 0; i < mapped.size(); ++i)
+        if (mapped[i].first == base) {
+            (void)hipHostUnregister(const_cast<void*>(base));
+            mapped.erase(mapped.begin() + (long)i);
+            return;
+        }
+}
+
+bool in_mapping(const void* p) {
+    std::lock_guard<std::mutex> lk(mu);
+    for (const auto& r : mapped)
+        if (p >= r.first && static_cast<const char*>(p) < static_cast<const char*>(r.first) + r.second) return true;
+    return false;
+}
+}  // namespace gpu
 
 struct Lin {
     Mat w;                     // [out][in]
@@ -122,6 +187,19 @@ Mat mat_of(const gguf_model_t* g, const std::string& name, int rows, int cols) {
 // y[t][o] = x[t][:] . w[o][:] + b[o]: parallel over the output rows o, and each row is read once for all T inputs (a
 // prefill or a code predictor's batch reuses the row from cache; a decode step has one input and the rows are the work)
 void linear(const float* x, int T, const Lin& L, float* y) {
+    if (L.w.h && T > 0 && (size_t)T * L.in <= gpu::stage_cap && (size_t)T * L.out <= gpu::stage_cap && gpu::in_mapping(L.w.h)) {
+        std::lock_guard<std::mutex> lk(gpu::mu);
+        std::memcpy(gpu::stage_in, x, sizeof(float) * (size_t)T * L.in);
+        if (qmatvec_launch_bf16f(L.w.h, sizeof(uint16_t) * (size_t)L.in, gpu::stage_in, gpu::stage_out, L.out, L.in, T, 0) ==
+                hipSuccess &&
+            hipStreamSynchronize(0) == hipSuccess) {
+            for (int t = 0; t < T; ++t)
+                for (int o = 0; o < L.out; ++o)
+                    y[(size_t)t * L.out + o] = gpu::stage_out[(size_t)t * L.out + o] + (L.b ? L.b[o] : 0.0f);
+            return;
+        }
+        // (a launch that fails falls through to the host path below)
+    }
 #pragma omp parallel for schedule(static)
     for (int o = 0; o < L.out; ++o) {
         const float bias = L.b ? L.b[o] : 0.0f;
@@ -457,6 +535,7 @@ struct qwen3tts_model {
         codec_nothink = 0, codec_think_bos = 0, codec_think_eos = 0;
     std::vector<std::string> languages;
     std::unique_ptr<Speaker> spk;       // the speaker encoder (absent in a GGUF without spk.* tensors)
+    const void* gpu_base = nullptr;     // the GGUF mapping registered for the device (NULL: host only)
     std::vector<int> language_ids;
     Mat text_embd;                      // [text_vocab][text_C]
     Mat codec_embd;                     // [codec_vocab][C]
@@ -648,6 +727,12 @@ qwen3tts_model_t* qwen3tts_open(const char* gguf_path) {
             m->pblk.push_back(block_of("pred.blk." + std::to_string(l) + ".", m->pC, m->pH, m->pHkv, m->pD, m->pFF));
         m->pred_out_norm = tensor(m->g, "pred.out_norm.weight", m->pC);
         m->tok = tokenizer_load_from_gguf(m->g);  // (NULL when the GGUF has no vocabulary)
+        // the device path: the GGUF's mapping registered (one mapping: an unsplit file)
+        if (gguf_n_maps(m->g) == 1) {
+            size_t map_size = 0;
+            const void* base = gguf_map_base(m->g, &map_size);
+            if (gpu::map(base, map_size)) m->gpu_base = base;
+        }
         // the speaker encoder, when the GGUF has it (spk.* tensors; a talker-only GGUF has none)
         size_t spk_bytes = 0;
         if (gguf_get_tensor_ptr(m->g, "spk.blocks.0.conv.weight", &spk_bytes)) {
@@ -672,6 +757,7 @@ qwen3tts_model_t* qwen3tts_open(const char* gguf_path) {
 
 void qwen3tts_close(qwen3tts_model_t* model) {
     if (!model) return;
+    gpu::unmap(model->gpu_base);
     tokenizer_free(model->tok);
     delete model;
 }
@@ -872,7 +958,7 @@ int qwen3tts_code_predictor(qwen3tts_model_t* m, const float* H, const int* code
                 const float* hr = hn.data() + (size_t)(k + 1) * C;
                 float* lr = logits + ((size_t)t * (ncb - 1) + k) * m->pvocab;
                 const Lin& hd = m->pred_head[k];
-                for (int o = 0; o < m->pvocab; ++o) lr[o] = mat_dot(hd.w, o, hr);
+                linear(hr, 1, hd, lr);
             }
         }
         return 0;
@@ -985,7 +1071,7 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
                     const float* last = k == 1 ? px.data() + C : row.data();
                     rms_norm(last, 1, C, m->eps, m->pred_out_norm, pn.data());
                     const Lin& hd = m->pred_head[k - 1];
-                    for (int v = 0; v < m->pvocab; ++v) lv[v] = mat_dot(hd.w, v, pn.data());
+                    linear(pn.data(), 1, hd, lv.data());
                     const int best = sample_token(lv.data(), m->pvocab, s->sub_temperature, s->sub_top_k, &rng);
                     frame[k] = best;
                     if (k + 1 < ncb) {

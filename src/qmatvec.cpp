@@ -15,6 +15,7 @@
 #include <vector>
 
 #define QMV_ROWS_PER_BLOCK 4  // must match ROWS_PER_BLOCK in matvec_q.hip
+#define QMV_MMF_TT 8          // must match MMF_TT in matvec_q.hip
 #define QMV_F32_PARTS 4       // must match F32_PARTS in matvec_q.hip
 #define QMV_MAX_TYPE 128
 
@@ -22,6 +23,7 @@ static hipModule_t g_mod = nullptr;
 static hipFunction_t g_fn[QMV_MAX_TYPE];
 static hipFunction_t g_fn_q8[QMV_MAX_TYPE];  // int8 kernels, matvec_q8_<type>
 static hipFunction_t g_quant = nullptr;
+static hipFunction_t g_fn_bf16f = nullptr, g_mm_bf16f = nullptr;  // matvec_bf16f / matmul_f_bf16f: BF16 weights, fp32 activations
 static hipFunction_t g_mm_f32 = nullptr;  // matmul_f32: batched F32
 static hipFunction_t g_mm_f32_tile = nullptr;  // matmul_f32_tile: F32 prefill, another summation order (WMMA mode)
 static hipFunction_t g_quant_rows_q8_0 = nullptr, g_mv_q8_0s = nullptr;  // int8 copy of a float LM head
@@ -133,6 +135,8 @@ int qmatvec_init(const char *co_path) {
     }
     if (hipModuleGetFunction(&g_quant, g_mod, "quantize_q8") != hipSuccess) g_quant = nullptr;
     if (hipModuleGetFunction(&g_mm_f32, g_mod, "matmul_f32") != hipSuccess) g_mm_f32 = nullptr;
+    if (hipModuleGetFunction(&g_fn_bf16f, g_mod, "matvec_bf16f") != hipSuccess) g_fn_bf16f = nullptr;
+    if (hipModuleGetFunction(&g_mm_bf16f, g_mod, "matmul_f_bf16f") != hipSuccess) g_mm_bf16f = nullptr;
     if (hipModuleGetFunction(&g_mm_f32_tile, g_mod, "matmul_f32_tile") != hipSuccess) g_mm_f32_tile = nullptr;
     if (hipModuleGetFunction(&g_lr_fast, g_mod, "matvec_q8_lr_q4_0_rocmfp4_fast") != hipSuccess) g_lr_fast = nullptr;
     if (hipModuleGetFunction(&g_quant_rows_q8_0, g_mod, "quantize_rows_q8_0") != hipSuccess) g_quant_rows_q8_0 = nullptr;
@@ -247,6 +251,21 @@ int qmatvec_supported(int type) {
     return type >= 0 && type < QMV_MAX_TYPE && g_fn[type] != nullptr;
 }
 
+hipError_t qmatvec_launch_bf16f(const void *W, size_t row_bytes, const float *x, float *y, int N, int K, int T,
+                                hipStream_t stream) {
+    if (!g_mod || !g_fn_bf16f || !g_mm_bf16f || !W || !x || !y || T < 1 || row_bytes != (size_t)K * 2) return hipErrorInvalidValue;
+    long long rb = (long long)row_bytes;
+    if (T == 1) {
+        void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K};
+        return hipModuleLaunchKernel(g_fn_bf16f, (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK), 1, 1,
+                                     32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream, args, nullptr);
+    }
+    void *args[] = {(void *)&W, &rb, (void *)&x, (void *)&y, &N, &K, &T};
+    return hipModuleLaunchKernel(g_mm_bf16f, (unsigned)((N + QMV_ROWS_PER_BLOCK - 1) / QMV_ROWS_PER_BLOCK),
+                                 (unsigned)((T + QMV_MMF_TT - 1) / QMV_MMF_TT), 1, 32 * QMV_ROWS_PER_BLOCK, 1, 1, 0, stream,
+                                 args, nullptr);
+}
+
 hipError_t qmatvec_launch(int type, const void *W, size_t row_bytes, const float *x, float *y, int N, int K,
                           hipStream_t stream) {
     if (!qmatvec_supported(type)) return hipErrorInvalidDeviceFunction;
@@ -263,7 +282,6 @@ hipError_t qmatvec_launch(int type, const void *W, size_t row_bytes, const float
 
 #define QMV_MF32_TT 8     // must match MF32_TT in matvec_q.hip
 #define QMV_MF32_ROWS 16  // must match MF32_ROWS in matvec_q.hip
-#define QMV_MMF_TT 8   // must match MMF_TT in matvec_q.hip
 
 static unsigned wf_grid(int N, int T) {
     return (unsigned)((N + QMV_WF_ROWS - 1) / QMV_WF_ROWS) * (unsigned)((T + QMV_WF_TOK - 1) / QMV_WF_TOK);

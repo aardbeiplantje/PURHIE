@@ -305,6 +305,10 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
 - T8 prefix KV cache: a voice's prefill (its reference text, codes and speaker embedding) is the same for every request
   in that voice, so its per-layer K/V is computed once and kept with the voice; a request continues from it (the KV
   cache's prefix reuse, as the engine's sequences do for chat).
+  **Decided 2026-11-13 (not built): the prefill is a small share.** Measured on the BF16 talker (16 threads): a 40 frame
+  utterance takes ~2.3 to 4 s, of which the prefill (84 positions, batched) is a fraction of one frame's 50 to 70 ms per
+  frame times the frames; a voice's cached prefix would save a few percent per request. The next speed item is the frame
+  itself (below), not the prefix.
 - T9 BF16 weights: the talker and the speaker encoder keep the checkpoint's BF16 in the GGUF (mmap, read in place, widened
   inside the dot products): half the bytes of the F32 files, no copy at load.
   **T9 and U1 done 2026-11-13 (the talker part of U1):** the talker GGUF writes its matrices and tables as BF16 (the
@@ -334,6 +338,18 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   measured for the speech (talker frames per second) and the transcription (seconds of audio per second).
 - U2 GPU path (UMA: the GGUF map is pinned, so the GPU reads the same pages): decided after U1 by the measured split;
   the talker's and the whisper's matmuls are the candidates (the engine's existing F32/BF16 GEMM kernels).
+  **Measured 2026-11-13 (the device path, opt-in: `QWEN3TTS_DEVICE=gpu`):** the GGUF mapping registered read-only
+  (`hipHostRegister`, coarse-grained: the UMA pattern of qwen_model's /dev/shm regions), the BF16 linears through a new
+  `matvec_bf16f` / `matmul_f_bf16f` kernel pair (fp32 activations; the existing BF16 kernels round the activations to
+  bf16, which costs 1.8e-3 of the peak, too coarse for the talker's checks) via `qmatvec_launch_bf16f`. A warm matvec of
+  4 MB of BF16 takes 17 to 37 us (about 110 to 240 GB/s: the weights are read from DRAM as the frame needs them). The
+  talker verifier passes on the device path (cosine 1.0000000, 6.8e-7 of the scale). But the talker's linears are
+  synchronized one by one (the activations staged through two pinned buffers, a launch and a stream sync per linear, ~430
+  per frame), so a frame takes 77 ms on the device against 52 ms on the host (41 frames: 3.16 s against 2.15 s). The host
+  stays the default. The next step for the device: the whole talker block on the device (rms norm, rotary, the KV
+  cache attention, the SiLU MLP as the engine's qwen kernels do) so that one frame is a few launches, not hundreds.
+  Activations are staged through pinned buffers (a few KB per call, a copy of activations only; the weights are never
+  copied).
 
 **Image generation (sd-turbo, `/data/hf-small/sd-turbo`):**
 - I1 reference: diffusers is not in the venv (pip install if the registry allows it); the one-step output for a fixed

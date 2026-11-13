@@ -993,7 +993,10 @@ matmul_f32_tile(const uint8_t *W, long long row_bytes, const float *x, float *y,
 // One lane's share of a BF16 row's dot product with x (the wave reduction follows): 16-byte chunks lane,
 // lane + 32, ... when the row and x are 16-byte aligned (the same for every lane), then the rest one value per
 // lane. Every BF16 kernel sums a (row, token) this way, so prefill and decoding give the same bits.
-__device__ __forceinline__ float bf16_lane_dot(const uint8_t *wr, const float *x, int K, int lane) {
+// ROUND_X: the activations rounded to BF16 (the default kernels, the WMMA-matched path); without, the fp32 activations as
+// they are (matvec_bf16f / matmul_f_bf16f: the talker's fp32 math over BF16 weights)
+template <bool ROUND_X>
+__device__ __forceinline__ float bf16_lane_dot_t(const uint8_t *wr, const float *x, int K, int lane) {
     float acc = 0.0f;
     int k0 = 0;
     if ((((uintptr_t)wr | (uintptr_t)x) & 15) == 0) {
@@ -1001,14 +1004,21 @@ __device__ __forceinline__ float bf16_lane_dot(const uint8_t *wr, const float *x
         for (int i = lane; i < n8; i += 32) {
             const uint4 u = ((const uint4 *)wr)[i];
             const float4 xa = ((const float4 *)x)[2 * i], xb = ((const float4 *)x)[2 * i + 1];
-            acc += bf16_lo(u.x) * bf16_round(xa.x) + bf16_hi(u.x) * bf16_round(xa.y) + bf16_lo(u.y) * bf16_round(xa.z) +
-                   bf16_hi(u.y) * bf16_round(xa.w) + bf16_lo(u.z) * bf16_round(xb.x) + bf16_hi(u.z) * bf16_round(xb.y) +
-                   bf16_lo(u.w) * bf16_round(xb.z) + bf16_hi(u.w) * bf16_round(xb.w);
+            const float x0 = ROUND_X ? bf16_round(xa.x) : xa.x, x1 = ROUND_X ? bf16_round(xa.y) : xa.y;
+            const float x2 = ROUND_X ? bf16_round(xa.z) : xa.z, x3 = ROUND_X ? bf16_round(xa.w) : xa.w;
+            const float x4 = ROUND_X ? bf16_round(xb.x) : xb.x, x5 = ROUND_X ? bf16_round(xb.y) : xb.y;
+            const float x6 = ROUND_X ? bf16_round(xb.z) : xb.z, x7 = ROUND_X ? bf16_round(xb.w) : xb.w;
+            acc += bf16_lo(u.x) * x0 + bf16_hi(u.x) * x1 + bf16_lo(u.y) * x2 + bf16_hi(u.y) * x3 + bf16_lo(u.z) * x4 +
+                   bf16_hi(u.z) * x5 + bf16_lo(u.w) * x6 + bf16_hi(u.w) * x7;
         }
         k0 = n8 * 8;
     }
-    for (int k = k0 + lane; k < K; k += 32) acc += bf16(wr + 2 * k) * bf16_round(x[k]);
+    for (int k = k0 + lane; k < K; k += 32) acc += bf16(wr + 2 * k) * (ROUND_X ? bf16_round(x[k]) : x[k]);
     return acc;
+}
+
+__device__ __forceinline__ float bf16_lane_dot(const uint8_t *wr, const float *x, int K, int lane) {
+    return bf16_lane_dot_t<true>(wr, x, K, lane);
 }
 
 extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
@@ -1032,6 +1042,32 @@ matmul_f_bf16(const uint8_t *W, long long row_bytes, const float *x, float *y, i
     const uint8_t *wr = W + (long long)row * row_bytes;
     for (int j = 0; j < nt; ++j) {
         float a = bf16_lane_dot(wr, x + (size_t)(t0 + j) * K, K, lane);
+        for (int off = 16; off > 0; off >>= 1) a += __shfl_xor(a, off, 32);
+        if (lane == 0) y[(size_t)(t0 + j) * N + row] = a;
+    }
+}
+
+// The fp32-activation BF16 kernels (see bf16_lane_dot_t): one row of y per wave, and the batch of T rows (each row's wave
+// reads its weights once per tile of MMF_TT tokens)
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
+matvec_bf16f(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+    float acc = bf16_lane_dot_t<false>(W + (long long)row * row_bytes, x, K, lane);
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
+    if (lane == 0) y[row] = acc;
+}
+
+extern "C" __global__ void __launch_bounds__(32 * ROWS_PER_BLOCK)
+matmul_f_bf16f(const uint8_t *W, long long row_bytes, const float *x, float *y, int N, int K, int T) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+    const int t0 = blockIdx.y * MMF_TT, nt = min(MMF_TT, T - t0);
+    const uint8_t *wr = W + (long long)row * row_bytes;
+    for (int j = 0; j < nt; ++j) {
+        float a = bf16_lane_dot_t<false>(wr, x + (size_t)(t0 + j) * K, K, lane);
         for (int off = 16; off > 0; off >>= 1) a += __shfl_xor(a, off, 32);
         if (lane == 0) y[(size_t)(t0 + j) * N + row] = a;
     }

@@ -28,6 +28,10 @@ void qmatvec_drop_out_scales(const void *owner);
 // 1 if a matvec kernel exists for this ggml type id.
 int qmatvec_supported(int type);
 
+// BF16 weights (row_bytes = 2 K) with fp32 activations: y[T][N] = W x[T][K] (the activations are not rounded, unlike the
+// BF16 kernels above: the talker's fp32 math). Pointers device-accessible (registered host memory on UMA).
+hipError_t qmatvec_launch_bf16f(const void *W, size_t row_bytes, const float *x, float *y, int N, int K, int T,
+                                hipStream_t stream);
 // Launch on the given stream (0 = default). W = first row, row_bytes = qt_row_size(type, K).
 // All pointers must be device-accessible (pinned host memory on UMA). Returns hipSuccess on success.
 hipError_t qmatvec_launch(int type, const void *W, size_t row_bytes, const float *x, float *y, int N, int K,

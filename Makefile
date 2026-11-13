@@ -207,11 +207,11 @@ $(EXPERT_CPU_BENCH): $(TESTSDIR)/expert_cpu_bench.cpp $(SRCDIR)/expert_cpu.cpp $
 $(MEL_VERIFY): $(TESTSDIR)/mel_verify.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/mel_verify.cpp $(SRCDIR)/mel.cpp -o $@
 
-$(QWEN3TTS_SPEECH_VERIFY): $(TESTSDIR)/qwen3tts_speech_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h $(SRCDIR)/qwen3tts.h $(SRCDIR)/qwen3tts_speech.cpp $(SRCDIR)/qwen3tts_speech.h $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
-	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/qwen3tts_speech_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/qwen3tts_speech.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
+$(QWEN3TTS_SPEECH_VERIFY): $(TESTSDIR)/qwen3tts_speech_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h $(SRCDIR)/qwen3tts.h $(SRCDIR)/qwen3tts_speech.cpp $(SRCDIR)/qwen3tts_speech.h $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/qwen3tts_speech_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
 
-$(SPEAKER_VERIFY): $(TESTSDIR)/speaker_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/qwen3tts.h $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
-	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/speaker_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
+$(SPEAKER_VERIFY): $(TESTSDIR)/speaker_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/qwen3tts.h $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/speaker_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
 
 $(CODEC_ENCODE_VERIFY): $(TESTSDIR)/codec_encode_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/codec_encode_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
@@ -219,8 +219,8 @@ $(CODEC_ENCODE_VERIFY): $(TESTSDIR)/codec_encode_verify.cpp $(SRCDIR)/qwen3tts_c
 $(QWEN3TTS_CODEC_VERIFY): $(TESTSDIR)/qwen3tts_codec_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/qwen3tts_codec_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
 
-$(QWEN3TTS_VERIFY): $(TESTSDIR)/qwen3tts_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h $(SRCDIR)/qwen3tts.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
-	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/qwen3tts_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
+$(QWEN3TTS_VERIFY): $(TESTSDIR)/qwen3tts_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h $(SRCDIR)/qwen3tts.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/qwen3tts_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
 
 $(AUDIO_VERIFY): $(TESTSDIR)/audio_verify.cpp $(SRCDIR)/audio.cpp $(SRCDIR)/audio.h
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/audio_verify.cpp $(SRCDIR)/audio.cpp -o $@
