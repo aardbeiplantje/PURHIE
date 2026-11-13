@@ -39,6 +39,13 @@ rocm-inference-server (OpenAI-compatible: chat, raw completions, embeddings, `--
 llama.cpp-rocm-gfx1151-docker (branch rocm-inference), which builds rocm-hip from GitHub `main` (a rebuild needs a
 new `CACHEBUST` to take new commits). Design: ARCHITECTURE.md; measurements: git history.
 
+6. **Multimodal and audio (section below, 2026-11-13)**: audio done through the voice clone from new audio, long-form
+   and translate; open: the talker's fused device block (U2: the device path is verified but slower per linear; the
+   whole block on the device is the next step), the image path's speed (the VAE and the UNet on the host: about half a
+   minute per 512 x 512 image; the GPU's job), MiniMax-H3-Image (inspect the checkout, the license) and the vision
+   tower's device path. The ComfyUI safetensors question: converted by rocm-convert as F16/BF16 GGUF (the engine reads
+   them in place; sd-turbo is done that way).
+
 ## Qwen3.8-Flash-Next
 
 Quantized: /models/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST-PLE_Q8_0.gguf (PLE table Q8_0 on disk). Open:
