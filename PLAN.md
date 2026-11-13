@@ -562,6 +562,12 @@ DiT and the text encoder, no ROCmFP4 unless the user asks for it):
   rotary's spatial scale (32) and the frame clock, the velocity update's sign convention, the adaLN row selection for the
   text rows, and whether the released checkpoint expects guidance or a prompt template that the modular pipeline adds. The
   server's `/v1/images/generations` (`--sd`) is unchanged: the MiniMax route waits for the quality check.
+  **Checked 2026-11-13:** the timestep (the scheduler's `timesteps` are `1 - sigmas[:-1]`), the initial noise (`randn` of
+  `(1, 24, 1, h, w)`, the same shape as the engine's), the velocity update, and the absence of guidance and of a prompt template
+  all match the reference code. The reference chain alone (diffusers' DiT with the prompt's states, six steps, diffusers' VAE,
+  `/data/minimax-ref/dit/reference_sample_256.png`) shows the same patch grid, so the engine reproduces the reference's output;
+  the open question is whether the reference chain reproduces the released model, which needs the released pipeline (not
+  runnable here: its components together exceed the 124 GB of memory).
 - M4 sampler and PDD: the six-sigma euler velocity loop, the fused heads from `pdd_fused_heads.safetensors` (check
   what they replace), t2i end to end against the diffusers pipeline (same seed, the same initial noise).
 - M5 server: the image endpoint's model choice (the request's `model` field; today there is one `--sd` file), the
