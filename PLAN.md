@@ -257,6 +257,32 @@ transformers 5.5.1, Pillow; no torchvision in that venv). A phase is done when i
   the sampled frames are not torch's (its generator), streaming, response formats other than wav, long texts are not
   chunked, one request at a time.
 
+**Audio, continued (2026-11-13, requested "continue with audio ... until it's done"; the UMA rules apply):** the open
+items of A1-A4 and T1-T4, in order, each a commit with its check here as history (done items are kept, not pruned):
+- A5 resampling: a band-limited (windowed-sinc) resampler in `src/audio.{h,cpp}` replaces the linear one in the WAV
+  decode (whisper and the TTS voice input at 24 kHz); checked against librosa's soxr_hq output.
+- T5 speaker encoder in the engine (the ECAPA-TDNN of qwen-tts's `Qwen3TTSSpeakerEncoder`, the 24 kHz log-mel of its
+  `mel_spectrogram`): converter writes `speaker_encoder.*` into the talker GGUF; checked against qwen-tts's
+  `extract_speaker_embedding` on the reference clip.
+- T6 codec encoder in the engine (the speech tokenizer's SEANet encoder, its 8-layer transformer, the downsample and
+  the residual VQ encode): converter writes `encoder.*` and the quantizer's encode tensors into the codec GGUF; checked
+  against qwen-tts's `encode` (the reference clip's codes, exact integers).
+- T7 voices from audio: the engine makes a voice from a WAV and its transcript (`qwen3tts_make_voice`); the server
+  takes `POST /v1/audio/voices` (multipart: name, file, ref_text), so `tools/qwen3tts_voice.py` is only the reference.
+- T8 prefix KV cache: a voice's prefill (its reference text, codes and speaker embedding) is the same for every request
+  in that voice, so its per-layer K/V is computed once and kept with the voice; a request continues from it (the KV
+  cache's prefix reuse, as the engine's sequences do for chat).
+- T9 BF16 weights: the talker and the speaker encoder keep the checkpoint's BF16 in the GGUF (mmap, read in place, widened
+  inside the dot products): half the bytes of the F32 files, no copy at load.
+- W1 whisper long-form: audio over 30 s is cut at the quietest point before each 30 s window and the texts joined.
+- W2 translate: `task` translate (the `<|translate|>` token in the prompt) through the endpoint.
+- W3 other languages: a French and a Chinese clip (qwen-tts speech, the Whisper reference from transformers) with the
+  engine's tokens equal to transformers' greedy tokens under the same language token.
+- U1 threads: the host matmuls and convolutions run on the 16 cores (OpenMP over output rows); real-time factors
+  measured for the speech (talker frames per second) and the transcription (seconds of audio per second).
+- U2 GPU path (UMA: the GGUF map is pinned, so the GPU reads the same pages): decided after U1 by the measured split;
+  the talker's and the whisper's matmuls are the candidates (the engine's existing F32/BF16 GEMM kernels).
+
 **Image generation (sd-turbo, `/data/hf-small/sd-turbo`):**
 - I1 reference: diffusers is not in the venv (pip install if the registry allows it); the one-step output for a fixed
   seed and prompt, and the intermediate latents.
