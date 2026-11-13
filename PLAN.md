@@ -4,9 +4,17 @@
 > Finished work, with its measurements, is in the git history (this file was pruned of it on 2026-11-05, 2026-11-06
 > and 2026-11-12).
 
-## ▶ Next (2026-11-12)
+## ▶ Next (2026-11-13)
 
-0. **MiniMax-H3-Image: DONE 2026-11-13 (was: check the image structure against the released pipeline).** Three causes:
+1. **MiniMax-H3-Image speed** (2026-11-13): a 256 request takes 222 s on the 2048 canvas. The linears run at about 9 TFLOPS
+   (17.7 s per forward at 4105 tokens): a wider LDS stage or a 256 x 256 tile. The flash attention runs at about 2.5 TFLOPS
+   (4.6 s per forward): a wider key tile, two query waves per key stage. Measure with `MM_PIPE_DEBUG=1` and `MMDIT_PROF=1`.
+2. **MiniMax server behaviour** (2026-11-13): one image at a time, and the default canvas is 2048². Check the resize filter
+   (ours: area averaging) against diffusers' image processor. Decide whether to queue or reject requests while one runs.
+3. **MiniMax quantization** (later, the user): FP8 or ROCmFP4 for the DiT (66 GB BF16 now). Measure the quality cost first;
+   BF16 stays the default until that is known.
+4. **ComfyUI backend** (backlog, planned 2026-11-13, see Later): the component API first, then the node package.
+- (done) **MiniMax-H3-Image: DONE 2026-11-13 (was: check the image structure against the released pipeline).** Three causes:
    (a) two layout errors in the native checkpoint, shared by the engine and my reference (so their agreement hid them): the
    fused QKV rows are grouped per head (q, k, v of D rows each per head: rows `(h * 3 + part) * D`), not `[all q | all k | all
    v]`; the FFN's projection holds the GATE first and the VALUE second (the released diffusers-format weights have the halves
@@ -22,15 +30,15 @@
    Runs: `tests/mm_canvas_verify` (the sampler on the released inputs), `tests/mm_dit_ref.py` (now released weights),
    `tests/mm_vae_ref.py` (released VAE). Note the default request in the released pipeline is 2048 x 2048: a 2048 image is
    four times the DiT's tokens and the attention is quadratic in them (speed: item 2).
-1. **Qwen3.8-Flash-Next in the deployment** (section below): the model's own MTP block as draft head and the parallel
+5. **Qwen3.8-Flash-Next in the deployment** (section below): the model's own MTP block as draft head and the parallel
    PLE reads are in; both are to be measured there (the user).
-2. **Concurrent runs** (section below): the deployment runs `--parallel` now; watch the store's resume (the `kv`
+6. **Concurrent runs** (section below): the deployment runs `--parallel` now; watch the store's resume (the `kv`
    line's mapped blocks) and the queue there.
-3. **Server logging** (section below): in and soaked on Flash (2026-11-12); nothing open on it except the `kv`
+7. **Server logging** (section below): in and soaked on Flash (2026-11-12); nothing open on it except the `kv`
    line's counters with several jobs.
-4. **GLM-5.3-Flash (`glm5_next`)**: runs whole (4.3-7.6 tok/s); its speed work is tabled (user, 2026-11-12). The open
+8. **GLM-5.3-Flash (`glm5_next`)**: runs whole (4.3-7.6 tok/s); its speed work is tabled (user, 2026-11-12). The open
    leads are in its section below.
-5. **Independent of llama.cpp** (user, 2026-11-09): `bin/rocm-convert` converts (byte for byte convert_hf_to_gguf.py's,
+9. **Independent of llama.cpp** (user, 2026-11-09): `bin/rocm-convert` converts (byte for byte convert_hf_to_gguf.py's,
    `tests/convert_verify.sh`) and quantizes (`inference_quantize`; `-r plain` byte for byte llama-quantize's,
    `tests/quantize_verify.sh`; default recipe `strix`; the quality measure for a recipe is `perplexity --kl`, the
    KL divergence from the reference model, ARCHITECTURE.md s4). Open: the recipe choices measured by KL on a real
@@ -55,7 +63,7 @@ rocm-inference-server (OpenAI-compatible: chat, raw completions, embeddings, `--
 llama.cpp-rocm-gfx1151-docker (branch rocm-inference), which builds rocm-hip from GitHub `main` (a rebuild needs a
 new `CACHEBUST` to take new commits). Design: ARCHITECTURE.md; measurements: git history.
 
-6. **Multimodal and audio (section below, 2026-11-13)**: audio done through the voice clone from new audio, long-form
+10. **Multimodal and audio (section below, 2026-11-13)**: audio done through the voice clone from new audio, long-form
    and translate; the talker's fused device block is the default (U2: 44 ms per frame against 51 to 55 on the host); the
    image path is on the GPU (I6: 3.3 s per 512 x 512 image against 28 s on the host; the reference image was noise before,
    corrected). Open: the device frame's launches and syncs, the VAE's convolutions (the GEMM), MiniMax-H3-Image (inspect
