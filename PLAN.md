@@ -261,6 +261,13 @@ transformers 5.5.1, Pillow; no torchvision in that venv). A phase is done when i
 items of A1-A4 and T1-T4, in order, each a commit with its check here as history (done items are kept, not pruned):
 - A5 resampling: a band-limited (windowed-sinc) resampler in `src/audio.{h,cpp}` replaces the linear one in the WAV
   decode (whisper and the TTS voice input at 24 kHz); checked against librosa's soxr_hq output.
+  **Done 2026-11-13:** `src/audio.{h,cpp}` (`audio_decode_wav` for any rate, `audio_resample`): the Kaiser-windowed sinc
+  with soxr-like constants (cutoff 0.9565 of the lower Nyquist, 90 zero crossings, beta 12.4, a table for the window,
+  OpenMP over the outputs). `tests/audio_verify.cpp` (`make build/audio_verify`) against librosa 0.11's soxr_hq on
+  /data/audio-ref/resample (dump.py there): 16 -> 24 kHz, 24 -> 16 kHz and a 44.1 kHz 16-bit WAV decoded to 16 kHz, each
+  at cosine 0.9999998 and a largest difference of 1.5e-3 of the peak. A 16 kHz WAV stays bit-identical through whisper
+  (`whisper_verify` passes, the WAV max difference 0). Not band-limited to soxr's exact polyphase: the rest is soxr's
+  design. Speed: 0.15 s for all three on 16 threads.
 - T5 speaker encoder in the engine (the ECAPA-TDNN of qwen-tts's `Qwen3TTSSpeakerEncoder`, the 24 kHz log-mel of its
   `mel_spectrogram`): converter writes `speaker_encoder.*` into the talker GGUF; checked against qwen-tts's
   `extract_speaker_embedding` on the reference clip.

@@ -3,6 +3,8 @@
 // tied LM head), with the order of operations of transformers' WhisperForConditionalGeneration.
 #include "whisper.h"
 
+#include "audio.h"
+
 #include "gguf_mmap.h"
 #include "mel.h"
 #include "tokenizer.h"
@@ -370,99 +372,15 @@ whisper_model_t* whisper_open(const char* gguf_path) {
 void whisper_close(whisper_model_t* model) { delete model; }
 
 int whisper_decode_wav(const unsigned char* d, size_t n, float** samples_out, size_t* count_out) {
-    if (!d || !samples_out || !count_out) { g_error = "whisper_decode_wav: null argument"; return -1; }
-    *samples_out = nullptr;
-    *count_out = 0;
-    auto u16 = [&](size_t p) { return (unsigned)(d[p] | (d[p + 1] << 8)); };
-    auto u32 = [&](size_t p) { return (unsigned long)(d[p] | (d[p + 1] << 8) | (d[p + 2] << 16)) | ((unsigned long)d[p + 3] << 24); };
-    if (n < 12 || std::memcmp(d, "RIFF", 4) != 0 || std::memcmp(d + 8, "WAVE", 4) != 0) {
-        g_error = "not a WAV file (RIFF WAVE)";
+    // (16 kHz mono: the audio module's WAV decode through its band-limited resampler, audio.h)
+    if (audio_decode_wav(d, n, 16000, samples_out, count_out) != 0) {
+        g_error = audio_last_error();
         return -1;
     }
-    bool have_fmt = false;
-    unsigned fmt_tag = 0, channels = 0, bits = 0;
-    unsigned long rate = 0;
-    size_t data_at = 0, data_n = 0;
-    bool have_data = false;
-    size_t p = 12;
-    while (p + 8 <= n) {
-        const unsigned long size = u32(p + 4);
-        const size_t body = p + 8;
-        const size_t avail = std::min<size_t>(size, n - body);
-        if (std::memcmp(d + p, "fmt ", 4) == 0 && avail >= 16) {
-            have_fmt = true;
-            fmt_tag = u16(body);
-            channels = u16(body + 2);
-            rate = u32(body + 4);
-            bits = u16(body + 14);
-            if (fmt_tag == 0xFFFE && avail >= 26) fmt_tag = u16(body + 24);  // WAVE_FORMAT_EXTENSIBLE: the sub-format
-        } else if (std::memcmp(d + p, "data", 4) == 0) {
-            have_data = true;
-            data_at = body;
-            data_n = avail;
-            break;  // (the samples are the last thing that matters)
-        }
-        p = body + size + (size & 1);
-    }
-    if (!have_fmt || !have_data) { g_error = "WAV: no fmt or data chunk"; return -1; }
-    const bool pcm = fmt_tag == 1, flt = fmt_tag == 3;
-    if (!(pcm && (bits == 8 || bits == 16 || bits == 24 || bits == 32)) && !(flt && bits == 32)) {
-        g_error = "WAV: only PCM 8, 16, 24, 32-bit or 32-bit float";
-        return -1;
-    }
-    if (channels == 0 || rate == 0) { g_error = "WAV: no channels or rate"; return -1; }
-    const size_t bps = bits / 8, frame = bps * channels;
-    const size_t frames = data_n / frame;
-    std::vector<float> mono(frames);
-    for (size_t i = 0; i < frames; ++i) {
-        double acc = 0.0;
-        for (unsigned c = 0; c < channels; ++c) {
-            const unsigned char* s = d + data_at + i * frame + c * bps;
-            double v;
-            if (flt) {
-                float f;
-                std::memcpy(&f, s, 4);
-                v = f;
-            } else if (bits == 8) {
-                v = ((int)s[0] - 128) / 128.0;
-            } else if (bits == 16) {
-                v = (int16_t)(s[0] | (s[1] << 8)) / 32768.0;
-            } else if (bits == 24) {
-                const int32_t x = (int32_t)((uint32_t)s[0] << 8 | (uint32_t)s[1] << 16 | (uint32_t)s[2] << 24);
-                v = (x >> 8) / 8388608.0;
-            } else {
-                const int32_t x = (int32_t)((uint32_t)s[0] | (uint32_t)s[1] << 8 | (uint32_t)s[2] << 16 | (uint32_t)s[3] << 24);
-                v = x / 2147483648.0;
-            }
-            acc += v;
-        }
-        mono[i] = (float)(acc / channels);
-    }
-    // 16 kHz by linear interpolation
-    std::vector<float> out;
-    if (rate == 16000) {
-        out = std::move(mono);
-    } else {
-        const double step = (double)rate / 16000.0;
-        const size_t len = (size_t)std::llround(frames / step);
-        out.resize(len);
-        for (size_t i = 0; i < len; ++i) {
-            const double pos = i * step;
-            const size_t i0 = (size_t)pos;
-            const double f = pos - i0;
-            const float a = mono[std::min(i0, frames - 1)], b = mono[std::min(i0 + 1, frames - 1)];
-            out[i] = (float)(a + (b - a) * f);
-        }
-    }
-    float* buf = static_cast<float*>(std::malloc(sizeof(float) * std::max<size_t>(out.size(), 1)));
-    if (!buf) { g_error = "whisper_decode_wav: no memory"; return -1; }
-    std::memcpy(buf, out.data(), sizeof(float) * out.size());
-    *samples_out = buf;
-    *count_out = out.size();
     return 0;
 }
 
-void whisper_free_samples(float* samples) { std::free(samples); }
+void whisper_free_samples(float* samples) { audio_free(samples); }
 
 int whisper_token_id(const whisper_model_t* m, const char* text) {
     if (!m || !text) return -1;
