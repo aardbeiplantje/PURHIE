@@ -525,6 +525,13 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   52.9 s text in 6 pieces took 68 s (about 100 ms per frame, the device path); a 1.4 s request beside it finished after
   about 22 s (it waits for one of the other's pieces). Open: the pieces do not share prosody (each is its own run),
   and a streamed WAV's header is not a finished file.
+- S3 the audio models rescanned (2026-11-14): with `--models-dir`, the directory's GGUF files are checked before each
+  speech, transcription or voice request (stat only; the classification by header runs when a file changed). A model
+  whose file changed is loaded again, or dropped when it is gone; a load that fails is logged and the last good model is
+  kept. A speech job holds the model it started with (tested: a talker swapped in during a 80 s request; both finished on
+  their own models). Voices are read per request as before. The flags' models are loaded once. Tested locally with links to
+  the F32 talker under other names (the BF16 file is no longer at /data/audio-ref/tts: it was moved). Speech answers 503
+  with no talker in the directory, and recovers when one comes back.
 - U3 device frame profile (2026-11-14, `QWEN3TTS_PROFILE=1`: the stages; `=2`: each kernel timed, direct launches).
   Before: a frame (45 frames of made-from-clip, device) took predictor 27.8 ms + talker 9.5 ms. The predictor's 16 stacks
   (5 layers each) and the talker's 28 blocks read about 2.6 GB and 0.9 GB of BF16 weights per frame. Changes: each block is

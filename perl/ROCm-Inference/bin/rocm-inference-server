@@ -39,38 +39,6 @@ my $no_draft = ($o{draft} // '') eq 'none';  # (no draft head, not even a model'
 delete $o{draft} if $no_draft;
 die "--draft goes with --model\n" if $o{draft} && !$o{model};
 die "--models-dir: no directory $o{'models-dir'}\n" if $o{'models-dir'} && !-d $o{'models-dir'};
-# --models-dir: the audio models in it run without flags. A Whisper GGUF (arch whisper) is the speech recognizer; a
-# Qwen3-TTS talker (arch qwen3tts) with its speech tokenizer (arch qwen3tts_codec) is the speech synthesizer, and its
-# voices are DIR/voices (made by POST /v1/audio/voices). The flags, when given, win.
-if ($o{'models-dir'}) {
-    my $dir = $o{'models-dir'};
-    my (%a);
-    opendir my $dh, $dir or die "--models-dir $dir: $!\n";
-    for my $f (sort readdir $dh) {
-        next unless $f =~ /\.gguf\z/;
-        my $info = eval { model_info("$dir/$f") } or next;
-        my $arch = $info->{arch} // '';
-        if    ($arch eq 'whisper')        { push @{ $a{whisper} }, "$dir/$f" }
-        elsif ($arch eq 'qwen3tts')       { push @{ $a{tts} },     "$dir/$f" }
-        elsif ($arch eq 'qwen3tts_codec') { push @{ $a{codec} },   "$dir/$f" }
-    }
-    closedir $dh;
-    if (!$o{whisper} && $a{whisper}) {
-        $o{whisper} = $a{whisper}[0];
-        $LOG->info('audio', event => 'auto', msg => "speech recognition (--whisper): $o{whisper}");
-    }
-    if (!$o{tts} && $a{tts} && $a{codec}) {
-        # a BF16 talker before an F32 one (the device path reads BF16; the F32 file runs on the host)
-        my ($talker) = sort { ($a =~ /f32/i) <=> ($b =~ /f32/i) || $a cmp $b } @{ $a{tts} };
-        ($o{tts}, $o{'tts-codec'}) = ($talker, $a{codec}[0]);
-        my $voices = "$dir/voices";
-        $o{voices} //= $voices if -d $voices || mkdir $voices;
-        $LOG->info('audio', event => 'auto', msg => "speech (--tts $o{tts} --tts-codec $o{'tts-codec'}, voices "
-                                                    . ($o{voices} // 'none') . ')');
-    } elsif (!$o{tts} && $a{tts}) {
-        $LOG->info('audio', event => 'auto', msg => "no speech codec in $dir: $a{tts}[0] not served");
-    }
-}
 my $parallel = $o{parallel} // 1;
 die "--parallel N: 1 or more\n" if $parallel < 1;
 $o{'store-snapshots'} //= 'lazy';
@@ -78,20 +46,126 @@ die "--store-snapshots: lazy or eager\n" unless $o{'store-snapshots'} =~ /\A(?:l
 die "--store-snapshot-every N: 0 or more\n" if ($o{'store-snapshot-every'} // 4) < 0;
 die "--parallel: not with --draft (speculative decoding is single-sequence)\n" if $parallel > 1 && $o{draft};
 die "--mmproj: no file $o{mmproj}\n" if $o{mmproj} && !-f $o{mmproj};
+# ---- The audio models: the speech recognizer (--whisper FILE: /v1/audio/transcriptions) and the speech synthesizer
+# (--tts TALKER --tts-codec CODEC --voices DIR: /v1/audio/speech, /v1/audio/voices). A model is given by its flags, or, with
+# --models-dir, found there by its architecture (whisper; qwen3tts with qwen3tts_codec; the voices are DIR/voices). A model
+# found in the directory is rescanned: before each speech, transcription or voice request the directory's GGUF files are
+# checked (names, sizes, times), and a model whose file changed (copied in, replaced, removed) is loaded again, or dropped.
+# A job in progress keeps the model it started with. The models named by flags are loaded once; their errors end the start.
 die "--whisper: no file $o{whisper}\n" if $o{whisper} && !-f $o{whisper};
-# the speech model (--whisper, a Whisper GGUF): /v1/audio/transcriptions; the model's name is its file name
-my $WHISPER = $o{whisper} ? eval { whisper_load($o{whisper}) } : undef;
-die "--whisper $o{whisper}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" if $o{whisper} && !$WHISPER;
-my $whisper_name = $o{whisper} ? basename($o{whisper}) =~ s/\.gguf\z//r : undef;
-# the speech synthesis (--tts TALKER.gguf --tts-codec CODEC.gguf --voices DIR): /v1/audio/speech; a voice is a directory
-# under DIR (tools/qwen3tts_voice.py writes one)
 die "--tts needs --tts-codec\n" if $o{tts} && !$o{'tts-codec'};
 die "--tts: no file $o{tts}\n" if $o{tts} && !-f $o{tts};
 die "--tts-codec: no file $o{'tts-codec'}\n" if $o{'tts-codec'} && !-f $o{'tts-codec'};
 die "--voices: no directory $o{voices}\n" if $o{voices} && !-d $o{voices};
-my $TTS = $o{tts} ? eval { speech_load($o{tts}, $o{'tts-codec'}) } : undef;
-die "--tts $o{tts}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" if $o{tts} && !$TTS;
-my $tts_name = $o{tts} ? basename($o{tts}) =~ s/\.gguf\z//r : undef;
+my %AUDIO_FLAG = (whisper => defined $o{whisper} ? 1 : 0, tts => defined $o{tts} ? 1 : 0);
+my ($WHISPER, $whisper_name, $TTS, $tts_name);
+my (%AUDIO_KEY, $AUDIO_DIR_SIG);  # the files each audio model was loaded from (and the last directory signature)
+if ($AUDIO_FLAG{whisper}) {
+    $WHISPER = eval { whisper_load($o{whisper}) };
+    die "--whisper $o{whisper}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" unless $WHISPER;
+    $whisper_name = basename($o{whisper}) =~ s/\.gguf\z//r;
+}
+if ($AUDIO_FLAG{tts}) {
+    $TTS = eval { speech_load($o{tts}, $o{'tts-codec'}) };
+    die "--tts $o{tts}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" unless $TTS;
+    $tts_name = basename($o{tts}) =~ s/\.gguf\z//r;
+}
+
+# the GGUF files of a directory and their signature (name, size, time): stat only, read before each audio request
+sub audio_listing {
+    my ($dir) = @_;
+    my (@files, @sig);
+    opendir my $dh, $dir or return ([], '');
+    for my $f (sort readdir $dh) {
+        next unless $f =~ /\.gguf\z/;
+        my @st = stat "$dir/$f" or next;
+        push @files, "$dir/$f";
+        push @sig, "$f:$st[7]:$st[9]";
+    }
+    closedir $dh;
+    return (\@files, join(' ', @sig));
+}
+
+# a file's identity for the rescan: its path, size and time ('gone' when it is not there)
+sub audio_key {
+    my ($path) = @_;
+    my @st = stat $path or return "$path:gone";
+    return "$path:$st[7]:$st[9]";
+}
+
+sub audio_load_whisper {
+    my ($path) = @_;
+    if (!defined $path) {
+        return unless $WHISPER;
+        ($WHISPER, $whisper_name) = (undef, undef);
+        $LOG->info('audio', event => 'unload', msg => 'speech recognition: no Whisper model in --models-dir');
+        return;
+    }
+    my $w = eval { whisper_load($path) };
+    if (!$w) {
+        $LOG->error(event => 'audio', msg => "speech recognition $path: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r));
+        return;
+    }
+    ($WHISPER, $whisper_name) = ($w, basename($path) =~ s/\.gguf\z//r);
+    $LOG->info('audio', event => 'load', msg => "speech recognition (--whisper): $path");
+}
+
+sub audio_load_tts {
+    my ($talker, $codec) = @_;
+    if (!defined $talker) {
+        return unless $TTS;
+        ($TTS, $tts_name) = (undef, undef);
+        $LOG->info('audio', event => 'unload', msg => 'speech: no talker and codec in --models-dir');
+        return;
+    }
+    my $t = eval { speech_load($talker, $codec) };
+    if (!$t) {
+        $LOG->error(event => 'audio', msg => "speech $talker: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r));
+        return;
+    }
+    ($TTS, $tts_name) = ($t, basename($talker) =~ s/\.gguf\z//r);
+    my $voices = "$o{'models-dir'}/voices";
+    $o{voices} //= $voices if -d $voices || mkdir $voices;
+    $LOG->info('audio', event => 'load', msg => "speech (--tts $talker --tts-codec $codec, voices " . ($o{voices} // 'none') . ')');
+}
+
+# The models found in --models-dir, when its files changed since the last look: the speech recognizer (the first Whisper
+# file) and the talker (a BF16 one before an F32 one: the device path reads BF16) with the codec (the first one)
+sub audio_rescan {
+    my $dir = $o{'models-dir'} or return;
+    return if $AUDIO_FLAG{whisper} && $AUDIO_FLAG{tts};
+    my ($files, $sig) = audio_listing($dir);
+    return if defined $AUDIO_DIR_SIG && $sig eq $AUDIO_DIR_SIG;
+    $AUDIO_DIR_SIG = $sig;
+    my %a;
+    for my $path (@$files) {
+        my $info = eval { model_info($path) } or next;
+        my $arch = $info->{arch} // '';
+        if    ($arch eq 'whisper')        { push @{ $a{whisper} }, $path }
+        elsif ($arch eq 'qwen3tts')       { push @{ $a{tts} },     $path }
+        elsif ($arch eq 'qwen3tts_codec') { push @{ $a{codec} },   $path }
+    }
+    if (!$AUDIO_FLAG{whisper}) {
+        my $path = $a{whisper} ? $a{whisper}[0] : undef;
+        my $key = defined $path ? audio_key($path) : '';
+        if ($key ne ($AUDIO_KEY{whisper} // '')) {
+            $AUDIO_KEY{whisper} = $key;
+            audio_load_whisper($path);
+        }
+    }
+    if (!$AUDIO_FLAG{tts}) {
+        my ($talker) = $a{tts} ? sort { ($a =~ /f32/i) <=> ($b =~ /f32/i) || $a cmp $b } @{ $a{tts} } : ();
+        my $codec = $a{codec} ? $a{codec}[0] : undef;
+        my $ok = defined $talker && defined $codec;
+        my $key = $ok ? audio_key($talker) . ' ' . audio_key($codec) : '';
+        if ($key ne ($AUDIO_KEY{tts} // '')) {
+            $AUDIO_KEY{tts} = $key;
+            audio_load_tts($talker, $codec) if $ok;
+            audio_load_tts() unless $ok;
+        }
+    }
+}
+audio_rescan() if $o{'models-dir'};  # (the models found at the start; the flags' ones are loaded above)
 # the image model (--sd FILE.gguf, rocm-convert of a diffusers pipeline such as sd-turbo): /v1/images/generations
 die "--sd: no file $o{sd}\n" if $o{sd} && !-f $o{sd};
 my $IMAGE = $o{sd} ? eval { sd_load($o{sd}) } : undef;
@@ -824,6 +898,7 @@ sub access_line {
 # ignored: a server has one speech model (--whisper)
 route::post '/v1/audio/transcriptions' => sub {
     my ($req) = @_;
+    audio_rescan();
     my $ct = $req->{headers}{'content-type'} // '';
     error(400, 'expected multipart/form-data with the audio file in the part "file"') unless $ct =~ m{multipart/form-data}i;
     error(503, 'no speech model: start the server with --whisper FILE.gguf', 'server_error') unless $WHISPER;
@@ -900,7 +975,7 @@ sub speech_step {
         my $i = $job->{next}++;
         my $pause = $i ? pack('f<', 0) x int($SPEECH_PAUSE * 24000) : '';
         my ($samples, $frames) = eval {
-            $TTS->speak($job->{pieces}[$i], voice => $job->{v}, language => $job->{lang}, %{ $job->{smp} },
+            $job->{tts}->speak($job->{pieces}[$i], voice => $job->{v}, language => $job->{lang}, %{ $job->{smp} },
                         seed => $job->{smp}{seed} + $i);
         };
         if ($@) {
@@ -925,7 +1000,7 @@ sub speech_step {
     $job->{finished} = 1;
     my $secs = length($job->{all}) / 4 / 24000;
     $LOG->info('request', event => 'speech', msg => sprintf('%s: voice %s, %d pieces, %d frames, %.2f s, %s%s',
-               $tts_name, $job->{name}, scalar @{ $job->{pieces} }, $job->{frames}, $secs, $job->{fmt},
+               $job->{tts_name}, $job->{name}, scalar @{ $job->{pieces} }, $job->{frames}, $secs, $job->{fmt},
                $job->{stream} ? ', streamed' : ''));
     return \$out if $progressive;
     # the file goes out in slices (one per round): Web::Route closes a response with more than its max_pending unsent
@@ -946,6 +1021,7 @@ sub speech_wav16_file { return ROCm::Inference::speech_wav16($_[0], 24000) }
 
 route::post '/v1/audio/speech' => sub {
     my ($req) = @_;
+    audio_rescan();
     error(503, 'no speech model: start the server with --tts TALKER.gguf --tts-codec CODEC.gguf --voices DIR', 'server_error')
         unless $TTS;
     my $p = $req->{json};
@@ -981,7 +1057,7 @@ route::post '/v1/audio/speech' => sub {
     my @pieces = speech_pieces($input);
     error(400, "'input' is required (the text to say)") unless @pieces;
     my $job = { pieces => \@pieces, next => 0, v => $v, name => $voice, lang => $lang, smp => \%smp, fmt => $fmt,
-                stream => $stream, all => '', frames => 0, t0 => Time::HiRes::time() };
+                stream => $stream, all => '', frames => 0, t0 => Time::HiRes::time(), tts => $TTS, tts_name => $tts_name };
     my $type = $stream && $fmt eq 'pcm' ? $SPEECH_FORMAT{pcm} : $SPEECH_FORMAT{$fmt};
     return pull(200, [ 'Content-Type' => $type ], sub { speech_step($job) }, on_close => sub {
         return if $job->{finished};
@@ -996,6 +1072,7 @@ route::post '/v1/audio/speech' => sub {
 # then speech's "voice" value.
 route::post '/v1/audio/voices' => sub {
     my ($req) = @_;
+    audio_rescan();
     error(503, 'no speech model: start the server with --tts TALKER.gguf --tts-codec CODEC.gguf --voices DIR', 'server_error')
         unless $TTS;
     error(503, 'no voices directory: start the server with --voices DIR') unless $o{voices};
@@ -1604,7 +1681,9 @@ context and KV cache type C<--ctx> / C<--kv-type> give, by default from its own 
 The audio models in the directory are served without flags: a Whisper GGUF (C<--whisper>, for
 C</v1/audio/transcriptions>), and a Qwen3-TTS talker with its speech tokenizer (C<--tts> and C<--tts-codec>, for
 C</v1/audio/speech>), whose voices are the directory's C<voices> subdirectory (C<--voices>, created when missing).
-The flags, when given, name other files.
+The flags, when given, name other files. The directory is looked at before each speech, transcription or voice request:
+a model copied in, replaced or removed is loaded again (or dropped) then, and a request in progress keeps the model it started
+with.
 
 =item --models-max N
 
