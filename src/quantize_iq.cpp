@@ -543,12 +543,147 @@ void iq2_xs_row(const float *x, uint8_t *out, int64_t n, const float *quant_weig
     }
 }
 
+// IQ2_S: block of 256: fp16 d (scaled by 0.9875), qs[32] (the low eight bits of each grid index), signs[32] (eight sign bits per
+// group of eight values), qh[8] (the two high bits of the indices), scales[8] (a 4-bit scale per 32 values)
+void iq2_s_row(const float *x, uint8_t *out, int64_t n, const float *quant_weights) {
+    const Iq2Tab &t = iq2_tab(3);
+    const int kMaxQ = 3;
+    const int64_t nbl = n / 256;
+    for (int64_t ibl = 0; ibl < nbl; ++ibl, out += 82) {
+        memset(out, 0, 82);  // (the zero block, as the reference's memset)
+        float scales[16];
+        float weight[16], xval[16], waux[16];
+        int8_t L[16], Laux[16];
+        bool is_on_grid[2], is_on_grid_aux[2];
+        uint8_t block_signs[2];
+        float max_scale = 0;
+        const float *xbl = x + 256 * ibl;
+        float sumx2 = 0;
+        for (int i = 0; i < 256; ++i) sumx2 += xbl[i] * xbl[i];
+        const float sigma2 = 2 * sumx2 / 256;
+        for (int ib = 0; ib < 16; ++ib) {
+            const float *xb = xbl + 16 * ib;
+            const float *qw = quant_weights + 256 * ibl + 16 * ib;
+            for (int i = 0; i < 16; ++i) weight[i] = qw[i] * sqrtf(sigma2 + xb[i] * xb[i]);
+            for (int i = 0; i < 16; ++i) waux[i] = sqrtf(weight[i]);
+            for (int k = 0; k < 2; ++k) {
+                uint8_t sg = 0;
+                for (int i = 0; i < 8; ++i) {
+                    if (xb[8 * k + i] >= 0) {
+                        xval[8 * k + i] = xb[8 * k + i];
+                    } else {
+                        xval[8 * k + i] = -xb[8 * k + i];
+                        sg |= (uint8_t)(1 << i);
+                    }
+                }
+                block_signs[k] = sg;
+            }
+            float max = xval[0];
+            for (int i = 1; i < 16; ++i) max = max_of(max, xval[i]);
+            memset(L, 0, 16);
+            if (max < 1e-8f) {  // (GROUP_MAX_EPS_IQ2_S)
+                scales[ib] = 0;
+                continue;
+            }
+            float best = 0;
+            float scale = max / (2 * kMaxQ - 1);
+            is_on_grid[0] = is_on_grid[1] = true;
+            for (int is = -9; is <= 9; ++is) {
+                const float id = (2 * kMaxQ - 1 + is * 0.1f) / max;
+                const float this_scale = 1 / id;
+                for (int k = 0; k < 2; ++k) {
+                    for (int i = 0; i < 8; ++i) {
+                        const int l = nearest_int(0.5f * (id * xval[8 * k + i] - 1));
+                        Laux[8 * k + i] = (int8_t)std::max(0, std::min(kMaxQ - 1, l));
+                    }
+                    uint16_t u = 0;
+                    for (int i = 0; i < 8; ++i) u |= (uint16_t)(Laux[8 * k + i] << 2 * i);
+                    const int grid_index = t.map[u];
+                    is_on_grid_aux[k] = true;
+                    if (grid_index < 0) {
+                        is_on_grid_aux[k] = false;
+                        iq2_find_best_neighbour(t, iq2_neighbours_base(t, u), xval + 8 * k, waux + 8 * k, this_scale, Laux + 8 * k);
+                    }
+                }
+                float sumqx = 0, sumq2 = 0;
+                for (int i = 0; i < 16; ++i) {
+                    const float w = weight[i];
+                    const float q = 2 * Laux[i] + 1;
+                    sumqx += w * xval[i] * q;
+                    sumq2 += w * q * q;
+                }
+                if (sumq2 > 0 && sumqx * sumqx > best * sumq2) {
+                    scale = sumqx / sumq2;
+                    best = scale * sumqx;
+                    for (int i = 0; i < 16; ++i) L[i] = Laux[i];
+                    for (int k = 0; k < 2; ++k) is_on_grid[k] = is_on_grid_aux[k];
+                }
+            }
+            int n_not_ongrid = 0;
+            for (int k = 0; k < 2; ++k)
+                if (!is_on_grid[k]) ++n_not_ongrid;
+            if (n_not_ongrid > 0 && scale > 0) {
+                const float id = 1 / scale;
+                for (int k = 0; k < 2; ++k) {
+                    if (is_on_grid[k]) continue;
+                    uint16_t u = 0;
+                    for (int i = 0; i < 8; ++i) {
+                        int l = nearest_int(0.5f * (id * xval[8 * k + i] - 1));
+                        l = std::max(0, std::min(kMaxQ - 1, l));
+                        u |= (uint16_t)(l << 2 * i);
+                        L[8 * k + i] = (int8_t)l;
+                    }
+                    const int grid_index = t.map[u];
+                    if (grid_index < 0) iq2_find_best_neighbour(t, iq2_neighbours_base(t, u), xval + 8 * k, waux + 8 * k, scale, L + 8 * k);
+                }
+                float sumqx = 0, sumq2 = 0;
+                for (int i = 0; i < 16; ++i) {
+                    const float w = weight[i];
+                    const float q = 2 * L[i] + 1;
+                    sumqx += w * xval[i] * q;
+                    sumq2 += w * q * q;
+                }
+                if (sumq2 > 0) scale = sumqx / sumq2;
+            }
+            if (scale < 0) {
+                scale = -scale;
+                for (int k = 0; k < 2; ++k) block_signs[k] = (uint8_t)~block_signs[k];
+            }
+            for (int k = 0; k < 2; ++k) {
+                uint16_t u = 0;
+                for (int i = 0; i < 8; ++i) u |= (uint16_t)(L[8 * k + i] << 2 * i);
+                const int grid_index = t.map[u];
+                if (grid_index < 0) throw std::runtime_error("iq2_s: a point is not on the grid (ggml aborts here too)");
+                const int i8 = 2 * ib + k;
+                out[2 + i8] = (uint8_t)(grid_index & 255);
+                out[66 + i8 / 4] |= (uint8_t)((grid_index >> 8) << 2 * (i8 % 4));
+                out[2 + 32 + i8] = block_signs[k];
+            }
+            scales[ib] = scale;
+            max_scale = max_of(max_scale, scale);
+        }
+        if (!max_scale) continue;
+        const float d = max_scale / 31;
+        const uint16_t hd = qz_fp32_to_fp16(d * 0.9875f);
+        memcpy(out, &hd, 2);
+        const float id = 1 / d;
+        uint8_t *scl = out + 74;
+        for (int ib = 0; ib < 16; ++ib) {
+            int l = nearest_int(0.5f * (id * scales[ib] - 1));
+            l = std::max(0, std::min(15, l));
+            if (ib % 2 == 0) scl[ib / 2] = (uint8_t)l;
+            else scl[ib / 2] |= (uint8_t)(l << 4);
+        }
+    }
+}
+
 }  // namespace
 
-int qz_iq_supported(int t) { return t == QT_IQ2_XXS || t == QT_IQ2_XS; }
+int qz_iq_supported(int t) { return t == QT_IQ2_XXS || t == QT_IQ2_XS || t == QT_IQ2_S; }
 
 void qz_iq_encode(int t, const float *x, void *y, int64_t n, const float *qw) {
     if (t == QT_IQ2_XXS) iq2_xxs_row(x, (uint8_t *)y, n, qw);
     else if (t == QT_IQ2_XS) iq2_xs_row(x, (uint8_t *)y, n, qw);
+    else if (t == QT_IQ2_S) iq2_s_row(x, (uint8_t *)y, n, qw);
     else throw std::runtime_error("qz_iq_encode: type not written yet");
 }
