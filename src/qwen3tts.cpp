@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <functional>
 #include <cstdint>
 #include <cstring>
@@ -583,14 +584,16 @@ namespace {
 namespace dev {
 
 hipModule_t mod = nullptr;
-hipFunction_t f_rmsnorm = nullptr, f_rope = nullptr, f_kv = nullptr, f_attn = nullptr, f_silu = nullptr, f_add = nullptr;
+hipFunction_t f_qkv = nullptr, f_qk = nullptr, f_attn = nullptr, f_oproj = nullptr, f_gateup = nullptr, f_down = nullptr,
+              f_head = nullptr;
+hipStream_t stream = nullptr;  // the run's stream (graph capture needs one: not the null stream)
 
 bool load() {
     if (f_attn) return true;
     if (kernel_module_load(&mod, "talker_gpu.co") != hipSuccess) return false;
-    hipFunction_t* fns[] = {&f_rmsnorm, &f_rope, &f_kv, &f_attn, &f_silu, &f_add};
-    const char* names[] = {"tk_rmsnorm", "tk_rope", "tk_kv_store", "tk_attn", "tk_silu_mul", "tk_add"};
-    for (int i = 0; i < 6; ++i)
+    hipFunction_t* fns[] = {&f_qkv, &f_qk, &f_attn, &f_oproj, &f_gateup, &f_down, &f_head};
+    const char* names[] = {"tk_qkv", "tk_qk_rope_kv", "tk_attn", "tk_oproj_add", "tk_gateup", "tk_down_add", "tk_head"};
+    for (int i = 0; i < 7; ++i)
         if (hipModuleGetFunction(fns[i], mod, names[i]) != hipSuccess) return false;
     return true;
 }
@@ -627,84 +630,109 @@ struct Arena {
     ~Arena() { close(); }
 };
 
+// QWEN3TTS_PROFILE: each launch timed by events on the stream; the sums per kernel are printed at the end of a run
+struct KTime {
+    hipFunction_t f;
+    hipEvent_t a, b;
+};
+std::vector<KTime>* ktimes = nullptr;  // (set for a profiled run)
+
 void launch(hipFunction_t f, unsigned blocks, unsigned threads, unsigned shm, void** args) {
-    if (hipModuleLaunchKernel(f, blocks, 1, 1, threads, 1, 1, shm, 0, args, nullptr) != hipSuccess)
+    if (ktimes) {
+        KTime k{f, nullptr, nullptr};
+        hipEventCreate(&k.a);
+        hipEventCreate(&k.b);
+        hipEventRecord(k.a, 0);
+        const hipError_t e = hipModuleLaunchKernel(f, blocks, 1, 1, threads, 1, 1, shm, stream, args, nullptr);
+        hipEventRecord(k.b, 0);
+        ktimes->push_back(k);
+        if (e != hipSuccess) throw std::runtime_error("qwen3tts device: a kernel launch failed");
+        return;
+    }
+    if (hipModuleLaunchKernel(f, blocks, 1, 1, threads, 1, 1, shm, stream, args, nullptr) != hipSuccess)
         throw std::runtime_error("qwen3tts device: a kernel launch failed");
 }
 
-// y = W x for one token (the BF16 matrix in place; fp32 activations)
-void mv(const Mat& W, const float* x, float* y) {
-    if (!W.h) throw std::runtime_error("qwen3tts device: a matrix is not BF16");
-    if (qmatvec_launch_bf16f(W.h, sizeof(uint16_t) * (size_t)W.cols, x, y, W.rows, W.cols, 1, 0) != hipSuccess)
-        throw std::runtime_error("qwen3tts device: the matvec launch failed");
+const char* kernel_name(hipFunction_t f) {
+    if (f == f_qkv) return "tk_qkv";
+    if (f == f_qk) return "tk_qk_rope_kv";
+    if (f == f_attn) return "tk_attn";
+    if (f == f_oproj) return "tk_oproj_add";
+    if (f == f_gateup) return "tk_gateup";
+    if (f == f_down) return "tk_down_add";
+    if (f == f_head) return "tk_head";
+    return "?";
 }
 
-// rows of n values: y = rms_norm(x) * w, one block per row (y may be x)
-void rms(const float* x, float* y, int rows, int n, const float* w, float eps) {
-    void* args[] = {(void*)&x, (void*)&w, (void*)&y, (void*)&n, (void*)&eps};
-    launch(f_rmsnorm, (unsigned)rows, 256, 0, args);
-}
-
-void rope(float* x, int heads, int D, int pos, const float* cs, const float* sn) {
-    const int threads = heads * (D / 2);
-    void* args[] = {(void*)&x, (void*)&cs, (void*)&sn, (void*)&heads, (void*)&D, (void*)&pos};
-    launch(f_rope, (unsigned)((threads + 255) / 256), 256, 0, args);
-}
-
-// one pre-norm block for one token at position pos: x [C] in place; the layer's cache rows kc / vc [maxL][Hkv * D]
+// one pre-norm block for one token (talker_gpu.hip, six launches): x [C] in place; the layer's cache rows kc / vc
+// [maxL][Hkv * D]; the rotary tables cs / sn [pos][D/2]; the position is *pos_p on the device (a graph of blocks serves
+// every position); max_ctx: the largest context (the attention's shared memory)
 struct Work {
-    float *h, *q, *k, *v, *att, *o, *g, *u;
+    float *q, *k, *v, *att, *g;
 };
 
-void block(const Block& B, const Dims& d, float* x, float* kc, float* vc, int pos, const float* cs, const float* sn,
-           const Work& w) {
-    const int C = d.C, KD = d.Hkv * d.D;
-    rms(x, w.h, 1, C, B.attn_norm, d.eps);
-    mv(B.q.w, w.h, w.q);
-    mv(B.k.w, w.h, w.k);
-    mv(B.v.w, w.h, w.v);
-    rms(w.q, w.q, d.H, d.D, B.q_norm, d.eps);
-    rms(w.k, w.k, d.Hkv, d.D, B.k_norm, d.eps);
-    rope(w.q, d.H, d.D, pos, cs, sn);
-    rope(w.k, d.Hkv, d.D, pos, cs, sn);
-    {
-        const float *k = w.k, *v = w.v;
-        void* args[] = {(void*)&k, (void*)&v, (void*)&kc, (void*)&vc, (void*)&pos, (void*)&KD};
-        launch(f_kv, (unsigned)((KD + 255) / 256), 256, 0, args);
+void block(const Block& B, const Dims& d, float* x, float* kc, float* vc, const int* pos_p, int max_ctx, const float* cs,
+           const float* sn, const Work& w) {
+    const int C = d.C, H = d.H, Hkv = d.Hkv, D = d.D, FF = d.FF;
+    const int KD = Hkv * D, HD = H * D;
+    const float eps = d.eps;
+    if (!B.q.w.h || !B.k.w.h || !B.v.w.h || !B.o.w.h || !B.gate.w.h || !B.up.w.h || !B.down.w.h)
+        throw std::runtime_error("qwen3tts device: a matrix is not BF16");
+    const float* attn_norm = B.attn_norm;
+    const uint16_t *Wq = B.q.w.h, *Wk = B.k.w.h, *Wv = B.v.w.h, *Wo = B.o.w.h, *Wg = B.gate.w.h, *Wu = B.up.w.h,
+                   *Wd = B.down.w.h;
+    const float *q_norm = B.q_norm, *k_norm = B.k_norm, *ffn_norm = B.ffn_norm;
+    {  // the attention's norm, then q, k and v (one launch: the rows of the three matrices)
+        const float* xin = x;
+        float *q = w.q, *k = w.k, *v = w.v;
+        const int nq = HD, nk = KD, nv = KD;
+        const int rows = nq + nk + nv;
+        void* args[] = {(void*)&xin, (void*)&attn_norm, (void*)&Wq, (void*)&Wk, (void*)&Wv, (void*)&C, (void*)&nq,
+                        (void*)&nk, (void*)&nv, (void*)&eps, (void*)&q, (void*)&k, (void*)&v};
+        launch(f_qkv, (unsigned)((rows + 7) / 8), 256, (unsigned)(C * sizeof(float)), args);
     }
-    {
+    {  // the q and k heads' norms and rotary, the cache row of this position
+        float *q = w.q, *k = w.k;
+        const float* v = w.v;
+        void* args[] = {(void*)&q, (void*)&k, (void*)&v, (void*)&q_norm, (void*)&k_norm, (void*)&cs, (void*)&sn,
+                        (void*)&pos_p, (void*)&kc, (void*)&vc, (void*)&H, (void*)&Hkv, (void*)&D, (void*)&KD, (void*)&eps};
+        launch(f_qk, (unsigned)(H + Hkv), 256, (unsigned)(D * sizeof(float)), args);
+    }
+    {  // the attention over the cache rows 0 .. pos
         const float* q = w.q;
-        const int n_ctx = pos + 1, H = d.H, Hkv = d.Hkv, D = d.D;
-        void* args[] = {(void*)&q, (void*)&kc, (void*)&vc, (void*)&w.att, (void*)&n_ctx, (void*)&H, (void*)&Hkv, (void*)&D};
-        launch(f_attn, (unsigned)d.H, 256, (unsigned)(n_ctx * sizeof(float)), args);
+        float* att = w.att;
+        void* args[] = {(void*)&q, (void*)&kc, (void*)&vc, (void*)&att, (void*)&pos_p, (void*)&H, (void*)&Hkv, (void*)&D};
+        launch(f_attn, (unsigned)H, 256, (unsigned)(max_ctx * sizeof(float)), args);
     }
-    mv(B.o.w, w.att, w.o);
-    {
-        const float* o = w.o;
-        void* args[] = {(void*)&x, (void*)&o, (void*)&C};
-        launch(f_add, (unsigned)((C + 255) / 256), 256, 0, args);
+    {  // x += Wo att
+        const float* att = w.att;
+        void* args[] = {(void*)&att, (void*)&Wo, (void*)&x, (void*)&HD, (void*)&C};
+        launch(f_oproj, (unsigned)((C + 7) / 8), 256, (unsigned)(HD * sizeof(float)), args);
     }
-    rms(x, w.h, 1, C, B.ffn_norm, d.eps);
-    mv(B.gate.w, w.h, w.g);
-    mv(B.up.w, w.h, w.u);
-    {
-        const int FF = d.FF;
-        const float* u = w.u;
-        void* args[] = {(void*)&w.g, (void*)&u, (void*)&FF};
-        launch(f_silu, (unsigned)((FF + 255) / 256), 256, 0, args);
+    {  // the FFN: g = SiLU(Wg rms(x)) * (Wu rms(x))
+        const float* xin = x;
+        float* g = w.g;
+        void* args[] = {(void*)&xin, (void*)&ffn_norm, (void*)&Wg, (void*)&Wu, (void*)&C, (void*)&FF, (void*)&eps, (void*)&g};
+        launch(f_gateup, (unsigned)((FF + 7) / 8), 256, (unsigned)(C * sizeof(float)), args);
     }
-    mv(B.down.w, w.g, w.o);
-    {
-        const float* o = w.o;
-        void* args[] = {(void*)&x, (void*)&o, (void*)&C};
-        launch(f_add, (unsigned)((C + 255) / 256), 256, 0, args);
+    {  // x += Wd g
+        const float* g = w.g;
+        void* args[] = {(void*)&g, (void*)&Wd, (void*)&x, (void*)&FF, (void*)&C};
+        launch(f_down, (unsigned)((C + 7) / 8), 256, (unsigned)(FF * sizeof(float)), args);
     }
 }
 
-// the head: rms_norm (the final norm) then the matrix, for one token: normed [C], out [rows]
+// the head for one token: normed = rms_norm(x) * norm_w, out = W normed (one launch; normed is the head's input row)
 void head(const float* x, const float* norm_w, const Mat& W, float eps, int C, float* normed, float* out) {
-    rms(x, normed, 1, C, norm_w, eps);
-    mv(W, normed, out);
+    if (!W.h) throw std::runtime_error("qwen3tts device: a matrix is not BF16");
+    const float* xin = x;
+    const float* nw = norm_w;
+    const uint16_t* Wh = W.h;
+    const int rows = W.rows;
+    float* nrm = normed;
+    float* o = out;
+    void* args[] = {(void*)&xin, (void*)&nw, (void*)&Wh, (void*)&C, (void*)&rows, (void*)&eps, (void*)&nrm, (void*)&o};
+    launch(f_head, (unsigned)((rows + 7) / 8), 256, (unsigned)(C * sizeof(float)), args);
 }
 
 // cos and sin of pos * theta^(-2i/D) for pos < rows, as the host's rope (double angles, rounded to float)
@@ -1190,6 +1218,18 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
         // one fused talker on the device at a time: the runs share stream 0 and each syncs it (the host's runs are not held)
         std::unique_lock<std::mutex> run_lock(gpu::run_mu, std::defer_lock);
         if (dev_on) run_lock.lock();
+        // the device run's stream, and the graphs of the talker's frame and of the predictor's stack (captured once per run,
+        // replayed per frame and per codebook: the position is read on the device, see dev::block)
+        struct DevRun {
+            hipStream_t s = nullptr;
+            hipGraphExec_t gtalk = nullptr, gpred = nullptr;
+            ~DevRun() {
+                if (gtalk) hipGraphExecDestroy(gtalk);
+                if (gpred) hipGraphExecDestroy(gpred);
+                if (s) hipStreamDestroy(s);
+                dev::stream = nullptr;
+            }
+        } devrun;
         // the caches and the activations: the arena (registered pages) on the device path, the host's vectors otherwise
         dev::Arena arena;
         std::vector<std::vector<float>> kc_h, vc_h, pk_h, pv_h;
@@ -1198,12 +1238,13 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
         float *xrow = xrow_h.data(), *hid = hid_h.data(), *logits = logits_h.data(), *plogits = lv_h.data(), *pin = pin_h.data(),
               *pn = pn_h.data(), *rcs = nullptr, *rsn = nullptr, *prcs = nullptr, *prsn = nullptr;
         dev::Work work{};
+        int* pos_dev = nullptr;  // the position of the step on the device (the kernels read it)
         if (dev_on) {
             const int mxC = std::max(C, pd.C), mxHD = std::max(HD, pHD), mxKD = std::max(KD, pKD), mxFF = std::max(d.FF, pd.FF);
             const size_t floats = (size_t)2 * m->n_layer * maxL * KD + (size_t)2 * m->pn_layer * (ncb + 1) * pKD +
                                   (size_t)maxL * (d.D / 2) * 2 + (size_t)(ncb + 1) * (pd.D / 2) * 2 +
-                                  (size_t)(3 * C + V + m->pvocab + 2 * mxC + mxC + C) + (size_t)(mxC + 2 * mxKD + 2 * mxHD + mxC + 2 * mxFF);
-            const size_t slack_allocs = (size_t)2 * m->n_layer + 2 * m->pn_layer + 4 + 14 + 8;
+                                  (size_t)(3 * C + V + m->pvocab + 2 * mxC + mxC + C) + (size_t)(2 * mxKD + 2 * mxHD + mxFF) + 1;
+            const size_t slack_allocs = (size_t)2 * m->n_layer + 2 * m->pn_layer + 4 + 14 + 8 + 1;
             if (!arena.open(floats * sizeof(float) + 256 * slack_allocs + 4096)) throw std::runtime_error("qwen3tts device: arena");
             for (int l = 0; l < m->n_layer; ++l) {
                 kc[l] = arena.alloc((size_t)maxL * KD);
@@ -1223,16 +1264,17 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
             plogits = arena.alloc(m->pvocab);
             pin = arena.alloc(mxC);
             pn = arena.alloc(pd.C);
-            work.h = arena.alloc(mxC);
             work.q = arena.alloc(mxHD);
             work.k = arena.alloc(mxKD);
             work.v = arena.alloc(mxKD);
             work.att = arena.alloc(mxHD);
-            work.o = arena.alloc(mxC);
             work.g = arena.alloc(mxFF);
-            work.u = arena.alloc(mxFF);
             dev::rope_tables(maxL, d.D, d.theta, rcs, rsn);
             dev::rope_tables(ncb + 1, pd.D, pd.theta, prcs, prsn);
+            pos_dev = reinterpret_cast<int*>(arena.alloc(1));
+            if (hipStreamCreateWithFlags(&devrun.s, hipStreamNonBlocking) != hipSuccess)
+                throw std::runtime_error("qwen3tts device: the stream");
+            dev::stream = devrun.s;
         } else {
             kc_h.assign(m->n_layer, std::vector<float>((size_t)maxL * KD));
             vc_h.assign(m->n_layer, std::vector<float>((size_t)maxL * KD));
@@ -1245,8 +1287,11 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
         // sampling, the predictor (its stacks, heads, samples) and the talker's block stack
         using clk = std::chrono::steady_clock;
         const bool prof = std::getenv("QWEN3TTS_PROFILE") != nullptr;
+        std::vector<dev::KTime> kt;
+        // QWEN3TTS_PROFILE=2: the kernels timed one by one (direct launches, not the graphs)
+        if (dev_on && std::getenv("QWEN3TTS_PROFILE") && std::getenv("QWEN3TTS_PROFILE")[0] == '2') dev::ktimes = &kt;
         auto ms_since = [](clk::time_point t) { return std::chrono::duration<double, std::milli>(clk::now() - t).count(); };
-        double t_prefill = 0, t_samp = 0, t_pred = 0, t_tal = 0;
+        double t_prefill = 0, t_samp = 0, t_pred = 0, t_tal = 0, t_issue = 0, t_head_wait = 0;
         const clk::time_point t_setup = clk::now();
         // the prefill (on the host, into the caches)
         std::vector<float> x(prefill.begin(), prefill.begin() + (size_t)P * C);
@@ -1265,10 +1310,48 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
         std::vector<int> frame(ncb);
         std::vector<float> lv(m->pvocab);  // the host predictor's logits (the device path writes plogits)
         auto sync = [&]() {
-            if (hipStreamSynchronize(0) != hipSuccess) throw std::runtime_error("qwen3tts device: the stream failed");
+            if (hipStreamSynchronize(devrun.s ? devrun.s : 0) != hipSuccess) throw std::runtime_error("qwen3tts device: the stream failed");
+        };
+        // the device's work of a step as a graph: captured once (the kernels and their arguments are the same every step; the
+        // position is pos_dev's value). With dev::ktimes set (the per-kernel profile) the launches are direct.
+        auto capture = [&](const std::function<void()>& body) {
+            hipGraph_t g = nullptr;
+            hipGraphExec_t e = nullptr;
+            if (hipStreamBeginCapture(devrun.s, hipStreamCaptureModeGlobal) != hipSuccess)
+                throw std::runtime_error("qwen3tts device: graph capture");
+            try {
+                body();
+            } catch (...) {
+                hipGraph_t tmp = nullptr;
+                (void)hipStreamEndCapture(devrun.s, &tmp);
+                if (tmp) hipGraphDestroy(tmp);
+                throw;
+            }
+            if (hipStreamEndCapture(devrun.s, &g) != hipSuccess) throw std::runtime_error("qwen3tts device: graph capture");
+            if (hipGraphInstantiate(&e, g, nullptr, nullptr, 0) != hipSuccess) throw std::runtime_error("qwen3tts device: graph");
+            hipGraphDestroy(g);
+            return e;
+        };
+        if (dev_on && !dev::ktimes) {
+            devrun.gpred = capture([&]() {
+                for (int l = 0; l < m->pn_layer; ++l) dev::block(m->pblk[l], pd, pin, pkc[l], pvc[l], pos_dev, ncb + 1, prcs, prsn, work);
+            });
+            devrun.gtalk = capture([&]() {
+                for (int l = 0; l < m->n_layer; ++l) dev::block(m->blk[l], d, xrow, kc[l], vc[l], pos_dev, maxL, rcs, rsn, work);
+                dev::head(xrow, m->out_norm, m->codec_head.w, m->eps, C, hid, logits);
+            });
+        }
+        auto run = [&](hipGraphExec_t exec, const std::function<void()>& direct) {
+            if (!exec) { direct(); return; }
+            if (hipGraphLaunch(exec, devrun.s) != hipSuccess) throw std::runtime_error("qwen3tts device: graph launch");
         };
         auto pred_stack = [&](int p) {  // one token of the predictor at position p, through its layers (pin in place)
-            for (int l = 0; l < m->pn_layer; ++l) dev::block(m->pblk[l], pd, pin, pkc[l], pvc[l], p, prcs, prsn, work);
+            const clk::time_point t0 = clk::now();
+            *pos_dev = p;
+            run(devrun.gpred, [&]() {
+                for (int l = 0; l < m->pn_layer; ++l) dev::block(m->pblk[l], pd, pin, pkc[l], pvc[l], pos_dev, ncb + 1, prcs, prsn, work);
+            });
+            if (prof) t_issue += ms_since(t0);
         };
         for (int t = 0; t < max_frames; ++t) {
             const clk::time_point t_frame = clk::now();
@@ -1325,8 +1408,10 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
                 mat_row(m->codec_embd, c0, pin);
                 pred_stack(1);
                 for (int k = 1; k < ncb; ++k) {
+                    const clk::time_point th = clk::now();
                     dev::head(pin, m->pred_out_norm, m->pred_head[k - 1].w, m->eps, pd.C, pn, plogits);
                     sync();
+                    if (prof) t_head_wait += ms_since(th);
                     const int best = sample_token(plogits, m->pvocab, s->sub_temperature, s->sub_top_k, &rng);
                     frame[k] = best;
                     if (k + 1 < ncb) {
@@ -1344,9 +1429,12 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
             const float* tr = t < nt ? &trailing[(size_t)t * C] : pad.data();
             if (qwen3tts_frame_input(m, frame.data(), tr, xrow) != 0) return -1;
             if (dev_on) {
-                for (int l = 0; l < m->n_layer; ++l) dev::block(m->blk[l], d, xrow, kc[l], vc[l], pos, rcs, rsn, work);
+                *pos_dev = pos;
+                run(devrun.gtalk, [&]() {
+                    for (int l = 0; l < m->n_layer; ++l) dev::block(m->blk[l], d, xrow, kc[l], vc[l], pos_dev, maxL, rcs, rsn, work);
+                    dev::head(xrow, m->out_norm, m->codec_head.w, m->eps, C, hid, logits);
+                });
                 ++pos;
-                dev::head(xrow, m->out_norm, m->codec_head.w, m->eps, C, hid, logits);
                 sync();
             } else {
                 for (int l = 0; l < m->n_layer; ++l) block_step(m->blk[l], d, xrow, 1, pos, kc[l], vc[l]);
@@ -1355,10 +1443,31 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
             }
             if (prof) t_tal += std::chrono::duration<double, std::milli>(clk::now() - t_talker).count();
         }
+        if (dev::ktimes) {  // the kernels' device time per frame
+            hipDeviceSynchronize();
+            struct Sum { double ms = 0; long n = 0; };
+            std::map<std::string, Sum> sums;
+            for (auto& k : *dev::ktimes) {
+                float ms = 0;
+                hipEventElapsedTime(&ms, k.a, k.b);
+                Sum& sm = sums[dev::kernel_name(k.f)];
+                sm.ms += ms;
+                sm.n += 1;
+                hipEventDestroy(k.a);
+                hipEventDestroy(k.b);
+            }
+            dev::ktimes->clear();
+            for (auto& kv : sums)
+                std::fprintf(stderr, "  %-16s %6ld launches  %8.2f ms per frame  (%5.1f us each)\n", kv.first.c_str(),
+                             kv.second.n / std::max(1, n_out), kv.second.ms / std::max(1, n_out),
+                             1000.0 * kv.second.ms / std::max(1L, kv.second.n));
+            dev::ktimes = nullptr;
+        }
         if (prof && n_out > 0)
-            std::fprintf(stderr, "qwen3tts profile (%s): %d frames, prefill %.0f ms; per frame: sample %.2f, predictor %.2f, "
-                         "talker %.2f ms\n", dev_on ? "device" : "host", n_out, t_prefill, t_samp / n_out, t_pred / n_out,
-                         t_tal / n_out);
+            std::fprintf(stderr, "qwen3tts profile (%s): %d frames, prefill %.0f ms; per frame: sample %.2f, predictor %.2f "
+                         "(stacks issued %.2f, head+wait %.2f), talker %.2f ms; talker C %d FF %d (%d layers), predictor C %d FF %d "
+                         "(%d layers, %d codebooks)\n", dev_on ? "device" : "host", n_out, t_prefill, t_samp / n_out, t_pred / n_out,
+                         t_issue / n_out, t_head_wait / n_out, t_tal / n_out, C, d.FF, m->n_layer, pd.C, pd.FF, m->pn_layer, ncb);
         arena.close();
         return n_out;
     } catch (const std::exception& e) {

@@ -32,9 +32,8 @@ Open work, in the order to take it. Each item names its state and the next concr
 4. **ComfyUI backend** (milestone 1 next: the component API, verified on sd-turbo). `/comfyui` is mounted again
    (28 files, about 167 GB, 7.9 GB free: converting to GGUF needs space on `/data`).
 5. **Audio** (2026-11-14; S1 and S2 in the audio section). Done: long texts in pieces, the speech pulled per piece (other
-   requests between them), wav / pcm / flac and stream for wav and pcm. Open, in order: (a) device frame fusion (U2:
-   fewer launches and syncs per talker frame, the sampler on the device; measured about 100 ms per frame in the server
-   runs, against the 44 ms of the device note: profile first, the codec decode per piece is part of it); (b) whisper
+   requests between them), wav / pcm / flac and stream for wav and pcm. Open, in order: (a) device frame (U3: fusion and graphs in, 27.5 ms per frame from 37 ms; open: the
+   2x of a predictor stack, and the sampler on the device); (b) whisper
    long-form by the Whisper seek rule (timestamps, the cut at the last complete segment) and previous-text conditioning;
    (c) whisper GPU path (the encoder's matmuls through sddev); (d) vision tower GPU path (V3 onwards); (e) torch-identical
    sampled frames: not started (the engine's sampler is its own generator; a bit match needs torch's CPU RNG path).
@@ -526,6 +525,24 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   52.9 s text in 6 pieces took 68 s (about 100 ms per frame, the device path); a 1.4 s request beside it finished after
   about 22 s (it waits for one of the other's pieces). Open: the pieces do not share prosody (each is its own run),
   and a streamed WAV's header is not a finished file.
+- U3 device frame profile (2026-11-14, `QWEN3TTS_PROFILE=1`: the stages; `=2`: each kernel timed, direct launches).
+  Before: a frame (45 frames of made-from-clip, device) took predictor 27.8 ms + talker 9.5 ms. The predictor's 16 stacks
+  (5 layers each) and the talker's 28 blocks read about 2.6 GB and 0.9 GB of BF16 weights per frame. Changes: each block is
+  six launches (`src/talker_gpu.hip`: the rms norm inside the QKV and gate/up matvecs, the q/k norms with the rotary and the
+  cache store, the residual adds in the output and down matvecs, the heads' norm), 4 loads in flight per lane; the
+  position is read on the device, so the talker frame and the predictor stack are HIP graphs replayed per step (the
+  stream is non-blocking; the profile level 2 keeps direct launches). After: predictor 20.3 ms + talker 7.2 ms = 27.5 ms
+  (26% less). Checks: the greedy generation equals qwen-tts's on all 200 frames (device and host), the top-k 1 frames
+  equal the greedy, the speech verifier and t/65 pass; the sampled frames changed from the old kernels' (the sampler's
+  draws are sensitive to the last bits of the logits), and the new version is stable over repeated runs and with
+  HIP_LAUNCH_BLOCKING=1. Measured in isolation (standalone benchmarks, the same kernels): a matvec of 12.6 MB reads at
+  320 GB/s whether its weights are a registered file mapping, a device copy or anonymous memory; the activation arena
+  costs nothing; graphs replace the launch overhead (30 launches: the same time either way once pipelined). Ruled out:
+  the registration size, /dev/shm huge pages (no change), the GPU clock (it drops only after pauses of 3 ms or more).
+  Open: a predictor stack costs about 1.1 ms on the device where the bandwidth floor is about 0.5 ms (the stage timers
+  count it through the heads' syncs); the per-kernel event timings are inflated by the events, and rocprofv3 wrote no
+  trace here (under it the speech output also changed, unexplained). Next options: find the 2x in the stack (a trace
+  without events), and the predictor's weights as Q8_0 (half the bytes; a quality decision, not the default).
 - U1 threads: the host matmuls and convolutions run on the 16 cores (OpenMP over output rows); real-time factors
   measured for the speech (talker frames per second) and the transcription (seconds of audio per second).
 - U2 GPU path (UMA: the GGUF map is pinned, so the GPU reads the same pages): decided after U1 by the measured split;
