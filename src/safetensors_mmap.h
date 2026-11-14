@@ -42,6 +42,11 @@ const char *st_shard_path(const st_model_t *m, int shard);
 /* a file's text (config.json, pdd_config.json): malloc'd, NUL-terminated; free with free(). NULL on failure. */
 char *st_read_text(const char *dir, const char *name);
 
+/* JSON text: the first number after "key": (0 if not found); the numbers of the array after "key": [ ... ] (up to max; the
+ * count returned, -1 if the key is missing). Plain scans: the configs' own keys are unique enough for these. */
+int st_json_number(const char *text, const char *key, double *out);
+int st_json_numbers(const char *text, const char *key, double *out, int max);
+
 #ifdef __cplusplus
 }
 #endif

@@ -330,3 +330,36 @@ char *st_read_text(const char *dir, const char *name) {
     out[s.size()] = 0;
     return out;
 }
+
+int st_json_number(const char *text, const char *key, double *out) {
+    if (!text || !key || !out) return 0;
+    const std::string k = std::string("\"") + key + "\"";
+    const char *p = strstr(text, k.c_str());
+    if (!p) return 0;
+    p += k.size();
+    while (*p == ' ' || *p == '\n' || *p == '\t' || *p == ':') ++p;
+    char *e = nullptr;
+    const double v = strtod(p, &e);
+    if (e == p) return 0;
+    *out = v;
+    return 1;
+}
+
+int st_json_numbers(const char *text, const char *key, double *out, int max) {
+    if (!text || !key || !out) return -1;
+    const std::string k = std::string("\"") + key + "\"";
+    const char *p = strstr(text, k.c_str());
+    if (!p) return -1;
+    const char *o = strchr(p + k.size(), '[');
+    const char *c = o ? strchr(o, ']') : nullptr;
+    if (!o || !c) return -1;
+    int n = 0;
+    for (const char *q = o + 1; q < c && n < max;) {
+        char *e = nullptr;
+        const double v = strtod(q, &e);
+        if (e == q) { ++q; continue; }
+        out[n++] = v;
+        q = e;
+    }
+    return n;
+}

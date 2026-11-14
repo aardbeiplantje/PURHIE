@@ -12,7 +12,12 @@
    original MiniMax DiT (`/hf/MiniMax-H3-Image/transformer`, 12 LFS shards): 531 tensors, 66.28 GB, bytes identical to the
    converted GGUF for every tensor. NEXT: the DiT, the PDD heads and the VAE read through a tensor source (a GGUF or a
    checkpoint directory; about 35 GGUF call sites in `minimax_dit.cpp` and `minimax_vae.cpp`), then `mm_open` takes the
-   checkpoint directories. DONE for the DiT and the PDD heads: `mmdit_open` takes a GGUF or the original checkpoint (the
+   checkpoint directories. DONE (2026-11-14): the VAE too (`mmvae_open` takes `vae/diffusion_pytorch_model.safetensors`; the
+   latents' statistics and the rope theta from its config.json; `mm_vae_verify` identical on both paths). The end-to-end 256
+   request on the originals (DiT dir, PDD file, VAE file; text encoder still its GGUF, the VL one per the user's choice) gives
+   a PNG byte-identical to the GGUF-path one. Its timing that run: text load 48 s (15 s before), DiT open 25 s, sampler 116 s,
+   VAE 23 s; the slower loads are likely page-cache contention (both the original and the GGUF files read), not checked.
+   LLM safetensors loading is left as is (user, 2026-11-14). DONE for the DiT and the PDD heads: `mmdit_open` takes a GGUF or the original checkpoint (the
    transformer directory; `pdd_fused_heads.safetensors` with `pdd_config.json` for the sigmas). Checked: the GGUF path and the
    checkpoint path give the same numbers. The DiT verifier's numbers moved with the flash-attention change (committed
    before this): velocity step 0 0.9984961-0.9985183, sampler 0.9840961 (was 0.9852158 before the flash kernel, `mm_dit_verify`

@@ -6,6 +6,8 @@
 #include "minimax_vae.h"
 
 #include "gguf_mmap.h"
+#include "minimax_weights.h"
+#include "safetensors_mmap.h"
 #include "kernel_loader.h"
 #include "sd_device.h"
 
@@ -162,11 +164,11 @@ Planes stitch(const std::vector<std::vector<Planes>>& tiles, const std::vector<i
 }  // namespace
 
 struct mmvae {
-    gguf_model_t* g = nullptr;
-    const void* dev_base = nullptr;
+    WeightFile w;  // the decoder's weights: the GGUF, or the original checkpoint
+    std::vector<const void*> dev_bases;  // the mappings registered for the device
+    sddev::Floats mean_own, std_own;  // the latents' statistics from the checkpoint's config.json (a GGUF has them as tensors)
     ~mmvae() {
-        if (dev_base) sddev::unregister_weights(dev_base);
-        if (g) gguf_mmap_close(g);
+        for (const void* base : dev_bases) sddev::unregister_weights(base);
     }
     const float *pq_w = nullptr, *pq_b = nullptr, *proj_in_w = nullptr, *proj_in_b = nullptr, *reg = nullptr,
                 *proj_out_w = nullptr, *proj_out_b = nullptr, *norm_out_w = nullptr, *norm_out_b = nullptr,
@@ -183,8 +185,8 @@ namespace {
 
 const float* tensor(const mmvae* m, const std::string& name) {
     size_t bytes = 0;
-    const void* p = gguf_get_tensor_ptr(m->g, name.c_str(), &bytes);
-    if (!p) throw std::runtime_error("minimax vae: no tensor " + name + " in the GGUF");
+    const void* p = m->w.tensor(name, &bytes);
+    if (!p) throw std::runtime_error("minimax vae: no tensor " + name);
     return static_cast<const float*>(p);
 }
 
@@ -330,25 +332,64 @@ void decode_tile(const mmvae* m, const float* zd, int H, int W, Planes& out) {
 
 }  // namespace
 
-mmvae_t* mmvae_open(const char* gguf_path) {
+// A path of a GGUF (rocm-convert's output), else the original checkpoint's decoder file (vae/diffusion_pytorch_model.safetensors,
+// its config.json in the same directory)
+static bool is_gguf_file(const char* path) {
+    const std::string s = path ? path : "";
+    return s.size() >= 5 && s.compare(s.size() - 5, 5, ".gguf") == 0;
+}
+
+mmvae_t* mmvae_open(const char* path) {
     try {
         std::unique_ptr<mmvae> m(new mmvae());
-        m->g = gguf_mmap_open(gguf_path);
-        if (!m->g) throw std::runtime_error(std::string("cannot open ") + (gguf_path ? gguf_path : "(null)"));
-        if (std::string(gguf_arch(m->g)) != "minimax_h3_vae") throw std::runtime_error("not a MiniMax-H3 VAE GGUF");
         if (!sddev::enabled()) throw std::runtime_error("minimax vae: needs the device (SD_DEVICE unset or gpu)");
-        if (gguf_arch_int(m->g, "decoder.layers", -1) != kLayers || gguf_arch_int(m->g, "decoder.heads", -1) != kHeads ||
-            gguf_arch_int(m->g, "decoder.head_dim", -1) != kHeadDim || gguf_arch_int(m->g, "decoder.register_tokens", -1) != kRegs ||
-            gguf_arch_int(m->g, "latent_channels", -1) != kLatent)
-            throw std::runtime_error("minimax vae: the GGUF's decoder is not the 24-layer 1024-wide one this engine has");
-        m->theta = gguf_arch_float(m->g, "decoder.rope_theta", (float)kTheta);
-        if (gguf_n_maps(m->g) == 1) {
+        if (is_gguf_file(path)) {
+            m->w.g = gguf_mmap_open(path);
+            if (!m->w.g) throw std::runtime_error(std::string("cannot open ") + (path ? path : "(null)"));
+            if (std::string(gguf_arch(m->w.g)) != "minimax_h3_vae") throw std::runtime_error("not a MiniMax-H3 VAE GGUF");
+            if (gguf_arch_int(m->w.g, "decoder.layers", -1) != kLayers || gguf_arch_int(m->w.g, "decoder.heads", -1) != kHeads ||
+                gguf_arch_int(m->w.g, "decoder.head_dim", -1) != kHeadDim || gguf_arch_int(m->w.g, "decoder.register_tokens", -1) != kRegs ||
+                gguf_arch_int(m->w.g, "latent_channels", -1) != kLatent)
+                throw std::runtime_error("minimax vae: the GGUF's decoder is not the 24-layer 1024-wide one this engine has");
+            m->theta = gguf_arch_float(m->w.g, "decoder.rope_theta", (float)kTheta);
+            if (gguf_n_maps(m->w.g) != 1) throw std::runtime_error("minimax vae: the GGUF is split");
             size_t bytes = 0;
-            m->dev_base = gguf_map_base(m->g, &bytes);
-            if (!sddev::register_weights(m->dev_base, bytes)) throw std::runtime_error("minimax vae: cannot register the weights");
+            const void* base = gguf_map_base(m->w.g, &bytes);
+            if (!sddev::register_weights(base, bytes)) throw std::runtime_error("minimax vae: cannot register the weights");
+            m->dev_bases.push_back(base);
         } else {
-            throw std::runtime_error("minimax vae: the GGUF is split");
+            // the original checkpoint: the decoder's tensors by their names, the rope theta and the latents' statistics from
+            // config.json (the decoder's own keys: vit_decoder_kwargs.rope_theta; latents_mean, latents_std: 24 values)
+            const std::string file = path ? path : "";
+            const std::string dir = file.substr(0, file.rfind('/'));
+            m->w.st = st_open(file.c_str());
+            if (!m->w.st) throw std::runtime_error(std::string("minimax vae: ") + st_last_error());
+            for (int i = 0; i < st_n_shards(m->w.st); ++i) {
+                size_t bytes = 0;
+                const void* base = st_shard_base(m->w.st, i, &bytes);
+                if (!sddev::register_weights(base, bytes)) throw std::runtime_error("minimax vae: cannot register the weights");
+                m->dev_bases.push_back(base);
+            }
+            if (st_find(m->w.st, ("decoder.transformer_blocks." + std::to_string(kLayers) + ".norm1.weight").c_str()))
+                throw std::runtime_error("minimax vae: the checkpoint's decoder has more layers than this engine's 24");
+            char* text = st_read_text(dir.c_str(), "config.json");
+            if (!text) throw std::runtime_error("minimax vae: no config.json next to " + file);
+            double theta = 0;
+            if (st_json_number(text, "rope_theta", &theta) == 1) m->theta = (float)theta;
+            double mean[kLatent], sd[kLatent];
+            if (st_json_numbers(text, "latents_mean", mean, kLatent) != kLatent || st_json_numbers(text, "latents_std", sd, kLatent) != kLatent) {
+                std::free(text);
+                throw std::runtime_error("minimax vae: config.json has no 24 latents_mean / latents_std");
+            }
+            std::free(text);
+            m->mean_own = sddev::Floats(kLatent);
+            m->std_own = sddev::Floats(kLatent);
+            for (int c = 0; c < kLatent; ++c) {
+                m->mean_own[c] = (float)mean[c];
+                m->std_own[c] = (float)sd[c];
+            }
         }
+        if (!sddev::enabled()) throw std::runtime_error("minimax vae: needs the device (SD_DEVICE unset or gpu)");
         m->pq_w = tensor(m.get(), "post_quant_conv.weight");
         m->pq_b = tensor(m.get(), "post_quant_conv.bias");
         m->proj_in_w = tensor(m.get(), "decoder.x_embedder.weight");
@@ -358,8 +399,13 @@ mmvae_t* mmvae_open(const char* gguf_path) {
         m->proj_out_b = tensor(m.get(), "decoder.proj_out.bias");
         m->norm_out_w = tensor(m.get(), "decoder.norm_out.weight");
         m->norm_out_b = tensor(m.get(), "decoder.norm_out.bias");
-        m->mean = tensor(m.get(), "latents.mean");
-        m->std_ = tensor(m.get(), "latents.std");
+        if (m->w.g) {
+            m->mean = tensor(m.get(), "latents.mean");
+            m->std_ = tensor(m.get(), "latents.std");
+        } else {
+            m->mean = m->mean_own.data();
+            m->std_ = m->std_own.data();
+        }
         for (int l = 0; l < kLayers; ++l) {
             const std::string p = "decoder.transformer_blocks." + std::to_string(l) + ".";
             mmvae::Block B;
