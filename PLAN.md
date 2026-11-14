@@ -11,7 +11,8 @@
    Q4_0, Q4_1, Q5_0, Q5_1 (byte-identical to the reference in `tests/quantize_verify`), ROCmFP4 and its FAST variant.
    Text encoder vs the BF16 reference (`tests/mm_te_verify`, worst row cosine, 3 prompts): BF16 0.99993; Q8_0 0.9998-0.9999
    (34.8 GB); ROCmFP4 plain 0.9916-0.9956 (18.4 GB); ROCmFP4 with the strix recipe 0.9903-0.9956 (19.2 GB): both kept
-   supported, not the default. Q4_0 and Q5_0: pending. Still to write: MXFP4, NVFP4, TQ1_0/TQ2_0, the K-quants Q2_K-Q6_K,
+   supported, not the default. Q5_0 0.9978-0.9983 (22.5 GB); Q4_0 0.9892-0.9954 (18.4 GB). All below the 0.999 bar of
+   `mm_te_verify`; Q8_0 is the only one under it. Q4_1 and Q5_1: not converted yet. Still to write: MXFP4, NVFP4, TQ1_0/TQ2_0, the K-quants Q2_K-Q6_K,
    and the IQ types (codebook searches). The residency goal (the pipeline keeps the text encoder and the DiT both mapped)
    is what a small text encoder buys: Q8_0 (35 GB) plus the DiT (66 GB) fit in the 124 GB of RAM at once.
 
