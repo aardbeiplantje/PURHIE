@@ -16,6 +16,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <map>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -98,8 +100,18 @@ void seeded_normal(unsigned long long seed, size_t n, std::vector<float>& out) {
 
 }  // namespace
 
+// The prompts' conditioning (the text encoder's layer-50 rows), kept for the last few prompts: a repeated prompt skips the
+// encoder's load (its 65 GB of weights, ~15 s from storage), which is the whole cost of the encoder's step for a prompt.
+struct PromptEmbedding {
+    std::vector<float> h;
+    int T = 0;
+};
+constexpr size_t kPromptCacheSize = 32;
+
 struct mm_pipe {
     std::string text, dit, pdd, vae;
+    std::map<std::string, PromptEmbedding> cache;
+    std::deque<std::string> cache_order;  // oldest first
 };
 
 mm_pipe_t* mm_open(const char* text_gguf, const char* dit_gguf, const char* pdd_gguf, const char* vae_gguf) {
@@ -199,8 +211,22 @@ int mm_generate(mm_pipe_t* p, const char* prompt, int height, int width, unsigne
         // 1. the prompt's conditioning, then the encoder is released (it and the DiT are not resident together)
         double tp = phase_now();
         int T = 0;
-        std::vector<float> text = encode_prompt(p->text.c_str(), prompt, &T);
-        phase("text encoder", tp);
+        std::vector<float> text;
+        const auto hit = p->cache.find(prompt);
+        if (hit != p->cache.end()) {
+            text = hit->second.h;
+            T = hit->second.T;
+            phase("text (cached)", tp);
+        } else {
+            text = encode_prompt(p->text.c_str(), prompt, &T);
+            phase("text encoder", tp);
+            if (p->cache_order.size() >= kPromptCacheSize) {
+                p->cache.erase(p->cache_order.front());
+                p->cache_order.pop_front();
+            }
+            p->cache[prompt] = PromptEmbedding{text, T};
+            p->cache_order.push_back(prompt);
+        }
         // 2. the initial noise and the six-step sampler
         std::vector<float> noise, lat((size_t)24 * h * w);
         seeded_normal(seed, (size_t)24 * h * w, noise);
