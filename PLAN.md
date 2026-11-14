@@ -15,7 +15,12 @@
    gives identical files, and `2f9604c` gives the same numbers. Per-block comparison (`tests/mm_dit_dump.py`, the engine's
    `MMDIT_DEBUG` + `MMDIT_DEBUG_ALL`): block 0 cosine 0.99999, blocks 0-25 at about 0.8% relative error (bf16 noise), then the
    drift grows from block 30 (cosine 0.99980) to block 49 (0.9927). Rounding the residual to bf16 in the engine does not change
-   the drift (the sampler 0.9852 -> 0.9892). Next: per-op comparison inside block 30. `tests/mm_canvas_verify` (released latents) was 0.99381 before the attention work.
+   the drift (the sampler 0.9852 -> 0.9892). Per-op inside block 30 (`MMDIT_DEBUG_LAYER=30`, `LAYER=30 tests/mm_dit_dump.py`): the input to the block (block 29's
+output) differs by 1.8%; after the AdaLN (attention input) 4.9%, the attention output 7.8%, the FFN output 7.6%. The error is
+spread over all tokens (median 3.9% per token) and channels (worst 0.14), with no localized operation: consistent with
+accumulated rounding, not a single wrong op. Open: the reference is bf16 throughout (its residual values reach 2.5e6); an
+fp32 pass of blocks 30-49 from the reference's block-29 values, one block at a time (weights cast per block), would settle
+whether the engine or the reference is the closer one. `tests/mm_canvas_verify` (released latents) was 0.99381 before the attention work.
    Attention (2026-11-14): the wrapper (`sddev::attention`, 4105 tokens, 56 heads) went 96.6 -> 31 ms per call. Two causes:
    the V transpose read with a stride per thread (101 ms; now a 32 x 32 LDS tile, 1.2 ms), and the scratch buffers zeroed on
    the CPU (now not). The kernel (`sd_flash_attn`): 8 waves per block, 128 query rows, Q in registers, DPP row reductions,

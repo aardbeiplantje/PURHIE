@@ -76,6 +76,14 @@ def save(name, t):
     arr.tofile(f'{OUT}/dbg_{name}.f32')
     store[name] = arr.size
 model.token_refiner.register_forward_hook(lambda m, i, o: save('tn', o[0] if isinstance(o, tuple) else o))
+# the per-op activations of one block (MMDIT_DEBUG_LAYER=<l> in the engine: L<l>_n1, _a, _o, _n2, _f)
+LAYER = int(os.environ.get('LAYER', '30'))
+blk = model.transformer_blocks[LAYER]
+blk.attn.register_forward_pre_hook(lambda m, a: save(f'L{LAYER}_n1', a[0]))        # the attention's input: after the AdaLN
+blk.attn.to_out[0].register_forward_pre_hook(lambda m, a: save(f'L{LAYER}_a', a[0]))  # the attention's output before its projection
+blk.attn.register_forward_hook(lambda m, i, o: save(f'L{LAYER}_o', o))             # the attention's output (projected)
+blk.ff.register_forward_pre_hook(lambda m, a: save(f'L{LAYER}_n2', a[0]))         # the FFN's input: after the AdaLN
+blk.ff.register_forward_hook(lambda m, i, o: save(f'L{LAYER}_f', o))              # the FFN's output (before its gate)
 for li, blk in enumerate(model.transformer_blocks):
     blk.register_forward_hook(lambda m, i, o, li=li: save(f'blk{li:02d}', o[0] if isinstance(o, tuple) else o))
 model.transformer_blocks[0].register_forward_pre_hook(lambda m, a: save('b0_in', a[0]))

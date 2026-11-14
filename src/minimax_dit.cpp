@@ -197,14 +197,21 @@ void mod_cols(const float* x, const float* sc, const float* sh, int S, float* y)
 
 // The attention block (or the refiner's plain block when mod is null): hid [S][H] updated in place. Rows: the modality row
 // of each token (0 image, 1 text) for the AdaLN table; cs/sn: the rotary tables of the S rows (null: no rotary).
+void dbg(const char* name, const float* p, size_t n);  // (defined below)
+int g_block_layer = -1;  // the block being run (for the per-op dumps)
+
 void block(const mmdit::BlockW& B, sddev::Floats& hid, int S, const sddev::Floats* mod, const sddev::Floats* rows,
            const float* cs, const float* sn) {
+    const char* dl = std::getenv("MMDIT_DEBUG_LAYER");
+    const bool dump_ops = dl && g_block_layer == std::atoi(dl);  // (debugging: this layer's per-op activations)
+    char nm[32];
     const int C = kInner, H = kH;
     sddev::Floats n1((size_t)S * H), qkv((size_t)S * 3 * C), q((size_t)S * C), k((size_t)S * C), v((size_t)S * C), qn((size_t)S * C),
         kn((size_t)S * C), a((size_t)S * C), o((size_t)S * H), n2((size_t)S * H), pj((size_t)S * 2 * kFF),
         g((size_t)S * kFF), f((size_t)S * H);
     rms(hid.data(), S, H, B.norm1.data(), n1.data());
     if (mod) mod_rows(n1.data(), rows->data(), mod->data(), S, 0, 1, n1.data());  // shift_msa, scale_msa
+    if (dump_ops) { std::snprintf(nm, sizeof nm, "L%d_n1", g_block_layer); dbg(nm, n1.data(), (size_t)S * H); }
     double tl = g_prof.on ? now_s() : 0;
     sddev::linear_bf16(n1.data(), S, B.qkv, H, 3 * C, nullptr, qkv.data());  // head-grouped rows: (q, k, v) per head
     split_qkv(qkv.data(), S, q.data(), k.data(), v.data());
@@ -218,19 +225,23 @@ void block(const mmdit::BlockW& B, sddev::Floats& hid, int S, const sddev::Float
     double t0 = g_prof.on ? now_s() : 0;
     sddev::attention(qn.data(), S, kn.data(), v.data(), S, C, kHeads, a.data());
     if (g_prof.on) g_prof.att += now_s() - t0;
+    if (dump_ops) { std::snprintf(nm, sizeof nm, "L%d_a", g_block_layer); dbg(nm, a.data(), (size_t)S * C); }
     tl = g_prof.on ? now_s() : 0;
     sddev::linear_bf16(a.data(), S, B.out, C, H, nullptr, o.data());
     if (g_prof.on) g_prof.lin += now_s() - tl;
+    if (dump_ops) { std::snprintf(nm, sizeof nm, "L%d_o", g_block_layer); dbg(nm, o.data(), (size_t)S * H); }
     if (mod) gate_rows(hid.data(), o.data(), rows->data(), mod->data(), S, 2);  // gate_msa
     else
         for (size_t i = 0; i < (size_t)S * H; ++i) hid[i] += o[i];
     rms(hid.data(), S, H, B.norm2.data(), n2.data());
     if (mod) mod_rows(n2.data(), rows->data(), mod->data(), S, 3, 4, n2.data());  // shift_mlp, scale_mlp
+    if (dump_ops) { std::snprintf(nm, sizeof nm, "L%d_n2", g_block_layer); dbg(nm, n2.data(), (size_t)S * H); }
     tl = g_prof.on ? now_s() : 0;
     sddev::linear_bf16(n2.data(), S, B.fc1, H, 2 * kFF, nullptr, pj.data());
     swiglu(pj.data(), S, g.data());
     sddev::linear_bf16(g.data(), S, B.fc2, kFF, H, nullptr, f.data());
     if (g_prof.on) g_prof.lin += now_s() - tl;
+    if (dump_ops) { std::snprintf(nm, sizeof nm, "L%d_f", g_block_layer); dbg(nm, f.data(), (size_t)S * H); }
     if (mod) gate_rows(hid.data(), f.data(), rows->data(), mod->data(), S, 5);  // gate_mlp
     else
         for (size_t i = 0; i < (size_t)S * H; ++i) hid[i] += f[i];
@@ -425,6 +436,7 @@ int mmdit_velocity(mmdit_t* m, const float* text, int T, const float* sample, in
         dbg("b0_in", hid.data(), (size_t)S * kH);
         for (size_t l = 0; l < m->blocks.size(); ++l) {
             const mmdit::BlockW& B = m->blocks[l];
+            g_block_layer = (int)l;
             sddev::Floats mod((size_t)3 * 6 * kH);
             sddev::linear_bf16(sil.data(), 1, B.adaln.w, kTemb, 3 * 6 * kH, B.adaln.b.data(), mod.data());
             block(B, hid, S, &mod, &rows, dcs.data(), dsn.data());
