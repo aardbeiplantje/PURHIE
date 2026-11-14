@@ -49,7 +49,10 @@
    0.8092, 0.7641): better, still far below the 0.999 bar. The IQ3 types with the same imatrix: IQ3_XXS (12.55 GB, 3.06 bits
    a value) worst row cosine 0.9792, 0.9868, 0.9777; IQ3_S (14.09 GB, 3.44 bits) 0.9523, 0.9871, 0.9883. Both sit below the
    Q4_K encoder (0.9917-0.9959 at 18.4 GB, no imatrix) and far below the bar, so no IQ type is a text-encoder default; the
-   quantized encoders that clear the bar are Q5_1 (0.9982-0.9987), Q5_0 (0.9978-0.9983) and Q8_0 (0.9998-0.9999). Legacy
+   quantized encoders that clear the bar are Q5_1 (0.9982-0.9987), Q5_0 (0.9978-0.9983) and Q8_0 (0.9998-0.9999).
+   GPU matvec on a real Hugging Face file (`matvec_verify` on redponike's Qwen3-VL-32B-Instruct-IQ4_XS.gguf, 17.7 GB): IQ4_XS
+   passes (worst relative error 3e-8; int8 path 1e-8; batched exact), and the same file's q5_K and q6_K pass. Not yet run on
+   the GPU: IQ4_NL, IQ2_S, IQ2_XS, IQ1_S, IQ1_M (the encoders and the CPU decoders exist for all of them). Legacy
    and K-quant full-matrix reference behaviour: ggml weighs Q4_0 etc. by an imatrix when given; the verifier passes none
    to those types. rocm-convert accepts all of them as targets (file types as ggml's; S variants where a type has none). The residency goal (the pipeline keeps the text encoder and the DiT both mapped)
    is what a small text encoder buys: Q8_0 (35 GB) plus the DiT (66 GB) fit in the 124 GB of RAM at once.
