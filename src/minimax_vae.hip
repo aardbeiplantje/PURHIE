@@ -158,3 +158,21 @@ mm_split_qkv(const float* in, int T, int heads, int D, float* q, float* k, float
     k[i] = row[D + d];
     v[i] = row[2 * D + d];
 }
+
+// Q8_0 weights [N][K] decoded to BF16 (the engine's decoder's F32 products, rounded to nearest even): one thread per value
+extern "C" __global__ void __launch_bounds__(MV_THREADS)
+mm_dequant_q8_0_bf16(const uint8_t* W, long long row_bytes, int N, int K, uint16_t* out) {
+    const long long i = (long long)blockIdx.x * MV_THREADS + threadIdx.x;  // over N * K
+    if (i >= (long long)N * K) return;
+    const long long r = i / K;
+    const int c = (int)(i % K);
+    const uint8_t* b = W + r * row_bytes + (long long)(c / 32) * 34;
+    const uint16_t dbits = (uint16_t)(b[0] | (b[1] << 8));
+    _Float16 dh;
+    __builtin_memcpy(&dh, &dbits, 2);
+    const float v = (float)((int8_t)b[2 + (c % 32)]) * (float)dh;
+    uint32_t u;
+    __builtin_memcpy(&u, &v, 4);
+    if ((u & 0x7F800000u) != 0x7F800000u) u += 0x7FFFu + ((u >> 16) & 1u);
+    out[i] = (uint16_t)(u >> 16);
+}

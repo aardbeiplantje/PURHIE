@@ -56,7 +56,7 @@ constexpr int kThreads = 256;
 struct Kernels {
     hipModule_t mod = nullptr;
     hipFunction_t rmsnorm = nullptr, rope = nullptr, swiglu = nullptr, mod_rows = nullptr, gate_rows = nullptr,
-                  mod_cols = nullptr, split_qkv = nullptr;
+                  mod_cols = nullptr, split_qkv = nullptr, dq_q8 = nullptr;
 };
 Kernels g_k;
 
@@ -67,9 +67,10 @@ void check(hipError_t e, const char* what) {
 void load_kernels() {
     if (g_k.mod) return;
     if (kernel_module_load(&g_k.mod, "minimax_vae.co") != hipSuccess) throw std::runtime_error("minimax dit: minimax_vae.co does not load");
-    hipFunction_t* fs[] = {&g_k.rmsnorm, &g_k.rope, &g_k.swiglu, &g_k.mod_rows, &g_k.gate_rows, &g_k.mod_cols, &g_k.split_qkv};
-    const char* names[] = {"mv_rmsnorm", "mv_rope", "mm_swiglu_native", "mm_mod_rows", "mm_gate_rows", "mm_mod_cols", "mm_split_qkv"};
-    for (int i = 0; i < 7; ++i) check(hipModuleGetFunction(fs[i], g_k.mod, names[i]), names[i]);
+    hipFunction_t* fs[] = {&g_k.rmsnorm, &g_k.rope, &g_k.swiglu, &g_k.mod_rows, &g_k.gate_rows, &g_k.mod_cols, &g_k.split_qkv, &g_k.dq_q8};
+    const char* names[] = {"mv_rmsnorm", "mv_rope", "mm_swiglu_native", "mm_mod_rows", "mm_gate_rows", "mm_mod_cols", "mm_split_qkv",
+                           "mm_dequant_q8_0_bf16"};
+    for (int i = 0; i < 8; ++i) check(hipModuleGetFunction(fs[i], g_k.mod, names[i]), names[i]);
 }
 
 void launch(hipFunction_t f, long n, void** args) {
@@ -206,8 +207,26 @@ void lin_apply(const mmdit::Lin& L0, const float* x, int T, float* y) {
             scr_n = nw;
         }
         uint16_t* wb = reinterpret_cast<uint16_t*>(scr->data());
-        if (L0.qt >= 0) dequant_bf16(L0.qt, static_cast<const uint8_t*>(L0.q), L0.row_bytes, L0.out, L0.in, wb);
-        else std::memcpy(wb, L0.w, nw * sizeof(uint16_t));
+        if (L0.qt == QT_Q8_0) {  // decoded on the device (memory-bound: the BF16 kernels read what it writes)
+            const uint8_t* W8 = static_cast<const uint8_t*>(L0.q);
+            long long rb = (long long)L0.row_bytes;
+            int N = L0.out, K = L0.in;
+            void* args[] = {(void*)&W8, (void*)&rb, (void*)&N, (void*)&K, (void*)&wb};
+            const long long total = (long long)nw;
+            check(hipModuleLaunchKernel(g_k.dq_q8, (unsigned)((total + 255) / 256), 1, 1, 256, 1, 1, 0, nullptr, args, nullptr),
+                  "dequant q8_0");
+            check(hipStreamSynchronize(nullptr), "stream");
+            if (std::getenv("MMDIT_CHECK_DEQUANT")) {  // (debugging: the device's decode against the CPU decoder, bit for bit)
+                std::vector<uint16_t> ref(nw);
+                dequant_bf16(L0.qt, W8, L0.row_bytes, L0.out, L0.in, ref.data());
+                if (std::memcmp(ref.data(), wb, nw * sizeof(uint16_t)) != 0)
+                    throw std::runtime_error("minimax dit: the device's Q8_0 decode differs from the CPU decoder");
+            }
+        } else if (L0.qt >= 0) {
+            dequant_bf16(L0.qt, static_cast<const uint8_t*>(L0.q), L0.row_bytes, L0.out, L0.in, wb);
+        } else {
+            std::memcpy(wb, L0.w, nw * sizeof(uint16_t));
+        }
         Ld = L0;
         Ld.qt = -1;
         Ld.w = wb;
