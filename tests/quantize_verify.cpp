@@ -27,7 +27,7 @@ static void check(bool ok, const std::string& what) {
     printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what.c_str());
 }
 
-static const int kTypes[] = {QT_Q8_0, QT_Q4_0_ROCMFP4, QT_Q4_0_ROCMFP4_FAST, QT_F16, QT_BF16, QT_Q4_0, QT_Q4_1, QT_Q5_0, QT_Q5_1, QT_Q4_K, QT_Q5_K};
+static const int kTypes[] = {QT_Q8_0, QT_Q4_0_ROCMFP4, QT_Q4_0_ROCMFP4_FAST, QT_F16, QT_BF16, QT_Q4_0, QT_Q4_1, QT_Q5_0, QT_Q5_1, QT_Q4_K, QT_Q5_K, QT_Q6_K};
 
 // Bytes differing between ours and the reference's for nrows x ncols; first differing row in *first
 static size_t compare(int t, const float* x, int64_t nrows, int64_t ncols, int64_t* first) {
@@ -53,8 +53,8 @@ static size_t compare(int t, const float* x, int64_t nrows, int64_t ncols, int64
 static void check_all(const char* what, const std::vector<float>& x, int64_t ncols, bool finite_only = false) {
     const int64_t nrows = (int64_t)x.size() / ncols;
     for (int t : kTypes) {
-        if (finite_only && (t == QT_Q4_K || t == QT_Q5_K)) continue;  // (see the NaN / Inf case)
-        if ((t == QT_Q4_K || t == QT_Q5_K) && ncols % 256) continue;  // a K-quant row is whole super-blocks (the reference has no row of 32)
+        if (finite_only && (t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K)) continue;  // (see the NaN / Inf case)
+        if ((t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K) && ncols % 256) continue;  // a K-quant row is whole super-blocks (the reference has no row of 32)
         int64_t first;
         const size_t nd = compare(t, x.data(), nrows, ncols, &first);
         char buf[256];
