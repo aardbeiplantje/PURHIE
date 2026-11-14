@@ -349,7 +349,7 @@ uninstall:
 	rm -f $(INSTALL_PKGCONFIGDIR)/rocm-inference.pc
 
 # Phase 4: Qwen 3 model static library
-QWEN_SRCS = $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_ops.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/deltanet.cpp $(SRCDIR)/attention.cpp $(SRCDIR)/gpu_ops.cpp $(SRCDIR)/kernel_loader.cpp $(SRCDIR)/glm5_ref.cpp $(SRCDIR)/glm5_gpu.cpp $(SRCDIR)/expert_cpu.cpp $(SRCDIR)/vision.cpp $(SRCDIR)/image.cpp $(SRCDIR)/mrope.cpp $(SRCDIR)/whisper.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/audio.cpp $(SRCDIR)/sd.cpp $(SRCDIR)/sd_device.cpp $(SRCDIR)/minimax_vae.cpp $(SRCDIR)/minimax_dit.cpp $(SRCDIR)/minimax_pipe.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_speech.cpp
+QWEN_SRCS = $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_ops.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/deltanet.cpp $(SRCDIR)/attention.cpp $(SRCDIR)/gpu_ops.cpp $(SRCDIR)/kernel_loader.cpp $(SRCDIR)/glm5_ref.cpp $(SRCDIR)/glm5_gpu.cpp $(SRCDIR)/expert_cpu.cpp $(SRCDIR)/vision.cpp $(SRCDIR)/image.cpp $(SRCDIR)/mrope.cpp $(SRCDIR)/whisper.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/audio.cpp $(SRCDIR)/sd.cpp $(SRCDIR)/sd_device.cpp $(SRCDIR)/minimax_vae.cpp $(SRCDIR)/minimax_dit.cpp $(SRCDIR)/minimax_pipe.cpp $(SRCDIR)/safetensors_mmap.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_speech.cpp
 QWEN_HDRS = $(SRCDIR)/whisper.h $(SRCDIR)/mel.h $(SRCDIR)/qwen3tts.h $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/qwen3tts_speech.h $(SRCDIR)/vision.h $(SRCDIR)/image.h $(SRCDIR)/mrope.h $(SRCDIR)/third_party/stb_image.h $(SRCDIR)/expert_pager.h $(SRCDIR)/expert_cpu.h $(SRCDIR)/qwen_model.h $(SRCDIR)/qwen_ops.h $(SRCDIR)/qmatvec.h $(SRCDIR)/deltanet.h $(SRCDIR)/attention.h $(SRCDIR)/gpu_ops.h $(SRCDIR)/inference_internal.h $(SRCDIR)/kernel_loader.h $(SRCDIR)/inference_log.h $(SRCDIR)/glm5_ref.h $(SRCDIR)/glm5_gpu.h
 # The engine's code objects, embedded in the library (kernels_embed.S, loaded by kernel_loader.cpp)
 ENGINE_COS = $(CODIR)/matvec_q.co $(CODIR)/gpu_ops.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/glm5_gpu.co $(CODIR)/talker_gpu.co $(CODIR)/sd_gpu.co $(CODIR)/minimax_vae.co
@@ -380,10 +380,11 @@ $(QWEN_MODEL_LIB): $(QWEN_SRCS) $(QWEN_HDRS) $(SRCDIR)/inference.h $(SRCDIR)/ggu
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/minimax_vae.cpp -o $(OBJDIR)/minimax_vae.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/minimax_dit.cpp -o $(OBJDIR)/minimax_dit.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/minimax_pipe.cpp -o $(OBJDIR)/minimax_pipe.o
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/safetensors_mmap.cpp -o $(OBJDIR)/safetensors_mmap.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/qwen3tts_codec.cpp -o $(OBJDIR)/qwen3tts_codec.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/qwen3tts_speech.cpp -o $(OBJDIR)/qwen3tts_speech.o
 	rm -f $@
-	ar rcs $@ $(OBJDIR)/qwen_model.o $(OBJDIR)/qwen_ops.o $(OBJDIR)/qmatvec.o $(OBJDIR)/deltanet.o $(OBJDIR)/attention.o $(OBJDIR)/gpu_ops.o $(OBJDIR)/kernel_loader.o $(OBJDIR)/glm5_ref.o $(OBJDIR)/glm5_gpu.o $(OBJDIR)/expert_cpu.o $(OBJDIR)/vision.o $(OBJDIR)/image.o $(OBJDIR)/mrope.o $(OBJDIR)/whisper.o $(OBJDIR)/mel.o $(OBJDIR)/audio.o $(OBJDIR)/sd.o $(OBJDIR)/sd_device.o $(OBJDIR)/minimax_vae.o $(OBJDIR)/minimax_dit.o $(OBJDIR)/minimax_pipe.o $(OBJDIR)/qwen3tts.o $(OBJDIR)/qwen3tts_codec.o $(OBJDIR)/qwen3tts_speech.o $(OBJDIR)/kernels_embed.o
+	ar rcs $@ $(OBJDIR)/qwen_model.o $(OBJDIR)/qwen_ops.o $(OBJDIR)/qmatvec.o $(OBJDIR)/deltanet.o $(OBJDIR)/attention.o $(OBJDIR)/gpu_ops.o $(OBJDIR)/kernel_loader.o $(OBJDIR)/glm5_ref.o $(OBJDIR)/glm5_gpu.o $(OBJDIR)/expert_cpu.o $(OBJDIR)/vision.o $(OBJDIR)/image.o $(OBJDIR)/mrope.o $(OBJDIR)/whisper.o $(OBJDIR)/mel.o $(OBJDIR)/audio.o $(OBJDIR)/sd.o $(OBJDIR)/sd_device.o $(OBJDIR)/minimax_vae.o $(OBJDIR)/minimax_dit.o $(OBJDIR)/minimax_pipe.o $(OBJDIR)/safetensors_mmap.o $(OBJDIR)/qwen3tts.o $(OBJDIR)/qwen3tts_codec.o $(OBJDIR)/qwen3tts_speech.o $(OBJDIR)/kernels_embed.o
 
 # Phase 4: Qwen 3 demo binary
 $(QWEN_DEMO): $(SRCDIR)/demo_qwen.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/matvec_q.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/gpu_ops.co
