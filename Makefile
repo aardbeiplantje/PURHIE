@@ -341,12 +341,12 @@ install: $(INFERENCE_SO) $(INFERENCE_LIB) $(PKGCONFIG)
 	cp -f $(INFERENCE_SO_1) $(DESTDIR)$(INSTALL_LIBDIR)/
 	ln -sf libinference.so.1.0 $(DESTDIR)$(INSTALL_LIBDIR)/libinference.so.1
 	ln -sf libinference.so.1 $(DESTDIR)$(INSTALL_LIBDIR)/libinference.so
-	cp -f $(SRCDIR)/inference.h $(SRCDIR)/sampler.h $(SRCDIR)/tokenizer.h $(SRCDIR)/vision.h $(SRCDIR)/image.h $(SRCDIR)/mrope.h $(SRCDIR)/whisper.h $(SRCDIR)/mel.h $(SRCDIR)/audio.h $(DESTDIR)$(INSTALL_INCDIR)/
+	cp -f $(SRCDIR)/inference.h $(SRCDIR)/sampler.h $(SRCDIR)/tokenizer.h $(SRCDIR)/vision.h $(SRCDIR)/image.h $(SRCDIR)/mrope.h $(SRCDIR)/whisper.h $(SRCDIR)/mel.h $(SRCDIR)/audio.h $(SRCDIR)/qwen3tts.h $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/qwen3tts_speech.h $(SRCDIR)/sd.h $(SRCDIR)/minimax_pipe.h $(DESTDIR)$(INSTALL_INCDIR)/
 	sed 's|^prefix=.*|prefix=$(PREFIX)|' $(PKGCONFIG) > $(DESTDIR)$(INSTALL_PKGCONFIGDIR)/rocm-inference.pc
 
 uninstall:
 	rm -f $(INSTALL_LIBDIR)/libinference.so $(INSTALL_LIBDIR)/libinference.so.1 $(INSTALL_LIBDIR)/libinference.so.1.0
-	rm -f $(INSTALL_INCDIR)/inference.h $(INSTALL_INCDIR)/sampler.h $(INSTALL_INCDIR)/tokenizer.h $(INSTALL_INCDIR)/vision.h $(INSTALL_INCDIR)/image.h $(INSTALL_INCDIR)/mrope.h $(INSTALL_INCDIR)/whisper.h $(INSTALL_INCDIR)/mel.h $(INSTALL_INCDIR)/audio.h
+	rm -f $(INSTALL_INCDIR)/inference.h $(INSTALL_INCDIR)/sampler.h $(INSTALL_INCDIR)/tokenizer.h $(INSTALL_INCDIR)/vision.h $(INSTALL_INCDIR)/image.h $(INSTALL_INCDIR)/mrope.h $(INSTALL_INCDIR)/whisper.h $(INSTALL_INCDIR)/mel.h $(INSTALL_INCDIR)/audio.h $(INSTALL_INCDIR)/qwen3tts.h $(INSTALL_INCDIR)/qwen3tts_codec.h $(INSTALL_INCDIR)/qwen3tts_speech.h $(INSTALL_INCDIR)/sd.h $(INSTALL_INCDIR)/minimax_pipe.h
 	rm -f $(INSTALL_PKGCONFIGDIR)/rocm-inference.pc
 
 # Phase 4: Qwen 3 model static library
