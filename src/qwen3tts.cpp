@@ -17,7 +17,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <cstdint>
 #include <cstring>
@@ -1238,6 +1241,13 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
                 vc[l] = vc_h[l].data();
             }
         }
+        // QWEN3TTS_PROFILE=1: the time of each stage (stderr, at the end): the prefill, and per frame the talker's
+        // sampling, the predictor (its stacks, heads, samples) and the talker's block stack
+        using clk = std::chrono::steady_clock;
+        const bool prof = std::getenv("QWEN3TTS_PROFILE") != nullptr;
+        auto ms_since = [](clk::time_point t) { return std::chrono::duration<double, std::milli>(clk::now() - t).count(); };
+        double t_prefill = 0, t_samp = 0, t_pred = 0, t_tal = 0;
+        const clk::time_point t_setup = clk::now();
         // the prefill (on the host, into the caches)
         std::vector<float> x(prefill.begin(), prefill.begin() + (size_t)P * C);
         for (int l = 0; l < m->n_layer; ++l) block_step(m->blk[l], d, x.data(), P, 0, kc[l], vc[l]);
@@ -1246,6 +1256,7 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
             linear(hid, 1, m->codec_head, logits);
         };
         head_host(x.data() + (size_t)(P - 1) * C);
+        t_prefill = ms_since(t_setup);
         int pos = P;
         std::vector<int> history;
         const int eos = m->codec_eos;
@@ -1260,6 +1271,7 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
             for (int l = 0; l < m->pn_layer; ++l) dev::block(m->pblk[l], pd, pin, pkc[l], pvc[l], p, prcs, prsn, work);
         };
         for (int t = 0; t < max_frames; ++t) {
+            const clk::time_point t_frame = clk::now();
             // the talker's logits, processed as qwen-tts does (repetition penalty, the suppressed range, the minimum)
             std::vector<float> lg(logits, logits + V);
             // (once per distinct token, as the transformers' processor: its scatter over the unique ids)
@@ -1276,6 +1288,8 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
             const int c0 = sample_token(lg.data(), V, s->temperature, s->top_k, &rng);
             if (c0 == eos) break;
             history.push_back(c0);
+            const clk::time_point t_after_sample = clk::now();
+            if (prof) t_samp += std::chrono::duration<double, std::milli>(t_after_sample - t_frame).count();
             // the code predictor: the rows H, E(c0), then each new codebook's embedding; the output row k gives codebook k
             // through head k - 1 (causal: one new row per codebook)
             std::fill(frame.begin(), frame.end(), 0);
@@ -1321,9 +1335,11 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
                     }
                 }
             }
+            if (prof) t_pred += std::chrono::duration<double, std::milli>(clk::now() - t_after_sample).count();
             std::memcpy(out_codes + (size_t)n_out * ncb, frame.data(), sizeof(int) * ncb);
             ++n_out;
             if (t + 1 == max_frames) break;
+            const clk::time_point t_talker = clk::now();
             // the next input: the frame's sum plus the trailing text (the pad after the trailing rows)
             const float* tr = t < nt ? &trailing[(size_t)t * C] : pad.data();
             if (qwen3tts_frame_input(m, frame.data(), tr, xrow) != 0) return -1;
@@ -1337,7 +1353,12 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
                 ++pos;
                 head_host(xrow);
             }
+            if (prof) t_tal += std::chrono::duration<double, std::milli>(clk::now() - t_talker).count();
         }
+        if (prof && n_out > 0)
+            std::fprintf(stderr, "qwen3tts profile (%s): %d frames, prefill %.0f ms; per frame: sample %.2f, predictor %.2f, "
+                         "talker %.2f ms\n", dev_on ? "device" : "host", n_out, t_prefill, t_samp / n_out, t_pred / n_out,
+                         t_tal / n_out);
         arena.close();
         return n_out;
     } catch (const std::exception& e) {
