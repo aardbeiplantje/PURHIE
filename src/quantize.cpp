@@ -62,6 +62,101 @@ void qz_row_q8_0(const float *x, void *y, int64_t k) {
     }
 }
 
+// ---------------------------------------------------------------- the legacy 4- and 5-bit types (ggml's reference encoders)
+// Q4_0: block of 32, fp16 d, qs[16] (value i in the low nibble, i + 16 in the high). d = max / -8 with max the value of
+// largest magnitude (sign kept); q = min(15, (int)(x / d + 8.5)).
+void qz_row_q4_0(const float *x, void *y, int64_t k) {
+    uint8_t *out = (uint8_t *)y;  // block: fp16 d, qs[16]
+    for (int64_t i = 0; i < k / 32; ++i, x += 32, out += 18) {
+        float amax = 0.0f, max = 0.0f;
+        for (int j = 0; j < 32; ++j)
+            if (fabsf(x[j]) > amax) {
+                amax = fabsf(x[j]);
+                max = x[j];
+            }
+        const float d = max / -8.0f;
+        const float id = d ? 1.0f / d : 0.0f;
+        const uint16_t h = qz_fp32_to_fp16(d);
+        memcpy(out, &h, 2);
+        for (int j = 0; j < 16; ++j) {
+            const int a = std::min(15, (int)(x[j] * id + 8.5f)), b = std::min(15, (int)(x[16 + j] * id + 8.5f));
+            out[2 + j] = (uint8_t)(a | (b << 4));
+        }
+    }
+}
+
+// Q4_1: fp16 d, fp16 m (the minimum), qs[16]; d = (max - min) / 15, q = min(15, (int)((x - min) / d + 0.5))
+void qz_row_q4_1(const float *x, void *y, int64_t k) {
+    uint8_t *out = (uint8_t *)y;  // block: fp16 d, fp16 m, qs[16]
+    for (int64_t i = 0; i < k / 32; ++i, x += 32, out += 20) {
+        float mn = FLT_MAX, mx = -FLT_MAX;
+        for (int j = 0; j < 32; ++j) {
+            mn = std::min(mn, x[j]);
+            mx = std::max(mx, x[j]);
+        }
+        const float d = (mx - mn) / 15.0f;
+        const float id = d ? 1.0f / d : 0.0f;
+        const uint16_t hd = qz_fp32_to_fp16(d), hm = qz_fp32_to_fp16(mn);
+        memcpy(out, &hd, 2);
+        memcpy(out + 2, &hm, 2);
+        for (int j = 0; j < 16; ++j) {
+            const int a = std::min(15, (int)((x[j] - mn) * id + 0.5f)), b = std::min(15, (int)((x[16 + j] - mn) * id + 0.5f));
+            out[4 + j] = (uint8_t)(a | (b << 4));
+        }
+    }
+}
+
+// Q5_0: fp16 d, qh[4] (the fifth bit of value i at bit i, of value i + 16 at bit i + 16), qs[16]; d = max / -16,
+// q = min(31, (int)(x / d + 16.5))
+void qz_row_q5_0(const float *x, void *y, int64_t k) {
+    uint8_t *out = (uint8_t *)y;  // block: fp16 d, qh[4], qs[16]
+    for (int64_t i = 0; i < k / 32; ++i, x += 32, out += 22) {
+        float amax = 0.0f, max = 0.0f;
+        for (int j = 0; j < 32; ++j)
+            if (fabsf(x[j]) > amax) {
+                amax = fabsf(x[j]);
+                max = x[j];
+            }
+        const float d = max / -16.0f;
+        const float id = d ? 1.0f / d : 0.0f;
+        const uint16_t h = qz_fp32_to_fp16(d);
+        memcpy(out, &h, 2);
+        uint32_t qh = 0;
+        for (int j = 0; j < 16; ++j) {
+            const int a = std::min(31, (int)(x[j] * id + 16.5f)), b = std::min(31, (int)(x[16 + j] * id + 16.5f));
+            out[6 + j] = (uint8_t)((a & 0x0F) | ((b & 0x0F) << 4));
+            qh |= (uint32_t)((a & 0x10) >> 4) << j;
+            qh |= (uint32_t)((b & 0x10) >> 4) << (j + 16);
+        }
+        memcpy(out + 2, &qh, 4);
+    }
+}
+
+// Q5_1: fp16 d, fp16 m, qh[4], qs[16]; d = (max - min) / 31, q = min(31, (int)((x - min) / d + 0.5))
+void qz_row_q5_1(const float *x, void *y, int64_t k) {
+    uint8_t *out = (uint8_t *)y;  // block: fp16 d, fp16 m, qh[4], qs[16]
+    for (int64_t i = 0; i < k / 32; ++i, x += 32, out += 24) {
+        float mn = FLT_MAX, mx = -FLT_MAX;
+        for (int j = 0; j < 32; ++j) {
+            mn = std::min(mn, x[j]);
+            mx = std::max(mx, x[j]);
+        }
+        const float d = (mx - mn) / 31.0f;
+        const float id = d ? 1.0f / d : 0.0f;
+        const uint16_t hd = qz_fp32_to_fp16(d), hm = qz_fp32_to_fp16(mn);
+        memcpy(out, &hd, 2);
+        memcpy(out + 2, &hm, 2);
+        uint32_t qh = 0;
+        for (int j = 0; j < 16; ++j) {
+            const int a = std::min(31, (int)((x[j] - mn) * id + 0.5f)), b = std::min(31, (int)((x[16 + j] - mn) * id + 0.5f));
+            out[8 + j] = (uint8_t)((a & 0x0F) | ((b & 0x0F) << 4));
+            qh |= (uint32_t)((a & 0x10) >> 4) << j;
+            qh |= (uint32_t)((b & 0x10) >> 4) << (j + 16);
+        }
+        memcpy(out + 4, &qh, 4);
+    }
+}
+
 // ---------------------------------------------------------------- ROCmFP4 (rocmfp4.c, without an importance matrix)
 
 // Unsigned E4M3 scale bytes 0..126 as half-scale values: subnormals e * 2^-10, then (8 + m) * 2^(E - 11)
@@ -202,7 +297,7 @@ void qz_row_rocmfp4_fast(const float *x, void *y, int64_t k) {
 
 int qz_supported(int t) {
     return t == QT_F32 || t == QT_F16 || t == QT_BF16 || t == QT_Q8_0 || t == QT_Q4_0_ROCMFP4 ||
-           t == QT_Q4_0_ROCMFP4_FAST;
+           t == QT_Q4_0_ROCMFP4_FAST || t == QT_Q4_0 || t == QT_Q4_1 || t == QT_Q5_0 || t == QT_Q5_1;
 }
 
 static void encode_row(int t, const float *x, void *y, int64_t n) {
@@ -211,6 +306,10 @@ static void encode_row(int t, const float *x, void *y, int64_t n) {
     case QT_F16: for (int64_t i = 0; i < n; ++i) ((uint16_t *)y)[i] = qz_fp32_to_fp16(x[i]); break;
     case QT_BF16: for (int64_t i = 0; i < n; ++i) ((uint16_t *)y)[i] = qz_fp32_to_bf16(x[i]); break;
     case QT_Q8_0: qz_row_q8_0(x, y, n); break;
+    case QT_Q4_0: qz_row_q4_0(x, y, n); break;
+    case QT_Q4_1: qz_row_q4_1(x, y, n); break;
+    case QT_Q5_0: qz_row_q5_0(x, y, n); break;
+    case QT_Q5_1: qz_row_q5_1(x, y, n); break;
     case QT_Q4_0_ROCMFP4: qz_row_rocmfp4(x, y, n); break;
     case QT_Q4_0_ROCMFP4_FAST: qz_row_rocmfp4_fast(x, y, n); break;
     }

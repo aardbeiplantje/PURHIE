@@ -27,7 +27,7 @@ static void check(bool ok, const std::string& what) {
     printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what.c_str());
 }
 
-static const int kTypes[] = {QT_Q8_0, QT_Q4_0_ROCMFP4, QT_Q4_0_ROCMFP4_FAST, QT_F16, QT_BF16};
+static const int kTypes[] = {QT_Q8_0, QT_Q4_0_ROCMFP4, QT_Q4_0_ROCMFP4_FAST, QT_F16, QT_BF16, QT_Q4_0, QT_Q4_1, QT_Q5_0, QT_Q5_1};
 
 // Bytes differing between ours and the reference's for nrows x ncols; first differing row in *first
 static size_t compare(int t, const float* x, int64_t nrows, int64_t ncols, int64_t* first) {
