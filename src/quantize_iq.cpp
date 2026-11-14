@@ -1088,9 +1088,203 @@ void iq3_s_row(const float *x, uint8_t *out, int64_t n, const float *quant_weigh
     }
 }
 
+// iq1_find_best_neighbour2 (ggml): the grid entry among the neighbours (or, when none, over the whole grid) that best fits xval
+// with weights, the levels of the codebook xg to L (the fallback's diff uses the grid index as ggml does)
+int iq1_find_best_neighbour2(const Iq2Tab &t, int base, const float *xval, const float *weight, float scale, const float *xg,
+                             int8_t *L, int ngrid) {
+    const int num_neighbors = t.nb[base];
+    float best_score = FLT_MAX;
+    int grid_index = -1;
+    for (int j = 1; j <= num_neighbors; ++j) {
+        const int8_t *pg = (const int8_t *)(t.grid.data() + t.nb[base + j]);
+        float d2 = 0;
+        for (int i = 0; i < 8; ++i) {
+            const float q = xg[(pg[i] - 1) / 2];
+            const float w = weight[i];
+            const float diff = scale * q - xval[i];
+            d2 += w * diff * diff;
+        }
+        if (d2 < best_score) {
+            best_score = d2;
+            grid_index = t.nb[base + j];
+        }
+    }
+    if (grid_index < 0) {
+        for (int i = 0; i < ngrid; ++i) {
+            const int8_t *grid_i = (const int8_t *)(t.grid.data() + i);
+            float d2 = 0;
+            for (int j = 0; j < 8; ++j) {
+                const float w = weight[j];
+                const float q = xg[(grid_i[j] - 1) / 2];
+                const float diff = scale * q - xval[i];
+                d2 += w * diff * diff;
+            }
+            if (d2 < best_score) {
+                best_score = d2;
+                grid_index = i;
+            }
+        }
+    }
+    if (grid_index < 0) throw std::runtime_error("iq1: did not find a grid point (ggml aborts here too)");
+    const int8_t *pg = (const int8_t *)(t.grid.data() + grid_index);
+    for (int i = 0; i < 8; ++i) L[i] = (int8_t)((pg[i] - 1) / 2);
+    return grid_index;
+}
+
+struct Iq1Pair {  // (value, index): ggml's pairs, sorted by value with qsort
+    float v;
+    int idx;
+};
+int iq1_sort_pairs(const void *left, const void *right) {
+    const float *l = (const float *)left;
+    const float *r = (const float *)right;
+    return *l < *r ? -1 : *l > *r ? 1 : 0;
+}
+
+// IQ1_S: block of 256: fp16 d (scaled by 1.125), qs[32] (the low eight bits of each 11-bit grid index), qh[8] (uint16: three high
+// bits of each of four indices, the 3-bit scale at 12, the shift's sign at 15)
+void iq1_s_row(const float *x, uint8_t *out, int64_t n, const float *quant_weights) {
+    const Iq2Tab &t = iq2_tab(2);
+    const float x_p[3] = {-1 + 0.125f, 0.125f, 1 + 0.125f};
+    const float x_m[3] = {-1 - 0.125f, -0.125f, 1 - 0.125f};
+    const int64_t nbl = n / 256;
+    const int block_size = 32;
+    for (int64_t ibl = 0; ibl < nbl; ++ibl, out += 50) {
+        const uint16_t zero_h = qz_fp32_to_fp16(0.f);
+        memcpy(out, &zero_h, 2);
+        memset(out + 2, 0, 32);
+        memset(out + 34, 0, 16);
+        uint8_t *qs = out + 2;
+        uint16_t *qh = (uint16_t *)(out + 34);
+        float scales[8];
+        int8_t shifts[8];
+        float max_scale = 0;
+        const float *xbl = x + 256 * ibl;
+        float sumx2 = 0;
+        for (int i = 0; i < 256; ++i) sumx2 += xbl[i] * xbl[i];
+        const float sigma2 = 2 * sumx2 / 256;
+        for (int ib = 0; ib < 256 / block_size; ++ib) {
+            const float *xb = xbl + block_size * ib;
+            const float *qw = quant_weights + 256 * ibl + block_size * ib;
+            float weight[32];
+            for (int i = 0; i < block_size; ++i) weight[i] = qw[i] * sqrtf(sigma2 + xb[i] * xb[i]);
+            float max = fabsf(xb[0]);
+            for (int i = 1; i < block_size; ++i) max = max_of(max, fabsf(xb[i]));
+            int8_t L[32];
+            uint16_t index[4];
+            if (max < 1e-12f) {  // (GROUP_MAX_EPS_IQ1_S)
+                scales[ib] = 0;
+                shifts[ib] = 1;
+                memset(L, 1, block_size);
+                continue;
+            }
+            // the weighted SSD minimization with three values (-1, 0, 1): the two split points by an exhaustive search over the
+            // sorted weights (ggml's prefix sums)
+            Iq1Pair pairs[32];
+            for (int j = 0; j < block_size; ++j) {
+                pairs[j].v = xb[j];
+                pairs[j].idx = j;
+            }
+            qsort(pairs, block_size, sizeof(Iq1Pair), iq1_sort_pairs);
+            float sumx[33], sumw[33];
+            sumx[0] = sumw[0] = 0;
+            for (int j = 0; j < block_size; ++j) {
+                const int i = pairs[j].idx;
+                sumx[j + 1] = sumx[j] + weight[i] * xb[i];
+                sumw[j + 1] = sumw[j] + weight[i];
+            }
+            float best_score = -FLT_MAX, scale = max;
+            int besti1 = -1, besti2 = -1, best_shift = 0;
+            for (int i1 = 0; i1 <= block_size; ++i1) {
+                for (int i2 = i1; i2 <= block_size; ++i2) {
+                    float sumqx = (sumx[i1] - sumx[0]) * x_p[0] + (sumx[i2] - sumx[i1]) * x_p[1] + (sumx[block_size] - sumx[i2]) * x_p[2];
+                    float sumq2 = (sumw[i1] - sumw[0]) * x_p[0] * x_p[0] + (sumw[i2] - sumw[i1]) * x_p[1] * x_p[1] +
+                                  (sumw[block_size] - sumw[i2]) * x_p[2] * x_p[2];
+                    if (sumq2 > 0 && sumqx * sumqx > best_score * sumq2) {
+                        scale = sumqx / sumq2;
+                        best_score = scale * sumqx;
+                        besti1 = i1;
+                        besti2 = i2;
+                        best_shift = 1;
+                    }
+                    sumqx = (sumx[i1] - sumx[0]) * x_m[0] + (sumx[i2] - sumx[i1]) * x_m[1] + (sumx[block_size] - sumx[i2]) * x_m[2];
+                    sumq2 = (sumw[i1] - sumw[0]) * x_m[0] * x_m[0] + (sumw[i2] - sumw[i1]) * x_m[1] * x_m[1] +
+                            (sumw[block_size] - sumw[i2]) * x_m[2] * x_m[2];
+                    if (sumq2 > 0 && sumqx * sumqx > best_score * sumq2) {
+                        scale = sumqx / sumq2;
+                        best_score = scale * sumqx;
+                        besti1 = i1;
+                        besti2 = i2;
+                        best_shift = -1;
+                    }
+                }
+            }
+            if (besti1 < 0 || besti2 < 0 || best_shift == 0) {
+                scales[ib] = 0;
+                shifts[ib] = 1;
+                memset(L, 1, block_size);
+                continue;
+            }
+            for (int j = 0; j < besti1; ++j) L[pairs[j].idx] = 0;
+            for (int j = besti1; j < besti2; ++j) L[pairs[j].idx] = 1;
+            for (int j = besti2; j < block_size; ++j) L[pairs[j].idx] = 2;
+            if (scale < 0) {
+                for (int j = 0; j < block_size; ++j) L[j] = (int8_t)(2 - L[j]);
+                scale = -scale;
+                best_shift = -best_shift;
+            }
+            bool all_on_grid = true;
+            const float *xx = best_shift == 1 ? x_p : x_m;
+            for (int k = 0; k < block_size / 8; ++k) {
+                uint16_t u = 0;
+                for (int j = 0; j < 8; ++j) u |= (uint16_t)(L[8 * k + j] << 2 * j);
+                int grid_index = t.map[u];
+                if (grid_index < 0) {
+                    all_on_grid = false;
+                    grid_index = iq1_find_best_neighbour2(t, -t.map[u] - 1, xb + 8 * k, weight + 8 * k, scale, xx, L + 8 * k, 2048);
+                }
+                index[k] = (uint16_t)grid_index;
+            }
+            if (!all_on_grid) {
+                float sumqx = 0, sumq2 = 0;
+                for (int k = 0; k < block_size / 8; ++k) {
+                    const int8_t *pg = (const int8_t *)(t.grid.data() + index[k]);
+                    for (int j = 0; j < 8; ++j) {
+                        const float w = weight[8 * k + j];
+                        const float q = xx[(pg[j] - 1) / 2];
+                        sumqx += w * q * xb[8 * k + j];
+                        sumq2 += w * q * q;
+                    }
+                }
+                if (sumqx > 0 && sumq2 > 0) scale = sumqx / sumq2;
+            }
+            uint16_t h = 0;
+            for (int k = 0; k < block_size / 8; ++k) {
+                qs[(block_size / 8) * ib + k] = (uint8_t)(index[k] & 255);
+                h |= (uint16_t)((index[k] >> 8) << 3 * k);
+            }
+            qh[ib] = h;
+            scales[ib] = scale;
+            shifts[ib] = (int8_t)best_shift;
+            max_scale = max_of(max_scale, scale);
+        }
+        if (!max_scale) continue;
+        const float d = max_scale / 15;
+        const uint16_t hd = qz_fp32_to_fp16(d * 1.125f);  // another fudge factor
+        memcpy(out, &hd, 2);
+        const float id = 1 / d;
+        for (int ib = 0; ib < 8; ++ib) {
+            int l = nearest_int(0.5f * (id * scales[ib] - 1));
+            l = std::max(0, std::min(7, l));
+            if (shifts[ib] == -1) l |= 8;
+            qh[ib] |= (uint16_t)(l << 12);
+        }
+    }
+}
+
 }  // namespace
 
-int qz_iq_supported(int t) { return t == QT_IQ2_XXS || t == QT_IQ2_XS || t == QT_IQ2_S || t == QT_IQ3_XXS || t == QT_IQ3_S; }
+int qz_iq_supported(int t) { return t == QT_IQ2_XXS || t == QT_IQ2_XS || t == QT_IQ2_S || t == QT_IQ3_XXS || t == QT_IQ3_S || t == QT_IQ1_S; }
 
 void qz_iq_encode(int t, const float *x, void *y, int64_t n, const float *qw) {
     if (t == QT_IQ2_XXS) iq2_xxs_row(x, (uint8_t *)y, n, qw);
@@ -1098,5 +1292,6 @@ void qz_iq_encode(int t, const float *x, void *y, int64_t n, const float *qw) {
     else if (t == QT_IQ2_S) iq2_s_row(x, (uint8_t *)y, n, qw);
     else if (t == QT_IQ3_XXS) iq3_xxs_row(x, (uint8_t *)y, n, qw);
     else if (t == QT_IQ3_S) iq3_s_row(x, (uint8_t *)y, n, qw);
+    else if (t == QT_IQ1_S) iq1_s_row(x, (uint8_t *)y, n, qw);
     else throw std::runtime_error("qz_iq_encode: type not written yet");
 }
