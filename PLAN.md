@@ -104,6 +104,13 @@ where the bf16 reference's reaches 4% (the engine keeps the residual in fp32; th
    quantized values, not the path. The batched quantized matmul (`qmatvec_launch_batch`) runs at ~1.4 TFLOP/s against
    15-25 for the BF16 kernels (the quantized route is not used for the DiT). Not measured: FP8 (the engine has no FP8 weight
    type to write). BF16 stays the default.
+   MIXED RECIPES (2026-11-14, `rocm-convert -r plain -t REGEX=keep`; the 2048 canvas, BF16 0.992087): "keep" = the tensor
+   stays BF16. Q8_0 with the first and last two blocks (0, 1, 48, 49) and the token refiner, condition_proj,
+   video_patch_proj, time_embedder and final_layer kept: 0.991640 at 38.4 GB (9.29 bits a value). ROCmFP4 ablation: all
+   layers 0.783152; only the blocks kept 0.766359; only the non-block tensors kept 0.965980; both kept 0.932446 (lower
+   than the non-block kept alone: unexplained, not chased). So the non-block tensors carry the sensitivity; adaLN
+   (`adaln_proj`, in every block) was not kept (kept at BF16 it would be about 26 GB). The mixed Q8_0 is the candidate for
+   an optional DiT; not a default (BF16 stays the default).
 4. **ComfyUI backend** (backlog, planned 2026-11-13, see Later): the component API first, then the node package.
 - (done) **MiniMax server and resize (item 2, 2026-11-13).** The released pipeline resizes the 2048 canvas to the request
    with diffusers' `VaeImageProcessor.resize`, which is PIL's LANCZOS (the processor's default `resample`). Our area
