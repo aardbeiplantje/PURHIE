@@ -21,8 +21,13 @@ spread over all tokens (median 3.9% per token) and channels (worst 0.14), with n
 accumulated rounding, not a single wrong op. RESULT (2026-11-14, `FIRST=30 tests/mm_dit_fp32chain.py`: blocks 30-49 in fp32 from the reference's block-29 values, weights
 exact from the bf16 release, only those 20 blocks on the GPU): the fp32 chain's block-49 output vs the reference: cosine
 0.99965 (relative 2.7%); vs the engine: 0.99303 (relative 11.9%); the engine vs the reference: 0.99268. The reference is
-close to fp32, so the drift from block 30 is an ENGINE error, not the reference's rounding. Next: per-op comparison of the
-engine (`MMDIT_DEBUG_LAYER=30`) with the fp32 chain's block 30, starting from the attention. `tests/mm_canvas_verify` (released latents) was 0.99381 before the attention work.
+close to fp32, so the drift from block 30 is an ENGINE error, not the reference's rounding. (Corrected below.)
+UPDATE (same day): the chain's timestep embedding was bf16 (the loader cast the release's F32 time embedder); with it in fp32
+the fp32 chain vs the reference is cosine 0.99914 (relative 4.3%), vs the engine 0.99386 (11.1%). Block 30, same input (the
+reference's block 29 fed to the engine via `MMDIT_REPLACE_IN`), per op vs the fp32 chain: post-AdaLN input 6e-5, attention
+output 0.4%, projected 0.4%, FFN input 0.2%, FFN output 0.4%: bf16-rounding size (the engine's GEMM and attention inputs
+are bf16, as the reference's are), not one wrong op. Open: why the engine's bf16 rounding accumulates to 11% by block 49
+where the bf16 reference's reaches 4% (the engine keeps the residual in fp32; the reference rounds it). `tests/mm_canvas_verify` (released latents) was 0.99381 before the attention work.
    Attention (2026-11-14): the wrapper (`sddev::attention`, 4105 tokens, 56 heads) went 96.6 -> 31 ms per call. Two causes:
    the V transpose read with a stride per thread (101 ms; now a 32 x 32 LDS tile, 1.2 ms), and the scratch buffers zeroed on
    the CPU (now not). The kernel (`sd_flash_attn`): 8 waves per block, 128 query rows, Q in registers, DPP row reductions,

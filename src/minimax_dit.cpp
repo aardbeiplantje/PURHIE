@@ -437,6 +437,16 @@ int mmdit_velocity(mmdit_t* m, const float* text, int T, const float* sample, in
         for (size_t l = 0; l < m->blocks.size(); ++l) {
             const mmdit::BlockW& B = m->blocks[l];
             g_block_layer = (int)l;
+            if (const char* rin = std::getenv("MMDIT_REPLACE_IN")) {  // (debugging: this layer's input from a file, the same
+                const char* rl = std::getenv("MMDIT_DEBUG_LAYER");  // input as another run's; with MMDIT_DEBUG_LAYER)
+                if (rl && (int)l == std::atoi(rl)) {
+                    if (FILE* f = std::fopen(rin, "rb")) {
+                        const size_t got = std::fread(hid.data(), sizeof(float), (size_t)S * kH, f);
+                        std::fclose(f);
+                        if (got != (size_t)S * kH) { g_error = "MMDIT_REPLACE_IN: wrong size"; return -1; }
+                    }
+                }
+            }
             sddev::Floats mod((size_t)3 * 6 * kH);
             sddev::linear_bf16(sil.data(), 1, B.adaln.w, kTemb, 3 * 6 * kH, B.adaln.b.data(), mod.data());
             block(B, hid, S, &mod, &rows, dcs.data(), dsn.data());

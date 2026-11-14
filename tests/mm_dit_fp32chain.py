@@ -52,6 +52,18 @@ for f in sorted(set(index.values())):
             with torch.no_grad():
                 sd[lk].copy_(fh.get_tensor(k).to('cuda', torch.bfloat16))
             seen.add(lk)
+# the time embedder in float32, as the release keeps it (its safetensors are F32; the loop above copied to bf16): the
+# step's timestep embedding is then fp32 as in the engine
+_index = json.load(open(REL + '/diffusion_pytorch_model.safetensors.index.json'))['weight_map']
+_te = [k for k in _index if k.startswith('time_embedder.')]
+model.time_embedder.float()
+_sdte = model.time_embedder.state_dict()
+for _f in sorted(set(_index[k] for k in _te)):
+    with safe_open(real(os.path.join(REL, _f)), 'pt') as fh:
+        for _k in _te:
+            if _index[_k] == _f:
+                _sdte[_k[len('time_embedder.'):]].copy_(fh.get_tensor(_k).float().to('cuda'))
+print('time embedder in fp32 from the release', len(_te), flush=True)
 print('gpu free after load: %.1f GB' % (torch.cuda.mem_get_info()[0] / 2**30), flush=True)
 missing = [k for k in sd if k not in seen and 'inv_freq' not in k]  # (the blocks before FIRST are not in the model)
 assert not missing, missing[:5]
@@ -100,6 +112,16 @@ temb, idx, rot = cap['temb'], cap['idx'], cap['rot']
 print('captured temb', tuple(temb.shape), temb.dtype, 'idx', tuple(idx.shape), 'rot', [tuple(r.shape) for r in rot], flush=True)
 h = torch.from_numpy(np.fromfile(f'/data/minimax-ref/dit_dbg/dbg_blk{FIRST - 1:02d}.f32', dtype=np.float32)).to('cuda')
 h = h.reshape(1, S, -1)
+# the per-op activations of the fp32 chain's first block (= block FIRST): the same five points as the engine's
+# MMDIT_DEBUG_LAYER dumps (L<l>_n1, _a, _o, _n2, _f), written as fp32_L<l>_<point>.f32
+def fsave(name, t):
+    t.detach().float().cpu().reshape(-1).numpy().astype(np.float32).tofile(f'{OUT}/fp32_L{FIRST}_{name}.f32')
+b0 = model.transformer_blocks[0]
+b0.attn.register_forward_pre_hook(lambda m, a: fsave('n1', a[0]))
+b0.attn.to_out[0].register_forward_pre_hook(lambda m, a: fsave('a', a[0]))
+b0.attn.register_forward_hook(lambda m, i, o: fsave('o', o))
+b0.ff.register_forward_pre_hook(lambda m, a: fsave('n2', a[0]))
+b0.ff.register_forward_hook(lambda m, i, o: fsave('f', o))
 with torch.inference_mode():
     temb32 = temb.float()
     rot32 = tuple(r.float() for r in rot)
