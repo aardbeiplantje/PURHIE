@@ -46,8 +46,10 @@
    importance matrix, not the decode path. IQ2_XXS (and IQ2_XS, IQ1_S) is not usable as a text encoder with uniform weights.
    WITH the imatrix (`Qwen_Qwen3-VL-32B-Instruct-imatrix.gguf` from bartowski/Qwen_Qwen3-VL-32B-Instruct-GGUF: a calibration
    of the base model, so the MiniMax encoder may differ from it) the worst row cosine is 0.9448, 0.9442, 0.8927 (was 0.8155,
-   0.8092, 0.7641): better, still far below the 0.999 bar. At 2 bits a value this model loses too much; the next candidates
-   to measure are the IQ3 types. Legacy
+   0.8092, 0.7641): better, still far below the 0.999 bar. The IQ3 types with the same imatrix: IQ3_XXS (12.55 GB, 3.06 bits
+   a value) worst row cosine 0.9792, 0.9868, 0.9777; IQ3_S (14.09 GB, 3.44 bits) 0.9523, 0.9871, 0.9883. Both sit below the
+   Q4_K encoder (0.9917-0.9959 at 18.4 GB, no imatrix) and far below the bar, so no IQ type is a text-encoder default; the
+   quantized encoders that clear the bar are Q5_1 (0.9982-0.9987), Q5_0 (0.9978-0.9983) and Q8_0 (0.9998-0.9999). Legacy
    and K-quant full-matrix reference behaviour: ggml weighs Q4_0 etc. by an imatrix when given; the verifier passes none
    to those types. rocm-convert accepts all of them as targets (file types as ggml's; S variants where a type has none). The residency goal (the pipeline keeps the text encoder and the DiT both mapped)
    is what a small text encoder buys: Q8_0 (35 GB) plus the DiT (66 GB) fit in the 124 GB of RAM at once.
