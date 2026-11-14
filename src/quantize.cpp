@@ -3,6 +3,7 @@
 // ROCmFPX's rocmfp4.c (rocmfp4_quantize_row_q4_0_ref / _fast_ref: Codebook10, UE4M3 scales, exhaustive search).
 
 #include "quantize.h"
+#include "quantize_iq.h"
 #include "quant_types.h"
 
 #include <algorithm>
@@ -1111,10 +1112,10 @@ void qz_row_rocmfp4_fast(const float *x, void *y, int64_t k) {
 
 int qz_supported(int t) {
     return t == QT_F32 || t == QT_F16 || t == QT_BF16 || t == QT_Q8_0 || t == QT_Q4_0_ROCMFP4 ||
-           t == QT_Q4_0_ROCMFP4_FAST || t == QT_Q4_0 || t == QT_Q4_1 || t == QT_Q5_0 || t == QT_Q5_1 || t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_Q2_K || t == QT_Q3_K || t == QT_MXFP4 || t == QT_NVFP4 || t == QT_TQ1_0 || t == QT_TQ2_0 || t == QT_IQ4_NL || t == QT_IQ4_XS;
+           t == QT_Q4_0_ROCMFP4_FAST || t == QT_Q4_0 || t == QT_Q4_1 || t == QT_Q5_0 || t == QT_Q5_1 || t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_Q2_K || t == QT_Q3_K || t == QT_MXFP4 || t == QT_NVFP4 || t == QT_TQ1_0 || t == QT_TQ2_0 || t == QT_IQ4_NL || t == QT_IQ4_XS || qz_iq_supported(t);
 }
 
-static void encode_row(int t, const float *x, void *y, int64_t n) {
+static void encode_row(int t, const float *x, void *y, int64_t n, const float *qw) {
     switch (t) {
     case QT_F32: memcpy(y, x, (size_t)n * 4); break;
     case QT_F16: for (int64_t i = 0; i < n; ++i) ((uint16_t *)y)[i] = qz_fp32_to_fp16(x[i]); break;
@@ -1135,6 +1136,7 @@ static void encode_row(int t, const float *x, void *y, int64_t n) {
     case QT_TQ2_0: qz_row_tq2_0(x, y, n); break;
     case QT_IQ4_NL: qz_row_iq4_nl(x, y, n); break;
     case QT_IQ4_XS: qz_row_iq4_xs(x, y, n); break;
+    case QT_IQ2_XXS: case QT_IQ2_XS: qz_iq_encode(t, x, y, n, qw); break;
     case QT_Q4_0_ROCMFP4: qz_row_rocmfp4(x, y, n); break;
     case QT_Q4_0_ROCMFP4_FAST: qz_row_rocmfp4_fast(x, y, n); break;
     }
@@ -1142,7 +1144,7 @@ static void encode_row(int t, const float *x, void *y, int64_t n) {
 
 // Rows 0 .. nrows of ncols values decoded by dec(row, floats) and encoded as dst_type, rows on n_threads threads
 template <typename Dec>
-static bool run_rows(int dst_type, void *dst, int64_t nrows, int64_t ncols, int n_threads, const Dec &dec) {
+static bool run_rows(int dst_type, void *dst, int64_t nrows, int64_t ncols, int n_threads, const float *qw, const Dec &dec) {
     const size_t dst_row = qt_row_size(dst_type, ncols);
     if (n_threads <= 0) n_threads = (int)std::max(1u, std::thread::hardware_concurrency());
     n_threads = (int)std::min<int64_t>(n_threads, std::max<int64_t>(1, nrows));
@@ -1161,7 +1163,7 @@ static bool run_rows(int dst_type, void *dst, int64_t nrows, int64_t ncols, int 
                     bad = 1;
                     return;
                 }
-                encode_row(dst_type, f.data(), (uint8_t *)dst + (size_t)r * dst_row, ncols);
+                encode_row(dst_type, f.data(), (uint8_t *)dst + (size_t)r * dst_row, ncols, qw);
             }
         }
     };
@@ -1185,6 +1187,11 @@ static bool check_dst(int dst_type, int64_t ncols, char *err, size_t err_len) {
 
 int qz_quantize(int dst_type, void *dst, int src_type, const void *src, int64_t nrows, int64_t ncols, int n_threads,
                 char *err, size_t err_len) {
+    return qz_quantize_im(dst_type, dst, src_type, src, nrows, ncols, nullptr, n_threads, err, err_len);
+}
+
+int qz_quantize_im(int dst_type, void *dst, int src_type, const void *src, int64_t nrows, int64_t ncols,
+                   const float *imatrix, int n_threads, char *err, size_t err_len) {
     const size_t src_row = qt_row_size(src_type, ncols);
     if (nrows < 0 || ncols <= 0 || !dst || !src) {
         snprintf(err, err_len, "quantize: bad arguments (%lld rows of %lld)", (long long)nrows, (long long)ncols);
@@ -1202,7 +1209,10 @@ int qz_quantize(int dst_type, void *dst, int src_type, const void *src, int64_t 
     }
     if (!check_dst(dst_type, ncols, err, err_len)) return -1;
     const uint8_t *s = (const uint8_t *)src;
-    if (!run_rows(dst_type, dst, nrows, ncols, n_threads,
+    // the IQ types' weights: the importance matrix, or uniform weights (ggml requires one for some of them)
+    const std::vector<float> ones(imatrix ? 0 : (size_t)ncols, 1.0f);
+    const float *qw = imatrix ? imatrix : ones.data();
+    if (!run_rows(dst_type, dst, nrows, ncols, n_threads, qw,
                   [&](int64_t r, float *f) { return qt_to_float(src_type, s + (size_t)r * src_row, f, ncols) == 0; })) {
         snprintf(err, err_len, "quantize: decoding type %d failed", src_type);
         return -1;
@@ -1238,7 +1248,7 @@ int qz_quantize_fp8_blocks(int dst_type, void *dst, const uint8_t *src, const fl
     }
     if (!check_dst(dst_type, ncols, err, err_len)) return -1;
     (void)g_fp8_init;
-    run_rows(dst_type, dst, nrows, ncols, n_threads, [&](int64_t r, float *f) {
+    run_rows(dst_type, dst, nrows, ncols, n_threads, nullptr, [&](int64_t r, float *f) {
         const uint8_t *w = src + (size_t)r * (size_t)ncols;
         const float *sc = scale + (size_t)(r / block_rows) * (size_t)scale_cols;
         for (int64_t j = 0; j < ncols; ++j) f[j] = g_fp8[w[j]] * sc[j / block_cols];  // one rounding, as torch's

@@ -26,6 +26,10 @@ int qz_supported(int dst_type);
 int qz_quantize(int dst_type, void *dst, int src_type, const void *src, int64_t nrows, int64_t ncols,
                 int n_threads, char *err, size_t err_len);
 
+// The same with an importance matrix (ncols weights, the same for every row; NULL: uniform weights). The IQ types use it.
+int qz_quantize_im(int dst_type, void *dst, int src_type, const void *src, int64_t nrows, int64_t ncols,
+                   const float *imatrix, int n_threads, char *err, size_t err_len);
+
 // FP8 e4m3fn rows with a float32 scale per block_rows x block_cols block (Hugging Face's weight_scale_inv): value =
 // fp8 * scale, as transformers / llama.cpp's converter dequantize, then encoded as dst_type. Row r of src uses scale
 // row r / block_rows (scale_cols columns a row): give src and scale from a row that starts a block.

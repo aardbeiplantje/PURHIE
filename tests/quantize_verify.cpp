@@ -27,15 +27,20 @@ static void check(bool ok, const std::string& what) {
     printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what.c_str());
 }
 
-static const int kTypes[] = {QT_Q8_0, QT_Q4_0_ROCMFP4, QT_Q4_0_ROCMFP4_FAST, QT_F16, QT_BF16, QT_Q4_0, QT_Q4_1, QT_Q5_0, QT_Q5_1, QT_Q4_K, QT_Q5_K, QT_Q6_K, QT_Q2_K, QT_Q3_K, QT_MXFP4, QT_NVFP4, QT_TQ1_0, QT_TQ2_0, QT_IQ4_NL, QT_IQ4_XS};
+static const int kTypes[] = {QT_Q8_0, QT_Q4_0_ROCMFP4, QT_Q4_0_ROCMFP4_FAST, QT_F16, QT_BF16, QT_Q4_0, QT_Q4_1, QT_Q5_0, QT_Q5_1, QT_Q4_K, QT_Q5_K, QT_Q6_K, QT_Q2_K, QT_Q3_K, QT_MXFP4, QT_NVFP4, QT_TQ1_0, QT_TQ2_0, QT_IQ4_NL, QT_IQ4_XS, QT_IQ2_XXS, QT_IQ2_XS};
 
 // Bytes differing between ours and the reference's for nrows x ncols; first differing row in *first
 static size_t compare(int t, const float* x, int64_t nrows, int64_t ncols, int64_t* first) {
     const size_t rs = qt_row_size(t, ncols);
     std::vector<uint8_t> ref(rs * nrows), ours(rs * nrows);
-    ggml_quantize_chunk((ggml_type)t, x, ref.data(), 0, nrows, ncols, nullptr);
+    // the IQ types need an importance matrix: uniform weights, the same for the reference and for us. The others take none
+    // (the reference weighs the search of some of them by it when given one)
+    const bool iq = t == QT_IQ2_XXS || t == QT_IQ2_XS;
+    const std::vector<float> ones((size_t)ncols, 1.0f);
+    const float *im = iq ? ones.data() : nullptr;
+    ggml_quantize_chunk((ggml_type)t, x, ref.data(), 0, nrows, ncols, im);
     char err[256];
-    if (qz_quantize(t, ours.data(), QT_F32, x, nrows, ncols, 8, err, sizeof err) != 0) {
+    if (qz_quantize_im(t, ours.data(), QT_F32, x, nrows, ncols, im, 8, err, sizeof err) != 0) {
         printf("    %s\n", err);
         *first = 0;
         return rs * nrows;
@@ -53,8 +58,10 @@ static size_t compare(int t, const float* x, int64_t nrows, int64_t ncols, int64
 static void check_all(const char* what, const std::vector<float>& x, int64_t ncols, bool finite_only = false) {
     const int64_t nrows = (int64_t)x.size() / ncols;
     for (int t : kTypes) {
-        if (finite_only && (t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_Q2_K || t == QT_Q3_K)) continue;  // (see the NaN / Inf case)
+        if (finite_only && (t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_Q2_K || t == QT_Q3_K)) continue;
+        if (finite_only && (t == QT_IQ2_XXS || t == QT_IQ2_XS)) continue;  // (the reference asserts on a NaN in its search)  // (see the NaN / Inf case)
         if ((t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_Q2_K || t == QT_Q3_K || t == QT_TQ1_0 || t == QT_TQ2_0 || t == QT_IQ4_XS) && ncols % 256) continue;
+        if ((t == QT_IQ2_XXS || t == QT_IQ2_XS) && ncols % 256) continue;  // whole super-blocks only
         if (t == QT_NVFP4 && ncols % 64) continue;  // a block of 64 (the reference reads past a shorter row)  // a K-quant row is whole super-blocks (the reference has no row of 32)
         int64_t first;
         const size_t nd = compare(t, x.data(), nrows, ncols, &first);
