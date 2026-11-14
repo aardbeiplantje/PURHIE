@@ -749,6 +749,88 @@ void qz_row_nvfp4(const float *x, void *y, int64_t k) {
     }
 }
 
+// ---------------------------------------------------------------- the ternary types (ggml's reference encoders)
+// TQ1_0: super-block of 256: qs[48] (5 trits per byte, base 3, the trits in the order of the reference's loops), qh[4] (4
+// trits per byte, the first one as the most significant), fp16 d at 52 (the maximum magnitude). A trit t is round(x / d) + 1.
+void qz_row_tq1_0(const float *x, void *y, int64_t k) {
+    uint8_t *out = (uint8_t *)y;  // block: qs[48], qh[4], fp16 d
+    for (int64_t b = 0; b < k / 256; ++b, x += 256, out += 54) {
+        float amax = 0.0f;
+        for (int j = 0; j < 256; ++j) amax = amax > fabsf(x[j]) ? amax : fabsf(x[j]);  // ggml's MAX: a NaN wins
+        const float d = amax;
+        const float id = d ? 1.0f / d : 0.0f;
+        const uint16_t hd = qz_fp32_to_fp16(d);
+        memcpy(out + 52, &hd, 2);
+        const float *xp = x;
+        // 5 trits per byte, along 32 bytes
+        for (int j = 0; j < 32; j += 32) {
+            for (int m = 0; m < 32; ++m) {
+                uint8_t q = 0;
+                for (int n = 0; n < 5; ++n) {
+                    const int xi = (int)lroundf(xp[m + n * 32] * id) + 1;
+                    q = (uint8_t)(q * 3);
+                    q = (uint8_t)(q + xi);
+                }
+                q = (uint8_t)(((uint16_t)q * 256 + (243 - 1)) / 243);
+                out[j + m] = q;
+            }
+            xp += 5 * 32;
+        }
+        // along 16 bytes
+        for (int j = 32; j < 48; j += 16) {
+            for (int m = 0; m < 16; ++m) {
+                uint8_t q = 0;
+                for (int n = 0; n < 5; ++n) {
+                    const int xi = (int)lroundf(xp[m + n * 16] * id) + 1;
+                    q = (uint8_t)(q * 3);
+                    q = (uint8_t)(q + xi);
+                }
+                q = (uint8_t)(((uint16_t)q * 256 + (243 - 1)) / 243);
+                out[j + m] = q;
+            }
+            xp += 5 * 16;
+        }
+        // 4 trits per byte
+        for (int j = 0; j < 4; ++j) {
+            uint8_t q = 0;
+            for (int m = 0; m < 4; ++m) {
+                const int xi = (int)lroundf(xp[j + m * 4] * id) + 1;
+                q = (uint8_t)(q * 3);
+                q = (uint8_t)(q + xi);
+            }
+            q = (uint8_t)(q * 3);
+            q = (uint8_t)(((uint16_t)q * 256 + (243 - 1)) / 243);
+            out[48 + j] = q;
+        }
+    }
+}
+
+// TQ2_0: super-block of 256: qs[64] (2 bits per trit, trit t = round(x / d) + 1, the value of the group of 32 at bits 2 l), fp16 d
+// at 64.
+void qz_row_tq2_0(const float *x, void *y, int64_t k) {
+    uint8_t *out = (uint8_t *)y;  // block: qs[64], fp16 d
+    for (int64_t b = 0; b < k / 256; ++b, x += 256, out += 66) {
+        float amax = 0.0f;
+        for (int j = 0; j < 256; ++j) amax = amax > fabsf(x[j]) ? amax : fabsf(x[j]);  // ggml's MAX: a NaN wins
+        const float d = amax;
+        const float id = d ? 1.0f / d : 0.0f;
+        const uint16_t hd = qz_fp32_to_fp16(d);
+        memcpy(out + 64, &hd, 2);
+        const float *xp = x;
+        for (int j = 0; j < 64; j += 32) {
+            for (int m = 0; m < 32; ++m) {
+                uint8_t q = 0;
+                for (int n = 0; n < 4; ++n) {
+                    const int xi = (int)lroundf(xp[m + n * 32] * id) + 1;
+                    q = (uint8_t)(q + ((xi & 3) << (2 * n)));
+                }
+                out[j + m] = q;
+            }
+            xp += 4 * 32;
+        }
+    }
+}
+
 // ---------------------------------------------------------------- ROCmFP4 (rocmfp4.c, without an importance matrix)
 
 // Unsigned E4M3 scale bytes 0..126 as half-scale values: subnormals e * 2^-10, then (8 + m) * 2^(E - 11)
@@ -889,7 +971,7 @@ void qz_row_rocmfp4_fast(const float *x, void *y, int64_t k) {
 
 int qz_supported(int t) {
     return t == QT_F32 || t == QT_F16 || t == QT_BF16 || t == QT_Q8_0 || t == QT_Q4_0_ROCMFP4 ||
-           t == QT_Q4_0_ROCMFP4_FAST || t == QT_Q4_0 || t == QT_Q4_1 || t == QT_Q5_0 || t == QT_Q5_1 || t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_Q2_K || t == QT_Q3_K || t == QT_MXFP4 || t == QT_NVFP4;
+           t == QT_Q4_0_ROCMFP4_FAST || t == QT_Q4_0 || t == QT_Q4_1 || t == QT_Q5_0 || t == QT_Q5_1 || t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_Q2_K || t == QT_Q3_K || t == QT_MXFP4 || t == QT_NVFP4 || t == QT_TQ1_0 || t == QT_TQ2_0;
 }
 
 static void encode_row(int t, const float *x, void *y, int64_t n) {
@@ -909,6 +991,8 @@ static void encode_row(int t, const float *x, void *y, int64_t n) {
     case QT_Q3_K: qz_row_q3_K(x, y, n); break;
     case QT_MXFP4: qz_row_mxfp4(x, y, n); break;
     case QT_NVFP4: qz_row_nvfp4(x, y, n); break;
+    case QT_TQ1_0: qz_row_tq1_0(x, y, n); break;
+    case QT_TQ2_0: qz_row_tq2_0(x, y, n); break;
     case QT_Q4_0_ROCMFP4: qz_row_rocmfp4(x, y, n); break;
     case QT_Q4_0_ROCMFP4_FAST: qz_row_rocmfp4_fast(x, y, n); break;
     }
