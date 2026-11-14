@@ -4,7 +4,29 @@
 > Finished work, with its measurements, is in the git history (this file was pruned of it on 2026-11-05, 2026-11-06
 > and 2026-11-12).
 
-## ▶ Next (2026-11-13)
+## ▶ Next (2026-11-14, kept current)
+
+Open work, in the order to take it. Each item names its state and the next concrete step.
+
+0. **Fast quantized DiT matmul** (IN PROGRESS, 2026-11-14; user's priority). The batched quantized kernel
+   (`qmatvec_launch_batch`) runs at ~1.4 TFLOP/s against 15-25 for the BF16 kernels, so the quantized DiT decoded its
+   weights on the CPU every call. Now: `mm_dequant_q8_0_bf16` (src/minimax_vae.hip) decodes Q8_0 linears on the device
+   into the BF16 scratch and the BF16 kernels run the matmul. Its numerics equal the CPU decode bit for bit (checked by
+   `MMDIT_CHECK_DEQUANT=1`, to run). Next: that check on the mixed Q8_0 DiT, the canvas number (must equal the CPU-decode
+   Q8 run), then the time per step. Then ROCmFP4 on the device (same pattern), and the int8 WMMA route for comparison (it
+   quantizes the activations: a different numerical path, measured separately). Benchmark (`bench_qbatch.cpp`, not committed, in the session scratch under /tmp): the batched Q8_0 matmul 1.4 TFLOP/s, BF16 15-25.
+1. **DiT mixed Q8_0 recipe** (measured, 0.991640 at 38.4 GB against BF16 0.992087). Decision open: ship it as an
+   optional DiT next to BF16 (BF16 stays the default). Needs item 0's speed first.
+2. **IQ types on the GPU** (matvec kernels exist; checked only for IQ2_XXS and IQ4_XS): IQ4_NL, IQ2_S, IQ2_XS, IQ1_S,
+   IQ1_M on real Hugging Face files (redponike and unsloth repos; about 38 GB of downloads, one file at a time).
+3. **MiniMax quantization, remaining**: FP8 not measured (the engine has no FP8 weight type to write: needs an encoder
+   and its operand path). DiT drift from block 30 (engine error grows against the fp32 chain; the mixed-recipe results
+   point at the non-block tensors' sensitivity; not chased).
+4. **ComfyUI backend** (milestone 1 next: the component API, verified on sd-turbo). `/comfyui` is mounted again
+   (28 files, about 167 GB, 7.9 GB free: converting to GGUF needs space on `/data`).
+5. **Audio** (done per the audio section below; open: long-form cuts at pauses, whisper GPU path, device frame launches).
+
+Earlier list (2026-11-13), kept for reference:
 
 -1. **Image models from the original checkpoints** (2026-11-14, user: use the originals, no GGUF conversion; the engine smart
    enough to read safetensors with LFS pointers). DONE: `src/safetensors_mmap` (the engine's reader: a directory or a file,
