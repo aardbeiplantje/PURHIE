@@ -145,6 +145,13 @@ sub audio_rescan {
         elsif ($arch eq 'qwen3tts')       { push @{ $a{tts} },     $path }
         elsif ($arch eq 'qwen3tts_codec') { push @{ $a{codec} },   $path }
     }
+    # one line per change of the directory: the audio models it holds now (a load or an unload follows, if they changed)
+    my @found;
+    for my $kind (qw(whisper tts codec)) {
+        push @found, map { basename($_) . " ($kind)" } @{ $a{$kind} // [] };
+    }
+    $LOG->info('audio', event => 'rescan', msg => sprintf('%s: %d GGUF files changed; audio models: %s', $dir, scalar @$files,
+               @found ? join(', ', @found) : 'none'));
     if (!$AUDIO_FLAG{whisper}) {
         my $path = $a{whisper} ? $a{whisper}[0] : undef;
         my $key = defined $path ? audio_key($path) : '';
