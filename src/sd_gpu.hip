@@ -661,28 +661,47 @@ sd_softmax_bf16_w(const float* S, uint16_t* P, int Tq, int Tk, int Tkp, long row
     for (int j = l; j < Tkp; j += 32) p[j] = j < Tk ? f2bf(expf(s[j] - mx) * inv) : (uint16_t)0;
 }
 
-// ---- flash attention (head width 128, BF16 Q, K and transposed V): one block per (64 query rows, head), four waves of 16 rows.
-// The scores of a 64-key tile stay in registers (WMMA accumulators), with an online softmax per row (the row max and sum reduced
-// over the half-wave's 16 lanes); P goes through LDS as the next WMMA's A operand; O accumulates in eight 16-wide tiles per wave.
-// Keys beyond Tk are masked; the value rows beyond Tk are zero (the host pads them). Shared memory 61 KB.
-extern "C" __global__ void __launch_bounds__(128)
+// ---- flash attention (head width 128, BF16 Q, K and transposed V): one block per (128 query rows, head), eight waves of 16 rows.
+// The K and V tiles (64 keys) are shared by the eight waves; Q lives in registers (eight A fragments per wave). The scores of
+// a 64-key tile stay in the WMMA accumulators; the row max and sum are reduced over the 16 lanes of a row with DPP (no LDS
+// round trip); the exponentials are exp2 of the scores scaled into log2 units; P goes through the wave's own LDS rows as the
+// next WMMA's A operand; O accumulates in eight 16-wide tiles per wave. Keys beyond Tk are masked; the value rows beyond Tk are
+// zero (the host pads them). Shared memory 54 KB.
+template <int CTRL>
+__device__ __forceinline__ float fa_dpp(float x) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, x), CTRL, 0xF, 0xF, true));
+}
+__device__ __forceinline__ float fa_row16_max(float x) {
+    x = fmaxf(x, fa_dpp<0xB1>(x));
+    x = fmaxf(x, fa_dpp<0x4E>(x));
+    x = fmaxf(x, fa_dpp<0x141>(x));
+    x = fmaxf(x, fa_dpp<0x140>(x));
+    return x;
+}
+__device__ __forceinline__ float fa_row16_sum(float x) {
+    x += fa_dpp<0xB1>(x);
+    x += fa_dpp<0x4E>(x);
+    x += fa_dpp<0x141>(x);
+    x += fa_dpp<0x140>(x);
+    return x;
+}
+
+extern "C" __global__ void __launch_bounds__(256)
 sd_flash_attn(const uint16_t* __restrict__ qb, const uint16_t* __restrict__ kb, const uint16_t* __restrict__ vt, float* __restrict__ out,
-              int Tq, int Tk, int Tkp, int C, float scale) {
-    __shared__ __attribute__((aligned(16))) uint16_t Qs[64][136];
+      int Tq, int Tk, int Tkp, int C, float scale) {
     __shared__ __attribute__((aligned(16))) uint16_t Ks[64][136];
     __shared__ __attribute__((aligned(16))) uint16_t Vs[128][72];
-    __shared__ __attribute__((aligned(16))) uint16_t Ps[64][72];
+    __shared__ __attribute__((aligned(16))) uint16_t Ps[8][16][72];
     const int t = threadIdx.x, w = t >> 5, l = t & 31, g = l >> 4, c16 = l & 15;
-    const int q0 = blockIdx.x * 64, h = blockIdx.y;
-    const uint16_t* Qp = qb + h * 128;
+    const int q0 = blockIdx.x * 128, h = blockIdx.y;
     const uint16_t* Kp = kb + h * 128;
     const uint16_t* Vp = vt + (long)h * 128 * Tkp;
-    {  // the query tile: thread t loads 64 values of row t / 2
-        const int r = t >> 1, hf = (t & 1) * 64, gm = q0 + r;
-        for (int j = 0; j < 8; ++j) {
-            uint4 v = {0u, 0u, 0u, 0u};
-            if (gm < Tq) v = *reinterpret_cast<const uint4*>(Qp + (long)gm * C + hf + 8 * j);
-            *reinterpret_cast<uint4*>(&Qs[r][hf + 8 * j]) = v;
+    bf16x16_t qa[8];
+    {
+        const int gm = q0 + w * 16 + c16;
+        for (int ks = 0; ks < 8; ++ks) {
+            if (gm < Tq) __builtin_memcpy(&qa[ks], qb + (long)gm * C + h * 128 + ks * 16, sizeof(bf16x16_t));
+            else for (int e = 0; e < 16; ++e) qa[ks][e] = (__bf16)0.0f;
         }
     }
     f32x8_t O[8];
@@ -694,60 +713,55 @@ sd_flash_attn(const uint16_t* __restrict__ qb, const uint16_t* __restrict__ kb, 
         lrow[i] = 0.0f;
     }
     for (int k0 = 0; k0 < Tkp; k0 += 64) {
-        {  // the key tile (rows of d, 64 per key): thread t loads 64 values of key t / 2; keys beyond Tk are zero
-            const int r = t >> 1, hf = (t & 1) * 64, gk = k0 + r;
-            for (int j = 0; j < 8; ++j) {
+        {  // K tile: thread t loads 32 values (of 128) of key t >> 2
+            const int r = t >> 2, qq = (t & 3) * 32, gk = k0 + r;
+            for (int j = 0; j < 4; ++j) {
                 uint4 v = {0u, 0u, 0u, 0u};
-                if (gk < Tk) v = *reinterpret_cast<const uint4*>(Kp + (long)gk * C + hf + 8 * j);
-                *reinterpret_cast<uint4*>(&Ks[r][hf + 8 * j]) = v;
+                if (gk < Tk) v = *reinterpret_cast<const uint4*>(Kp + (long)gk * C + qq + 8 * j);
+                *reinterpret_cast<uint4*>(&Ks[r][qq + 8 * j]) = v;
             }
         }
-        {  // the value tile, transposed: thread t loads the 64 keys of value dimension t
-            const uint16_t* src = Vp + (long)t * Tkp + k0;
-            for (int j = 0; j < 8; ++j) *reinterpret_cast<uint4*>(&Vs[t][8 * j]) = *reinterpret_cast<const uint4*>(src + 8 * j);
+        {  // V tile (transposed: dims x keys): thread t loads 32 keys (of 64) of dim t >> 1
+            const int r = t >> 1, hf = (t & 1) * 32;
+            const uint16_t* src = Vp + (long)r * Tkp + k0 + hf;
+            for (int j = 0; j < 4; ++j) *reinterpret_cast<uint4*>(&Vs[r][hf + 8 * j]) = *reinterpret_cast<const uint4*>(src + 8 * j);
         }
         __syncthreads();
-        // S = Q K^T for this wave's 16 query rows and the tile's 64 keys
         f32x8_t S[4];
         for (int nt = 0; nt < 4; ++nt)
             for (int i = 0; i < 8; ++i) S[nt][i] = 0.0f;
-        for (int ks = 0; ks < 8; ++ks) {
-            bf16x16_t a;
-            __builtin_memcpy(&a, &Qs[w * 16 + c16][ks * 16], sizeof(bf16x16_t));
+        for (int ks = 0; ks < 8; ++ks)
             for (int nt = 0; nt < 4; ++nt) {
                 bf16x16_t b;
                 __builtin_memcpy(&b, &Ks[nt * 16 + c16][ks * 16], sizeof(bf16x16_t));
-                S[nt] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, S[nt]);
+                S[nt] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(qa[ks], b, S[nt]);
             }
-        }
-        // the online softmax per row (row = 2 i + g of this wave's 16 rows)
         for (int i = 0; i < 8; ++i) {
             float v[4];
             for (int nt = 0; nt < 4; ++nt) {
-                v[nt] = S[nt][i] * scale;
+                v[nt] = S[nt][i] * (scale * 1.4426950408889634f);  // log2 domain
                 if (k0 + nt * 16 + c16 >= Tk) v[nt] = -INFINITY;
             }
             float mx = fmaxf(fmaxf(v[0], v[1]), fmaxf(v[2], v[3]));
-            for (int off = 8; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off, 32));
+            mx = fa_row16_max(mx);
             const float mnew = fmaxf(mrow[i], mx);
-            const float alpha = expf(mrow[i] - mnew);
+            const float alpha = exp2f(mrow[i] - mnew);
             float p[4], sum = 0.0f;
             for (int nt = 0; nt < 4; ++nt) {
-                p[nt] = expf(v[nt] - mnew);
+                p[nt] = exp2f(v[nt] - mnew);
                 sum += p[nt];
             }
-            for (int off = 8; off > 0; off >>= 1) sum += __shfl_xor(sum, off, 32);
+            sum = fa_row16_sum(sum);
             lrow[i] = lrow[i] * alpha + sum;
             mrow[i] = mnew;
             for (int dt = 0; dt < 8; ++dt) O[dt][i] *= alpha;
-            const int row = w * 16 + 2 * i + g;
-            for (int nt = 0; nt < 4; ++nt) Ps[row][nt * 16 + c16] = f2bf(p[nt]);
+            const int row = 2 * i + g;
+            for (int nt = 0; nt < 4; ++nt) Ps[w][row][nt * 16 + c16] = f2bf(p[nt]);
         }
         __syncthreads();
-        // O += P V: k = the tile's 64 keys (four steps), n = the 128 value dimensions (eight tiles)
         for (int ks = 0; ks < 4; ++ks) {
             bf16x16_t a;
-            __builtin_memcpy(&a, &Ps[w * 16 + c16][ks * 16], sizeof(bf16x16_t));
+            __builtin_memcpy(&a, &Ps[w][c16][ks * 16], sizeof(bf16x16_t));
             for (int dt = 0; dt < 8; ++dt) {
                 bf16x16_t b;
                 __builtin_memcpy(&b, &Vs[dt * 16 + c16][ks * 16], sizeof(bf16x16_t));

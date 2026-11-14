@@ -421,7 +421,7 @@ void attention_flash(const float* q, int Tq, const float* k, const float* v, int
         const float scale = 1.0f / std::sqrt((float)(C / heads));
         int tq = Tq, tk = Tk, tkp = Tkp, c = C;
         void* a4[] = {(void*)&qb, (void*)&kb, (void*)&vt, (void*)&out, (void*)&tq, (void*)&tk, (void*)&tkp, (void*)&c, (void*)&scale};
-        check(hipModuleLaunchKernel(f_flash, (unsigned)((Tq + 63) / 64), (unsigned)heads, 1, 128, 1, 1, 0, nullptr, a4, nullptr),
+        check(hipModuleLaunchKernel(f_flash, (unsigned)((Tq + 127) / 128), (unsigned)heads, 1, 256, 1, 1, 0, nullptr, a4, nullptr),
               "flash attention");
     }
     check(hipStreamSynchronize(nullptr), "stream");
