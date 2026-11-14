@@ -408,24 +408,35 @@ model_info(path)
     RETVAL
 
 SV*
-quantize(dst_type, src_type, src, nrows, ncols, n_threads = 0)
+quantize(dst_type, src_type, src, nrows, ncols, n_threads = 0, imatrix = &PL_sv_undef)
     int dst_type
     int src_type
     SV* src
     IV nrows
     IV ncols
     int n_threads
+    SV* imatrix
   CODE:
-    /* nrows x ncols values of src_type (a byte string) re-encoded as dst_type: a byte string (inference_quantize) */
+    /* nrows x ncols values of src_type (a byte string) re-encoded as dst_type: a byte string (inference_quantize). imatrix:
+       undef, or a byte string of ncols F32 weights (the IQ types' search weights) */
     const size_t srs = inference_quant_row_size(src_type, ncols), drs = inference_quant_row_size(dst_type, ncols);
     if (!srs || !drs) croak("quantize: type %d or %d cannot hold rows of %ld values", src_type, dst_type, (long)ncols);
     STRLEN len;
     const char* p = SvPVbyte(src, len);
     if (nrows < 0 || len < srs * (size_t)nrows)
         croak("quantize: %lu bytes of input, %lu needed", (unsigned long)len, (unsigned long)(srs * (size_t)nrows));
+    const float* im = NULL;
+    if (SvOK(imatrix)) {
+        STRLEN ilen;
+        const char* ip = SvPVbyte(imatrix, ilen);
+        if (ilen != 4 * (size_t)ncols)
+            croak("quantize: an importance matrix of %lu bytes for %ld columns (%lu wanted)", (unsigned long)ilen, (long)ncols,
+                  (unsigned long)(4 * (size_t)ncols));
+        im = (const float*)ip;
+    }
     RETVAL = newSV(drs * (size_t)nrows + 1);
     SvPOK_only(RETVAL);
-    if (inference_quantize(dst_type, SvPVX(RETVAL), src_type, p, nrows, ncols, n_threads) != 0) {
+    if (inference_quantize_im(dst_type, SvPVX(RETVAL), src_type, p, nrows, ncols, im, n_threads) != 0) {
         SvREFCNT_dec(RETVAL);
         croak_last(aTHX_ "quantize", INFERENCE_ERR_INVALID_ARG);
     }

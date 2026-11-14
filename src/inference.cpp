@@ -1171,8 +1171,13 @@ int inference_quant_can_encode(int dst_type) { return qz_supported(dst_type); }
 
 int inference_quantize(int dst_type, void* dst, int src_type, const void* src, long long nrows, long long ncols,
                        int n_threads) {
+    return inference_quantize_im(dst_type, dst, src_type, src, nrows, ncols, nullptr, n_threads);
+}
+
+int inference_quantize_im(int dst_type, void* dst, int src_type, const void* src, long long nrows, long long ncols,
+                          const float* imatrix, int n_threads) {
     char err[256];
-    if (qz_quantize(dst_type, dst, src_type, src, nrows, ncols, n_threads, err, sizeof err) != 0) {
+    if (qz_quantize_im(dst_type, dst, src_type, src, nrows, ncols, imatrix, n_threads, err, sizeof err) != 0) {
         set_error("%s", err);
         return INFERENCE_ERR_INVALID_ARG;
     }

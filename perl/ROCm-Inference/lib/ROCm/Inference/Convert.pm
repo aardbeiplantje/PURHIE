@@ -778,6 +778,29 @@ sub write_file {
         croak "$s->{name}: $tn cannot hold rows of $s->{ne}[0]" unless $blk && $s->{ne}[0] % $blk == 0;
         $s->{bytes} = $s->{ne}[0] / $blk * $tsz * $rows;
     }
+    # the IQ types search their codebooks weighted by an importance matrix: a GGUF input's tensors take the one given (one
+    # set per expert for a 3-D tensor). Without one ggml's reference and ours use uniform weights, and the quality is poor
+    # (2026-11-14: the IQ2_XXS text encoder's worst row cosine 0.76-0.82): warned, once per type
+    my $im = $a{imatrix};
+    my %miss;
+    for my $s (@$specs) {
+        my ($tn) = gguf_type_info($s->{type});
+        next unless $tn =~ /^iq/;
+        next if $s->{gguf} && $s->{gguf}{type} == $s->{type};  # a copy: nothing is encoded
+        croak "$s->{name}: an importance matrix goes with a GGUF input (a checkpoint's tensors take none yet)"
+            if $im && !$s->{gguf};
+        my $sets = $im ? $im->{$s->{name}} : undef;
+        if (!$sets) { $miss{$tn}++; next }
+        croak "$s->{name}: " . scalar(@$sets) . " importance matrix sets for $s->{rows} rows"
+            unless $s->{rows} % @$sets == 0;
+        croak "$s->{name}: an importance matrix of $s->{ne}[0] columns wanted"
+            if grep { length($_) != 4 * $s->{ne}[0] } @$sets;
+        $s->{imatrix} = $sets;
+    }
+    for my $tn (sort keys %miss) {
+        warn sprintf("%s: %d tensor(s) use uniform weights (%s): the quality is poor\n", $tn, $miss{$tn},
+                     $im ? 'not in the importance matrix' : 'no importance matrix given, --imatrix FILE');
+    }
     my ($header, $data) = gguf_write_header($kv, $specs, $align);
     my $res = {kv => $kv, tensors => $specs, bytes => length($header) + $data};
     return $res if $a{dry_run};
@@ -834,12 +857,18 @@ sub write_file {
             my $fi = $fh{$t->{path}} //= do { open my $f, '<:raw', $t->{path} or croak "$t->{path}: $!"; $f };
             my $copy = $s->{type} == $t->{type};
             my $chunk = int((64 << 20) / $t->{ne}[0]) || 1;
-            for (my $r = 0; $r < $s->{rows}; $r += $chunk) {
-                my $n = $r + $chunk > $s->{rows} ? $s->{rows} - $r : $chunk;
-                my $b = ROCm::Inference::GGUF::gguf_read_rows($fi, $t, $r, $n);
-                $b = ROCm::Inference::quantize($s->{type}, $t->{type}, $b, $n, $t->{ne}[0], $th) unless $copy;
-                $wr->($b);
-                $written += length $b;
+            # one importance matrix set per expert: a 3-D tensor's rows are its experts in turn (set k: rows k * per on)
+            my @sets = $s->{imatrix} ? @{$s->{imatrix}} : (undef);
+            my $per = $s->{rows} / @sets;
+            for my $k (0 .. $#sets) {
+                my ($r0, $r1) = ($k * $per, ($k + 1) * $per);
+                for (my $r = $r0; $r < $r1; $r += $chunk) {
+                    my $n = $r + $chunk > $r1 ? $r1 - $r : $chunk;
+                    my $b = ROCm::Inference::GGUF::gguf_read_rows($fi, $t, $r, $n);
+                    $b = ROCm::Inference::quantize($s->{type}, $t->{type}, $b, $n, $t->{ne}[0], $th, $sets[$k]) unless $copy;
+                    $wr->($b);
+                    $written += length $b;
+                }
             }
         }
         for my $p (@{$s->{parts} // []}) {
@@ -867,6 +896,39 @@ sub write_file {
     close $fo or croak "$part: $!";
     rename $part, $out or croak "rename $part -> $out: $!";
     return $res;
+}
+
+# An importance matrix (llama-imatrix's GGUF, general.type = imatrix): name => [one packed F32 set of the tensor's ncols
+# weights per expert]. The weights are llama.cpp's quantize's: each in_sum2 value over its counts entry (the calls of its
+# expert), 1 where the count is 0. The names are the GGUF tensors' (the .in_sum2 suffix removed).
+sub load_imatrix {
+    my ($file) = @_;
+    my $g = ROCm::Inference::GGUF::gguf_read($file);
+    my ($ty) = grep { $_->[0] eq 'general.type' } @{$g->{kv}};
+    croak "$file: not an importance matrix" unless $ty && ($ty->[2] // '') eq 'imatrix';
+    my %t = map { $_->{name} => $_ } @{$g->{tensors}};
+    open my $fi, '<:raw', $file or croak "$file: $!";
+    my $F32 = gguf_type_id('f32');
+    my %im;
+    for my $t (grep { $_->{name} =~ /\.in_sum2$/ } @{$g->{tensors}}) {
+        (my $name = $t->{name}) =~ s/\.in_sum2$//;
+        croak "$file: $t->{name} is not F32" unless $t->{type} == $F32;
+        my $c = $t{"$name.counts"} // croak "$file: $name has no counts";
+        croak "$file: $c->{name} is not F32" unless $c->{type} == $F32;
+        my $ne0 = $t->{ne}[0];
+        my $sets = $t->{ne}[1] // 1;
+        my @sums = unpack 'f<*', ROCm::Inference::GGUF::gguf_read_rows($fi, $t, 0, $sets);
+        my @cnt = unpack 'f<*', ROCm::Inference::GGUF::gguf_read_rows($fi, $c, 0, 1);
+        croak "$file: $name: " . scalar(@cnt) . " counts for $sets sets" unless @cnt == $sets;
+        my @w;
+        for my $j (0 .. $sets - 1) {
+            my @v;
+            for my $i (0 .. $ne0 - 1) { push @v, $cnt[$j] > 0 ? $sums[$j * $ne0 + $i] / $cnt[$j] : 1 }
+            push @w, pack 'f<*', @v;
+        }
+        $im{$name} = \@w;
+    }
+    return \%im;
 }
 
 # A GGUF re-encoded: its metadata (general.file_type and general.quantization_version set, moved to the end as

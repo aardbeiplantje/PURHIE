@@ -17,7 +17,7 @@ use ROCm::Inference::Quant ();
 
 my %o = (threads => 0, type => [], recipe => 'strix');
 GetOptions(\%o, 'type|t=s@', 'recipe|r=s', 'threads|j=i', 'arch=s', 'pre=s', 'name=s', 'dry-run|n', 'force|f',
-           'quiet|q', 'keep-cache', 'list', 'mmproj', 'help|h')
+           'quiet|q', 'keep-cache', 'list', 'mmproj', 'imatrix=s', 'help|h')
     or pod2usage(2);
 pod2usage(-verbose => 2, -exitval => 0) if $o{help};
 if ($o{list}) { print "$_\n" for ROCm::Inference::Convert::architectures(); exit 0 }
@@ -33,6 +33,7 @@ if (lc $target ne 'bf16-ref') {
 }
 my %a = (quant => $q, threads => $o{threads}, dry_run => $o{'dry-run'}, keep_cache => $o{'keep-cache'},
          progress => sub { report(@_) unless $o{quiet} });
+$a{imatrix} = eval { ROCm::Inference::Convert::load_imatrix($o{imatrix}) } or fail($@) if $o{imatrix};
 my $t0 = time;
 my $res;
 if (-d $in && -f "$in/pdd_fused_heads.safetensors" && -f "$in/pdd_config.json") {
@@ -155,6 +156,14 @@ C<plain>: every tensor TYPE, as llama-quantize writes it.
 =item B<-j>, B<--threads> N
 
 Encoder threads (default: one a core). Give fewer on a host that is serving a model.
+
+=item B<--imatrix> FILE
+
+An importance matrix (llama-imatrix's GGUF, C<general.type = imatrix>, e.g. C<bartowski/Qwen_Qwen3-VL-32B-Instruct-GGUF>'s
+C<Qwen_Qwen3-VL-32B-Instruct-imatrix.gguf>) for the IQ types: each tensor's codebook search is weighted by its values
+(each C<.in_sum2> over its C<.counts>, as llama-quantize reads them). Without one the IQ tensors use uniform weights,
+and the converter warns: the quality is poor (the IQ2_XXS text encoder's worst row cosine was 0.76-0.82). For a GGUF
+input only; the other types ignore it.
 
 =item B<--arch> NAME, B<--pre> NAME, B<--name> NAME
 

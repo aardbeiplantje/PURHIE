@@ -30,15 +30,16 @@ static void check(bool ok, const std::string& what) {
 
 static const int kTypes[] = {QT_Q8_0, QT_Q4_0_ROCMFP4, QT_Q4_0_ROCMFP4_FAST, QT_F16, QT_BF16, QT_Q4_0, QT_Q4_1, QT_Q5_0, QT_Q5_1, QT_Q4_K, QT_Q5_K, QT_Q6_K, QT_Q2_K, QT_Q3_K, QT_MXFP4, QT_NVFP4, QT_TQ1_0, QT_TQ2_0, QT_IQ4_NL, QT_IQ4_XS, QT_IQ2_XXS, QT_IQ2_XS, QT_IQ2_S, QT_IQ3_XXS, QT_IQ3_S, QT_IQ1_S, QT_IQ1_M};
 
-// Bytes differing between ours and the reference's for nrows x ncols; first differing row in *first
-static size_t compare(int t, const float* x, int64_t nrows, int64_t ncols, int64_t* first) {
+// Bytes differing between ours and the reference's for nrows x ncols; first differing row in *first. weights: an
+// importance matrix (ncols values) for the IQ types; NULL: uniform weights
+static size_t compare(int t, const float* x, int64_t nrows, int64_t ncols, int64_t* first, const float* weights = nullptr) {
     const size_t rs = qt_row_size(t, ncols);
     std::vector<uint8_t> ref(rs * nrows), ours(rs * nrows);
     // the IQ types need an importance matrix: uniform weights, the same for the reference and for us. The others take none
     // (the reference weighs the search of some of them by it when given one)
     const bool iq = qz_iq_supported(t);
     const std::vector<float> ones((size_t)ncols, 1.0f);
-    const float *im = iq ? ones.data() : nullptr;
+    const float *im = iq ? (weights ? weights : ones.data()) : nullptr;
     ggml_quantize_chunk((ggml_type)t, x, ref.data(), 0, nrows, ncols, im);
     char err[256];
     if (qz_quantize_im(t, ours.data(), QT_F32, x, nrows, ncols, im, 8, err, sizeof err) != 0) {
@@ -66,6 +67,20 @@ static void check_all(const char* what, const std::vector<float>& x, int64_t nco
         if (t == QT_NVFP4 && ncols % 64) continue;  // a block of 64 (the reference reads past a shorter row)  // a K-quant row is whole super-blocks (the reference has no row of 32)
         int64_t first;
         const size_t nd = compare(t, x.data(), nrows, ncols, &first);
+        char buf[256];
+        snprintf(buf, sizeof buf, "%-28s %4lld x %-6lld %-18s %zu bytes differ%s", what, (long long)nrows,
+                 (long long)ncols, qt_get_traits(t)->name, nd, nd ? (" (row " + std::to_string(first) + ")").c_str() : "");
+        check(nd == 0, buf);
+    }
+}
+
+// The IQ types with an importance matrix (the same weights for the reference and for us)
+static void check_iq_im(const char* what, const std::vector<float>& x, int64_t ncols, const std::vector<float>& im) {
+    const int64_t nrows = (int64_t)x.size() / ncols;
+    for (int t : kTypes) {
+        if (!qz_iq_supported(t) || ncols % 256) continue;
+        int64_t first;
+        const size_t nd = compare(t, x.data(), nrows, ncols, &first, im.data());
         char buf[256];
         snprintf(buf, sizeof buf, "%-28s %4lld x %-6lld %-18s %zu bytes differ%s", what, (long long)nrows,
                  (long long)ncols, qt_get_traits(t)->name, nd, nd ? (" (row " + std::to_string(first) + ")").c_str() : "");
@@ -156,6 +171,14 @@ int main(int argc, char** argv) {
         std::vector<float> x(32 * C);
         for (auto& v : x) v = qt_bf16_to_fp32(qz_fp32_to_bf16(g(rng)));
         check_all("bf16-rounded gaussian", x, C);
+    }
+    {  // an importance matrix (random, 0.01 .. 4): the IQ types weigh their codebook search by it
+        std::normal_distribution<float> g(0.0f, 0.02f);
+        std::uniform_real_distribution<float> u(0.01f, 4.0f);
+        std::vector<float> x(32 * C), im(C);
+        for (auto& v : x) v = g(rng);
+        for (auto& w : im) w = u(rng);
+        check_iq_im("gaussian, importance matrix", x, C, im);
     }
 
     for (int a = 1; a < argc; ++a) {
