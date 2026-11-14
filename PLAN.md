@@ -6,6 +6,15 @@
 
 ## ▶ Next (2026-11-13)
 
+0. **Quantized text encoder and converter types** (2026-11-14, user: convert to every type the engine reads, no llama.cpp
+   dependency; keep every type supported even when its quality is lower). Native encoders so far: F32, F16, BF16, Q8_0,
+   Q4_0, Q4_1, Q5_0, Q5_1 (byte-identical to the reference in `tests/quantize_verify`), ROCmFP4 and its FAST variant.
+   Text encoder vs the BF16 reference (`tests/mm_te_verify`, worst row cosine, 3 prompts): BF16 0.99993; Q8_0 0.9998-0.9999
+   (34.8 GB); ROCmFP4 plain 0.9916-0.9956 (18.4 GB); ROCmFP4 with the strix recipe 0.9903-0.9956 (19.2 GB): both kept
+   supported, not the default. Q4_0 and Q5_0: pending. Still to write: MXFP4, NVFP4, TQ1_0/TQ2_0, the K-quants Q2_K-Q6_K,
+   and the IQ types (codebook searches). The residency goal (the pipeline keeps the text encoder and the DiT both mapped)
+   is what a small text encoder buys: Q8_0 (35 GB) plus the DiT (66 GB) fit in the 124 GB of RAM at once.
+
 1. **MiniMax-H3-Image speed** (2026-11-13). End to end (2026-11-14, `mm_pipe_verify` 256 x 256 on the 2048 canvas, alone on the
    device): 165.8 s (was 222 s): text 17.9 s, DiT open 15.6 s, sampler 109.0 s (was 169 s), VAE 22.8 s; the image is clean.
    The text encoder's 16.5 s is the load of its 65 GB weights (15.3 s; ~4 GB/s, the same as the DiT's open 16 s); its prefill is
