@@ -12,7 +12,11 @@
    original MiniMax DiT (`/hf/MiniMax-H3-Image/transformer`, 12 LFS shards): 531 tensors, 66.28 GB, bytes identical to the
    converted GGUF for every tensor. NEXT: the DiT, the PDD heads and the VAE read through a tensor source (a GGUF or a
    checkpoint directory; about 35 GGUF call sites in `minimax_dit.cpp` and `minimax_vae.cpp`), then `mm_open` takes the
-   checkpoint directories. The text encoder (the Qwen3 LLM through the qwen loader) needs the same source in the qwen
+   checkpoint directories. DONE for the DiT and the PDD heads: `mmdit_open` takes a GGUF or the original checkpoint (the
+   transformer directory; `pdd_fused_heads.safetensors` with `pdd_config.json` for the sigmas). Checked: the GGUF path and the
+   checkpoint path give the same numbers. The DiT verifier's numbers moved with the flash-attention change (committed
+   before this): velocity step 0 0.9984961-0.9985183, sampler 0.9840961 (was 0.9852158 before the flash kernel, `mm_dit_verify`
+   on HEAD gives 0.9840961). Same direction as the canvas check (0.9938 -> 0.9921). The text encoder (the Qwen3 LLM through the qwen loader) needs the same source in the qwen
    loader: a larger change, after the image path.
 
 0. **Quantized text encoder and converter types** (2026-11-14, user: convert to every type the engine reads, no llama.cpp

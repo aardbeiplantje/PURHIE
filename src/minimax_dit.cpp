@@ -9,6 +9,7 @@
 #include "kernel_loader.h"
 #include "minimax_vae.h"  // (the MiniMax kernels' module: minimax_vae.co)
 #include "sd_device.h"
+#include "safetensors_mmap.h"
 
 #include <hip/hip_runtime.h>
 
@@ -74,10 +75,30 @@ void launch(hipFunction_t f, long n, void** args) {
 
 }  // namespace
 
-struct mmdit {
+// The weights of one checkpoint, from a GGUF (rocm-convert's output) or the original safetensors (a directory or a file):
+// a tensor by its checkpoint name, its bytes in place.
+struct WeightFile {
     gguf_model_t* g = nullptr;
-    const void* dev_base = nullptr;
-    gguf_model_t* pg = nullptr;
+    st_model_t* st = nullptr;
+    WeightFile() = default;
+    WeightFile(const WeightFile&) = delete;
+    WeightFile& operator=(const WeightFile&) = delete;
+    ~WeightFile() {
+        if (g) gguf_mmap_close(g);
+        if (st) st_close(st);
+    }
+    const void* tensor(const std::string& name, size_t* bytes) const {
+        if (g) return gguf_get_tensor_ptr(g, name.c_str(), bytes);
+        const st_tensor_t* t = st ? st_find(st, name.c_str()) : nullptr;
+        if (!t) return nullptr;
+        *bytes = t->bytes;
+        return t->data;
+    }
+};
+
+struct mmdit {
+    WeightFile w, pw;  // the DiT's and the PDD heads' weights
+    std::vector<const void*> dev_bases;  // the mappings registered for the device
 
     struct Lin {
         const uint16_t* w = nullptr;  // BF16 [out][in], in place (or null: F32 in wf)
@@ -100,9 +121,9 @@ struct mmdit {
 namespace {
 
 // a tensor's values as F32: an F32 tensor is copied, a BF16 one converted (the checkpoint's own values either way)
-sddev::Floats floats_of(gguf_model_t* g, const std::string& name, size_t numel) {
+sddev::Floats floats_of(const WeightFile& w, const std::string& name, size_t numel) {
     size_t bytes = 0;
-    const void* p = gguf_get_tensor_ptr(g, name.c_str(), &bytes);
+    const void* p = w.tensor(name, &bytes);
     if (!p) throw std::runtime_error("minimax dit: no tensor " + name);
     sddev::Floats out(numel);
     if (bytes == 4 * numel) {
@@ -119,22 +140,22 @@ sddev::Floats floats_of(gguf_model_t* g, const std::string& name, size_t numel) 
     return out;
 }
 
-const uint16_t* bf16_of(gguf_model_t* g, const std::string& name, size_t numel) {
+const uint16_t* bf16_of(const WeightFile& w, const std::string& name, size_t numel) {
     size_t bytes = 0;
-    const void* p = gguf_get_tensor_ptr(g, name.c_str(), &bytes);
+    const void* p = w.tensor(name, &bytes);
     if (!p) throw std::runtime_error("minimax dit: no tensor " + name);
     if (bytes != 2 * numel) throw std::runtime_error("minimax dit: " + name + " is not BF16 of its size");
     return static_cast<const uint16_t*>(p);
 }
 
-mmdit::Lin lin_of(gguf_model_t* g, const std::string& prefix, int in, int out, bool bias) {
+mmdit::Lin lin_of(const WeightFile& w, const std::string& prefix, int in, int out, bool bias) {
     mmdit::Lin L;
     size_t bytes = 0;
-    const void* wp = gguf_get_tensor_ptr(g, (prefix + ".weight").c_str(), &bytes);
+    const void* wp = w.tensor(prefix + ".weight", &bytes);
     if (!wp) throw std::runtime_error("minimax dit: no tensor " + prefix + ".weight");
     if (bytes == 4 * (size_t)in * out) L.wf = static_cast<const float*>(wp);
-    else L.w = bf16_of(g, prefix + ".weight", (size_t)in * out);
-    if (bias) L.b = floats_of(g, prefix + ".bias", (size_t)out);
+    else L.w = bf16_of(w, prefix + ".weight", (size_t)in * out);
+    if (bias) L.b = floats_of(w, prefix + ".bias", (size_t)out);
     L.in = in;
     L.out = out;
     return L;
@@ -270,66 +291,118 @@ void sinusoid(float t, float* out) {
 
 }  // namespace
 
-mmdit_t* mmdit_open(const char* dit_gguf, const char* pdd_gguf) {
+// A path of a GGUF (rocm-convert's output), else the original checkpoint: a directory (transformer/) or a safetensors file
+static bool is_gguf_path(const char* path) {
+    const std::string s = path ? path : "";
+    return s.size() >= 5 && s.compare(s.size() - 5, 5, ".gguf") == 0;
+}
+
+// The PDD sigmas of a checkpoint's pdd_config.json (the directory of the heads' file): "sigmas": [ ... ]
+static std::vector<float> sigmas_of_config(const std::string& dir) {
+    std::vector<float> out;
+    char* text = st_read_text(dir.c_str(), "pdd_config.json");
+    if (!text) return out;
+    const char* k = std::strstr(text, "\"sigmas\"");
+    const char* o = k ? std::strchr(k, '[') : nullptr;
+    const char* c = o ? std::strchr(o, ']') : nullptr;
+    if (o && c) {
+        for (const char* p = o + 1; p < c;) {
+            char* e = nullptr;
+            const double v = std::strtod(p, &e);
+            if (e == p) { ++p; continue; }
+            out.push_back((float)v);
+            p = e;
+        }
+    }
+    std::free(text);
+    return out;
+}
+
+mmdit_t* mmdit_open(const char* dit_path, const char* pdd_path) {
     try {
         std::unique_ptr<mmdit> m(new mmdit());
-        m->g = gguf_mmap_open(dit_gguf);
-        if (!m->g) throw std::runtime_error(std::string("cannot open ") + (dit_gguf ? dit_gguf : "(null)"));
-        if (std::string(gguf_arch(m->g)) != "minimax_h3_dit") throw std::runtime_error("not a MiniMax-H3 DiT GGUF");
-        if (gguf_arch_int(m->g, "hidden_size", -1) != kH || gguf_arch_int(m->g, "layers", -1) != kLayers ||
-            gguf_arch_int(m->g, "heads", -1) != kHeads || gguf_arch_int(m->g, "head_dim", -1) != kD ||
-            gguf_arch_int(m->g, "ffn_size", -1) != kFF)
-            throw std::runtime_error("minimax dit: the GGUF's configuration is not the one this engine has");
+        if (is_gguf_path(dit_path)) {
+            m->w.g = gguf_mmap_open(dit_path);
+            if (!m->w.g) throw std::runtime_error(std::string("cannot open ") + dit_path);
+            if (std::string(gguf_arch(m->w.g)) != "minimax_h3_dit") throw std::runtime_error("not a MiniMax-H3 DiT GGUF");
+            if (gguf_arch_int(m->w.g, "hidden_size", -1) != kH || gguf_arch_int(m->w.g, "layers", -1) != kLayers ||
+                gguf_arch_int(m->w.g, "heads", -1) != kHeads || gguf_arch_int(m->w.g, "head_dim", -1) != kD ||
+                gguf_arch_int(m->w.g, "ffn_size", -1) != kFF)
+                throw std::runtime_error("minimax dit: the GGUF's configuration is not the one this engine has");
+        } else {
+            // the original checkpoint: its tensors are the names and the layouts the engine reads (the converter copies them)
+            m->w.st = st_open(dit_path);
+            if (!m->w.st) throw std::runtime_error(std::string("minimax dit: ") + st_last_error());
+        }
         if (!sddev::enabled()) throw std::runtime_error("minimax dit: needs the device (SD_DEVICE unset or gpu)");
-        size_t bytes = 0;
-        const void* base = gguf_map_base(m->g, &bytes);
-        if (gguf_n_maps(m->g) != 1 || !sddev::register_weights(base, bytes))
-            throw std::runtime_error("minimax dit: the weights cannot be registered for the device");
-        m->dev_base = base;
-
-        m->cond = lin_of(m->g, "condition_proj", kText, kH, true);
-        m->pvp = lin_of(m->g, "video_patch_proj", kPatch, kH, true);
-        m->t1 = lin_of(m->g, "time_embedder.proj_in", kFreq, kTembH, true);
-        m->t2 = lin_of(m->g, "time_embedder.proj_out", kTembH, kTemb, true);
-        m->fadaln = lin_of(m->g, "final_layer.adaln_proj.linear", kTemb, 2 * kH, true);
-        m->fnorm = floats_of(m->g, "final_layer.norm.weight", kH);
-        m->refnorm = floats_of(m->g, "token_refiner.final_norm.weight", kH);
+        if (m->w.g) {
+            size_t bytes = 0;
+            const void* base = gguf_map_base(m->w.g, &bytes);
+            if (gguf_n_maps(m->w.g) != 1 || !sddev::register_weights(base, bytes))
+                throw std::runtime_error("minimax dit: the weights cannot be registered for the device");
+            m->dev_bases.push_back(base);
+        } else {
+            for (int i = 0; i < st_n_shards(m->w.st); ++i) {
+                size_t bytes = 0;
+                const void* base = st_shard_base(m->w.st, i, &bytes);
+                if (!sddev::register_weights(base, bytes))
+                    throw std::runtime_error("minimax dit: the weights cannot be registered for the device");
+                m->dev_bases.push_back(base);
+            }
+        }
+        const WeightFile& w = m->w;
+        m->cond = lin_of(w, "condition_proj", kText, kH, true);
+        m->pvp = lin_of(w, "video_patch_proj", kPatch, kH, true);
+        m->t1 = lin_of(w, "time_embedder.proj_in", kFreq, kTembH, true);
+        m->t2 = lin_of(w, "time_embedder.proj_out", kTembH, kTemb, true);
+        m->fadaln = lin_of(w, "final_layer.adaln_proj.linear", kTemb, 2 * kH, true);
+        m->fnorm = floats_of(w, "final_layer.norm.weight", kH);
+        m->refnorm = floats_of(w, "token_refiner.final_norm.weight", kH);
         for (int l = 0; l < kRefiner; ++l) {
             const std::string p = "token_refiner.blocks." + std::to_string(l) + ".";
             mmdit::BlockW B;
-            B.norm1 = floats_of(m->g, p + "norm1.weight", kH);
-            B.norm2 = floats_of(m->g, p + "norm2.weight", kH);
-            B.qn = floats_of(m->g, p + "attn.q_norm.weight", kD);
-            B.kn = floats_of(m->g, p + "attn.k_norm.weight", kD);
-            B.qkv = bf16_of(m->g, p + "attn.qkv_proj.weight", (size_t)3 * kInner * kH);
-            B.out = bf16_of(m->g, p + "attn.out_proj.weight", (size_t)kH * kInner);
-            B.fc1 = bf16_of(m->g, p + "mlp.fc1.weight", (size_t)2 * kFF * kH);
-            B.fc2 = bf16_of(m->g, p + "mlp.fc2.weight", (size_t)kH * kFF);
+            B.norm1 = floats_of(w, p + "norm1.weight", kH);
+            B.norm2 = floats_of(w, p + "norm2.weight", kH);
+            B.qn = floats_of(w, p + "attn.q_norm.weight", kD);
+            B.kn = floats_of(w, p + "attn.k_norm.weight", kD);
+            B.qkv = bf16_of(w, p + "attn.qkv_proj.weight", (size_t)3 * kInner * kH);
+            B.out = bf16_of(w, p + "attn.out_proj.weight", (size_t)kH * kInner);
+            B.fc1 = bf16_of(w, p + "mlp.fc1.weight", (size_t)2 * kFF * kH);
+            B.fc2 = bf16_of(w, p + "mlp.fc2.weight", (size_t)kH * kFF);
             m->refiner.push_back(std::move(B));
         }
         for (int l = 0; l < kLayers; ++l) {
             const std::string p = "blocks." + std::to_string(l) + ".";
             mmdit::BlockW B;
-            B.norm1 = floats_of(m->g, p + "norm1.weight", kH);
-            B.norm2 = floats_of(m->g, p + "norm2.weight", kH);
-            B.qn = floats_of(m->g, p + "attn.q_norm.weight", kD);
-            B.kn = floats_of(m->g, p + "attn.k_norm.weight", kD);
-            B.qkv = bf16_of(m->g, p + "attn.qkv_proj.weight", (size_t)3 * kInner * kH);
-            B.out = bf16_of(m->g, p + "attn.out_proj.weight", (size_t)kH * kInner);
-            B.fc1 = bf16_of(m->g, p + "mlp.fc1.weight", (size_t)2 * kFF * kH);
-            B.fc2 = bf16_of(m->g, p + "mlp.fc2.weight", (size_t)kH * kFF);
-            B.adaln = lin_of(m->g, p + "adaln_proj.linear", kTemb, 3 * 6 * kH, true);
+            B.norm1 = floats_of(w, p + "norm1.weight", kH);
+            B.norm2 = floats_of(w, p + "norm2.weight", kH);
+            B.qn = floats_of(w, p + "attn.q_norm.weight", kD);
+            B.kn = floats_of(w, p + "attn.k_norm.weight", kD);
+            B.qkv = bf16_of(w, p + "attn.qkv_proj.weight", (size_t)3 * kInner * kH);
+            B.out = bf16_of(w, p + "attn.out_proj.weight", (size_t)kH * kInner);
+            B.fc1 = bf16_of(w, p + "mlp.fc1.weight", (size_t)2 * kFF * kH);
+            B.fc2 = bf16_of(w, p + "mlp.fc2.weight", (size_t)kH * kFF);
+            B.adaln = lin_of(w, p + "adaln_proj.linear", kTemb, 3 * 6 * kH, true);
             m->blocks.push_back(std::move(B));
         }
-        // the PDD heads and the sigmas
-        m->pg = gguf_mmap_open(pdd_gguf);
-        if (!m->pg) throw std::runtime_error(std::string("cannot open ") + (pdd_gguf ? pdd_gguf : "(null)"));
-        if (std::string(gguf_arch(m->pg)) != "minimax_h3_pdd") throw std::runtime_error("not a MiniMax-H3 PDD heads GGUF");
-        m->pdd_w = floats_of(m->pg, "video_out.weight", (size_t)kSteps * kPatch * kH);
-        m->pdd_b = floats_of(m->pg, "video_out.bias", (size_t)kSteps * kPatch);
-        {
-            sddev::Floats s = floats_of(m->pg, "sigmas", (size_t)kSteps + 1);
+        // the PDD heads and the sigmas: the GGUF's tensors, or the checkpoint's heads file and pdd_config.json
+        if (is_gguf_path(pdd_path)) {
+            m->pw.g = gguf_mmap_open(pdd_path);
+            if (!m->pw.g) throw std::runtime_error(std::string("cannot open ") + pdd_path);
+            if (std::string(gguf_arch(m->pw.g)) != "minimax_h3_pdd") throw std::runtime_error("not a MiniMax-H3 PDD heads GGUF");
+            m->pdd_w = floats_of(m->pw, "video_out.weight", (size_t)kSteps * kPatch * kH);
+            m->pdd_b = floats_of(m->pw, "video_out.bias", (size_t)kSteps * kPatch);
+            sddev::Floats s = floats_of(m->pw, "sigmas", (size_t)kSteps + 1);
             m->sigmas.assign(s.data(), s.data() + s.size());
+        } else {
+            m->pw.st = st_open(pdd_path);
+            if (!m->pw.st) throw std::runtime_error(std::string("minimax dit: ") + st_last_error());
+            m->pdd_w = floats_of(m->pw, "video_out.weight", (size_t)kSteps * kPatch * kH);
+            m->pdd_b = floats_of(m->pw, "video_out.bias", (size_t)kSteps * kPatch);
+            const std::string pdir = std::string(pdd_path).substr(0, std::string(pdd_path).rfind('/'));
+            m->sigmas = sigmas_of_config(pdir);
+            if (m->sigmas.size() != (size_t)kSteps + 1)
+                throw std::runtime_error("minimax dit: pdd_config.json has no sigmas of " + std::to_string(kSteps + 1));
         }
         load_kernels();
         return m.release();
@@ -341,10 +414,8 @@ mmdit_t* mmdit_open(const char* dit_gguf, const char* pdd_gguf) {
 
 void mmdit_close(mmdit_t* model) {
     if (!model) return;
-    if (model->dev_base) sddev::unregister_weights(model->dev_base);
-    if (model->g) gguf_mmap_close(model->g);
-    if (model->pg) gguf_mmap_close(model->pg);
-    delete model;
+    for (const void* base : model->dev_bases) sddev::unregister_weights(base);
+    delete model;  // (the weight files close with their WeightFile)
 }
 
 const char* mmdit_last_error(void) { return g_error.c_str(); }
