@@ -502,8 +502,12 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
 - S1 audio from MODELS_DIR (done 2026-11-14): `rocm-inference-server --models-dir DIR` serves the audio models in DIR
   without flags: a Whisper GGUF (arch whisper) becomes `--whisper`; a talker (arch qwen3tts) with its codec (arch
   qwen3tts_codec) becomes `--tts` and `--tts-codec`, with voices in DIR/voices (created). Flags still win. Checked: the
-  server's log names the picked files, the audio GGUFs are not listed as chat models. Not checked end to end: the server
-  under the container (its Perl modules are not in this sandbox; the auto block was run with the Web::Route stub).
+  server's log names the picked files, the audio GGUFs are not listed as chat models. Checked in the container
+  (2026-11-14, the server at /rocm/v1): `/v1/audio/transcriptions` on a copied WAV, `POST /v1/audio/voices` (a 16 s clip,
+  frames 204), and `/v1/audio/speech` with that voice returns a WAV that Whisper transcribes as "Hello there. This is a
+  test.". Found and fixed on the way: the device path needs BF16 talker matrices; the F32 talker (talker-f32) failed with
+  "a matrix is not BF16". It now runs on the host (`bf16_matrices`), and the auto-pick prefers the BF16 talker.
+  `qwen3tts_speech_verify` passes with both files.
 - U1 threads: the host matmuls and convolutions run on the 16 cores (OpenMP over output rows); real-time factors
   measured for the speech (talker frames per second) and the transcription (seconds of audio per second).
 - U2 GPU path (UMA: the GGUF map is pinned, so the GPU reads the same pages): decided after U1 by the measured split;
