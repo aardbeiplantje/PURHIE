@@ -157,6 +157,158 @@ void qz_row_q5_1(const float *x, void *y, int64_t k) {
     }
 }
 
+// ---------------------------------------------------------------- the K-quants (ggml's reference encoders)
+// nearest_int (ggml): round to nearest, ties to even, by adding the magic 1.5 * 2^23
+static inline int kq_nearest_int(float fval) {
+    float val = fval + 12582912.f;
+    int i;
+    memcpy(&i, &val, sizeof(int));
+    return (i & 0x007fffff) - 0x00400000;
+}
+
+// make_qkx2_quants (ggml): the scale and the minimum (*the_min = -min) of n values with weights, nmax levels, a search of
+// nstep steps; L receives the levels. use_mad selects |diff| instead of diff^2 for the error.
+static float kq_make_qkx2(int n, int nmax, const float *x, const float *weights, uint8_t *L, float *the_min, uint8_t *Laux,
+                          float rmin, float rdelta, int nstep, bool use_mad) {
+    float min = x[0];
+    float max = x[0];
+    float sum_w = weights[0];
+    float sum_x = sum_w * x[0];
+    for (int i = 1; i < n; ++i) {
+        if (x[i] < min) min = x[i];
+        if (x[i] > max) max = x[i];
+        const float w = weights[i];
+        sum_w += w;
+        sum_x += w * x[i];
+    }
+    if (min > 0) min = 0;
+    if (max == min) {
+        for (int i = 0; i < n; ++i) L[i] = 0;
+        *the_min = -min;
+        return 0.f;
+    }
+    float iscale = nmax / (max - min);
+    float scale = 1 / iscale;
+    float best_error = 0;
+    for (int i = 0; i < n; ++i) {
+        int l = kq_nearest_int(iscale * (x[i] - min));
+        L[i] = (uint8_t)std::max(0, std::min(nmax, l));
+        float diff = scale * L[i] + min - x[i];
+        diff = use_mad ? fabsf(diff) : diff * diff;
+        const float w = weights[i];
+        best_error += w * diff;
+    }
+    if (nstep < 1) {
+        *the_min = -min;
+        return scale;
+    }
+    for (int is = 0; is <= nstep; ++is) {
+        iscale = (rmin + rdelta * is + nmax) / (max - min);
+        float sum_l = 0, sum_l2 = 0, sum_xl = 0;
+        for (int i = 0; i < n; ++i) {
+            int l = kq_nearest_int(iscale * (x[i] - min));
+            l = std::max(0, std::min(nmax, l));
+            Laux[i] = (uint8_t)l;
+            const float w = weights[i];
+            sum_l += w * l;
+            sum_l2 += w * l * l;
+            sum_xl += w * l * x[i];
+        }
+        const float D = sum_w * sum_l2 - sum_l * sum_l;
+        if (D > 0) {
+            float this_scale = (sum_w * sum_xl - sum_x * sum_l) / D;
+            float this_min = (sum_l2 * sum_x - sum_l * sum_xl) / D;
+            if (this_min > 0) {
+                this_min = 0;
+                this_scale = sum_xl / sum_l2;
+            }
+            float cur_error = 0;
+            for (int i = 0; i < n; ++i) {
+                float diff = this_scale * Laux[i] + this_min - x[i];
+                diff = use_mad ? fabsf(diff) : diff * diff;
+                const float w = weights[i];
+                cur_error += w * diff;
+            }
+            if (cur_error < best_error) {
+                for (int i = 0; i < n; ++i) L[i] = Laux[i];
+                best_error = cur_error;
+                scale = this_scale;
+                min = this_min;
+            }
+        }
+    }
+    *the_min = -min;
+    return scale;
+}
+
+// get_scale_min_k4 (ggml): the 6-bit scale and minimum of sub-block j from the 12 packed bytes
+static inline void kq_get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+// Q4_K: super-block of 256: fp16 d, fp16 dmin, scales[12] (eight 6-bit scales and minimums), qs[128] (value i in the low
+// nibble of byte (i mod 128 within a 64-group) and i + 32 in the high). The reference's structure, byte for byte.
+void qz_row_q4_K(const float *x, void *y, int64_t k) {
+    uint8_t *out = (uint8_t *)y;  // block: fp16 d, fp16 dmin, scales[12], qs[128]
+    for (int64_t b = 0; b < k / 256; ++b, x += 256, out += 144) {
+        uint8_t L[256], Laux[32];
+        float weights[32], mins[8], scales[8];
+        memset(out, 0, 144);  // the packed scales are built with |=
+        float max_scale = 0, max_min = 0;  // scales are positive: the minimum is deducted
+        for (int j = 0; j < 8; ++j) {
+            float sum_x2 = 0;
+            for (int l = 0; l < 32; ++l) sum_x2 += x[32 * j + l] * x[32 * j + l];
+            const float av_x = sqrtf(sum_x2 / 32);
+            for (int l = 0; l < 32; ++l) weights[l] = av_x + fabsf(x[32 * j + l]);
+            scales[j] = kq_make_qkx2(32, 15, x + 32 * j, weights, L + 32 * j, &mins[j], Laux, -1.f, 0.1f, 20, false);
+            if (scales[j] > max_scale) max_scale = scales[j];
+            if (mins[j] > max_min) max_min = mins[j];
+        }
+        const float inv_scale = max_scale > 0 ? 63.f / max_scale : 0.f;
+        const float inv_min = max_min > 0 ? 63.f / max_min : 0.f;
+        uint8_t *scl = out + 4;
+        for (int j = 0; j < 8; ++j) {
+            uint8_t ls = (uint8_t)kq_nearest_int(inv_scale * scales[j]);
+            uint8_t lm = (uint8_t)kq_nearest_int(inv_min * mins[j]);
+            ls = std::min<uint8_t>(63, ls);
+            lm = std::min<uint8_t>(63, lm);
+            if (j < 4) {
+                scl[j] = ls;
+                scl[j + 4] = lm;
+            } else {
+                scl[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
+                scl[j - 4] |= (uint8_t)((ls >> 4) << 6);
+                scl[j - 0] |= (uint8_t)((lm >> 4) << 6);
+            }
+        }
+        const uint16_t hd = qz_fp32_to_fp16(max_scale / 63.f), hm = qz_fp32_to_fp16(max_min / 63.f);
+        memcpy(out, &hd, 2);
+        memcpy(out + 2, &hm, 2);
+        for (int j = 0; j < 8; ++j) {
+            uint8_t sc, m;
+            kq_get_scale_min_k4(j, scl, &sc, &m);
+            const float d = qt_fp16_to_fp32(hd) * sc;
+            if (!d) continue;
+            const float dm = qt_fp16_to_fp32(hm) * m;
+            for (int ii = 0; ii < 32; ++ii) {
+                int l = kq_nearest_int((x[32 * j + ii] + dm) / d);
+                L[32 * j + ii] = (uint8_t)std::max(0, std::min(15, l));
+            }
+        }
+        uint8_t *q = out + 16;
+        for (int j = 0; j < 256; j += 64) {
+            for (int l = 0; l < 32; ++l) q[l] = (uint8_t)(L[j + l] | (L[j + l + 32] << 4));
+            q += 32;
+        }
+    }
+}
+
 // ---------------------------------------------------------------- ROCmFP4 (rocmfp4.c, without an importance matrix)
 
 // Unsigned E4M3 scale bytes 0..126 as half-scale values: subnormals e * 2^-10, then (8 + m) * 2^(E - 11)
@@ -297,7 +449,7 @@ void qz_row_rocmfp4_fast(const float *x, void *y, int64_t k) {
 
 int qz_supported(int t) {
     return t == QT_F32 || t == QT_F16 || t == QT_BF16 || t == QT_Q8_0 || t == QT_Q4_0_ROCMFP4 ||
-           t == QT_Q4_0_ROCMFP4_FAST || t == QT_Q4_0 || t == QT_Q4_1 || t == QT_Q5_0 || t == QT_Q5_1;
+           t == QT_Q4_0_ROCMFP4_FAST || t == QT_Q4_0 || t == QT_Q4_1 || t == QT_Q5_0 || t == QT_Q5_1 || t == QT_Q4_K;
 }
 
 static void encode_row(int t, const float *x, void *y, int64_t n) {
@@ -310,6 +462,7 @@ static void encode_row(int t, const float *x, void *y, int64_t n) {
     case QT_Q4_1: qz_row_q4_1(x, y, n); break;
     case QT_Q5_0: qz_row_q5_0(x, y, n); break;
     case QT_Q5_1: qz_row_q5_1(x, y, n); break;
+    case QT_Q4_K: qz_row_q4_K(x, y, n); break;
     case QT_Q4_0_ROCMFP4: qz_row_rocmfp4(x, y, n); break;
     case QT_Q4_0_ROCMFP4_FAST: qz_row_rocmfp4_fast(x, y, n); break;
     }

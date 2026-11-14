@@ -27,7 +27,7 @@ static void check(bool ok, const std::string& what) {
     printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what.c_str());
 }
 
-static const int kTypes[] = {QT_Q8_0, QT_Q4_0_ROCMFP4, QT_Q4_0_ROCMFP4_FAST, QT_F16, QT_BF16, QT_Q4_0, QT_Q4_1, QT_Q5_0, QT_Q5_1};
+static const int kTypes[] = {QT_Q8_0, QT_Q4_0_ROCMFP4, QT_Q4_0_ROCMFP4_FAST, QT_F16, QT_BF16, QT_Q4_0, QT_Q4_1, QT_Q5_0, QT_Q5_1, QT_Q4_K};
 
 // Bytes differing between ours and the reference's for nrows x ncols; first differing row in *first
 static size_t compare(int t, const float* x, int64_t nrows, int64_t ncols, int64_t* first) {
@@ -50,9 +50,11 @@ static size_t compare(int t, const float* x, int64_t nrows, int64_t ncols, int64
     return nd;
 }
 
-static void check_all(const char* what, const std::vector<float>& x, int64_t ncols) {
+static void check_all(const char* what, const std::vector<float>& x, int64_t ncols, bool finite_only = false) {
     const int64_t nrows = (int64_t)x.size() / ncols;
     for (int t : kTypes) {
+        if (finite_only && t == QT_Q4_K) continue;  // (see the NaN / Inf case)
+        if (t == QT_Q4_K && ncols % 256) continue;  // a K-quant row is whole super-blocks (the reference has no row of 32)
         int64_t first;
         const size_t nd = compare(t, x.data(), nrows, ncols, &first);
         char buf[256];
@@ -129,7 +131,9 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < x.size(); ++i) x[i] = g(rng);
         for (size_t i = 3; i < x.size(); i += 97) x[i] = NAN;
         for (size_t i = 11; i < x.size(); i += 131) x[i] = (i & 1) ? INFINITY : -INFINITY;
-        check_all("NaN / Inf", x, 256);
+        // ggml's K-quant reference indexes its tables with nearest_int of a NaN and crashes (the reference's own
+        // undefined behaviour): the K-quants are checked on the finite cases only
+        check_all("NaN / Inf", x, 256, true);
     }
     {  // values on the Codebook10 decision boundaries (a = 0.5, 1.5, ... 9.0) for the block's own scale
         std::vector<float> x(16 * 32);
