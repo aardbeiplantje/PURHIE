@@ -39,7 +39,12 @@
    `tools/gen_iq_grids.py`) and `src/iq_kgrids.h` (`tools/gen_iq_kgrids.py`), ggml's neighbour tables built on first use).
    ggml's reference needs an importance matrix for IQ2_XXS, IQ2_XS and IQ1_S (it asserts without one): the converter and
    the verifier use UNIFORM weights (all ones) when none is given (`qz_quantize_im`); the imatrix file input is not written
-   yet. With that: every type the engine decodes has a native encoder, 189 verifier cases byte-identical to ggml. Legacy
+   yet. With that: every type the engine decodes has a native encoder, 189 verifier cases byte-identical to ggml.
+   MEASURED (2026-11-14): the IQ2_XXS text encoder (`rocm-convert -r plain`, 8.45 GB, 2.06 bits a value, uniform weights,
+   1141 s to convert) FAILS the bar: worst row cosine 0.8155, 0.8092, 0.7641 (3 prompts). `matvec_verify` on the same file
+   matches the GPU matvec to the CPU decode (worst relative error 3e-8), so the loss is the quantization without an
+   importance matrix, not the decode path. IQ2_XXS (and IQ2_XS, IQ1_S) is not usable as a text encoder until the imatrix
+   input exists. Legacy
    and K-quant full-matrix reference behaviour: ggml weighs Q4_0 etc. by an imatrix when given; the verifier passes none
    to those types. rocm-convert accepts all of them as targets (file types as ggml's; S variants where a type has none). The residency goal (the pipeline keeps the text encoder and the DiT both mapped)
    is what a small text encoder buys: Q8_0 (35 GB) plus the DiT (66 GB) fit in the 124 GB of RAM at once.
