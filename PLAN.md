@@ -6,6 +6,15 @@
 
 ## ▶ Next (2026-11-13)
 
+-1. **Image models from the original checkpoints** (2026-11-14, user: use the originals, no GGUF conversion; the engine smart
+   enough to read safetensors with LFS pointers). DONE: `src/safetensors_mmap` (the engine's reader: a directory or a file,
+   the index, LFS pointers resolved to `<git>/lfs/objects`, the tensors addressed by name in place). Feasibility shown: the
+   original MiniMax DiT (`/hf/MiniMax-H3-Image/transformer`, 12 LFS shards): 531 tensors, 66.28 GB, bytes identical to the
+   converted GGUF for every tensor. NEXT: the DiT, the PDD heads and the VAE read through a tensor source (a GGUF or a
+   checkpoint directory; about 35 GGUF call sites in `minimax_dit.cpp` and `minimax_vae.cpp`), then `mm_open` takes the
+   checkpoint directories. The text encoder (the Qwen3 LLM through the qwen loader) needs the same source in the qwen
+   loader: a larger change, after the image path.
+
 0. **Quantized text encoder and converter types** (2026-11-14, user: convert to every type the engine reads, no llama.cpp
    dependency; keep every type supported even when its quality is lower). Native encoders so far: F32, F16, BF16, Q8_0,
    Q4_0, Q4_1, Q5_0, Q5_1 (byte-identical to the reference in `tests/quantize_verify`), ROCmFP4 and its FAST variant.
