@@ -472,6 +472,60 @@ void qz_row_q6_K(const float *x, void *y, int64_t k) {
     }
 }
 
+// Q2_K: super-block of 256 in 16 groups of 16: scales[16] (the low nibble the 4-bit scale, the high the 4-bit minimum), qs[64]
+// (the 2-bit level of value i in bits 2 * (i / 32) of byte i mod 32 ... as the reference's packing), fp16 d at 80, dmin at 82.
+void qz_row_q2_K(const float *x, void *y, int64_t k) {
+    uint8_t *out = (uint8_t *)y;  // block: scales[16], qs[64], fp16 d, fp16 dmin
+    for (int64_t b = 0; b < k / 256; ++b, x += 256, out += 84) {
+        uint8_t L[256], Laux[16];
+        float weights[16], mins[16], scales[16];
+        float max_scale = 0, max_min = 0;
+        for (int j = 0; j < 16; ++j) {
+            for (int l = 0; l < 16; ++l) weights[l] = fabsf(x[16 * j + l]);
+            scales[j] = kq_make_qkx2(16, 3, x + 16 * j, weights, L + 16 * j, &mins[j], Laux, -0.5f, 0.1f, 15, true);
+            if (scales[j] > max_scale) max_scale = scales[j];
+            if (mins[j] > max_min) max_min = mins[j];
+        }
+        const float q4scale = 15.f;
+        uint8_t *sc = out;
+        if (max_scale > 0) {
+            const float iscale = q4scale / max_scale;
+            for (int j = 0; j < 16; ++j) sc[j] = (uint8_t)kq_nearest_int(iscale * scales[j]);
+            const uint16_t hd = qz_fp32_to_fp16(max_scale / q4scale);
+            memcpy(out + 80, &hd, 2);
+        } else {
+            const uint16_t hd = qz_fp32_to_fp16(0.f);
+            memcpy(out + 80, &hd, 2);
+        }
+        if (max_min > 0) {
+            const float iscale = q4scale / max_min;
+            for (int j = 0; j < 16; ++j) sc[j] |= (uint8_t)(kq_nearest_int(iscale * mins[j]) << 4);
+            const uint16_t hm = qz_fp32_to_fp16(max_min / q4scale);
+            memcpy(out + 82, &hm, 2);
+        } else {
+            const uint16_t hm = qz_fp32_to_fp16(0.f);
+            memcpy(out + 82, &hm, 2);
+        }
+        uint16_t hd, hm;
+        memcpy(&hd, out + 80, 2);
+        memcpy(&hm, out + 82, 2);
+        const float fd = qt_fp16_to_fp32(hd), fm = qt_fp16_to_fp32(hm);
+        for (int j = 0; j < 16; ++j) {
+            const float d = fd * (sc[j] & 0xF);
+            if (!d) continue;
+            const float dm = fm * (sc[j] >> 4);
+            for (int ii = 0; ii < 16; ++ii) {
+                const int l = kq_nearest_int((x[16 * j + ii] + dm) / d);
+                L[16 * j + ii] = (uint8_t)std::max(0, std::min(3, l));
+            }
+        }
+        uint8_t *qs = out + 16;
+        for (int j = 0; j < 256; j += 128)
+            for (int l = 0; l < 32; ++l)
+                qs[j / 4 + l] = (uint8_t)(L[j + l] | (L[j + l + 32] << 2) | (L[j + l + 64] << 4) | (L[j + l + 96] << 6));
+    }
+}
+
 // ---------------------------------------------------------------- ROCmFP4 (rocmfp4.c, without an importance matrix)
 
 // Unsigned E4M3 scale bytes 0..126 as half-scale values: subnormals e * 2^-10, then (8 + m) * 2^(E - 11)
@@ -612,7 +666,7 @@ void qz_row_rocmfp4_fast(const float *x, void *y, int64_t k) {
 
 int qz_supported(int t) {
     return t == QT_F32 || t == QT_F16 || t == QT_BF16 || t == QT_Q8_0 || t == QT_Q4_0_ROCMFP4 ||
-           t == QT_Q4_0_ROCMFP4_FAST || t == QT_Q4_0 || t == QT_Q4_1 || t == QT_Q5_0 || t == QT_Q5_1 || t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K;
+           t == QT_Q4_0_ROCMFP4_FAST || t == QT_Q4_0 || t == QT_Q4_1 || t == QT_Q5_0 || t == QT_Q5_1 || t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_Q2_K;
 }
 
 static void encode_row(int t, const float *x, void *y, int64_t n) {
@@ -628,6 +682,7 @@ static void encode_row(int t, const float *x, void *y, int64_t n) {
     case QT_Q4_K: qz_row_q4_K(x, y, n); break;
     case QT_Q5_K: qz_row_q5_K(x, y, n); break;
     case QT_Q6_K: qz_row_q6_K(x, y, n); break;
+    case QT_Q2_K: qz_row_q2_K(x, y, n); break;
     case QT_Q4_0_ROCMFP4: qz_row_rocmfp4(x, y, n); break;
     case QT_Q4_0_ROCMFP4_FAST: qz_row_rocmfp4_fast(x, y, n); break;
     }
