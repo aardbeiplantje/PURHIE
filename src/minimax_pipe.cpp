@@ -26,6 +26,17 @@ namespace {
 
 std::string g_error;
 
+// phase timing (MM_PIPE_DEBUG set: printed to stderr)
+static double phase_now() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static void phase(const char* name, double& t) {
+    if (!std::getenv("MM_PIPE_DEBUG")) return;
+    const double now = phase_now();
+    std::fprintf(stderr, "phase %-16s %7.2f s\n", name, now - t);
+    t = now;
+}
+
 struct Layer50 {
     std::vector<float>* out;
     int E;
@@ -34,18 +45,22 @@ struct Layer50 {
 // The prompt's hidden state after decoder layer 50 (index 49), one row per token; the prompt verbatim, no special tokens
 // (the tokenizer adds none for this model), as the M1 verifier checks against transformers.
 std::vector<float> encode_prompt(const char* gguf, const std::string& prompt, int* T_out) {
+    double tq = phase_now();
     inference_model* m = inference_load_model(gguf);
+    phase("  te load", tq);
     if (!m) throw std::runtime_error(std::string("text encoder: ") + inference_get_last_error());
     struct Free {
         inference_model* m;
         ~Free() { inference_free_model(m); }
     } guard{m};
     if (inference_kv_cache_init(m, 1024) != 0) throw std::runtime_error(std::string("text encoder kv: ") + inference_get_last_error());
+    phase("  te kv init", tq);
     int n = 0;
     int32_t* ids = inference_tokenize(m, prompt.c_str(), &n);
     if (!ids || n <= 0) throw std::runtime_error("text encoder: the prompt does not tokenize");
     std::vector<int> tokens(ids, ids + n);
     delete[] ids;
+    phase("  te tokenize", tq);
     if (std::getenv("MM_PIPE_DEBUG")) {
         std::fprintf(stderr, "prompt tokens %d:", n);
         for (int i = 0; i < n && i < 16; ++i) std::fprintf(stderr, " %d", tokens[i]);
@@ -63,6 +78,7 @@ std::vector<float> encode_prompt(const char* gguf, const std::string& prompt, in
     std::vector<float> logits(m->vocab_size);
     const int rc = qwen_model_prefill(qm, tokens.data(), n, 0, logits.data());
     qwen_model_set_layer_callback(qm, nullptr, nullptr);
+    phase("  te prefill", tq);
     if (rc != 0) throw std::runtime_error(std::string("text encoder prefill: ") + inference_get_last_error());
     *T_out = n;
     return hid;
@@ -169,17 +185,6 @@ void resize_lanczos(const unsigned char* src, int sh, int sw, unsigned char* dst
                     acc += ty[y].w[k] * mid[((size_t)(ty[y].first + k) * dw + x) * 3 + c];
                 dst[((size_t)y * dw + x) * 3 + c] = clip8(acc);
             }
-}
-
-// phase timing (MM_PIPE_DEBUG set: printed to stderr)
-static double phase_now() {
-    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-static void phase(const char* name, double& t) {
-    if (!std::getenv("MM_PIPE_DEBUG")) return;
-    const double now = phase_now();
-    std::fprintf(stderr, "phase %-16s %7.2f s\n", name, now - t);
-    t = now;
 }
 
 int mm_generate(mm_pipe_t* p, const char* prompt, int height, int width, unsigned long long seed, unsigned char* rgb) {

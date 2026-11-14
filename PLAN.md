@@ -7,7 +7,10 @@
 ## ▶ Next (2026-11-13)
 
 1. **MiniMax-H3-Image speed** (2026-11-13). End to end (2026-11-14, `mm_pipe_verify` 256 x 256 on the 2048 canvas, alone on the
-   device): 165.8 s (was 222 s): text 17.9 s, DiT open 15.6 s, sampler 109.0 s (was 169 s), VAE 22.8 s; the image is clean. The linears: `sd_gemm_wmma256b` (BF16 activations, converted once per call; a
+   device): 165.8 s (was 222 s): text 17.9 s, DiT open 15.6 s, sampler 109.0 s (was 169 s), VAE 22.8 s; the image is clean.
+   The text encoder's 16.5 s is the load of its 65 GB weights (15.3 s; ~4 GB/s, the same as the DiT's open 16 s); its prefill is
+   0.75 s. Both loads are I/O, not compute. Options: cache the prompt's embedding (repeat prompts skip 16 s); keep the weights
+   resident (not with both models: 131 GB against 128 GB UMA). The linears: `sd_gemm_wmma256b` (BF16 activations, converted once per call; a
    32-wide k-tile double-buffered in LDS; the output staged through LDS for 8-row stores) runs 4096 x 4105 x 4096 in 8.8 ms
    (15.6 TFLOPS) against 16.1 ms for the F32-activation tile; the 1024 canvas velocity 4.00 s (4.76 s before). Found by
    ablation: the F32 activations, re-read per 256 output rows, were the bottleneck (compute was not). Not done: a 256 x 256
