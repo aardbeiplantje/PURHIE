@@ -622,12 +622,24 @@ sd_gemm_wmma128bb(const uint16_t* __restrict__ A0, long lda, const uint16_t* __r
             }
 }
 
-// Vt[c * Tkp + j] = V[j * C + c] in BF16 (zero for Tk <= j < Tkp): the attention's values for the batched GEMM
+// Vt[c * Tkp + j] = V[j * C + c] in BF16 (zero for Tk <= j < Tkp): the attention's values for the batched GEMM. A 32 x 32 tile
+// through LDS (one block of 256 threads per tile, the grid is the tiles in row-major order over (channel, key) blocks), so the
+// reads of V and the writes of Vt are both contiguous. (The direct form read V with a stride of C per thread: 101 ms per call.)
 extern "C" __global__ void __launch_bounds__(256) sd_transpose_pad_bf16(const float* V, int Tk, int Tkp, int C, uint16_t* Vt) {
-    const long i = (long)blockIdx.x * 256 + threadIdx.x;
-    if (i >= (long)C * Tkp) return;
-    const int c = (int)(i / Tkp), j = (int)(i % Tkp);
-    Vt[i] = j < Tk ? f2bf(V[(long)j * C + c]) : (uint16_t)0;
+    __shared__ float tile[32][33];
+    const int tx = threadIdx.x & 31, ty = threadIdx.x >> 5;
+    const int tiles_c = (C + 31) / 32;
+    const int bc = blockIdx.x % tiles_c, bj = blockIdx.x / tiles_c;  // channel block, key block
+    const int c0 = bc * 32, j0 = bj * 32;
+    for (int k = 0; k < 4; ++k) {  // V rows (keys) j0 + ty + 8k, columns (channels) c0 + tx
+        const int j = j0 + ty + 8 * k, c = c0 + tx;
+        tile[ty + 8 * k][tx] = (j < Tk && c < C) ? V[(long)j * C + c] : 0.0f;
+    }
+    __syncthreads();
+    for (int k = 0; k < 4; ++k) {  // Vt rows (channels) c0 + ty + 8k, columns (keys) j0 + tx
+        const int c = c0 + ty + 8 * k, j = j0 + tx;
+        if (c < C && j < Tkp) Vt[(long)c * Tkp + j] = f2bf(tile[tx][ty + 8 * k]);
+    }
 }
 
 // The same softmax with one wave (32 lanes) per row, eight rows per 256-thread block: the reductions are wave shuffles, no block

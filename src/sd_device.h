@@ -22,8 +22,8 @@ void unregister_weights(const void* base);
 // One sd_model at a time on the device: the callers hold this for a whole UNet or VAE call (the streams sync per op).
 std::recursive_mutex& run_mutex();
 
-// Zeroed float memory: pinned and device-visible when the device path is on, else calloc. Pooled (a freed block is reused).
-void* alloc(size_t bytes);
+// Float memory (zeroed unless zero is false): pinned and device-visible when the device path is on, else calloc. Pooled.
+void* alloc(size_t bytes, bool zero = true);  // zero = false: the caller writes every byte (no memset: a CPU pass)
 void release(void* p, size_t bytes);
 
 // Float32 activations: the memory of alloc, zeroed. Copies are deep (the image's tensors are small next to the weights).

@@ -111,11 +111,11 @@ void unregister_weights(const void* base) {
 
 std::recursive_mutex& run_mutex() { return g_run; }
 
-void* alloc(size_t bytes) {
+void* alloc(size_t bytes, bool zero) {
     if (bytes == 0) return nullptr;
     const size_t need = round_up_page(bytes);
     if (!enabled()) {
-        void* p = std::calloc(1, need);
+        void* p = zero ? std::calloc(1, need) : std::malloc(need);
         if (!p) throw std::runtime_error("sd: out of memory");
         return p;
     }
@@ -127,13 +127,13 @@ void* alloc(size_t bytes) {
         if (best != (size_t)-1) {
             void* p = g_free[best].p;
             g_free.erase(g_free.begin() + (long)best);
-            std::memset(p, 0, need);
+            if (zero) std::memset(p, 0, need);
             return p;
         }
     }
     void* p = nullptr;
     if (hipHostMalloc(&p, need, hipHostMallocDefault) != hipSuccess) throw std::runtime_error("sd device: out of pinned memory");
-    std::memset(p, 0, need);
+    if (zero) std::memset(p, 0, need);
     return p;
 }
 
@@ -190,7 +190,7 @@ void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, cons
             // the activations converted to BF16 once (the tile re-reads them once per 256 output rows: the F32 bytes were the
             // bottleneck, see sd_gemm_wmma256b)
             const long nb = (long)T * in;
-            uint16_t* xb = static_cast<uint16_t*>(alloc(sizeof(uint16_t) * (size_t)nb));
+            uint16_t* xb = static_cast<uint16_t*>(alloc(sizeof(uint16_t) * (size_t)nb, false));
             const float* xs = x;
             void* ac[] = {(void*)&xs, (void*)&xb, (void*)&nb};
             launch(f_to_bf16, dim3((unsigned)((nb + kThreads - 1) / kThreads)), ac);
@@ -397,9 +397,10 @@ void attention_tc(const float* q, int Tq, const float* k, const float* v, int Tk
 // The flash attention (sd_flash_attn): Q, K BF16 row-major, the values transposed and padded to a multiple of 64 keys (BF16)
 void attention_flash(const float* q, int Tq, const float* k, const float* v, int Tk, int C, int heads, float* out) {
     const int Tkp = (Tk + 63) / 64 * 64;
-    uint16_t* qb = static_cast<uint16_t*>(alloc(sizeof(uint16_t) * (size_t)Tq * C));
-    uint16_t* kb = static_cast<uint16_t*>(alloc(sizeof(uint16_t) * (size_t)Tk * C));
-    uint16_t* vt = static_cast<uint16_t*>(alloc(sizeof(uint16_t) * (size_t)C * Tkp));
+    // (written in full by the conversions and the transpose: no zeroing pass)
+    uint16_t* qb = static_cast<uint16_t*>(alloc(sizeof(uint16_t) * (size_t)Tq * C, false));
+    uint16_t* kb = static_cast<uint16_t*>(alloc(sizeof(uint16_t) * (size_t)Tk * C, false));
+    uint16_t* vt = static_cast<uint16_t*>(alloc(sizeof(uint16_t) * (size_t)C * Tkp, false));
     {
         long n = (long)Tq * C;
         void* a1[] = {(void*)&q, (void*)&qb, (void*)&n};
@@ -414,7 +415,7 @@ void attention_flash(const float* q, int Tq, const float* k, const float* v, int
         const float* vp = v;
         uint16_t* vtp = vt;
         void* a3[] = {(void*)&vp, (void*)&tk, (void*)&tkp, (void*)&c, (void*)&vtp};
-        launch(f_transpose_pad_bf16, dim3((unsigned)(((long)C * Tkp + kThreads - 1) / kThreads)), a3);
+        launch(f_transpose_pad_bf16, dim3((unsigned)(((C + 31) / 32) * ((Tkp + 31) / 32))), a3);  // one block per 32 x 32 tile
     }
     {
         const float scale = 1.0f / std::sqrt((float)(C / heads));
