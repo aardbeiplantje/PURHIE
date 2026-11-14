@@ -28,7 +28,7 @@ static void check(bool ok, const std::string& what) {
     printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what.c_str());
 }
 
-static const int kTypes[] = {QT_Q8_0, QT_Q4_0_ROCMFP4, QT_Q4_0_ROCMFP4_FAST, QT_F16, QT_BF16, QT_Q4_0, QT_Q4_1, QT_Q5_0, QT_Q5_1, QT_Q4_K, QT_Q5_K, QT_Q6_K, QT_Q2_K, QT_Q3_K, QT_MXFP4, QT_NVFP4, QT_TQ1_0, QT_TQ2_0, QT_IQ4_NL, QT_IQ4_XS, QT_IQ2_XXS, QT_IQ2_XS, QT_IQ2_S};
+static const int kTypes[] = {QT_Q8_0, QT_Q4_0_ROCMFP4, QT_Q4_0_ROCMFP4_FAST, QT_F16, QT_BF16, QT_Q4_0, QT_Q4_1, QT_Q5_0, QT_Q5_1, QT_Q4_K, QT_Q5_K, QT_Q6_K, QT_Q2_K, QT_Q3_K, QT_MXFP4, QT_NVFP4, QT_TQ1_0, QT_TQ2_0, QT_IQ4_NL, QT_IQ4_XS, QT_IQ2_XXS, QT_IQ2_XS, QT_IQ2_S, QT_IQ3_XXS, QT_IQ3_S};
 
 // Bytes differing between ours and the reference's for nrows x ncols; first differing row in *first
 static size_t compare(int t, const float* x, int64_t nrows, int64_t ncols, int64_t* first) {

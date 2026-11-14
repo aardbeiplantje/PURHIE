@@ -1136,7 +1136,7 @@ static void encode_row(int t, const float *x, void *y, int64_t n, const float *q
     case QT_TQ2_0: qz_row_tq2_0(x, y, n); break;
     case QT_IQ4_NL: qz_row_iq4_nl(x, y, n); break;
     case QT_IQ4_XS: qz_row_iq4_xs(x, y, n); break;
-    case QT_IQ2_XXS: case QT_IQ2_XS: case QT_IQ2_S: qz_iq_encode(t, x, y, n, qw); break;
+    case QT_IQ2_XXS: case QT_IQ2_XS: case QT_IQ2_S: case QT_IQ3_XXS: case QT_IQ3_S: qz_iq_encode(t, x, y, n, qw); break;
     case QT_Q4_0_ROCMFP4: qz_row_rocmfp4(x, y, n); break;
     case QT_Q4_0_ROCMFP4_FAST: qz_row_rocmfp4_fast(x, y, n); break;
     }

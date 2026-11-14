@@ -677,13 +677,426 @@ void iq2_s_row(const float *x, uint8_t *out, int64_t n, const float *quant_weigh
     }
 }
 
+// ---- the 3-bit codebooks (ggml's iq3xs_init_impl): 4-value entries of 3-bit levels, the map over 12-bit indices
+struct Iq3Tab {
+    std::vector<uint32_t> grid;
+    std::vector<int> map;
+    std::vector<uint16_t> nb;
+};
+
+Iq3Tab build_iq3_tab(const uint16_t *kgrid, int grid_size, int nwant) {
+    const int kmap_size = 4096;
+    Iq3Tab t;
+    t.grid.resize(grid_size);
+    for (int k = 0; k < grid_size; ++k) {
+        int8_t *pos = (int8_t *)(t.grid.data() + k);
+        for (int i = 0; i < 4; ++i) {
+            const int l = (kgrid[k] >> 3 * i) & 0x7;
+            pos[i] = (int8_t)(2 * l + 1);
+        }
+    }
+    t.map.assign(kmap_size, -1);
+    for (int i = 0; i < grid_size; ++i) {
+        uint32_t aux32 = t.grid[i];
+        uint8_t *aux8 = (uint8_t *)&aux32;
+        uint16_t index = 0;
+        for (int k = 0; k < 4; ++k) {
+            const uint16_t q = (uint16_t)((aux8[k] - 1) / 2);
+            index |= (uint16_t)(q << 3 * k);
+        }
+        t.map[index] = i;
+    }
+    std::vector<int> dist2(2 * (size_t)grid_size);
+    auto point_dist = [&](int i, int8_t *pos) {
+        for (int k = 0; k < 4; ++k) {
+            const int l = (i >> 3 * k) & 0x7;
+            pos[k] = (int8_t)(2 * l + 1);
+        }
+        for (int j = 0; j < grid_size; ++j) {
+            const int8_t *pg = (const int8_t *)(t.grid.data() + j);
+            int d2 = 0;
+            for (int k = 0; k < 4; ++k) d2 += (pg[k] - pos[k]) * (pg[k] - pos[k]);
+            dist2[2 * j + 0] = d2;
+            dist2[2 * j + 1] = j;
+        }
+        qsort(dist2.data(), grid_size, 2 * sizeof(int), iq2_compare);
+    };
+    int8_t pos[4];
+    int num_neighbors = 0, num_not_in_map = 0;
+    for (int i = 0; i < kmap_size; ++i) {
+        if (t.map[i] >= 0) continue;
+        ++num_not_in_map;
+        point_dist(i, pos);
+        int n = 0;
+        int d2 = dist2[0];
+        int nhave = 1;
+        for (int j = 0; j < grid_size; ++j) {
+            if (dist2[2 * j] > d2) {
+                if (nhave == nwant) break;
+                d2 = dist2[2 * j];
+                ++nhave;
+            }
+            ++n;
+        }
+        num_neighbors += n;
+    }
+    t.nb.assign((size_t)num_neighbors + num_not_in_map, 0);
+    int counter = 0;
+    for (int i = 0; i < kmap_size; ++i) {
+        if (t.map[i] >= 0) continue;
+        point_dist(i, pos);
+        t.map[i] = -(counter + 1);
+        const int start = counter++;
+        int d2 = dist2[0];
+        int n = 0, nhave = 1;
+        for (int j = 0; j < grid_size; ++j) {
+            if (dist2[2 * j] > d2) {
+                if (nhave == nwant) break;
+                d2 = dist2[2 * j];
+                ++nhave;
+            }
+            t.nb[counter++] = (uint16_t)dist2[2 * j + 1];
+            ++n;
+        }
+        t.nb[start] = (uint16_t)n;
+    }
+    return t;
+}
+
+// 256 entries (IQ3_XXS: two neighbours), 512 (IQ3_S: three)
+const Iq3Tab &iq3_tab(int grid_size) {
+    static const Iq3Tab t256 = build_iq3_tab(kgrid_iq3_256, 256, 2);
+    static const Iq3Tab t512 = build_iq3_tab(kgrid_iq3_512, 512, 3);
+    return grid_size == 256 ? t256 : t512;
+}
+
+inline int iq3_neighbours_base(const Iq3Tab &t, uint16_t u) { return -t.map[u] - 1; }
+
+// iq3_find_best_neighbour (ggml)
+int iq3_find_best_neighbour(const Iq3Tab &t, int base, const float *xval, const float *weight, float scale, int8_t *L) {
+    const int num_neighbors = t.nb[base];
+    float best_d2 = FLT_MAX;
+    int grid_index = -1;
+    for (int j = 1; j <= num_neighbors; ++j) {
+        const int8_t *pg = (const int8_t *)(t.grid.data() + t.nb[base + j]);
+        float d2 = 0;
+        for (int i = 0; i < 4; ++i) {
+            const float q = pg[i];
+            const float diff = scale * q - xval[i];
+            d2 += weight[i] * diff * diff;
+        }
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            grid_index = t.nb[base + j];
+        }
+    }
+    const int8_t *pg = (const int8_t *)(t.grid.data() + grid_index);
+    for (int i = 0; i < 4; ++i) L[i] = (int8_t)((pg[i] - 1) / 2);
+    return grid_index;
+}
+
+// IQ3_XXS: block of 256: fp16 d (scaled by 1.0125), qs[96]: 64 grid indices (one per four values), then eight 32-bit words of four
+// 7-bit sign groups and a 4-bit scale (per 32 values)
+void iq3_xxs_row(const float *x, uint8_t *out, int64_t n, const float *quant_weights) {
+    const Iq3Tab &t = iq3_tab(256);
+    const int kMaxQ = 8;
+    const int64_t nbl = n / 256;
+    for (int64_t ibl = 0; ibl < nbl; ++ibl, out += 98) {
+        const uint16_t zero_h = qz_fp32_to_fp16(0.f);
+        memcpy(out, &zero_h, 2);
+        uint8_t q3[96];
+        memset(q3, 0, 96);
+        uint32_t *sas = (uint32_t *)(q3 + 64);  // scales and signs
+        float scales[8];
+        float weight[32], xval[32], waux[32];
+        int8_t L[32], Laux[32];
+        bool is_on_grid[8], is_on_grid_aux[8];
+        uint8_t block_signs[4];
+        float max_scale = 0;
+        const float *xbl = x + 256 * ibl;
+        float sumx2 = 0;
+        for (int i = 0; i < 256; ++i) sumx2 += xbl[i] * xbl[i];
+        const float sigma2 = 2 * sumx2 / 256;
+        for (int ib = 0; ib < 8; ++ib) {
+            const float *xb = xbl + 32 * ib;
+            const float *qw = quant_weights + 256 * ibl + 32 * ib;
+            for (int i = 0; i < 32; ++i) weight[i] = qw[i] * sqrtf(sigma2 + xb[i] * xb[i]);
+            for (int i = 0; i < 32; ++i) waux[i] = sqrtf(weight[i]);
+            for (int k = 0; k < 4; ++k) {
+                int nflip = 0;
+                uint8_t s = 0;
+                for (int i = 0; i < 8; ++i) {
+                    if (xb[8 * k + i] >= 0) {
+                        xval[8 * k + i] = xb[8 * k + i];
+                    } else {
+                        xval[8 * k + i] = -xb[8 * k + i];
+                        ++nflip;
+                        s |= (uint8_t)(1 << i);
+                    }
+                }
+                if (nflip % 2) {
+                    int imin = 0;
+                    float min = weight[8 * k + imin] * xb[8 * k + imin] * xb[8 * k + imin];
+                    for (int i = 1; i < 8; ++i) {
+                        const float ax = weight[8 * k + i] * xb[8 * k + i] * xb[8 * k + i];
+                        if (ax < min) {
+                            min = ax;
+                            imin = i;
+                        }
+                    }
+                    xval[8 * k + imin] = -xval[8 * k + imin];
+                    s ^= (uint8_t)(1 << imin);
+                }
+                block_signs[k] = s & 127;
+            }
+            float max = xval[0];
+            for (int i = 1; i < 32; ++i) max = max_of(max, xval[i]);
+            memset(L, 0, 32);
+            if (max < 1e-8f) {  // (GROUP_MAX_EPS_IQ3_XXS)
+                scales[ib] = 0;
+                continue;
+            }
+            float best = 0;
+            float scale = max / (2 * kMaxQ - 1);
+            for (int k = 0; k < 8; ++k) is_on_grid[k] = true;
+            for (int is = -15; is <= 15; ++is) {
+                const float id = (2 * kMaxQ - 1 + is * 0.2f) / max;
+                const float this_scale = 1 / id;
+                for (int k = 0; k < 8; ++k) {
+                    for (int i = 0; i < 4; ++i) {
+                        const int l = nearest_int(0.5f * (id * xval[4 * k + i] - 1));
+                        Laux[4 * k + i] = (int8_t)std::max(0, std::min(kMaxQ - 1, l));
+                    }
+                    uint16_t u = 0;
+                    for (int i = 0; i < 4; ++i) u |= (uint16_t)(Laux[4 * k + i] << 3 * i);
+                    const int grid_index = t.map[u];
+                    is_on_grid_aux[k] = true;
+                    if (grid_index < 0) {
+                        is_on_grid_aux[k] = false;
+                        iq3_find_best_neighbour(t, iq3_neighbours_base(t, u), xval + 4 * k, waux + 4 * k, this_scale, Laux + 4 * k);
+                    }
+                }
+                float sumqx = 0, sumq2 = 0;
+                for (int i = 0; i < 32; ++i) {
+                    const float w = weight[i];
+                    const float q = 2 * Laux[i] + 1;
+                    sumqx += w * xval[i] * q;
+                    sumq2 += w * q * q;
+                }
+                if (sumq2 > 0 && sumqx * sumqx > best * sumq2) {
+                    scale = sumqx / sumq2;
+                    best = scale * sumqx;
+                    for (int i = 0; i < 32; ++i) L[i] = Laux[i];
+                    for (int k = 0; k < 8; ++k) is_on_grid[k] = is_on_grid_aux[k];
+                }
+            }
+            int n_not_ongrid = 0;
+            for (int k = 0; k < 8; ++k)
+                if (!is_on_grid[k]) ++n_not_ongrid;
+            if (n_not_ongrid > 0 && scale > 0) {
+                const float id = 1 / scale;
+                for (int k = 0; k < 8; ++k) {
+                    if (is_on_grid[k]) continue;
+                    uint16_t u = 0;
+                    for (int i = 0; i < 4; ++i) {
+                        int l = nearest_int(0.5f * (id * xval[4 * k + i] - 1));
+                        l = std::max(0, std::min(kMaxQ - 1, l));
+                        u |= (uint16_t)(l << 3 * i);
+                    }
+                    int grid_index = t.map[u];
+                    if (grid_index < 0) grid_index = iq3_find_best_neighbour(t, iq3_neighbours_base(t, u), xval + 4 * k, waux + 4 * k, scale, L + 4 * k);
+                    const int8_t *pg = (const int8_t *)(t.grid.data() + grid_index);
+                    for (int i = 0; i < 4; ++i) L[4 * k + i] = (int8_t)((pg[i] - 1) / 2);
+                }
+                float sumqx = 0, sumq2 = 0;
+                for (int i = 0; i < 32; ++i) {
+                    const float w = weight[i];
+                    const float q = 2 * L[i] + 1;
+                    sumqx += w * xval[i] * q;
+                    sumq2 += w * q * q;
+                }
+                if (sumq2 > 0) scale = sumqx / sumq2;
+            }
+            if (scale < 0) {
+                scale = -scale;
+                for (int k = 0; k < 4; ++k) block_signs[k] = (~block_signs[k]) & 127;
+            }
+            for (int k = 0; k < 8; ++k) {
+                uint16_t u = 0;
+                for (int i = 0; i < 4; ++i) u |= (uint16_t)(L[4 * k + i] << 3 * i);
+                const int grid_index = t.map[u];
+                if (grid_index < 0) throw std::runtime_error("iq3_xxs: a point is not on the grid (ggml aborts here too)");
+                q3[8 * ib + k] = (uint8_t)grid_index;
+            }
+            sas[ib] = (uint32_t)block_signs[0] | ((uint32_t)block_signs[1] << 7) | ((uint32_t)block_signs[2] << 14) |
+                      ((uint32_t)block_signs[3] << 21);
+            scales[ib] = scale;
+            max_scale = max_of(max_scale, scale);
+        }
+        if (!max_scale) {
+            memset(out + 2, 0, 96);
+            continue;
+        }
+        const float d = max_scale / 31;
+        const uint16_t hd = qz_fp32_to_fp16(d * 1.0125f);  // small improvement via this fudge factor
+        memcpy(out, &hd, 2);
+        const float id = 1 / d;
+        for (int ib = 0; ib < 8; ++ib) {
+            int l = nearest_int(0.5f * (id * scales[ib] - 1));
+            l = std::max(0, std::min(15, l));
+            sas[ib] |= ((uint32_t)l) << 28;
+        }
+        memcpy(out + 2, q3, 96);
+    }
+}
+
+// IQ3_S: block of 256 in eight blocks of 32: fp16 d (scaled by 1.033), qs[64] (the low eight bits of each grid index), qh[8] (the
+// ninth bit of each), signs[32] (eight sign bits per block of 32 in four bytes, one per group of eight values), scales[4] (two 4-bit
+// scales per byte)
+void iq3_s_row(const float *x, uint8_t *out, int64_t n, const float *quant_weights) {
+    const Iq3Tab &t = iq3_tab(512);
+    const int kMaxQ = 8;
+    const int64_t nbl = n / 256;
+    const int block_size = 32, bs4 = 8, bs8 = 4;
+    for (int64_t ibl = 0; ibl < nbl; ++ibl, out += 110) {
+        memset(out, 0, 110);  // (the reference's memset of the block, then d = 0)
+        uint8_t *qs = out + 2, *qh = out + 66, *signs = out + 74, *scl = out + 106;
+        float scales[8];
+        float weight[32], xval[32], waux[32];
+        int8_t L[32], Laux[32];
+        bool is_on_grid[8], is_on_grid_aux[8];
+        uint8_t block_signs[4];
+        float max_scale = 0;
+        const float *xbl = x + 256 * ibl;
+        float sumx2 = 0;
+        for (int i = 0; i < 256; ++i) sumx2 += xbl[i] * xbl[i];
+        const float sigma2 = 2 * sumx2 / 256;
+        for (int ib = 0; ib < 256 / block_size; ++ib) {
+            const float *xb = xbl + block_size * ib;
+            const float *qw = quant_weights + 256 * ibl + block_size * ib;
+            for (int i = 0; i < block_size; ++i) weight[i] = qw[i] * sqrtf(sigma2 + xb[i] * xb[i]);
+            for (int i = 0; i < block_size; ++i) waux[i] = sqrtf(weight[i]);
+            for (int k = 0; k < bs8; ++k) {
+                uint8_t sg = 0;
+                for (int i = 0; i < 8; ++i) {
+                    if (xb[8 * k + i] >= 0) {
+                        xval[8 * k + i] = xb[8 * k + i];
+                    } else {
+                        xval[8 * k + i] = -xb[8 * k + i];
+                        sg |= (uint8_t)(1 << i);
+                    }
+                }
+                block_signs[k] = sg;
+            }
+            float max = xval[0];
+            for (int i = 1; i < block_size; ++i) max = max_of(max, xval[i]);
+            memset(L, 0, block_size);
+            if (!max) {
+                scales[ib] = 0;
+                continue;
+            }
+            float best = 0;
+            float scale = max / (2 * kMaxQ - 1);
+            for (int k = 0; k < bs4; ++k) is_on_grid[k] = false;
+            for (int is = -9; is <= 9; ++is) {
+                const float id = (2 * kMaxQ - 1 + is * 0.2f) / max;
+                const float this_scale = 1 / id;
+                for (int k = 0; k < bs4; ++k) {
+                    for (int i = 0; i < 4; ++i) {
+                        const int l = nearest_int(0.5f * (id * xval[4 * k + i] - 1));
+                        Laux[4 * k + i] = (int8_t)std::max(0, std::min(kMaxQ - 1, l));
+                    }
+                    uint16_t u = 0;
+                    for (int i = 0; i < 4; ++i) u |= (uint16_t)(Laux[4 * k + i] << 3 * i);
+                    const int grid_index = t.map[u];
+                    is_on_grid_aux[k] = true;
+                    if (grid_index < 0) {
+                        is_on_grid_aux[k] = false;
+                        iq3_find_best_neighbour(t, iq3_neighbours_base(t, u), xval + 4 * k, waux + 4 * k, this_scale, Laux + 4 * k);
+                    }
+                }
+                float sumqx = 0, sumq2 = 0;
+                for (int i = 0; i < block_size; ++i) {
+                    const float w = weight[i];
+                    const float q = 2 * Laux[i] + 1;
+                    sumqx += w * xval[i] * q;
+                    sumq2 += w * q * q;
+                }
+                if (sumq2 > 0 && sumqx * sumqx > best * sumq2) {
+                    scale = sumqx / sumq2;
+                    best = scale * sumqx;
+                    for (int i = 0; i < block_size; ++i) L[i] = Laux[i];
+                    for (int k = 0; k < bs4; ++k) is_on_grid[k] = is_on_grid_aux[k];
+                }
+            }
+            int n_not_ongrid = 0;
+            for (int k = 0; k < bs4; ++k)
+                if (!is_on_grid[k]) ++n_not_ongrid;
+            if (n_not_ongrid > 0 && scale > 0) {
+                const float id = 1 / scale;
+                for (int k = 0; k < bs4; ++k) {  // (ggml's check of is_on_grid is commented out here: every group is refined)
+                    uint16_t u = 0;
+                    for (int i = 0; i < 4; ++i) {
+                        int l = nearest_int(0.5f * (id * xval[4 * k + i] - 1));
+                        l = std::max(0, std::min(kMaxQ - 1, l));
+                        u |= (uint16_t)(l << 3 * i);
+                    }
+                    int grid_index = t.map[u];
+                    if (grid_index < 0) grid_index = iq3_find_best_neighbour(t, iq3_neighbours_base(t, u), xval + 4 * k, waux + 4 * k, scale, L + 4 * k);
+                    const int8_t *pg = (const int8_t *)(t.grid.data() + grid_index);
+                    for (int i = 0; i < 4; ++i) L[4 * k + i] = (int8_t)((pg[i] - 1) / 2);
+                }
+                float sumqx = 0, sumq2 = 0;
+                for (int i = 0; i < block_size; ++i) {
+                    const float w = weight[i];
+                    const float q = 2 * L[i] + 1;
+                    sumqx += w * xval[i] * q;
+                    sumq2 += w * q * q;
+                }
+                if (sumq2 > 0) scale = sumqx / sumq2;
+            }
+            if (scale < 0) {
+                scale = -scale;
+                for (int k = 0; k < bs8; ++k) block_signs[k] = (uint8_t)~block_signs[k];
+            }
+            for (int k = 0; k < bs4; ++k) {
+                uint16_t u = 0;
+                for (int i = 0; i < 4; ++i) u |= (uint16_t)(L[4 * k + i] << 3 * i);
+                const int grid_index = t.map[u];
+                if (grid_index < 0) throw std::runtime_error("iq3_s: a point is not on the grid (ggml aborts here too)");
+                qs[k] = (uint8_t)(grid_index & 255);
+                qh[(ib * bs4 + k) / 8] |= (uint8_t)((grid_index >> 8) << ((ib * bs4 + k) % 8));
+            }
+            qs += bs4;
+            for (int k = 0; k < bs8; ++k) signs[k] = block_signs[k];
+            signs += bs8;
+            scales[ib] = scale;
+            max_scale = max_of(max_scale, scale);
+        }
+        if (!max_scale) continue;
+        const float d = max_scale / 31;
+        const uint16_t hd = qz_fp32_to_fp16(d * 1.033f);
+        memcpy(out, &hd, 2);
+        const float id = 1 / d;
+        for (int ib = 0; ib < 8; ib += 2) {
+            int l1 = nearest_int(0.5f * (id * scales[ib + 0] - 1));
+            l1 = std::max(0, std::min(15, l1));
+            int l2 = nearest_int(0.5f * (id * scales[ib + 1] - 1));
+            l2 = std::max(0, std::min(15, l2));
+            scl[ib / 2] = (uint8_t)(l1 | (l2 << 4));
+        }
+    }
+}
+
 }  // namespace
 
-int qz_iq_supported(int t) { return t == QT_IQ2_XXS || t == QT_IQ2_XS || t == QT_IQ2_S; }
+int qz_iq_supported(int t) { return t == QT_IQ2_XXS || t == QT_IQ2_XS || t == QT_IQ2_S || t == QT_IQ3_XXS || t == QT_IQ3_S; }
 
 void qz_iq_encode(int t, const float *x, void *y, int64_t n, const float *qw) {
     if (t == QT_IQ2_XXS) iq2_xxs_row(x, (uint8_t *)y, n, qw);
     else if (t == QT_IQ2_XS) iq2_xs_row(x, (uint8_t *)y, n, qw);
     else if (t == QT_IQ2_S) iq2_s_row(x, (uint8_t *)y, n, qw);
+    else if (t == QT_IQ3_XXS) iq3_xxs_row(x, (uint8_t *)y, n, qw);
+    else if (t == QT_IQ3_S) iq3_s_row(x, (uint8_t *)y, n, qw);
     else throw std::runtime_error("qz_iq_encode: type not written yet");
 }
