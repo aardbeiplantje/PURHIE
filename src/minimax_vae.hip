@@ -176,3 +176,28 @@ mm_dequant_q8_0_bf16(const uint8_t* W, long long row_bytes, int N, int K, uint16
     if ((u & 0x7F800000u) != 0x7F800000u) u += 0x7FFFu + ((u >> 16) & 1u);
     out[i] = (uint16_t)(u >> 16);
 }
+
+// Q4_0_ROCMFP4 (fast = 0: 18-byte blocks, two scales; fast = 1: Q4_0_ROCMFP4_FAST, 17-byte blocks, one scale) [N][K]
+// decoded to BF16, as src/quant_types.cpp's decoders: the codebook value times the unsigned E4M3 half scale, exact in F32
+extern "C" __global__ void __launch_bounds__(MV_THREADS)
+mm_dequant_fp4_bf16(const uint8_t* W, long long row_bytes, int N, int K, int fast, uint16_t* out) {
+    const long long i = (long long)blockIdx.x * MV_THREADS + threadIdx.x;  // over N * K
+    if (i >= (long long)N * K) return;
+    const long long r = i / K;
+    const int c = (int)(i % K);
+    const int j = c % 32;
+    const uint8_t* b = W + r * row_bytes + (long long)(c / 32) * (fast ? 17 : 18);
+    const int8_t cb[16] = {0, 1, 2, 3, 4, 6, 8, 10, 0, -1, -2, -3, -4, -6, -8, -10};
+    const int nib = j < 16 ? (b[j] & 0x0f) : (b[j - 16] >> 4);
+    const uint8_t e = fast ? b[16] : (j < 16 ? b[16] : b[17]);
+    float d = 0.0f;
+    if (e <= 0x7e) {
+        const int ex = e >> 3, m = e & 7;
+        d = ex == 0 ? (float)m * 0x1p-10f : (float)(8 + m) * ldexpf(1.0f, ex - 11);
+    }
+    const float v = (float)cb[nib] * d;
+    uint32_t u;
+    __builtin_memcpy(&u, &v, 4);
+    if ((u & 0x7F800000u) != 0x7F800000u) u += 0x7FFFu + ((u >> 16) & 1u);
+    out[i] = (uint16_t)(u >> 16);
+}

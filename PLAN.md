@@ -11,8 +11,9 @@ Open work, in the order to take it. Each item names its state and the next concr
 0. **Fast quantized DiT matmul** (DONE for Q8_0, 2026-11-14; user's priority). Device decode `mm_dequant_q8_0_bf16`
    (`src/minimax_vae.hip`) into the BF16 scratch, then the BF16 kernels. Checks: bit-exact against the CPU decoder on the
    mixed Q8_0 DiT (`MMDIT_CHECK_DEQUANT=1`, no mismatch); the 2048 canvas 0.991640 (= the CPU-decode run); wall time
-   129.5 s against 134.7 s for BF16 on the same run (the file is smaller). Still open: ROCmFP4 on the device (same pattern),
-   the int8 WMMA route (quantizes activations: a different numerical path, not measured). The earlier note: the batched kernel
+   129.5 s against 134.7 s for BF16 on the same run (the file is smaller). ROCmFP4 and its FAST variant are on the device too
+   (`mm_dequant_fp4_bf16`; 2026-11-14): bit-exact against the CPU decoder (`MMDIT_CHECK_DEQUANT=1`, full ROCmFP4 DiT, 18.6 GB),
+   the canvas 0.783152 (= the CPU-decode run), wall 128.9 s. Still open: the int8 WMMA route (quantizes activations: a different numerical path, not measured). The earlier note: the batched kernel
    (`qmatvec_launch_batch`) runs at ~1.4 TFLOP/s against 15-25 for the BF16 kernels, so the quantized DiT decoded its
    weights on the CPU every call. Now: `mm_dequant_q8_0_bf16` (src/minimax_vae.hip) decodes Q8_0 linears on the device
    into the BF16 scratch and the BF16 kernels run the matmul. Its numerics equal the CPU decode bit for bit (checked by
