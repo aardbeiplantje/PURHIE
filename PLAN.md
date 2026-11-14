@@ -18,9 +18,11 @@
    the drift (the sampler 0.9852 -> 0.9892). Per-op inside block 30 (`MMDIT_DEBUG_LAYER=30`, `LAYER=30 tests/mm_dit_dump.py`): the input to the block (block 29's
 output) differs by 1.8%; after the AdaLN (attention input) 4.9%, the attention output 7.8%, the FFN output 7.6%. The error is
 spread over all tokens (median 3.9% per token) and channels (worst 0.14), with no localized operation: consistent with
-accumulated rounding, not a single wrong op. Open: the reference is bf16 throughout (its residual values reach 2.5e6); an
-fp32 pass of blocks 30-49 from the reference's block-29 values, one block at a time (weights cast per block), would settle
-whether the engine or the reference is the closer one. `tests/mm_canvas_verify` (released latents) was 0.99381 before the attention work.
+accumulated rounding, not a single wrong op. RESULT (2026-11-14, `FIRST=30 tests/mm_dit_fp32chain.py`: blocks 30-49 in fp32 from the reference's block-29 values, weights
+exact from the bf16 release, only those 20 blocks on the GPU): the fp32 chain's block-49 output vs the reference: cosine
+0.99965 (relative 2.7%); vs the engine: 0.99303 (relative 11.9%); the engine vs the reference: 0.99268. The reference is
+close to fp32, so the drift from block 30 is an ENGINE error, not the reference's rounding. Next: per-op comparison of the
+engine (`MMDIT_DEBUG_LAYER=30`) with the fp32 chain's block 30, starting from the attention. `tests/mm_canvas_verify` (released latents) was 0.99381 before the attention work.
    Attention (2026-11-14): the wrapper (`sddev::attention`, 4105 tokens, 56 heads) went 96.6 -> 31 ms per call. Two causes:
    the V transpose read with a stride per thread (101 ms; now a 32 x 32 LDS tile, 1.2 ms), and the scratch buffers zeroed on
    the CPU (now not). The kernel (`sd_flash_attn`): 8 waves per block, 128 query rows, Q in registers, DPP row reductions,
