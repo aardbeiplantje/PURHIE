@@ -60,7 +60,9 @@ if ($o{'models-dir'}) {
         $LOG->info('audio', event => 'auto', msg => "speech recognition (--whisper): $o{whisper}");
     }
     if (!$o{tts} && $a{tts} && $a{codec}) {
-        ($o{tts}, $o{'tts-codec'}) = ($a{tts}[0], $a{codec}[0]);
+        # a BF16 talker before an F32 one (the device path reads BF16; the F32 file runs on the host)
+        my ($talker) = sort { ($a =~ /f32/i) <=> ($b =~ /f32/i) || $a cmp $b } @{ $a{tts} };
+        ($o{tts}, $o{'tts-codec'}) = ($talker, $a{codec}[0]);
         my $voices = "$dir/voices";
         $o{voices} //= $voices if -d $voices || mkdir $voices;
         $LOG->info('audio', event => 'auto', msg => "speech (--tts $o{tts} --tts-codec $o{'tts-codec'}, voices "

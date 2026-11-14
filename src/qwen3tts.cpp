@@ -192,6 +192,17 @@ Mat mat_of(const gguf_model_t* g, const std::string& name, int rows, int cols) {
 }
 
 
+// The device path reads the talker's and the predictor's matrices as BF16 in place: a GGUF with F32 matrices (the
+// talker-f32 file) runs on the host. A matrix is a tensor with two or more rows (the norms and biases are vectors).
+bool bf16_matrices(const gguf_model_t* g) {
+    for (int64_t i = 0; i < gguf_n_tensors(g); ++i) {
+        const char* name = gguf_tensor_name(g, i);
+        if (strncmp(name, "talker.", 7) && strncmp(name, "pred.", 5)) continue;
+        if (gguf_tensor_ne(g, i)[1] > 1 && gguf_tensor_type(g, i) != 30) return false;  // 30: ggml's BF16
+    }
+    return true;
+}
+
 // y[t][o] = x[t][:] . w[o][:] + b[o]: parallel over the output rows o, and each row is read once for all T inputs (a
 // prefill or a code predictor's batch reuses the row from cache; a decode step has one input and the rows are the work)
 void linear(const float* x, int T, const Lin& L, float* y) {
@@ -879,8 +890,8 @@ qwen3tts_model_t* qwen3tts_open(const char* gguf_path) {
             m->pblk.push_back(block_of("pred.blk." + std::to_string(l) + ".", m->pC, m->pH, m->pHkv, m->pD, m->pFF));
         m->pred_out_norm = tensor(m->g, "pred.out_norm.weight", m->pC);
         m->tok = tokenizer_load_from_gguf(m->g);  // (NULL when the GGUF has no vocabulary)
-        // the device path: the GGUF's mapping registered (one mapping: an unsplit file)
-        if (gguf_n_maps(m->g) == 1) {
+        // the device path: the GGUF's mapping registered (one mapping: an unsplit file; BF16 matrices, see bf16_matrices)
+        if (gguf_n_maps(m->g) == 1 && bf16_matrices(m->g)) {
             size_t map_size = 0;
             const void* base = gguf_map_base(m->g, &map_size);
             if (gpu::map(base, map_size)) m->gpu_base = base;
