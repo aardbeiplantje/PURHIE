@@ -31,7 +31,14 @@ Open work, in the order to take it. Each item names its state and the next concr
    point at the non-block tensors' sensitivity; not chased).
 4. **ComfyUI backend** (milestone 1 next: the component API, verified on sd-turbo). `/comfyui` is mounted again
    (28 files, about 167 GB, 7.9 GB free: converting to GGUF needs space on `/data`).
-5. **Audio** (done per the audio section below; open: long-form cuts at pauses, whisper GPU path, device frame launches).
+5. **Audio** (2026-11-14; S1 and S2 in the audio section). Done: long texts in pieces, the speech pulled per piece (other
+   requests between them), wav / pcm / flac and stream for wav and pcm. Open, in order: (a) device frame fusion (U2:
+   fewer launches and syncs per talker frame, the sampler on the device; measured about 100 ms per frame in the server
+   runs, against the 44 ms of the device note: profile first, the codec decode per piece is part of it); (b) whisper
+   long-form by the Whisper seek rule (timestamps, the cut at the last complete segment) and previous-text conditioning;
+   (c) whisper GPU path (the encoder's matmuls through sddev); (d) vision tower GPU path (V3 onwards); (e) torch-identical
+   sampled frames: not started (the engine's sampler is its own generator; a bit match needs torch's CPU RNG path).
+   mp3 / opus / aac: not built (no encoder in the image).
 
 Earlier list (2026-11-13), kept for reference:
 
