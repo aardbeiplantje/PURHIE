@@ -32,8 +32,8 @@ Open work, in the order to take it. Each item names its state and the next concr
 4. **ComfyUI backend** (milestone 1 next: the component API, verified on sd-turbo). `/comfyui` is mounted again
    (28 files, about 167 GB, 7.9 GB free: converting to GGUF needs space on `/data`).
 5. **Audio** (2026-11-14; S1 and S2 in the audio section). Done: long texts in pieces, the speech pulled per piece (other
-   requests between them), wav / pcm / flac and stream for wav and pcm. Open, in order: (a) device frame (U3: fusion and graphs in, 27.5 ms per frame from 37 ms; open: the
-   2x of a predictor stack, and the sampler on the device); (b) whisper
+   requests between them), wav / pcm / flac and stream for wav and pcm. Open, in order: (a) device frame (U3, U4: 23 ms per frame from 37; open: the matvec kernels at 175 to 206 GB/s
+   against 256, and the sampler on the device); (b) whisper
    long-form by the Whisper seek rule (timestamps, the cut at the last complete segment) and previous-text conditioning;
    (c) whisper GPU path (the encoder's matmuls through sddev); (d) vision tower GPU path (V3 onwards); (e) torch-identical
    sampled frames: not started (the engine's sampler is its own generator; a bit match needs torch's CPU RNG path).
@@ -543,6 +543,18 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   count it through the heads' syncs); the per-kernel event timings are inflated by the events, and rocprofv3 wrote no
   trace here (under it the speech output also changed, unexplained). Next options: find the 2x in the stack (a trace
   without events), and the predictor's weights as Q8_0 (half the bytes; a quality decision, not the default).
+- U4 the predictor stack, round two (2026-11-14). A stack (5 layers, six launches each) in a standalone benchmark
+  (`bench_stack`: the same kernels and arguments, a graph; device memory) takes 1156 us; with a sync after each it is the
+  same (the sync costs nothing). Per layer, with one kernel type left out at a time: QKV 48 us (8.4 MB: 175 GB/s), the
+  output projection 36 us (4.2 MB: 117 GB/s), gate/up 61 us (12.6 MB: 206 GB/s), down 31 us (6.3 MB: 203 GB/s), the
+  attention and the rotary about 3 us each. Findings: the earlier 323 GB/s of a single matvec was a cache artifact (the
+  same 12.6 MB read again and again); the stack reads 157 MB, which is cold. Achievable: a streaming read reaches 256 GB/s
+  with no flush (a memset before a run leaves dirty lines to write back during the read: 147 GB/s, a bad measurement).
+  Kept: the dot product's four loads per step unconditional (a load inside a branch serialized them: 1156 -> 1034 us with
+  the fix), the RMS prologue with wave shuffles. Not kept: two rows per warp (eight loads in flight): 1035 us, 100 to
+  108 VGPRs per thread (the activations' reads), and capping the registers at 64 spilled (1850 us). Engine (45 frames of
+  made-from-clip): predictor 17.0 ms, talker 6.2 ms: 23.2 ms per frame, down from 37.3 at the start of U3. The
+  predictor's floor at 256 GB/s is about 10 ms, the talker's about 3.5 ms. Open: the matvec kernels at 175 to 206 GB/s.
 - U1 threads: the host matmuls and convolutions run on the 16 cores (OpenMP over output rows); real-time factors
   measured for the speech (talker frames per second) and the transcription (seconds of audio per second).
 - U2 GPU path (UMA: the GGUF map is pinned, so the GPU reads the same pages): decided after U1 by the measured split;

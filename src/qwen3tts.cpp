@@ -678,6 +678,8 @@ void block(const Block& B, const Dims& d, float* x, float* kc, float* vc, const 
     const float eps = d.eps;
     if (!B.q.w.h || !B.k.w.h || !B.v.w.h || !B.o.w.h || !B.gate.w.h || !B.up.w.h || !B.down.w.h)
         throw std::runtime_error("qwen3tts device: a matrix is not BF16");
+    if (C % 1024 || HD % 1024 || FF % 1024 || KD % 2)
+        throw std::runtime_error("qwen3tts device: the widths must be multiples of 1024 (talker_gpu.hip's row loops)");
     const float* attn_norm = B.attn_norm;
     const uint16_t *Wq = B.q.w.h, *Wk = B.k.w.h, *Wv = B.v.w.h, *Wo = B.o.w.h, *Wg = B.gate.w.h, *Wu = B.up.w.h,
                    *Wd = B.down.w.h;
@@ -725,6 +727,7 @@ void block(const Block& B, const Dims& d, float* x, float* kc, float* vc, const 
 // the head for one token: normed = rms_norm(x) * norm_w, out = W normed (one launch; normed is the head's input row)
 void head(const float* x, const float* norm_w, const Mat& W, float eps, int C, float* normed, float* out) {
     if (!W.h) throw std::runtime_error("qwen3tts device: a matrix is not BF16");
+    if (C % 1024) throw std::runtime_error("qwen3tts device: the head's width (talker_gpu.hip's row loops)");
     const float* xin = x;
     const float* nw = norm_w;
     const uint16_t* Wh = W.h;
@@ -1291,7 +1294,7 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
         // QWEN3TTS_PROFILE=2: the kernels timed one by one (direct launches, not the graphs)
         if (dev_on && std::getenv("QWEN3TTS_PROFILE") && std::getenv("QWEN3TTS_PROFILE")[0] == '2') dev::ktimes = &kt;
         auto ms_since = [](clk::time_point t) { return std::chrono::duration<double, std::milli>(clk::now() - t).count(); };
-        double t_prefill = 0, t_samp = 0, t_pred = 0, t_tal = 0, t_issue = 0, t_head_wait = 0;
+        double t_prefill = 0, t_samp = 0, t_pred = 0, t_tal = 0, t_issue = 0, t_head_wait = 0, t_stack0 = 0;
         const clk::time_point t_setup = clk::now();
         // the prefill (on the host, into the caches)
         std::vector<float> x(prefill.begin(), prefill.begin() + (size_t)P * C);
@@ -1403,8 +1406,10 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
             } else {
                 // the same on the device: pin holds the predictor's current row (the output of its last token)
                 std::memcpy(pin, hid, sizeof(float) * C);
+                const clk::time_point ts0 = clk::now();
                 pred_stack(0);
                 sync();  // the host writes pin next: the stack above must have finished with it
+                if (prof) t_stack0 += ms_since(ts0);
                 mat_row(m->codec_embd, c0, pin);
                 pred_stack(1);
                 for (int k = 1; k < ncb; ++k) {
@@ -1465,9 +1470,9 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
         }
         if (prof && n_out > 0)
             std::fprintf(stderr, "qwen3tts profile (%s): %d frames, prefill %.0f ms; per frame: sample %.2f, predictor %.2f "
-                         "(stacks issued %.2f, head+wait %.2f), talker %.2f ms; talker C %d FF %d (%d layers), predictor C %d FF %d "
+                         "(stacks issued %.2f, head+wait %.2f, first stack+sync %.2f), talker %.2f ms; talker C %d FF %d (%d layers), predictor C %d FF %d "
                          "(%d layers, %d codebooks)\n", dev_on ? "device" : "host", n_out, t_prefill, t_samp / n_out, t_pred / n_out,
-                         t_issue / n_out, t_head_wait / n_out, t_tal / n_out, C, d.FF, m->n_layer, pd.C, pd.FF, m->pn_layer, ncb);
+                         t_issue / n_out, t_head_wait / n_out, t_stack0 / n_out, t_tal / n_out, C, d.FF, m->n_layer, pd.C, pd.FF, m->pn_layer, ncb);
         arena.close();
         return n_out;
     } catch (const std::exception& e) {

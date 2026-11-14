@@ -16,18 +16,17 @@ __device__ __forceinline__ float tk_bf16(uint16_t b) {
     return __uint_as_float(u);
 }
 
-// the block's rms norm of x [n] into xs [n] (xs = x * rsqrt(mean(x^2) + eps) * w), with the reduction of tk_rmsnorm; red has
-// TK_THREADS floats. Ends with a barrier: xs is ready for every thread.
+// the block's rms norm of x [n] into xs [n] (xs = x * rsqrt(mean(x^2) + eps) * w): each wave sums its squares by shuffles,
+// the waves' sums are added in one order by every thread (two barriers in all). red has TK_THREADS / 32 floats at least.
 __device__ void tk_rms_lds(const float *x, const float *w, int n, float eps, float *xs, float *red) {
     float s = 0.0f;
     for (int i = threadIdx.x; i < n; i += TK_THREADS) s += x[i] * x[i];
-    red[threadIdx.x] = s;
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor(s, o);
+    if (threadIdx.x % 32 == 0) red[threadIdx.x / 32] = s;
     __syncthreads();
-    for (int off = TK_THREADS / 2; off > 0; off >>= 1) {
-        if (threadIdx.x < off) red[threadIdx.x] += red[threadIdx.x + off];
-        __syncthreads();
-    }
-    const float inv = 1.0f / sqrtf(red[0] / (float)n + eps);
+    float tot = 0.0f;
+    for (int wv = 0; wv < TK_THREADS / 32; ++wv) tot += red[wv];
+    const float inv = 1.0f / sqrtf(tot / (float)n + eps);
     for (int i = threadIdx.x; i < n; i += TK_THREADS) xs[i] = x[i] * inv * w[i];
     __syncthreads();
 }
@@ -43,19 +42,14 @@ __device__ __forceinline__ float tk_dot8(const uint4 v, const float *xp) {
 }
 
 __device__ __forceinline__ float tk_row_dot(const uint16_t *wr, const float *xs, int n, int lane) {
+    // (n is a multiple of 1024: the four loads of a step are unconditional; a load inside a branch serialized them)
     const uint4 *w4 = reinterpret_cast<const uint4 *>(wr);
     const int n8 = n / 8;
     float acc = 0.0f;
     for (int j = lane; j < n8; j += 128) {
-        const uint4 v0 = w4[j];
-        const bool h1 = j + 32 < n8, h2 = j + 64 < n8, h3 = j + 96 < n8;
-        const uint4 v1 = h1 ? w4[j + 32] : make_uint4(0, 0, 0, 0);
-        const uint4 v2 = h2 ? w4[j + 64] : make_uint4(0, 0, 0, 0);
-        const uint4 v3 = h3 ? w4[j + 96] : make_uint4(0, 0, 0, 0);
-        acc += tk_dot8(v0, xs + 8 * j);
-        if (h1) acc += tk_dot8(v1, xs + 8 * (j + 32));
-        if (h2) acc += tk_dot8(v2, xs + 8 * (j + 64));
-        if (h3) acc += tk_dot8(v3, xs + 8 * (j + 96));
+        const uint4 v0 = w4[j], v1 = w4[j + 32], v2 = w4[j + 64], v3 = w4[j + 96];
+        acc += tk_dot8(v0, xs + 8 * j) + tk_dot8(v1, xs + 8 * (j + 32)) + tk_dot8(v2, xs + 8 * (j + 64)) +
+               tk_dot8(v3, xs + 8 * (j + 96));
     }
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor(acc, o);
     return acc;
