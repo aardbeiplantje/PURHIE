@@ -19,8 +19,10 @@ Open work, in the order to take it. Each item names its state and the next concr
    `MMDIT_CHECK_DEQUANT=1`, to run). Next: that check on the mixed Q8_0 DiT, the canvas number (must equal the CPU-decode
    Q8 run), then the time per step. Then ROCmFP4 on the device (same pattern), and the int8 WMMA route for comparison (it
    quantizes the activations: a different numerical path, measured separately). Benchmark (`bench_qbatch.cpp`, not committed, in the session scratch under /tmp): the batched Q8_0 matmul 1.4 TFLOP/s, BF16 15-25.
-1. **DiT mixed Q8_0 recipe** (measured, 0.991640 at 38.4 GB against BF16 0.992087). Decision open: ship it as an
-   optional DiT next to BF16 (BF16 stays the default). Needs item 0's speed first.
+1. **DiT mixed Q8_0 recipe** (measured, 0.991640 at 38.4 GB against BF16 0.992087; decided 2026-11-14: BF16 stays the
+   default, the mixed Q8_0 stays supported as an option). Rebuild it from the BF16 GGUF with
+   `perl -Iblib/lib -Iblib/arch bin/rocm-convert -r plain -t '^blocks\.(0|1|48|49)\.=keep' -t '^(token_refiner|condition_proj|video_patch_proj|time_embedder|final_layer)=keep' dit-bf16.gguf dit-q8mix.gguf q8_0`
+   (run in perl/ROCm-Inference). `mm_open` takes any DiT GGUF path, and the device decode makes it run at BF16 speed.
 2. **IQ types on the GPU** (matvec kernels exist; checked only for IQ2_XXS and IQ4_XS): IQ4_NL, IQ2_S, IQ2_XS, IQ1_S,
    IQ1_M on real Hugging Face files (redponike and unsloth repos; about 38 GB of downloads, one file at a time).
 3. **MiniMax quantization, remaining**: FP8 not measured (the engine has no FP8 weight type to write: needs an encoder
