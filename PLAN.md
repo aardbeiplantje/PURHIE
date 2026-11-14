@@ -30,8 +30,13 @@
    Text encoder vs the BF16 reference (`tests/mm_te_verify`, worst row cosine, 3 prompts): BF16 0.99993; Q8_0 0.9998-0.9999
    (34.8 GB); ROCmFP4 plain 0.9916-0.9956 (18.4 GB); ROCmFP4 with the strix recipe 0.9903-0.9956 (19.2 GB): both kept
    supported, not the default. Q5_0 0.9978-0.9983 (22.5 GB); Q4_0 0.9892-0.9954 (18.4 GB). All below the 0.999 bar of
-   `mm_te_verify`; Q8_0 is the only one under it. Q4_1 and Q5_1: not converted yet. Still to write: MXFP4, NVFP4, TQ1_0/TQ2_0, the K-quants Q2_K-Q6_K,
-   and the IQ types (codebook searches). The residency goal (the pipeline keeps the text encoder and the DiT both mapped)
+   `mm_te_verify`; Q8_0 is the only one under it. Q4_1 0.9930-0.9947 (20.5 GB); Q5_1 0.9982-0.9987 (24.6 GB); Q4_K 0.9917-0.9959 (18.4 GB, read by the engine as is).
+   NATIVE ENCODERS (2026-11-14, each byte-identical to ggml's reference in `tests/quantize_verify`, 147 cases): Q4_0, Q4_1,
+   Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K (all five K-quants), MXFP4, NVFP4, TQ1_0, TQ2_0, IQ4_NL, IQ4_XS (no importance
+   matrix: the chunk API's search). `rocm-convert` accepts all of them as targets (the dry runs on the text encoder give the
+   sizes: Q2_K 10.8 GB, Q4_K 18.4, Q6_K 26.9, MXFP4 17.4, TQ2_0 8.5). STILL TO WRITE: the IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+   IQ3_S, IQ1_S, IQ1_M encoders (codebook grids from ggml-common.h and ggml's neighbour search; a table extraction and a
+   larger port). The residency goal (the pipeline keeps the text encoder and the DiT both mapped)
    is what a small text encoder buys: Q8_0 (35 GB) plus the DiT (66 GB) fit in the 124 GB of RAM at once.
 
 1. **MiniMax-H3-Image speed** (2026-11-13). End to end (2026-11-14, `mm_pipe_verify` 256 x 256 on the 2048 canvas, alone on the
