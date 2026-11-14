@@ -13,7 +13,10 @@ our $VERSION = '0.01';
 
 my %ALIAS = (fast => 'q4_0_rocmfp4_fast', rocmfp4_fast => 'q4_0_rocmfp4_fast', rocmfp4 => 'q4_0_rocmfp4');
 # general.file_type (llama_ftype) of a file whose tensors are mostly this type
+# (a type with no file type of its own takes the S variant's, the closest one; metadata only)
 our %FTYPE = (f32 => 0, f16 => 1, q4_0 => 2, q4_1 => 3, q5_0 => 8, q5_1 => 9, q8_0 => 7, bf16 => 32,
+    q2_k => 10, q3_k => 11, q4_k => 14, q5_k => 16, q6_k => 18, iq4_nl => 25, iq4_xs => 30,
+    tq1_0 => 36, tq2_0 => 37, mxfp4 => 38, nvfp4 => 39,
     q4_0_rocmfp4 => 100, q4_0_rocmfp4_fast => 103);
 # Sources re-encoded by default: the ones a 4-bit or 8-bit encoding loses nothing new from. Anything else (K-quants,
 # MXFP4 / NVFP4 experts, ...) is already quantized and is kept unless a rule names it.
