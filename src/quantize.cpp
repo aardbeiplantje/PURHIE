@@ -831,6 +831,146 @@ void qz_row_tq2_0(const float *x, void *y, int64_t k) {
     }
 }
 
+// ---------------------------------------------------------------- IQ4_NL and IQ4_XS (ggml's reference encoders, no importance matrix)
+static const int8_t kq_kvalues_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+// best_index_int8 (ggml): the nearest of the sorted values (a binary search, the lower one on a tie)
+static inline int kq_best_index_int8(int n, const int8_t *val, float x) {
+    if (x <= val[0]) return 0;
+    if (x >= val[n - 1]) return n - 1;
+    int ml = 0, mu = n - 1;
+    while (mu - ml > 1) {
+        const int mav = (ml + mu) / 2;
+        if (x < val[mav]) mu = mav;
+        else ml = mav;
+    }
+    return x - val[mu - 1] < val[mu] - x ? mu - 1 : mu;
+}
+
+// quantize_row_iq4_nl_impl (ggml) without quant_weights: the weights are x^2. One block of sbs values in blocks of bs; with more
+// than one block (IQ4_XS), the blocks' scales are quantized to six bits around -max / 32 (scales_h: two bits per block above
+// the low four, in 16-bit words; scales_l: the low four bits, two blocks per byte).
+static void kq_iq4_impl(int sbs, int bs, const float *x, uint16_t *dh, uint8_t *q4, uint16_t *scales_h, uint8_t *scales_l,
+                        float *scales, float *weight, uint8_t *L, const int8_t *values, int ntry) {
+    memset(q4, 0, sbs / 2);
+    dh[0] = qz_fp32_to_fp16(0.f);
+    float max_scale = 0, amax_scale = 0;
+    for (int ib = 0; ib < sbs / bs; ++ib) {
+        const float *xb = x + ib * bs;
+        uint8_t *Lb = L + ib * bs;
+        for (int j = 0; j < bs; ++j) weight[j] = xb[j] * xb[j];
+        float amax = 0, max = 0;
+        for (int j = 0; j < bs; ++j) {
+            const float ax = fabsf(xb[j]);
+            if (ax > amax) {
+                amax = ax;
+                max = xb[j];
+            }
+        }
+        if (amax < 1e-15f) {
+            scales[ib] = 0;
+            continue;
+        }
+        float d = ntry > 0 ? -max / values[0] : max / values[0];
+        float id = 1 / d;
+        float sumqx = 0, sumq2 = 0;
+        for (int j = 0; j < bs; ++j) {
+            const float al = id * xb[j];
+            const int l = kq_best_index_int8(16, values, al);
+            Lb[j] = (uint8_t)l;
+            const float q = values[l];
+            const float w = weight[j];
+            sumqx += w * q * xb[j];
+            sumq2 += w * q * q;
+        }
+        d = sumq2 > 0 ? sumqx / sumq2 : 0.f;
+        float best = d * sumqx;
+        for (int itry = -ntry; itry <= ntry; ++itry) {
+            id = (itry + values[0]) / max;
+            sumqx = sumq2 = 0;
+            for (int j = 0; j < bs; ++j) {
+                const float al = id * xb[j];
+                const int l = kq_best_index_int8(16, values, al);
+                const float q = values[l];
+                const float w = weight[j];
+                sumqx += w * q * xb[j];
+                sumq2 += w * q * q;
+            }
+            if (sumq2 > 0 && sumqx * sumqx > best * sumq2) {
+                d = sumqx / sumq2;
+                best = d * sumqx;
+            }
+        }
+        scales[ib] = d;
+        const float abs_d = fabsf(d);
+        if (abs_d > amax_scale) {
+            amax_scale = abs_d;
+            max_scale = d;
+        }
+    }
+    if (sbs / bs > 1) {
+        const int nb = sbs / bs;
+        memset(scales_h, 0, ((nb + 7) / 8) * sizeof(uint16_t));
+        const float d = -max_scale / 32;
+        dh[0] = qz_fp32_to_fp16(d);
+        const float id = d ? 1 / d : 0.f;
+        for (int ib = 0; ib < nb; ++ib) {
+            int l = kq_nearest_int(id * scales[ib]);
+            l = std::max(-32, std::min(31, l));
+            const float dl = d * l;
+            const float idl = dl ? 1 / dl : 0.f;
+            uint8_t *Lb = L + ib * bs;
+            const float *xb = x + ib * bs;
+            for (int j = 0; j < bs; ++j) Lb[j] = (uint8_t)kq_best_index_int8(16, values, idl * xb[j]);
+            l += 32;
+            const uint8_t l_l = l & 0xf, l_h = (uint8_t)(l >> 4);
+            if (ib % 2 == 0) scales_l[ib / 2] = l_l;
+            else scales_l[ib / 2] |= (uint8_t)(l_l << 4);
+            scales_h[ib / 8] |= (uint16_t)(l_h << (2 * (ib % 8)));
+        }
+    } else {
+        dh[0] = qz_fp32_to_fp16(scales[0]);
+        if (ntry > 0) {
+            const float id = scales[0] ? 1 / scales[0] : 0;
+            for (int j = 0; j < sbs; ++j) L[j] = (uint8_t)kq_best_index_int8(16, values, id * x[j]);
+        }
+    }
+    for (int i = 0; i < sbs / 32; ++i)
+        for (int j = 0; j < 16; ++j) q4[16 * i + j] = (uint8_t)(L[32 * i + j] | (L[32 * i + 16 + j] << 4));
+}
+
+// IQ4_NL: block of 32: fp16 d, qs[16] (the non-linear levels kvalues_iq4nl of the low and high nibbles)
+void qz_row_iq4_nl(const float *x, void *y, int64_t k) {
+    uint8_t *out = (uint8_t *)y;  // block: fp16 d, qs[16]
+    float weight[32], scales[1];
+    uint8_t L[32];
+    for (int64_t b = 0; b < k / 32; ++b, x += 32, out += 18) {
+        uint16_t dh;
+        uint8_t q4[16];
+        // (the search of ggml's quantize_iq4_nl, the chunk API llama-quantize uses: seven retries)
+        kq_iq4_impl(32, 32, x, &dh, q4, nullptr, nullptr, scales, weight, L, kq_kvalues_iq4nl, 7);
+        memcpy(out, &dh, 2);
+        memcpy(out + 2, q4, 16);
+    }
+}
+
+// IQ4_XS: super-block of 256 in eight blocks of 32: fp16 d, scales_h (two bits of the six-bit scales), scales_l[4] (their low four
+// bits), qs[128]
+void qz_row_iq4_xs(const float *x, void *y, int64_t k) {
+    uint8_t *out = (uint8_t *)y;  // block: fp16 d, scales_h (uint16), scales_l[4], qs[128]
+    float weight[32], scales[8];
+    uint8_t L[256];
+    for (int64_t b = 0; b < k / 256; ++b, x += 256, out += 136) {
+        uint16_t dh = 0, sh = 0;
+        uint8_t sl[4] = {0, 0, 0, 0}, q4[128];
+        kq_iq4_impl(256, 32, x, &dh, q4, &sh, sl, scales, weight, L, kq_kvalues_iq4nl, 7);
+        memcpy(out, &dh, 2);
+        memcpy(out + 2, &sh, 2);
+        memcpy(out + 4, sl, 4);
+        memcpy(out + 8, q4, 128);
+    }
+}
+
 // ---------------------------------------------------------------- ROCmFP4 (rocmfp4.c, without an importance matrix)
 
 // Unsigned E4M3 scale bytes 0..126 as half-scale values: subnormals e * 2^-10, then (8 + m) * 2^(E - 11)
@@ -971,7 +1111,7 @@ void qz_row_rocmfp4_fast(const float *x, void *y, int64_t k) {
 
 int qz_supported(int t) {
     return t == QT_F32 || t == QT_F16 || t == QT_BF16 || t == QT_Q8_0 || t == QT_Q4_0_ROCMFP4 ||
-           t == QT_Q4_0_ROCMFP4_FAST || t == QT_Q4_0 || t == QT_Q4_1 || t == QT_Q5_0 || t == QT_Q5_1 || t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_Q2_K || t == QT_Q3_K || t == QT_MXFP4 || t == QT_NVFP4 || t == QT_TQ1_0 || t == QT_TQ2_0;
+           t == QT_Q4_0_ROCMFP4_FAST || t == QT_Q4_0 || t == QT_Q4_1 || t == QT_Q5_0 || t == QT_Q5_1 || t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_Q2_K || t == QT_Q3_K || t == QT_MXFP4 || t == QT_NVFP4 || t == QT_TQ1_0 || t == QT_TQ2_0 || t == QT_IQ4_NL || t == QT_IQ4_XS;
 }
 
 static void encode_row(int t, const float *x, void *y, int64_t n) {
@@ -993,6 +1133,8 @@ static void encode_row(int t, const float *x, void *y, int64_t n) {
     case QT_NVFP4: qz_row_nvfp4(x, y, n); break;
     case QT_TQ1_0: qz_row_tq1_0(x, y, n); break;
     case QT_TQ2_0: qz_row_tq2_0(x, y, n); break;
+    case QT_IQ4_NL: qz_row_iq4_nl(x, y, n); break;
+    case QT_IQ4_XS: qz_row_iq4_xs(x, y, n); break;
     case QT_Q4_0_ROCMFP4: qz_row_rocmfp4(x, y, n); break;
     case QT_Q4_0_ROCMFP4_FAST: qz_row_rocmfp4_fast(x, y, n); break;
     }
