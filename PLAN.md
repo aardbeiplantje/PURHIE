@@ -11,8 +11,11 @@
    (15.6 TFLOPS) against 16.1 ms for the F32-activation tile; the 1024 canvas velocity 4.00 s (4.76 s before). Found by
    ablation: the F32 activations, re-read per 256 output rows, were the bottleneck (compute was not). Not done: a 256 x 256
    tile did no better (16 waves, single stage); swapping the block order is slower. `tests/mm_dit_verify` fails on its
-   reference files (velocity cosine 0.99852 at step 0, sampler 0.985) on the committed build too: the reference is stale
-   against the released weights; `tests/mm_canvas_verify` (released latents) was 0.99381 before the attention work.
+   reference files (velocity cosine 0.99852 at step 0, sampler 0.985). Not stale: regenerating them from the released weights
+   gives identical files, and `2f9604c` gives the same numbers. Per-block comparison (`tests/mm_dit_dump.py`, the engine's
+   `MMDIT_DEBUG` + `MMDIT_DEBUG_ALL`): block 0 cosine 0.99999, blocks 0-25 at about 0.8% relative error (bf16 noise), then the
+   drift grows from block 30 (cosine 0.99980) to block 49 (0.9927). Rounding the residual to bf16 in the engine does not change
+   the drift (the sampler 0.9852 -> 0.9892). Next: per-op comparison inside block 30. `tests/mm_canvas_verify` (released latents) was 0.99381 before the attention work.
    Attention (2026-11-14): the wrapper (`sddev::attention`, 4105 tokens, 56 heads) went 96.6 -> 31 ms per call. Two causes:
    the V transpose read with a stride per thread (101 ms; now a 32 x 32 LDS tile, 1.2 ms), and the scratch buffers zeroed on
    the CPU (now not). The kernel (`sd_flash_attn`): 8 waves per block, 128 query rows, Q in registers, DPP row reductions,

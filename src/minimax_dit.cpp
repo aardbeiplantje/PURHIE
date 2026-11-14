@@ -429,6 +429,11 @@ int mmdit_velocity(mmdit_t* m, const float* text, int T, const float* sample, in
             sddev::linear_bf16(sil.data(), 1, B.adaln.w, kTemb, 3 * 6 * kH, B.adaln.b.data(), mod.data());
             block(B, hid, S, &mod, &rows, dcs.data(), dsn.data());
             if (l == 0) dbg("b0_out", hid.data(), (size_t)S * kH);
+            if (std::getenv("MMDIT_DEBUG_ALL")) {  // (debugging: every block's output, named blk<NN>)
+                char nm[16];
+                std::snprintf(nm, sizeof nm, "blk%02zu", l);
+                dbg(nm, hid.data(), (size_t)S * kH);
+            }
             if (l + 1 == m->blocks.size()) dbg("b49_out", hid.data(), (size_t)S * kH);
         }
         // the final layer: norm, then the AdaLN (shift, then scale) of the one timestep
