@@ -10,10 +10,12 @@
 #include "minimax_vae.h"  // (the MiniMax kernels' module: minimax_vae.co)
 #include "sd_device.h"
 #include "minimax_weights.h"
+#include "quant_types.h"
 #include "safetensors_mmap.h"
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -23,6 +25,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -85,10 +88,13 @@ struct mmdit {
         const float* wf = nullptr;    // F32 [out][in] in place, for the checkpoint's F32 linears
         sddev::Floats b;              // the bias (F32; the BF16 ones converted), or empty
         int in = 0, out = 0;
+        int qt = -1;                  // a quantized weight: its ggml type id, q its first row, row_bytes per row (else -1)
+        const void* q = nullptr;
+        size_t row_bytes = 0;
     };
     struct BlockW {
         sddev::Floats norm1, norm2, qn, kn;
-        const uint16_t *qkv = nullptr, *out = nullptr, *fc1 = nullptr, *fc2 = nullptr;
+        Lin qkv, out, fc1, fc2;  // (no bias)
         Lin adaln;  // (blocks only: 2688 -> 6 * 3 * 5376)
     };
     std::vector<BlockW> refiner, blocks;
@@ -120,12 +126,33 @@ sddev::Floats floats_of(const WeightFile& w, const std::string& name, size_t num
     return out;
 }
 
-const uint16_t* bf16_of(const WeightFile& w, const std::string& name, size_t numel) {
-    size_t bytes = 0;
-    const void* p = w.tensor(name, &bytes);
-    if (!p) throw std::runtime_error("minimax dit: no tensor " + name);
-    if (bytes != 2 * numel) throw std::runtime_error("minimax dit: " + name + " is not BF16 of its size");
-    return static_cast<const uint16_t*>(p);
+// a value's BF16 bits (round to nearest, ties to even; inf and NaN truncated)
+uint16_t bf16_bits(float v) {
+    uint32_t u;
+    std::memcpy(&u, &v, 4);
+    if ((u & 0x7F800000u) != 0x7F800000u) u += 0x7FFFu + ((u >> 16) & 1u);
+    return (uint16_t)(u >> 16);
+}
+
+// the rows of a quantized [N][K] matrix decoded to BF16 (the engine's CPU decoders, on up to 8 threads)
+void dequant_bf16(int qt, const uint8_t* src, size_t row_bytes, int N, int K, uint16_t* dst) {
+    const int nt = std::max(1, std::min(8, (int)std::thread::hardware_concurrency()));
+    std::vector<char> ok((size_t)nt, 1);
+    std::vector<std::thread> th;
+    for (int t = 0; t < nt; ++t)
+        th.emplace_back([&, t] {
+            std::vector<float> row((size_t)K);
+            for (int r = t; r < N; r += nt) {
+                if (qt_to_float(qt, src + (size_t)r * row_bytes, row.data(), K) != 0) {
+                    ok[(size_t)t] = 0;
+                    return;
+                }
+                for (int i = 0; i < K; ++i) dst[(size_t)r * K + i] = bf16_bits(row[(size_t)i]);
+            }
+        });
+    for (auto& x : th) x.join();
+    for (char c : ok)
+        if (!c) throw std::runtime_error("minimax dit: a quantized weight does not decode");
 }
 
 mmdit::Lin lin_of(const WeightFile& w, const std::string& prefix, int in, int out, bool bias) {
@@ -133,19 +160,67 @@ mmdit::Lin lin_of(const WeightFile& w, const std::string& prefix, int in, int ou
     size_t bytes = 0;
     const void* wp = w.tensor(prefix + ".weight", &bytes);
     if (!wp) throw std::runtime_error("minimax dit: no tensor " + prefix + ".weight");
-    if (bytes == 4 * (size_t)in * out) L.wf = static_cast<const float*>(wp);
-    else L.w = bf16_of(w, prefix + ".weight", (size_t)in * out);
+    if (bytes == 4 * (size_t)in * out) {
+        L.wf = static_cast<const float*>(wp);
+    } else if (bytes == 2 * (size_t)in * out) {
+        L.w = static_cast<const uint16_t*>(wp);
+    } else {  // a quantized GGUF tensor (rocm-convert's --type), decoded to BF16 for each call (lin_apply)
+        const int qt = w.gguf_type(prefix + ".weight");
+        if (qt < 0 || !qt_get_traits(qt) || bytes != (size_t)out * qt_row_size(qt, in))
+            throw std::runtime_error("minimax dit: " + prefix + ".weight is not BF16, F32 or a quantized type of its size");
+        L.qt = qt;
+        L.q = wp;
+        L.row_bytes = qt_row_size(qt, in);
+    }
     if (bias) L.b = floats_of(w, prefix + ".bias", (size_t)out);
     L.in = in;
     L.out = out;
     return L;
 }
 
-// y = x W^T + b for the linear L (its weight in place, BF16 or F32), T token rows
-void lin_apply(const mmdit::Lin& L, const float* x, int T, float* y) {
+// the token rows per GPU launch (MMDIT_UBATCH, default 256): one launch over a 2k-row matmul holds the device for long
+// stretches, and the screen stalls with it; the rows are independent, so the batches give the same numbers
+int ubatch() {
+    static const int u = [] {
+        const char* e = std::getenv("MMDIT_UBATCH");
+        const int v = e ? std::atoi(e) : 256;
+        return v > 0 ? v : 256;
+    }();
+    return u;
+}
+
+// y = x W^T + b for the linear L, T token rows: its weight in place (BF16 or F32), or a quantized one decoded to BF16 once
+// for the call, then the BF16 kernels with the activations rounded on load as always (so a run differs from the BF16 one
+// by the weights' decoded values alone). The rows go in ubatch-row launches; the rows are independent
+void lin_apply(const mmdit::Lin& L0, const float* x, int T, float* y) {
     const double t0 = g_prof.on ? now_s() : 0;
-    if (L.wf) sddev::linear_f32(x, T, L.wf, L.in, L.out, L.b.data(), y);
-    else sddev::linear_bf16(x, T, L.w, L.in, L.out, L.b.data(), y);
+    static sddev::Floats* scr = new sddev::Floats();  // (the decoded weights; leaked, so no static teardown of device memory)
+    static size_t scr_n = 0;                          // its capacity, in BF16 values
+    mmdit::Lin Ld;
+    const mmdit::Lin* Lp = &L0;
+    const bool control = L0.w && !L0.wf && std::getenv("MMDIT_SCRATCH_BF16") != nullptr;  // (debugging: BF16 through the scratch)
+    if (L0.qt >= 0 || control) {
+        const size_t nw = (size_t)L0.out * L0.in;
+        if (scr_n < nw) {
+            *scr = sddev::Floats((nw + 1) / 2);
+            scr_n = nw;
+        }
+        uint16_t* wb = reinterpret_cast<uint16_t*>(scr->data());
+        if (L0.qt >= 0) dequant_bf16(L0.qt, static_cast<const uint8_t*>(L0.q), L0.row_bytes, L0.out, L0.in, wb);
+        else std::memcpy(wb, L0.w, nw * sizeof(uint16_t));
+        Ld = L0;
+        Ld.qt = -1;
+        Ld.w = wb;
+        Lp = &Ld;
+    }
+    const mmdit::Lin& L = *Lp;
+    for (int r = 0; r < T; r += ubatch()) {  // the rows in ubatch-row launches
+        const int n = std::min(ubatch(), T - r);
+        const float* xr = x + (size_t)r * L.in;
+        float* yr = y + (size_t)r * L.out;
+        if (L.wf) sddev::linear_f32(xr, n, L.wf, L.in, L.out, L.b.data(), yr);
+        else sddev::linear_bf16(xr, n, L.w, L.in, L.out, L.b.data(), yr);
+    }
     if (g_prof.on) g_prof.lin += now_s() - t0;
 }
 
@@ -214,7 +289,7 @@ void block(const mmdit::BlockW& B, sddev::Floats& hid, int S, const sddev::Float
     if (mod) mod_rows(n1.data(), rows->data(), mod->data(), S, 0, 1, n1.data());  // shift_msa, scale_msa
     if (dump_ops) { std::snprintf(nm, sizeof nm, "L%d_n1", g_block_layer); dbg(nm, n1.data(), (size_t)S * H); }
     double tl = g_prof.on ? now_s() : 0;
-    sddev::linear_bf16(n1.data(), S, B.qkv, H, 3 * C, nullptr, qkv.data());  // head-grouped rows: (q, k, v) per head
+    lin_apply(B.qkv, n1.data(), S, qkv.data());  // head-grouped rows: (q, k, v) per head
     split_qkv(qkv.data(), S, q.data(), k.data(), v.data());
     if (g_prof.on) g_prof.lin += now_s() - tl;
     rms(q.data(), (long)S * kHeads, kD, B.qn.data(), qn.data());
@@ -224,11 +299,14 @@ void block(const mmdit::BlockW& B, sddev::Floats& hid, int S, const sddev::Float
         rope(kn.data(), S, cs, sn);
     }
     double t0 = g_prof.on ? now_s() : 0;
-    sddev::attention(qn.data(), S, kn.data(), v.data(), S, C, kHeads, a.data());
+    for (int r = 0; r < S; r += ubatch()) {  // the queries in ubatch-row launches (each row's softmax is its own)
+        const int n = std::min(ubatch(), S - r);
+        sddev::attention(qn.data() + (size_t)r * C, n, kn.data(), v.data(), S, C, kHeads, a.data() + (size_t)r * C);
+    }
     if (g_prof.on) g_prof.att += now_s() - t0;
     if (dump_ops) { std::snprintf(nm, sizeof nm, "L%d_a", g_block_layer); dbg(nm, a.data(), (size_t)S * C); }
     tl = g_prof.on ? now_s() : 0;
-    sddev::linear_bf16(a.data(), S, B.out, C, H, nullptr, o.data());
+    lin_apply(B.out, a.data(), S, o.data());
     if (g_prof.on) g_prof.lin += now_s() - tl;
     if (dump_ops) { std::snprintf(nm, sizeof nm, "L%d_o", g_block_layer); dbg(nm, o.data(), (size_t)S * H); }
     if (mod) gate_rows(hid.data(), o.data(), rows->data(), mod->data(), S, 2);  // gate_msa
@@ -238,9 +316,9 @@ void block(const mmdit::BlockW& B, sddev::Floats& hid, int S, const sddev::Float
     if (mod) mod_rows(n2.data(), rows->data(), mod->data(), S, 3, 4, n2.data());  // shift_mlp, scale_mlp
     if (dump_ops) { std::snprintf(nm, sizeof nm, "L%d_n2", g_block_layer); dbg(nm, n2.data(), (size_t)S * H); }
     tl = g_prof.on ? now_s() : 0;
-    sddev::linear_bf16(n2.data(), S, B.fc1, H, 2 * kFF, nullptr, pj.data());
+    lin_apply(B.fc1, n2.data(), S, pj.data());
     swiglu(pj.data(), S, g.data());
-    sddev::linear_bf16(g.data(), S, B.fc2, kFF, H, nullptr, f.data());
+    lin_apply(B.fc2, g.data(), S, f.data());
     if (g_prof.on) g_prof.lin += now_s() - tl;
     if (dump_ops) { std::snprintf(nm, sizeof nm, "L%d_f", g_block_layer); dbg(nm, f.data(), (size_t)S * H); }
     if (mod) gate_rows(hid.data(), f.data(), rows->data(), mod->data(), S, 5);  // gate_mlp
@@ -345,10 +423,10 @@ mmdit_t* mmdit_open(const char* dit_path, const char* pdd_path) {
             B.norm2 = floats_of(w, p + "norm2.weight", kH);
             B.qn = floats_of(w, p + "attn.q_norm.weight", kD);
             B.kn = floats_of(w, p + "attn.k_norm.weight", kD);
-            B.qkv = bf16_of(w, p + "attn.qkv_proj.weight", (size_t)3 * kInner * kH);
-            B.out = bf16_of(w, p + "attn.out_proj.weight", (size_t)kH * kInner);
-            B.fc1 = bf16_of(w, p + "mlp.fc1.weight", (size_t)2 * kFF * kH);
-            B.fc2 = bf16_of(w, p + "mlp.fc2.weight", (size_t)kH * kFF);
+            B.qkv = lin_of(w, p + "attn.qkv_proj", kH, 3 * kInner, false);
+            B.out = lin_of(w, p + "attn.out_proj", kInner, kH, false);
+            B.fc1 = lin_of(w, p + "mlp.fc1", kH, 2 * kFF, false);
+            B.fc2 = lin_of(w, p + "mlp.fc2", kFF, kH, false);
             m->refiner.push_back(std::move(B));
         }
         for (int l = 0; l < kLayers; ++l) {
@@ -358,10 +436,10 @@ mmdit_t* mmdit_open(const char* dit_path, const char* pdd_path) {
             B.norm2 = floats_of(w, p + "norm2.weight", kH);
             B.qn = floats_of(w, p + "attn.q_norm.weight", kD);
             B.kn = floats_of(w, p + "attn.k_norm.weight", kD);
-            B.qkv = bf16_of(w, p + "attn.qkv_proj.weight", (size_t)3 * kInner * kH);
-            B.out = bf16_of(w, p + "attn.out_proj.weight", (size_t)kH * kInner);
-            B.fc1 = bf16_of(w, p + "mlp.fc1.weight", (size_t)2 * kFF * kH);
-            B.fc2 = bf16_of(w, p + "mlp.fc2.weight", (size_t)kH * kFF);
+            B.qkv = lin_of(w, p + "attn.qkv_proj", kH, 3 * kInner, false);
+            B.out = lin_of(w, p + "attn.out_proj", kInner, kH, false);
+            B.fc1 = lin_of(w, p + "mlp.fc1", kH, 2 * kFF, false);
+            B.fc2 = lin_of(w, p + "mlp.fc2", kFF, kH, false);
             B.adaln = lin_of(w, p + "adaln_proj.linear", kTemb, 3 * 6 * kH, true);
             m->blocks.push_back(std::move(B));
         }
@@ -499,7 +577,7 @@ int mmdit_velocity(mmdit_t* m, const float* text, int T, const float* sample, in
                 }
             }
             sddev::Floats mod((size_t)3 * 6 * kH);
-            sddev::linear_bf16(sil.data(), 1, B.adaln.w, kTemb, 3 * 6 * kH, B.adaln.b.data(), mod.data());
+            lin_apply(B.adaln, sil.data(), 1, mod.data());
             block(B, hid, S, &mod, &rows, dcs.data(), dsn.data());
             if (l == 0) dbg("b0_out", hid.data(), (size_t)S * kH);
             if (std::getenv("MMDIT_DEBUG_ALL")) {  // (debugging: every block's output, named blk<NN>)
@@ -512,7 +590,7 @@ int mmdit_velocity(mmdit_t* m, const float* text, int T, const float* sample, in
         // the final layer: norm, then the AdaLN (shift, then scale) of the one timestep
         sddev::Floats n((size_t)S * kH), fm((size_t)2 * kH), n2((size_t)S * kH);
         rms(hid.data(), S, kH, m->fnorm.data(), n.data());
-        sddev::linear_bf16(sil.data(), 1, m->fadaln.w, kTemb, 2 * kH, m->fadaln.b.data(), fm.data());
+        lin_apply(m->fadaln, sil.data(), 1, fm.data());
         mod_cols(n.data(), fm.data() + kH, fm.data(), S, n2.data());
         dbg("norm_out", n2.data(), (size_t)S * kH);
         if (g_prof.on) {

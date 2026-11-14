@@ -95,7 +95,15 @@ where the bf16 reference's reaches 4% (the engine keeps the residual in fp32; th
    all; a bf16 attention reference would be the fairer comparison.
 2. **MiniMax server behaviour** (done 2026-11-13, see the record below): images queue, one at a time (no 503).
 3. **MiniMax quantization** (later, the user): FP8 or ROCmFP4 for the DiT (66 GB BF16 now). Measure the quality cost first;
-   BF16 stays the default until that is known.
+   BF16 stays the default until that is known. MEASURED (2026-11-14): the DiT reads quantized GGUF linears (`lin_of`; each
+   decoded to BF16 once per call, `dequant_bf16`, then the BF16 kernels; `MMDIT_UBATCH` rows per launch, default 256).
+   Sampler cosine, 16 x 16 check (`mm_dit_verify`, BF16 0.9841) and the 2048 canvas (`mm_canvas_verify` on the released
+   inputs, BF16 0.992087): Q8_0 (35.2 GB) 0.9849 and 0.9068; ROCmFP4 (`rocmfp4`, 18.6 GB, 4.5 bits) 0.9761 and 0.7832.
+   Controls: the decoded Q8_0 linear matches the BF16 original (cosine 0.999983); BF16 weights through the same scratch give
+   0.992087 (`MMDIT_SCRATCH_BF16=1`); 128-row batches give the same canvas number as 256. So the canvas drop is the
+   quantized values, not the path. The batched quantized matmul (`qmatvec_launch_batch`) runs at ~1.4 TFLOP/s against
+   15-25 for the BF16 kernels (the quantized route is not used for the DiT). Not measured: FP8 (the engine has no FP8 weight
+   type to write). BF16 stays the default.
 4. **ComfyUI backend** (backlog, planned 2026-11-13, see Later): the component API first, then the node package.
 - (done) **MiniMax server and resize (item 2, 2026-11-13).** The released pipeline resizes the 2048 canvas to the request
    with diffusers' `VaeImageProcessor.resize`, which is PIL's LANCZOS (the processor's default `resample`). Our area

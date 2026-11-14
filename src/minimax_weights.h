@@ -26,6 +26,13 @@ struct WeightFile {
         *bytes = t->bytes;
         return t->data;
     }
+    // the GGUF tensor's ggml type id (-1: not a GGUF, or no such tensor)
+    int gguf_type(const std::string& name) const {
+        if (!g) return -1;
+        for (int64_t i = 0; i < gguf_n_tensors(g); ++i)
+            if (name == gguf_tensor_name(g, i)) return gguf_tensor_type(g, i);
+        return -1;
+    }
 };
 
 #endif /* MINIMAX_WEIGHTS_H */
