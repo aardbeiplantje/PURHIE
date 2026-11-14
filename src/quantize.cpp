@@ -526,6 +526,127 @@ void qz_row_q2_K(const float *x, void *y, int64_t k) {
     }
 }
 
+// make_q3_quants (ggml, the do_rmse path): the scale of n values for nmax levels (-nmax .. nmax - 1, stored as L + nmax):
+// the rounded levels, then a coordinate refinement of the least-squares error (weights x^2), five passes at most.
+static float kq_make_q3(int n, int nmax, const float *x, int8_t *L) {
+    const float kGroupMaxEps = 1e-15f;
+    float max = 0;
+    float amax = 0;
+    for (int i = 0; i < n; ++i) {
+        const float ax = fabsf(x[i]);
+        if (ax > amax) {
+            amax = ax;
+            max = x[i];
+        }
+    }
+    if (amax < kGroupMaxEps) {  // all zero
+        for (int i = 0; i < n; ++i) L[i] = 0;
+        return 0.f;
+    }
+    const float iscale = -nmax / max;
+    float sumlx = 0;
+    float suml2 = 0;
+    for (int i = 0; i < n; ++i) {
+        int l = kq_nearest_int(iscale * x[i]);
+        l = std::max(-nmax, std::min(nmax - 1, l));
+        L[i] = (int8_t)l;
+        const float w = x[i] * x[i];
+        sumlx += w * x[i] * l;
+        suml2 += w * l * l;
+    }
+    for (int itry = 0; itry < 5; ++itry) {
+        int n_changed = 0;
+        for (int i = 0; i < n; ++i) {
+            const float w = x[i] * x[i];
+            float slx = sumlx - w * x[i] * L[i];
+            if (slx > 0) {
+                float sl2 = suml2 - w * L[i] * L[i];
+                int new_l = kq_nearest_int(x[i] * sl2 / slx);
+                new_l = std::max(-nmax, std::min(nmax - 1, new_l));
+                if (new_l != L[i]) {
+                    slx += w * x[i] * new_l;
+                    sl2 += w * new_l * new_l;
+                    if (sl2 > 0 && slx * slx * suml2 > sumlx * sumlx * sl2) {
+                        L[i] = (int8_t)new_l;
+                        sumlx = slx;
+                        suml2 = sl2;
+                        ++n_changed;
+                    }
+                }
+            }
+        }
+        if (!n_changed) break;
+    }
+    for (int i = 0; i < n; ++i) L[i] += (int8_t)nmax;
+    return suml2 > 0.0f ? sumlx / suml2 : 0.0f;
+}
+
+// Q3_K: super-block of 256 in 16 groups: hmask[32] (the fourth bit of value i at bit i / 32 of byte i mod 32), qs[64] (the low
+// two bits), scales[12] (sixteen 6-bit scales, offset by 32, packed), fp16 d at 108.
+void qz_row_q3_K(const float *x, void *y, int64_t k) {
+    uint8_t *out = (uint8_t *)y;  // block: hmask[32], qs[64], scales[12], fp16 d
+    for (int64_t b = 0; b < k / 256; ++b, x += 256, out += 110) {
+        int8_t L[256];
+        float scales[16];
+        float max_scale = 0, amax = 0;
+        for (int j = 0; j < 16; ++j) {
+            scales[j] = kq_make_q3(16, 4, x + 16 * j, L + 16 * j);
+            const float scale = fabsf(scales[j]);
+            if (scale > amax) {
+                amax = scale;
+                max_scale = scales[j];
+            }
+        }
+        uint8_t *sc = out + 96;
+        memset(sc, 0, 12);
+        uint16_t hd;
+        if (max_scale) {
+            const float iscale = -32.f / max_scale;
+            for (int j = 0; j < 16; ++j) {
+                int8_t l = (int8_t)kq_nearest_int(iscale * scales[j]);
+                l = (int8_t)(std::max(-32, std::min(31, (int)l)) + 32);
+                if (j < 8) sc[j] = (uint8_t)(l & 0xF);
+                else sc[j - 8] |= (uint8_t)((l & 0xF) << 4);
+                l >>= 4;
+                sc[j % 4 + 8] |= (uint8_t)(l << (2 * (j / 4)));
+            }
+            hd = qz_fp32_to_fp16(1 / iscale);
+        } else {
+            hd = qz_fp32_to_fp16(0.f);
+        }
+        memcpy(out + 108, &hd, 2);
+        const float fd = qt_fp16_to_fp32(hd);
+        for (int j = 0; j < 16; ++j) {
+            int sv = j < 8 ? (sc[j] & 0xF) : (sc[j - 8] >> 4);
+            sv = (sv | (((sc[8 + j % 4] >> (2 * (j / 4))) & 3) << 4)) - 32;
+            const float d = fd * sv;
+            if (!d) continue;
+            for (int ii = 0; ii < 16; ++ii) {
+                int l = kq_nearest_int(x[16 * j + ii] / d);
+                l = std::max(-4, std::min(3, l));
+                L[16 * j + ii] = (int8_t)(l + 4);
+            }
+        }
+        memset(out, 0, 32);  // hmask
+        int m = 0;
+        uint8_t hm = 1;
+        for (int j = 0; j < 256; ++j) {
+            if (L[j] > 3) {
+                out[m] |= hm;
+                L[j] -= 4;
+            }
+            if (++m == 32) {
+                m = 0;
+                hm <<= 1;
+            }
+        }
+        uint8_t *qs = out + 32;
+        for (int j = 0; j < 256; j += 128)
+            for (int l = 0; l < 32; ++l)
+                qs[j / 4 + l] = (uint8_t)(L[j + l] | (L[j + l + 32] << 2) | (L[j + l + 64] << 4) | (L[j + l + 96] << 6));
+    }
+}
+
 // ---------------------------------------------------------------- ROCmFP4 (rocmfp4.c, without an importance matrix)
 
 // Unsigned E4M3 scale bytes 0..126 as half-scale values: subnormals e * 2^-10, then (8 + m) * 2^(E - 11)
@@ -666,7 +787,7 @@ void qz_row_rocmfp4_fast(const float *x, void *y, int64_t k) {
 
 int qz_supported(int t) {
     return t == QT_F32 || t == QT_F16 || t == QT_BF16 || t == QT_Q8_0 || t == QT_Q4_0_ROCMFP4 ||
-           t == QT_Q4_0_ROCMFP4_FAST || t == QT_Q4_0 || t == QT_Q4_1 || t == QT_Q5_0 || t == QT_Q5_1 || t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_Q2_K;
+           t == QT_Q4_0_ROCMFP4_FAST || t == QT_Q4_0 || t == QT_Q4_1 || t == QT_Q5_0 || t == QT_Q5_1 || t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_Q2_K || t == QT_Q3_K;
 }
 
 static void encode_row(int t, const float *x, void *y, int64_t n) {
@@ -683,6 +804,7 @@ static void encode_row(int t, const float *x, void *y, int64_t n) {
     case QT_Q5_K: qz_row_q5_K(x, y, n); break;
     case QT_Q6_K: qz_row_q6_K(x, y, n); break;
     case QT_Q2_K: qz_row_q2_K(x, y, n); break;
+    case QT_Q3_K: qz_row_q3_K(x, y, n); break;
     case QT_Q4_0_ROCMFP4: qz_row_rocmfp4(x, y, n); break;
     case QT_Q4_0_ROCMFP4_FAST: qz_row_rocmfp4_fast(x, y, n); break;
     }
