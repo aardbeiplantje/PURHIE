@@ -647,6 +647,108 @@ void qz_row_q3_K(const float *x, void *y, int64_t k) {
     }
 }
 
+// ---------------------------------------------------------------- MXFP4 and NVFP4 (ggml's reference encoders)
+// The E2M1 codebook of the two (twice the values: the scale is taken at half), as ggml's kvalues_mxfp4
+static const int8_t kq_kvalues_mxfp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+// GGML_E8M0_TO_FP32_HALF: 2^(e - 128)
+static inline float kq_e8m0_half(uint8_t x) {
+    const uint32_t bits = x < 2 ? 0x00200000u << x : (uint32_t)(x - 1) << 23;
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
+// ggml_ue4m3_to_fp32 (the half convention: value * 0.5 of the UE4M3 value)
+static inline float kq_ue4m3_to_fp32(uint8_t x) {
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const int ex = (x >> 3) & 0xF, man = x & 0x7;
+    const float raw = ex == 0 ? ldexpf((float)man, -9) : ldexpf(1.0f + (float)man / 8.0f, ex - 7);
+    return raw * 0.5f;
+}
+
+// ggml_fp32_to_ue4m3 (ggml's rounding: nearest, the subnormals as m * 2^-9)
+static inline uint8_t kq_fp32_to_ue4m3(float x) {
+    if (!(x > 0.0f)) return 0;
+    if (x > 448.0f) x = 448.0f;
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    int fp32_exp = (int)((bits >> 23) & 0xFF) - 127;
+    const int fp32_man = (bits >> 20) & 0x7;
+    int ue4m3_exp = fp32_exp + 7;
+    if (ue4m3_exp <= 0) {
+        int man = (int)(x * 512.0f + 0.5f);
+        if (man > 7) man = 7;
+        if (man < 1) return 0;
+        return (uint8_t)man;
+    }
+    if (ue4m3_exp >= 15) return 0x7E;
+    const int round_bit = (bits >> 19) & 1;
+    int ue4m3_man = fp32_man + round_bit;
+    if (ue4m3_man > 7) {
+        ue4m3_man = 0;
+        ue4m3_exp++;
+        if (ue4m3_exp >= 15) return 0x7E;
+    }
+    return (uint8_t)((ue4m3_exp << 3) | ue4m3_man);
+}
+
+// best_index_mxfp4 (ggml): the codebook entry whose value times e is nearest x (the first on a tie)
+static inline uint8_t kq_best_index_mxfp4(float x, float e) {
+    int best_index = 0;
+    float best_err = fabsf(kq_kvalues_mxfp4[0] * e - x);
+    for (int i = 1; i < 16; i++) {
+        const float err = fabsf(kq_kvalues_mxfp4[i] * e - x);
+        if (err < best_err) {
+            best_index = i;
+            best_err = err;
+        }
+    }
+    return (uint8_t)best_index;
+}
+
+// MXFP4: block of 32: e (the E8M0 exponent of the block's maximum), qs[16] (value j in the low nibble of byte j, j + 16 in the high)
+void qz_row_mxfp4(const float *x, void *y, int64_t k) {
+    uint8_t *out = (uint8_t *)y;  // block: e, qs[16]
+    for (int64_t i = 0; i < k / 32; ++i, x += 32, out += 17) {
+        float amax = 0.0f;
+        for (int j = 0; j < 32; ++j) {
+            const float v = x[j];
+            if (amax < fabsf(v)) amax = fabsf(v);
+        }
+        const uint8_t e = amax > 0.0f ? (uint8_t)(floorf(log2f(amax)) - 2 + 127) : 0;
+        const float d = kq_e8m0_half(e);
+        out[0] = e;
+        for (int j = 0; j < 16; ++j) {
+            const uint8_t x0 = kq_best_index_mxfp4(x[j], d);
+            const uint8_t x1 = kq_best_index_mxfp4(x[16 + j], d);
+            out[1 + j] = (uint8_t)(x0 | (x1 << 4));
+        }
+    }
+}
+
+// NVFP4: block of 64 in four sub-blocks of 16: d[4] (the UE4M3 scale of each, amax / 6), qs[32] (sub-block s in bytes 8s .. 8s + 7:
+// value j in the low nibble of byte j, j + 8 in the high)
+void qz_row_nvfp4(const float *x, void *y, int64_t k) {
+    uint8_t *out = (uint8_t *)y;  // block: d[4], qs[32]
+    for (int64_t i = 0; i < k / 64; ++i, x += 64, out += 36) {
+        for (int sb = 0; sb < 4; ++sb) {
+            const float *xb = x + 16 * sb;
+            float amax = 0.0f;
+            for (int j = 0; j < 16; ++j)
+                if (amax < fabsf(xb[j])) amax = fabsf(xb[j]);
+            const uint8_t ue = kq_fp32_to_ue4m3(amax / 6.0f);
+            out[sb] = ue;
+            const float d = kq_ue4m3_to_fp32(ue);
+            for (int j = 0; j < 8; ++j) {
+                const uint8_t x0 = kq_best_index_mxfp4(xb[j], d);
+                const uint8_t x1 = kq_best_index_mxfp4(xb[8 + j], d);
+                out[4 + 8 * sb + j] = (uint8_t)(x0 | (x1 << 4));
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- ROCmFP4 (rocmfp4.c, without an importance matrix)
 
 // Unsigned E4M3 scale bytes 0..126 as half-scale values: subnormals e * 2^-10, then (8 + m) * 2^(E - 11)
@@ -787,7 +889,7 @@ void qz_row_rocmfp4_fast(const float *x, void *y, int64_t k) {
 
 int qz_supported(int t) {
     return t == QT_F32 || t == QT_F16 || t == QT_BF16 || t == QT_Q8_0 || t == QT_Q4_0_ROCMFP4 ||
-           t == QT_Q4_0_ROCMFP4_FAST || t == QT_Q4_0 || t == QT_Q4_1 || t == QT_Q5_0 || t == QT_Q5_1 || t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_Q2_K || t == QT_Q3_K;
+           t == QT_Q4_0_ROCMFP4_FAST || t == QT_Q4_0 || t == QT_Q4_1 || t == QT_Q5_0 || t == QT_Q5_1 || t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_Q2_K || t == QT_Q3_K || t == QT_MXFP4 || t == QT_NVFP4;
 }
 
 static void encode_row(int t, const float *x, void *y, int64_t n) {
@@ -805,6 +907,8 @@ static void encode_row(int t, const float *x, void *y, int64_t n) {
     case QT_Q6_K: qz_row_q6_K(x, y, n); break;
     case QT_Q2_K: qz_row_q2_K(x, y, n); break;
     case QT_Q3_K: qz_row_q3_K(x, y, n); break;
+    case QT_MXFP4: qz_row_mxfp4(x, y, n); break;
+    case QT_NVFP4: qz_row_nvfp4(x, y, n); break;
     case QT_Q4_0_ROCMFP4: qz_row_rocmfp4(x, y, n); break;
     case QT_Q4_0_ROCMFP4_FAST: qz_row_rocmfp4_fast(x, y, n); break;
     }
