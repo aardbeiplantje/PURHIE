@@ -508,6 +508,17 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   test.". Found and fixed on the way: the device path needs BF16 talker matrices; the F32 talker (talker-f32) failed with
   "a matrix is not BF16". It now runs on the host (`bf16_matrices`), and the auto-pick prefers the BF16 talker.
   `qwen3tts_speech_verify` passes with both files.
+- S2 speech for real use (2026-11-14): (a) long texts: cut at the sentence ends into pieces of at most 220 characters
+  (`speech_pieces`), one talker run each, piece i with seed + i, 0.2 s of silence between pieces; input up to 20000
+  characters. (b) the server pulls the speech one piece per round (Web::Route's `pull`): other requests are served
+  between the pieces. Web::Route: a reference to a string as the last piece ends the body in its round
+  (t/31-pull-last.t). (c) response_format wav, pcm and flac (`audio_flac16` in src/audio.cpp: FLAC with fixed predictors
+  of order 0 to 3 and Rice residuals, lossless; decoded with libsndfile, exact on the test signals and on the speech:
+  the FLAC decodes to the WAV's samples). mp3, opus and aac are refused (400): no encoder in the image. (d) stream: true
+  with wav (header of unknown length) or pcm sends each piece as it is made. Measured locally on the BF16 talker: a
+  52.9 s text in 6 pieces took 68 s (about 100 ms per frame, the device path); a 1.4 s request beside it finished after
+  about 22 s (it waits for one of the other's pieces). Open: the pieces do not share prosody (each is its own run),
+  and a streamed WAV's header is not a finished file.
 - U1 threads: the host matmuls and convolutions run on the 16 cores (OpenMP over output rows); real-time factors
   measured for the speech (talker frames per second) and the transcription (seconds of audio per second).
 - U2 GPU path (UMA: the GGUF map is pinned, so the GPU reads the same pages): decided after U1 by the measured split;

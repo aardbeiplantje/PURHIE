@@ -847,9 +847,103 @@ route::post '/v1/audio/transcriptions' => sub {
 };
 
 # OpenAI's speech: a JSON body with the input text, the voice (a directory under --voices), the language (a name such as
-# english, default english), response_format (wav, the only one) and the sampling: temperature, top_k, repetition_penalty,
-# seed (0 by default: the same request, the same speech), max_frames (the talker's bound). 'model' is ignored. The
-# speech is generated on the host, one request at a time (the request waits for it).
+# english, default english), response_format (wav, pcm or flac), stream (true: the audio goes out as it is made: wav or
+# pcm), and the sampling: temperature, top_k, repetition_penalty, seed (0 by default: the same request, the same speech),
+# max_frames (the talker's bound per piece). 'model' is ignored. A long text is cut at its sentence ends into pieces of at
+# most $SPEECH_CHUNK characters; each piece is one talker run (piece i uses seed + i) with a short pause before it. The
+# server pulls the speech one piece per round (Web::Route's pull), so other requests are served between the pieces.
+my $SPEECH_CHUNK = 220;     # characters per piece
+my $SPEECH_PAUSE = 0.2;     # seconds of silence between pieces
+my $SPEECH_MAX_TEXT = 20000;
+my %SPEECH_FORMAT = (wav => 'audio/wav', pcm => 'audio/L16; rate=24000', flac => 'audio/flac');
+
+# The pieces of a text: its sentences (ends of . ! ? and the CJK marks), joined up to $SPEECH_CHUNK characters; a sentence
+# longer than that is cut at the last space before it (or at the limit)
+sub speech_pieces {
+    my ($text) = @_;
+    $text =~ s/\s+/ /g;
+    $text =~ s/\A\s+|\s+\z//g;
+    my @sent;
+    for my $s (grep { length } split /(?<=[.!?])\s+|(?<=[\x{3002}\x{FF01}\x{FF1F}])/, $text) {
+        while (length $s > $SPEECH_CHUNK) {
+            my ($head) = $s =~ /\A(.{1,$SPEECH_CHUNK})\s/s;
+            $head //= substr($s, 0, $SPEECH_CHUNK);
+            push @sent, $head;
+            ($s = substr($s, length $head)) =~ s/\A\s+//;
+        }
+        push @sent, $s if length $s;
+    }
+    my @piece;
+    for my $s (@sent) {
+        if (@piece && length($piece[-1]) + 1 + length($s) <= $SPEECH_CHUNK) { $piece[-1] .= ' ' . $s }
+        else { push @piece, $s }
+    }
+    return @piece;
+}
+
+# The WAV header of a stream of unknown length (the sizes 0xFFFFFFFF: a player reads to the end)
+sub speech_stream_header {
+    return pack('a4 V a4 a4 V v v V V v v a4 V', 'RIFF', 0xFFFFFFFF, 'WAVE', 'fmt ', 16, 1, 1, 24000, 48000, 2, 16,
+                'data', 0xFFFFFFFF);
+}
+
+# One round of a speech job: the next piece's samples (float32 at 24 kHz) and what goes to the client. The last piece
+# ends the body in its own round (a reference: Web::Route's last piece), so a finished request does not wait a round.
+sub speech_step {
+    my ($job) = @_;
+    return undef if $job->{gone};
+    return speech_send($job) if $job->{body};
+    return undef if $job->{finished};
+    my $progressive = $job->{stream} || $job->{fmt} eq 'pcm';
+    my $out = '';
+    if ($job->{next} < @{ $job->{pieces} }) {
+        my $i = $job->{next}++;
+        my $pause = $i ? pack('f<', 0) x int($SPEECH_PAUSE * 24000) : '';
+        my ($samples, $frames) = eval {
+            $TTS->speak($job->{pieces}[$i], voice => $job->{v}, language => $job->{lang}, %{ $job->{smp} },
+                        seed => $job->{smp}{seed} + $i);
+        };
+        if ($@) {
+            $LOG->error(event => 'speech', msg => 'piece ' . ($i + 1) . ' of ' . @{ $job->{pieces} } . ' failed: '
+                        . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r));
+            $job->{finished} = 1;
+            return undef;
+        }
+        $job->{frames} += $frames;
+        $LOG->info('speech', event => 'piece', msg => sprintf('%d of %d: %d frames, %.2f s, at %.0f ms', $i + 1,
+                   scalar @{ $job->{pieces} }, $frames, length($samples) / 4 / 24000,
+                   1000 * (Time::HiRes::time() - $job->{t0})));
+        my $all = $pause . $samples;
+        $job->{all} .= $all;
+        if ($progressive) {
+            $out = ($i == 0 && $job->{fmt} eq 'wav' ? speech_stream_header() : '')
+                 . substr(ROCm::Inference::speech_wav16($all, 24000), 44);  # (the 16-bit PCM after the 44-byte header)
+        }
+        return $out unless $job->{next} == @{ $job->{pieces} };
+    }
+    # all pieces said: the body ends with this round's piece
+    $job->{finished} = 1;
+    my $secs = length($job->{all}) / 4 / 24000;
+    $LOG->info('request', event => 'speech', msg => sprintf('%s: voice %s, %d pieces, %d frames, %.2f s, %s%s',
+               $tts_name, $job->{name}, scalar @{ $job->{pieces} }, $job->{frames}, $secs, $job->{fmt},
+               $job->{stream} ? ', streamed' : ''));
+    return \$out if $progressive;
+    # the file goes out in slices (one per round): Web::Route closes a response with more than its max_pending unsent
+    $job->{body} = $job->{fmt} eq 'wav' ? speech_wav16_file($job->{all}) : ROCm::Inference::speech_flac16($job->{all}, 24000);
+    $job->{off} = 0;
+    return speech_send($job);
+}
+
+# One slice of a finished body (256 KB); the last one is a reference, which ends the body
+sub speech_send {
+    my ($job) = @_;
+    my $slice = substr($job->{body}, $job->{off}, 262144);
+    $job->{off} += length $slice;
+    return $job->{off} >= length $job->{body} ? \$slice : $slice;
+}
+
+sub speech_wav16_file { return ROCm::Inference::speech_wav16($_[0], 24000) }
+
 route::post '/v1/audio/speech' => sub {
     my ($req) = @_;
     error(503, 'no speech model: start the server with --tts TALKER.gguf --tts-codec CODEC.gguf --voices DIR', 'server_error')
@@ -858,13 +952,16 @@ route::post '/v1/audio/speech' => sub {
     ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
     my $input = $p->{input};
     error(400, "'input' is required (the text to say)") unless defined $input && !ref $input && length $input;
-    error(400, 'input: at most 4096 characters') if length $input > 4096;
+    error(400, "input: at most $SPEECH_MAX_TEXT characters") if length $input > $SPEECH_MAX_TEXT;
     my $voice = $p->{voice} // '';
     error(400, "'voice' is required: a voice directory's name") unless $voice =~ /\A[A-Za-z0-9_.-]+\z/ && $voice !~ /\A\.{1,2}\z/;
     error(503, 'no voices: start the server with --voices DIR') unless $o{voices};
     my $v = eval { ROCm::Inference::speech_voice("$o{voices}/$voice") } or error(404, "no voice '$voice' in --voices");
     my $fmt = $p->{response_format} // 'wav';
-    error(400, "response_format: wav, not '$fmt'") unless $fmt eq 'wav';
+    error(400, "response_format: wav, pcm or flac (mp3, opus and aac are not built), not '$fmt'")
+        unless $SPEECH_FORMAT{$fmt};
+    my $stream = $p->{stream} ? 1 : 0;
+    error(400, 'stream: wav or pcm (flac is written whole)') if $stream && $fmt eq 'flac';
     my $lang = $p->{language} // 'english';
     error(400, "language: a name such as english, not '$lang'") unless $lang =~ /\A[a-z]{3,20}\z/;
     my %smp;
@@ -880,12 +977,17 @@ route::post '/v1/audio/speech' => sub {
     }
     $smp{max_frames} = 2048 unless $smp{max_frames};
     error(400, 'max_frames: at most 8192') if $smp{max_frames} > 8192;
-    my ($samples, $frames) = eval { $TTS->speak($input, voice => $v, language => $lang, %smp) };
-    error(400, $@ =~ s/ at \S+ line \d+\.?\n?\z//r) if $@;
-    my $wav = ROCm::Inference::speech_wav16($samples, 24000);
-    $LOG->info('request', event => 'speech', msg => sprintf('%s: voice %s, %d frames, %.2f s', $tts_name, $voice, $frames,
-                                                         length($samples) / 4 / 24000));
-    return [ 200, [ 'Content-Type' => 'audio/wav' ], $wav ];
+    $smp{seed} //= 0;
+    my @pieces = speech_pieces($input);
+    error(400, "'input' is required (the text to say)") unless @pieces;
+    my $job = { pieces => \@pieces, next => 0, v => $v, name => $voice, lang => $lang, smp => \%smp, fmt => $fmt,
+                stream => $stream, all => '', frames => 0, t0 => Time::HiRes::time() };
+    my $type = $stream && $fmt eq 'pcm' ? $SPEECH_FORMAT{pcm} : $SPEECH_FORMAT{$fmt};
+    return pull(200, [ 'Content-Type' => $type ], sub { speech_step($job) }, on_close => sub {
+        return if $job->{finished};
+        $job->{gone} = 1;
+        $LOG->warn_(event => 'speech', msg => "client gone after piece $job->{next} of " . @pieces);
+    });
 };
 
 # A voice from audio (T7 of PLAN.md): a multipart body with the reference clip in the part "file" (a WAV file, 0.5 to 60 s),

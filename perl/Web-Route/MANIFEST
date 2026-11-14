@@ -8,6 +8,7 @@ lib/Web/Route.pm
 t/10-dispatch.t
 t/20-server.t
 t/30-pull.t
+t/31-pull-last.t
 t/35-stall.t
 xt/pod-coverage.t
 xt/pod.t

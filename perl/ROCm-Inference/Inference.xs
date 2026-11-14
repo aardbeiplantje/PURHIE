@@ -1539,6 +1539,23 @@ _audio_wav_samples(wav, rate)
   OUTPUT:
     RETVAL
 
+SV*
+_audio_flac16(samples, rate)
+    SV* samples
+    int rate
+  CODE:
+    /* float32 samples (packed) at rate: a FLAC stream, 16-bit mono, lossless (audio.cpp) */
+    STRLEN len = 0;
+    const float* x = (const float*)SvPV(samples, len);
+    if (len % sizeof(float)) croak("ROCm::Inference: audio_flac16: the samples are not float32");
+    unsigned char* out = NULL;
+    size_t n = 0;
+    if (audio_flac16(x, len / sizeof(float), rate, &out, &n) != 0) croak("ROCm::Inference: %s", audio_last_error());
+    RETVAL = newSVpvn((const char*)out, (STRLEN)n);
+    audio_free((float*)out);
+  OUTPUT:
+    RETVAL
+
 # ---- Images (Stable Diffusion, sd-turbo: src/sd.{h,cpp}). A handle is the model; the PNG is made in the engine.
 
 IV

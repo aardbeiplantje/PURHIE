@@ -1,6 +1,7 @@
 Revision history for Web-Route
 
 0.01  unreleased
+    - pull: a reference to a string is the last piece (the body ends in that round; t/31-pull-last.t)
     - First version: Flask-like routes as plain functions in the route:: package (route::get, post, put,
       patch, delete, head, options, any, add, list, clear; :name and *name parameters; nothing exported that
       clashes), requests as plain hashes, responses as [status, headers, body] (a hash becomes JSON,

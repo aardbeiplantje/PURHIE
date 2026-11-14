@@ -26,7 +26,7 @@ our @EXPORT_OK = qw(
     generate last_prompt_stats last_error
     store_open store_close store_set_lazy store_stats store_block_names
     chat_render chat reply_tags
-    vision_load image_prompt set_mm mm_rope_delta whisper_load speech_load speech_wav16 speech_voice speech_voice_write
+    vision_load image_prompt set_mm mm_rope_delta whisper_load speech_load speech_wav16 speech_flac16 speech_voice speech_voice_write
     speech_wav_samples sd_load
     STOP_NONE STOP_EOG STOP_MAX_TOKENS STOP_STRING STOP_CALLBACK STOP_CONTEXT_FULL
 );
@@ -726,6 +726,12 @@ sub speech_wav16 {
     my $n = length $pcm;
     return pack('a4 V a4 a4 V v v V V v v a4 V', 'RIFF', 36 + $n, 'WAVE', 'fmt ', 16, 1, 1, $rate, $rate * 2, 2, 16,
                 'data', $n) . $pcm;
+}
+
+# speech_flac16($samples, $rate): a FLAC stream (16-bit mono, lossless: the same samples as speech_wav16) of float32 samples
+sub speech_flac16 {
+    my ($samples, $rate) = @_;
+    return ROCm::Inference::_audio_flac16($samples, $rate // 24000);
 }
 
 # sd_load($gguf): the image model (rocm-convert of a diffusers pipeline: sd-turbo) as a ROCm::Inference::Image object;

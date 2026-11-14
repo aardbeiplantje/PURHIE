@@ -357,6 +357,8 @@ sub run {
                 } elsif (!defined $piece) {
                     $l->{done} = 1;
                 } else {
+                    # a reference to a string is the last piece: the body ends with it, in this round
+                    if (ref $piece eq 'SCALAR') { $piece = $$piece; $l->{done} = 1 }
                     utf8::encode($piece) if utf8::is_utf8($piece);
                     $l->{out} .= $piece;
                 }
@@ -499,7 +501,8 @@ C<Cache-Control: no-cache> are added, so nginx passes events on as they come eve
 
 A body the server pulls without waiting for it: C<run> keeps the connection open and calls the sub again each
 round, serving other connections in between, until it returns C<undef>. It returns the next piece, or C<''> when
-there is nothing yet. C<on_close> (optional) is called once if the client leaves first. Many such responses make
+there is nothing yet; a reference to a string (C<\$last>) is the last piece, sent and ended in the same round (no
+extra round for the end). C<on_close> (optional) is called once if the client leaves first. Many such responses make
 progress together, typically fed by C<run>'s C<tick> (e.g. an inference server stepping one token of every open
 conversation per round). Writes are non-blocking; headers as for C<stream>.
 
