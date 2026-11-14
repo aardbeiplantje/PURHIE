@@ -39,6 +39,36 @@ my $no_draft = ($o{draft} // '') eq 'none';  # (no draft head, not even a model'
 delete $o{draft} if $no_draft;
 die "--draft goes with --model\n" if $o{draft} && !$o{model};
 die "--models-dir: no directory $o{'models-dir'}\n" if $o{'models-dir'} && !-d $o{'models-dir'};
+# --models-dir: the audio models in it run without flags. A Whisper GGUF (arch whisper) is the speech recognizer; a
+# Qwen3-TTS talker (arch qwen3tts) with its speech tokenizer (arch qwen3tts_codec) is the speech synthesizer, and its
+# voices are DIR/voices (made by POST /v1/audio/voices). The flags, when given, win.
+if ($o{'models-dir'}) {
+    my $dir = $o{'models-dir'};
+    my (%a);
+    opendir my $dh, $dir or die "--models-dir $dir: $!\n";
+    for my $f (sort readdir $dh) {
+        next unless $f =~ /\.gguf\z/;
+        my $info = eval { model_info("$dir/$f") } or next;
+        my $arch = $info->{arch} // '';
+        if    ($arch eq 'whisper')        { push @{ $a{whisper} }, "$dir/$f" }
+        elsif ($arch eq 'qwen3tts')       { push @{ $a{tts} },     "$dir/$f" }
+        elsif ($arch eq 'qwen3tts_codec') { push @{ $a{codec} },   "$dir/$f" }
+    }
+    closedir $dh;
+    if (!$o{whisper} && $a{whisper}) {
+        $o{whisper} = $a{whisper}[0];
+        $LOG->info('audio', event => 'auto', msg => "speech recognition (--whisper): $o{whisper}");
+    }
+    if (!$o{tts} && $a{tts} && $a{codec}) {
+        ($o{tts}, $o{'tts-codec'}) = ($a{tts}[0], $a{codec}[0]);
+        my $voices = "$dir/voices";
+        $o{voices} //= $voices if -d $voices || mkdir $voices;
+        $LOG->info('audio', event => 'auto', msg => "speech (--tts $o{tts} --tts-codec $o{'tts-codec'}, voices "
+                                                    . ($o{voices} // 'none') . ')');
+    } elsif (!$o{tts} && $a{tts}) {
+        $LOG->info('audio', event => 'auto', msg => "no speech codec in $dir: $a{tts}[0] not served");
+    }
+}
 my $parallel = $o{parallel} // 1;
 die "--parallel N: 1 or more\n" if $parallel < 1;
 $o{'store-snapshots'} //= 'lazy';
@@ -1466,6 +1496,11 @@ request. The directory is read again when the list is asked for, so files added 
 block, else a draft (MTP) head in the directory, is used for the model it fits (Qwen3.8-Flash-Next; not with
 C<--parallel>). Each model gets the
 context and KV cache type C<--ctx> / C<--kv-type> give, by default from its own trained context (C<--kv-budget>).
+
+The audio models in the directory are served without flags: a Whisper GGUF (C<--whisper>, for
+C</v1/audio/transcriptions>), and a Qwen3-TTS talker with its speech tokenizer (C<--tts> and C<--tts-codec>, for
+C</v1/audio/speech>), whose voices are the directory's C<voices> subdirectory (C<--voices>, created when missing).
+The flags, when given, name other files.
 
 =item --models-max N
 

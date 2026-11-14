@@ -62,3 +62,6 @@ refdata/
 
 # Request body logs from the deployment (opencode prompts: never commit)
 requests*.log
+
+# Audio files (test clips, speech output): generated or copied, never committed
+*.wav

@@ -499,6 +499,11 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   clip's voice, /data/audio-ref/lang/dump.py) transcribes and translates exactly as transformers' whisper-tiny does (20 and
   10 tokens, equal texts). Open: the cut is a pause, not a timestamp (a word at a window's end with no pause is not
   protected), no previous-text conditioning across windows.
+- S1 audio from MODELS_DIR (done 2026-11-14): `rocm-inference-server --models-dir DIR` serves the audio models in DIR
+  without flags: a Whisper GGUF (arch whisper) becomes `--whisper`; a talker (arch qwen3tts) with its codec (arch
+  qwen3tts_codec) becomes `--tts` and `--tts-codec`, with voices in DIR/voices (created). Flags still win. Checked: the
+  server's log names the picked files, the audio GGUFs are not listed as chat models. Not checked end to end: the server
+  under the container (its Perl modules are not in this sandbox; the auto block was run with the Web::Route stub).
 - U1 threads: the host matmuls and convolutions run on the 16 cores (OpenMP over output rows); real-time factors
   measured for the speech (talker frames per second) and the transcription (seconds of audio per second).
 - U2 GPU path (UMA: the GGUF map is pinned, so the GPU reads the same pages): decided after U1 by the measured split;
