@@ -15,8 +15,6 @@ the 38 GB of IQ downloads (item 2 of the list below) do not fit: local conversio
 
 The open work as packages. Each is one agent's task with its check; it is done when the check passes and it is committed.
 The lists below keep each item's background.
-- C (item 9) the codec on the device: the time per layer, the output convolution's tile (one channel in a 32-row tile),
-  the host stages (36 ms a piece). Check: the three codec verifiers, the pieces bit-identical.
 - D (item 7) the samplers' sort (28 us a codebook, 55 us for c0). Check: `talker_sample_verify` (exact), the frame's time.
 - E (item 10) Whisper's stage times on the host, to decide on a device path (only whisper-tiny is on this host).
 - F (item 15) the vision tower's stage times (`vision_verify` on `/data/vision-ref`) and its device plan.
@@ -78,10 +76,15 @@ Performance:
    codebooks are drawn on the device. The frame's time is its GPU work (predictor about 16.5 ms, talker 6.7 ms), so the
    speed-up left is item 7's.
 9. **Codec decoder on the GPU: first version done 2026-11-15 (U10).** The decoder's convolutions (the input convolution,
-   the four blocks, the output) run on the device; 40 frames decode in 186 ms (800 ms on the CPU). Open: the kernels run at
-   about 1.5 TFLOPS (a piece of 32 frames: 105 ms on the device, 36 ms in the host stages before it: the quantizer, the
-   pre-convolution, the transformer, the upsamplers with their ConvNeXt blocks); the output convolution computes 32 rows
-   for its one channel.
+   the four blocks, the output) run on the device; 40 frames decode in 190 ms (800 ms on the CPU). Per layer
+   (`QWEN3TTS_CODEC_PROFILE=2`; a piece of 32 frames, 106 ms on the device): the residual units' kernel-7 convolutions 67 ms
+   (63%, about 1.6 TFLOPS in every block), their kernel-1 convolutions 16 ms, the transposed convolutions 15 ms, the input
+   and output convolutions 5 ms (the output's 32-row tile for one channel costs 1.5 ms: not worth a variant), the pads 2 ms.
+   Tried and not kept (64 frames, best of 5, 282 ms): 32 input channels a chunk for kernel 7 (302 ms: 52 KB of shared
+   memory a block), 32 and 96 for kernel 1 (279 and 284 ms). Open: the host stages before the device (36 ms a piece, a
+   quarter of the decode: run the next piece's while the device works, or move the pre-convolution and the upsamplers to
+   the kernels); the kernel-7 inner loop. A 40-frame request spends about 0.9 s in the talker: the codec is no longer the
+   larger part.
 10. **Whisper on the GPU.** The encoder's and decoder's matmuls through sddev (whisper-tiny is small: measure first).
 
 Quality and scope (decisions):
