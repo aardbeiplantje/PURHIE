@@ -110,38 +110,41 @@ void linear(const float* x, int T, const Lin& L, float* y) {
 void conv_causal(const float* x, int T, const Conv& C, float* y) {
     const int pad = (C.k - 1) * C.dil;
     if (C.groups == 1) {
-        // blocks of 4 output rows and 256 time steps: the block's sums stay in cache over the input channels and the taps
-        // (the row-by-row form read and wrote each output row once per tap). Every output sums in the order it always did
-        // (its bias, then the input channels, then the taps), so the result is the same bits.
-        constexpr int MO = 8, TC = 256;
-        const int nob = (C.cout + MO - 1) / MO, ntb = (T + TC - 1) / TC;
+        // blocks of 8 output rows and 16 time steps, the 8 x 16 sums in registers: each input vector is loaded once for the
+        // 8 rows (the row-by-row form read and wrote each output row once per tap). The input is copied with its zero left
+        // padding, so every tap reads a full vector; the zero products add nothing (the same bits). Every output sums in the
+        // order it always did (its bias, then the input channels, then the taps).
+        constexpr int MO = 4, TV = 64;
+        const int padl = pad, Tp = T + pad + TV;
+        std::vector<float> xp((size_t)C.cin * Tp, 0.0f);
+#pragma omp parallel for schedule(static)
+        for (int c = 0; c < C.cin; ++c)
+            std::memcpy(xp.data() + (size_t)c * Tp + padl, x + (size_t)c * T, sizeof(float) * (size_t)T);
+        const int nob = (C.cout + MO - 1) / MO, ntv = (T + TV - 1) / TV;
 #pragma omp parallel for schedule(static) collapse(2)
         for (int ob = 0; ob < nob; ++ob) {
-            for (int tb = 0; tb < ntb; ++tb) {
+            for (int tv = 0; tv < ntv; ++tv) {
                 const int o0 = ob * MO, no = std::min(MO, C.cout - o0);
-                const int t0 = tb * TC, nt = std::min(TC, T - t0);
-                float acc[MO][TC];
-                for (int j = 0; j < no; ++j) {
-                    const float bias = C.b ? C.b[o0 + j] : 0.0f;
-                    for (int t = 0; t < nt; ++t) acc[j][t] = bias;
+                const int t0 = tv * TV;
+                float acc[MO][TV];
+                for (int j = 0; j < MO; ++j) {
+                    const float bias = j < no && C.b ? C.b[o0 + j] : 0.0f;
+                    for (int t = 0; t < TV; ++t) acc[j][t] = bias;
                 }
                 for (int c = 0; c < C.cin; ++c) {
-                    const float* xr = x + (size_t)c * T;
+                    const float* xr = xp.data() + (size_t)c * Tp;
                     for (int k = 0; k < C.k; ++k) {
-                        const int sh = k * C.dil - pad;  // acc[j][t] += w * x[t + sh] where 0 <= t + sh < T
-                        const int a0 = std::max(t0, -sh), a1 = std::min(t0 + nt, T - sh);
-                        if (a0 >= a1) continue;
-                        for (int j = 0; j < no; ++j) {
-                            const float w = C.w[((size_t)(o0 + j) * C.cin + c) * C.k + k];
-                            float* ar = acc[j] - t0;
+                        const float* xv = xr + t0 + k * C.dil;  // y[t] += w * x[t + k * dil - pad]
+                        for (int j = 0; j < MO; ++j) {
+                            const float w = j < no ? C.w[((size_t)(o0 + j) * C.cin + c) * C.k + k] : 0.0f;
 #pragma omp simd
-                            for (int t = a0; t < a1; ++t) ar[t] += w * xr[t + sh];
+                            for (int t = 0; t < TV; ++t) acc[j][t] += w * xv[t];
                         }
                     }
                 }
                 for (int j = 0; j < no; ++j) {
                     float* yr = y + (size_t)(o0 + j) * T;
-                    for (int t = 0; t < nt; ++t) yr[t0 + t] = acc[j][t];
+                    for (int t = 0; t < TV && t0 + t < T; ++t) yr[t0 + t] = acc[j][t];
                 }
             }
         }
