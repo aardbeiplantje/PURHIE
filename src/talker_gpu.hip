@@ -369,3 +369,95 @@ tk_gemm(const uint16_t *W, const float *X, float *Y, int K, int N, int T) {
         if (t0 + tq + 16 < T) Y[(size_t)(t0 + tq + 16) * N + n0 + r] = a1;
     }
 }
+
+// The codebook sampler on the device (qwen3tts.cpp's sample_token, in the device's order): the top_k most likely of the n
+// logits, by (logit descending, index ascending) (top_k 0: all n), drawn from their softmax at the temperature with the
+// splitmix state in *state (advanced once, as the host's); temperature <= 0: the first maximum. One block of 1024 threads
+// sorts the logits in LDS (a bitonic network; n <= TK_SMAX). The token goes to *tok_out. With next, the token's row of the
+// table (BF16 [rows][C]) goes to row (the predictor's next input) and *pos advances (the predictor's next stack reads it).
+#define TK_SMAX 2048
+
+__device__ __forceinline__ bool tk_before(float va, int ia, float vb, int ib) { return va > vb || (va == vb && ia < ib); }
+
+__device__ __forceinline__ uint64_t tk_next_u64(uint64_t *state) {
+    uint64_t z = (*state += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+extern "C" __global__ void __launch_bounds__(1024)
+tk_sample_next(const float *logits, int n, float temperature, int top_k, uint64_t *state, int *tok_out,
+               const uint16_t *table, int C, float *row, int *pos, int next) {
+    __shared__ float sv[TK_SMAX], ev[TK_SMAX];
+    __shared__ int si[TK_SMAX];
+    __shared__ int tok_s;
+    const int tid = threadIdx.x;
+    int NP = 1;
+    while (NP < n) NP <<= 1;
+    for (int i = tid; i < NP; i += 1024) {
+        sv[i] = i < n ? logits[i] : -INFINITY;
+        si[i] = i < n ? i : 0x7fffffff;
+    }
+    __syncthreads();
+    // the bitonic sort into the "before" order: sv[0] is the largest, ties the lowest index
+    for (int k = 2; k <= NP; k <<= 1)
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = tid; i < NP; i += 1024) {
+                const int p = i ^ j;
+                if (p > i) {
+                    const bool up = (i & k) == 0;
+                    const bool sw = up ? tk_before(sv[p], si[p], sv[i], si[i]) : tk_before(sv[i], si[i], sv[p], si[p]);
+                    if (sw) {
+                        const float tv = sv[i];
+                        sv[i] = sv[p];
+                        sv[p] = tv;
+                        const int ti = si[i];
+                        si[i] = si[p];
+                        si[p] = ti;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    const bool draw = temperature > 0.0f && sv[0] > -INFINITY;
+    const int K = (top_k > 0 && top_k < n) ? top_k : n;
+    if (draw)
+        for (int i = tid; i < K; i += 1024) ev[i] = sv[i] > -INFINITY ? expf((sv[i] - sv[0]) / temperature) : 0.0f;
+    __syncthreads();
+    if (tid == 0) {
+        int tok;
+        if (!(sv[0] > -INFINITY)) {
+            tok = 0;  // (no finite logit: the host's 0)
+        } else if (!draw) {
+            tok = si[0];  // the first maximum
+        } else {
+            double sum = 0.0;
+            for (int i = 0; i < K; ++i) sum += (double)ev[i];
+            double r = (double)(tk_next_u64(state) >> 11) * (1.0 / 9007199254740992.0) * sum;
+            tok = si[K - 1];
+            for (int i = 0; i < K; ++i) {
+                r -= (double)ev[i];
+                if (r < 0.0) {
+                    tok = si[i];
+                    break;
+                }
+            }
+        }
+        tok_s = tok;
+        *tok_out = tok;
+    }
+    __syncthreads();
+    if (next) {
+        const uint16_t *src = table + (size_t)tok_s * C;
+        for (int i = tid; i < C; i += 1024) row[i] = tk_bf16(src[i]);
+        if (tid == 0) *pos += 1;
+    }
+}
+
+// row = table[tok] (BF16 [rows][C]) as floats, and *pos advances: the predictor's first input is the codec embedding of c0
+extern "C" __global__ void __launch_bounds__(256) tk_gather_row(const uint16_t *table, int tok, int C, float *row, int *pos) {
+    const uint16_t *src = table + (size_t)tok * C;
+    for (int i = threadIdx.x; i < C; i += blockDim.x) row[i] = tk_bf16(src[i]);
+    if (threadIdx.x == 0) *pos += 1;
+}

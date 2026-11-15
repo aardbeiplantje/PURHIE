@@ -48,8 +48,9 @@ Performance:
    LDS-only barrier so they stay in flight: the stack 1170 us against 938 us. The in-order vmcnt makes the norm's global
    reads wait for those weights; with the loads moved back after the norm (same dot code) it is 1000 us, so the grouping
    of the dot costs about 60 us on its own. Not retried: the early loads. Open: more bytes in flight without the VGPR cost.
-8. **Sampler on the device.** The predictor's 15 syncs per frame are the sampler's: the top-k draw on the device would
-   remove them (the RNG is splitmix, a fixed function).
+8. **Sampler on the device: done 2026-11-15 (U9).** The predictor's per-codebook syncs are gone. Open: the talker's head
+   and the host's draw of c0 (the repetition penalty, the suppressed range) still need a sync each frame; c0 on the device
+   would make one sync per frame. The predictor's time is its GPU work (about 16.5 ms per frame), so the speed-up is item 7's.
 9. **Codec decoder on the GPU.** About 1.3 s of a 94-frame speech request on the CPU (U5/U6); the convolutions and the
    transposed ones are the cost (both on the CPU now).
 10. **Whisper on the GPU.** The encoder's and decoder's matmuls through sddev (whisper-tiny is small: measure first).
@@ -636,6 +637,16 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   the transcription correct; the output is no longer byte-identical to the earlier one (the prefill sums in another order).
   The first version (qmatvec's batched product) was not faster: it re-reads each token's activations per output
   row (266 GB of cache traffic for the prompt). The profile line shows the request rows' time (`request rows`).
+- U9 the predictor's sampler on the device (2026-11-15, item 8). Per frame the predictor's stacks, heads, draws and the next
+  rows' embeddings are launches on the stream (`tk_sample_next`: the top_k by (logit desc, index asc) in a bitonic sort in
+  LDS, the draw from the float softmax with the splitmix state on the device; `tk_gather_row`: the codec embedding of c0,
+  the position advances on the device); the host syncs once for the frame's codes and RNG state. The host path and c0's
+  draw are unchanged. Checks: `tests/talker_sample_verify` (3000 rows: ties, -inf, greedy, top_k 0/1/50/2, the state and the
+  position): 0 mismatches; `qwen3tts_verify` (BF16 talker on the device): greedy 200 frames equal to qwen-tts, top_k 1 equal
+  to greedy, PASS; `qwen3tts_speech_verify` PASS; Perl `t/65-speech.t` 13 pass. Sampled frames for a seed changed (the
+  draw maps the same u to the sorted order); the rule is the same. Timing, predictor per frame (200 frames): idle 16.80 ms
+  before, 16.70 after (the syncs cost nothing when the GPU is the bound); with every core busy (32 busy-loop processes)
+  31.7 and 34.7 ms before, 18.3 and 17.6 ms after: the old per-codebook syncs were exposed to host scheduling.
 - U1 threads: the host matmuls and convolutions run on the 16 cores (OpenMP over output rows); real-time factors
   measured for the speech (talker frames per second) and the transcription (seconds of audio per second).
 - U2 GPU path (UMA: the GGUF map is pinned, so the GPU reads the same pages): decided after U1 by the measured split;
