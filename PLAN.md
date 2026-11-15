@@ -24,7 +24,6 @@ The lists below keep each item's background.
 - D (item 7) the samplers' sort (28 us a codebook, 55 us for c0). Check: `talker_sample_verify` (exact), the frame's time.
 - E (item 10) Whisper's stage times on the host, to decide on a device path (only whisper-tiny is on this host).
 - F (item 15) the vision tower's stage times (`vision_verify` on `/data/vision-ref`) and its device plan.
-- G tests: t/60's "is 91 prime" check (fails on Qwen3-0.6B), the secondary-colours regex of t/10 and t/20.
 
 The user's decisions: item 12 (prosody across speech pieces) and item 13 (mp3 / opus / aac). Not runnable on this host:
 the Flash measurements (its own MTP block, the PLE reads), `--parallel` and the store on the deployment,
@@ -414,9 +413,7 @@ transformers 5.5.1, Pillow; no torchvision in that venv). A phase is done when i
   rows neither reads nor writes the KV block store, and its RoPE offset ends when it is truncated below its images
   (the store's skip is not covered by a test yet). Checks: `perl/ROCm-Inference/t/63-server-image.t` (env-gated, passes
   on the 0.8B), the store and server suites (30, 40, 45, 60) pass. Open: `--parallel` above 1 refuses images; the
-  vision tower runs on the host (float32), a GPU path is not started; t/10 and t/20 each have one reply check that
-  expects green/orange/purple for "three secondary colors" and gets "Yellow, Cyan, and Magenta" (a correct answer
-  from the 0.8B; the regex is too strict, not changed here).
+  vision tower runs on the host (float32), a GPU path is not started.
 
 **Audio transcription (whisper-tiny, `/data/hf-small/whisper-tiny`):**
 - A1 reference (done 2026-11-13): `/data/audio-ref/dump.py` writes `/data/audio-ref/whisper-tiny/`: the clip (5.9 s of
@@ -1102,8 +1099,6 @@ Tests and API:
 - In `make regress`: kv_verify, generate_verify, events_test, seq_verify (0.6B, 4B), store_verify.sh, and the Perl
   suites (Web::Route, Minijinja, ROCm::Inference with the server tests on Qwen3.5-4B). Still out: mtp_verify and
   `events_test MODEL DRAFT` (the Flash model and its draft head: a window with the deployment stopped).
-- `t/60-server.t`'s "is 91 prime" content check fails on Qwen3-0.6B (the model says yes); the suite runs it on
-  Qwen3.5-4B (tests/regress.tsv). Loosen it or keep the 4B.
 - **Raw completions (`POST /v1/completions`, 2026-11-12: whole and streamed, sequential and `--parallel`) leave out
   two parts of OpenAI's; likely not needed** (coding agents use chat; both are what evaluation harnesses use), so do
   them when a client asks: `prompt` as an array (several prompts answered as choices[i], or token ids instead of

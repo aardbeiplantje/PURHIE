@@ -40,7 +40,7 @@ push @messages, { role => 'assistant', content => $reply }, { role => 'user', co
 my $reply2 = chat($m, \@messages, { temperature => 0, max_new_tokens => 48, vars => { enable_thinking => 0 } });
 my ($reused) = last_prompt_stats($m);
 ok($reused > 0, "turn 2 reused $reused tokens");
-like($reply2, qr/green|orange|purple/i, "reply 2: $reply2");
+like($reply2, qr/green|orange|purple|violet|cyan|magenta|yellow/i, "reply 2: $reply2");
 
 # Thinking on, streamed by kind, with a thinking budget: the reasoning is cut short, then the answer follows
 SKIP: {

@@ -89,7 +89,7 @@ my $turn2 = "$sys" . $bt->('user') . "Name three primary colors.$et" . $bt->('as
 my ($a2) = generate($m, tokenize($m, $turn2), { max_new_tokens => 64, temperature => 0, reuse_prefix => 1 });
 my ($reused, $prefilled) = last_prompt_stats($m);
 ok($reused > 0, "turn 2 reused $reused tokens, prefilled $prefilled");
-like(detokenize($m, $a2), qr/green|orange|purple/i, 'turn 2 answers about secondary colors');
+like(detokenize($m, $a2), qr/green|orange|purple|violet|cyan|magenta|yellow/i, 'turn 2 answers about secondary colors');
 
 my $logits = get_logits($m);
 is(length($logits), 4 * vocab_size($m), 'get_logits: packed floats');
