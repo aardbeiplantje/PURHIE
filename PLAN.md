@@ -43,7 +43,11 @@ Performance:
    host (about 0.5 s for a 204-frame voice). Start: the rows through qmatvec's batched BF16 GEMM, then the causal
    attention for several rows on the device.
 7. **Matvec kernels to ~230 GB/s.** The predictor and talker stacks run at 175-206 GB/s (U4). Start from the ablation
-   benchmark (`bench_stack`, not committed: recreate from the U4 notes) and the access-pattern results.
+   benchmark (`bench_stack`, not committed: recreate from the U4 notes) and the access-pattern results. Tried 2026-11-15, not
+   kept: each row's weight loads issued before the norm (and before the LDS copy of the output and down matvecs), with an
+   LDS-only barrier so they stay in flight: the stack 1170 us against 938 us. The in-order vmcnt makes the norm's global
+   reads wait for those weights; with the loads moved back after the norm (same dot code) it is 1000 us, so the grouping
+   of the dot costs about 60 us on its own. Not retried: the early loads. Open: more bytes in flight without the VGPR cost.
 8. **Sampler on the device.** The predictor's 15 syncs per frame are the sampler's: the top-k draw on the device would
    remove them (the RNG is splitmix, a fixed function).
 9. **Codec decoder on the GPU.** About 1.3 s of a 94-frame speech request on the CPU (U5/U6); the convolutions and the
