@@ -42,11 +42,22 @@ __device__ __forceinline__ float tk_dot8(const uint4 v, const float *xp) {
 }
 
 __device__ __forceinline__ float tk_row_dot(const uint16_t *wr, const float *xs, int n, int lane) {
-    // (n is a multiple of 1024: the four loads of a step are unconditional; a load inside a branch serialized them)
+    // (n is a multiple of 1024: the four loads of a step are unconditional; a load inside a branch serialized them.) Two
+    // steps' loads are issued together where the row has them (n >= 2048: eight loads in flight); the sums keep the order
+    // of one step after the other.
     const uint4 *w4 = reinterpret_cast<const uint4 *>(wr);
     const int n8 = n / 8;
     float acc = 0.0f;
-    for (int j = lane; j < n8; j += 128) {
+    int j = lane;
+    for (; j + 128 < n8; j += 256) {
+        const uint4 a0 = w4[j], a1 = w4[j + 32], a2 = w4[j + 64], a3 = w4[j + 96];
+        const uint4 b0 = w4[j + 128], b1 = w4[j + 160], b2 = w4[j + 192], b3 = w4[j + 224];
+        acc += tk_dot8(a0, xs + 8 * j) + tk_dot8(a1, xs + 8 * (j + 32)) + tk_dot8(a2, xs + 8 * (j + 64)) +
+               tk_dot8(a3, xs + 8 * (j + 96));
+        acc += tk_dot8(b0, xs + 8 * (j + 128)) + tk_dot8(b1, xs + 8 * (j + 160)) + tk_dot8(b2, xs + 8 * (j + 192)) +
+               tk_dot8(b3, xs + 8 * (j + 224));
+    }
+    for (; j < n8; j += 128) {
         const uint4 v0 = w4[j], v1 = w4[j + 32], v2 = w4[j + 64], v3 = w4[j + 96];
         acc += tk_dot8(v0, xs + 8 * j) + tk_dot8(v1, xs + 8 * (j + 32)) + tk_dot8(v2, xs + 8 * (j + 64)) +
                tk_dot8(v3, xs + 8 * (j + 96));
@@ -184,8 +195,20 @@ tk_gateup(const float *x, const float *nw, const uint16_t *Wg, const uint16_t *W
     tk_rms_lds(x, nw, C, eps, xs, red);
     const int row = blockIdx.x * TK_ROWS + threadIdx.x / 32, lane = threadIdx.x % 32;
     if (row >= FF) return;
-    const float gate = tk_row_dot(Wg + (size_t)row * C, xs, C, lane);
-    const float up = tk_row_dot(Wu + (size_t)row * C, xs, C, lane);
+    // the gate's and the up's rows read together (eight loads in flight); the sums are tk_row_dot's
+    const uint4 *g4 = reinterpret_cast<const uint4 *>(Wg + (size_t)row * C);
+    const uint4 *u4 = reinterpret_cast<const uint4 *>(Wu + (size_t)row * C);
+    float gate = 0.0f, up = 0.0f;
+    for (int j = lane; j < C / 8; j += 128) {
+        const uint4 a0 = g4[j], a1 = g4[j + 32], a2 = g4[j + 64], a3 = g4[j + 96];
+        const uint4 b0 = u4[j], b1 = u4[j + 32], b2 = u4[j + 64], b3 = u4[j + 96];
+        gate += tk_dot8(a0, xs + 8 * j) + tk_dot8(a1, xs + 8 * (j + 32)) + tk_dot8(a2, xs + 8 * (j + 64)) +
+                tk_dot8(a3, xs + 8 * (j + 96));
+        up += tk_dot8(b0, xs + 8 * j) + tk_dot8(b1, xs + 8 * (j + 32)) + tk_dot8(b2, xs + 8 * (j + 64)) +
+              tk_dot8(b3, xs + 8 * (j + 96));
+    }
+    for (int o = 16; o > 0; o >>= 1) gate += __shfl_xor(gate, o);
+    for (int o = 16; o > 0; o >>= 1) up += __shfl_xor(up, o);
     if (lane == 0) g[row] = gate / (1.0f + expf(-gate)) * up;
 }
 

@@ -42,12 +42,17 @@ Performance:
 6. **Prompt prefill on the GPU: done 2026-11-15 (U8).** The voice's prefix is cached (U7), but each request still runs its own rows on the
    host (about 0.5 s for a 204-frame voice). Start: the rows through qmatvec's batched BF16 GEMM, then the causal
    attention for several rows on the device.
-7. **Matvec kernels to ~230 GB/s.** The predictor and talker stacks run at 175-206 GB/s (U4). Start from the ablation
-   benchmark (`bench_stack`, not committed: recreate from the U4 notes) and the access-pattern results. Tried 2026-11-15, not
-   kept: each row's weight loads issued before the norm (and before the LDS copy of the output and down matvecs), with an
-   LDS-only barrier so they stay in flight: the stack 1170 us against 938 us. The in-order vmcnt makes the norm's global
-   reads wait for those weights; with the loads moved back after the norm (same dot code) it is 1000 us, so the grouping
-   of the dot costs about 60 us on its own. Not retried: the early loads. Open: more bytes in flight without the VGPR cost.
+7. **Matvec kernels to ~230 GB/s.** State 2026-11-15: a predictor stack (5 layers, 30 launches, 157 MB of BF16) takes
+   905 us, was 940: rows of 2048 and more (the output projection, the down) issue two steps' loads together, and the gate's
+   and the up's rows are read together (eight loads in flight; the sums' order kept: the speech is byte-identical). The
+   frame: 23.4 -> 22.8 ms (predictor 16.3, talker 6.5). Where the 905 us go (`bench_stack`, not committed): with the weight
+   loads removed the stack takes 142 us (the launches' fixed cost: attention 37, QKV 33, gate/up 28, down 16, output 14,
+   q/k 14), so the weights stream in about 760 us: 206 GB/s, where the memory's peak is 256 (reached only by a pure stream;
+   the one-row pattern alone reaches 206). Not kept: each row's weight loads issued before the norm (1170 us: the in-order
+   vmcnt makes the norm's reads wait for the weights; an LDS-only barrier did not help). Leads, each a few percent: fewer
+   launches (the q/k norm and rotary inside the attention; the norm once per layer), and the samplers (28 us per codebook,
+   55 us for c0: 0.47 ms a frame; the bitonic sort's 66 barrier rounds in one block: a rank sort over several blocks and a
+   second launch for the draw would be about 10 us).
 8. **Sampler on the device: done 2026-11-15 (U9).** A frame is one sync (after the predictor): c0 and the predictor's
    codebooks are drawn on the device. The frame's time is its GPU work (predictor about 16.5 ms, talker 6.7 ms), so the
    speed-up left is item 7's.
