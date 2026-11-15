@@ -597,14 +597,19 @@ namespace dev {
 hipModule_t mod = nullptr;
 hipFunction_t f_qkv = nullptr, f_qk = nullptr, f_attn = nullptr, f_oproj = nullptr, f_gateup = nullptr, f_down = nullptr,
               f_head = nullptr;
+hipFunction_t f_rms_rows = nullptr, f_qk_rows = nullptr, f_attn_rows = nullptr, f_add_rows = nullptr, f_silu2 = nullptr,
+              f_gemm = nullptr;
 hipStream_t stream = nullptr;  // the run's stream (graph capture needs one: not the null stream)
 
 bool load() {
     if (f_attn) return true;
     if (kernel_module_load(&mod, "talker_gpu.co") != hipSuccess) return false;
-    hipFunction_t* fns[] = {&f_qkv, &f_qk, &f_attn, &f_oproj, &f_gateup, &f_down, &f_head};
-    const char* names[] = {"tk_qkv", "tk_qk_rope_kv", "tk_attn", "tk_oproj_add", "tk_gateup", "tk_down_add", "tk_head"};
-    for (int i = 0; i < 7; ++i)
+    hipFunction_t* fns[] = {&f_qkv,    &f_qk,       &f_attn,   &f_oproj,  &f_gateup,   &f_down,
+                            &f_head,   &f_rms_rows, &f_qk_rows, &f_attn_rows, &f_add_rows, &f_silu2, &f_gemm};
+    const char* names[] = {"tk_qkv",     "tk_qk_rope_kv", "tk_attn", "tk_oproj_add", "tk_gateup", "tk_down_add",
+                           "tk_head",    "tk_rms_rows",   "tk_qk_rows", "tk_attn_rows", "tk_add_rows", "tk_silu_mul2",
+                           "tk_gemm"};
+    for (int i = 0; i < 13; ++i)
         if (hipModuleGetFunction(fns[i], mod, names[i]) != hipSuccess) return false;
     return true;
 }
@@ -647,6 +652,12 @@ struct KTime {
     hipEvent_t a, b;
 };
 std::vector<KTime>* ktimes = nullptr;  // (set for a profiled run)
+
+// a launch with a two-dimensional grid (gx, gy) of blocks
+void launch2(hipFunction_t f, unsigned gx, unsigned gy, unsigned threads, unsigned shm, void** args) {
+    if (hipModuleLaunchKernel(f, gx, gy, 1, threads, 1, 1, shm, stream, args, nullptr) != hipSuccess)
+        throw std::runtime_error("qwen3tts device: a kernel launch failed");
+}
 
 void launch(hipFunction_t f, unsigned blocks, unsigned threads, unsigned shm, void** args) {
     if (ktimes) {
@@ -747,6 +758,88 @@ void head(const float* x, const float* norm_w, const Mat& W, float eps, int C, f
     float* o = out;
     void* args[] = {(void*)&xin, (void*)&nw, (void*)&Wh, (void*)&C, (void*)&rows, (void*)&eps, (void*)&nrm, (void*)&o};
     launch(f_head, (unsigned)((rows + 7) / 8), 256, (unsigned)(C * sizeof(float)), args);
+}
+
+// The prefill (the talker's prompt rows through the layers, on the device): the batched forms of the decode step's kernels.
+// The batched BF16 product (qmatvec's matmul) sums each token as its single-token product does, and reads a tile of 8
+// tokens' weights once. The buffers are the arena's: x [Tn][C] in place, the rest per block.
+struct PrefillBuf {
+    float *h = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *att = nullptr, *o = nullptr, *g = nullptr, *u = nullptr;
+};
+
+// y [Tn][N] = x [Tn][K] . W^T (W: the BF16 matrix [N][K]): talker_gpu.hip's tiled matmul (K a multiple of 64)
+void mm(const Mat& W, const float* x, float* y, int N, int K, int Tn) {
+    if (!W.h) throw std::runtime_error("qwen3tts device: a matrix is not BF16");
+    if (K % 64) throw std::runtime_error("qwen3tts device: the matmul's K is not a multiple of 64");
+    const uint16_t* Wh = W.h;
+    const float* xin = x;
+    float* yo = y;
+    int KK = K, NN = N, TT = Tn;
+    void* args[] = {(void*)&Wh, (void*)&xin, (void*)&yo, (void*)&KK, (void*)&NN, (void*)&TT};
+    launch2(f_gemm, (unsigned)((N + 15) / 16), (unsigned)((Tn + 31) / 32), 256, 0, args);
+}
+
+// the prefill's block for Tn rows at the positions pos0 ..: x [Tn][C] in place, their keys and values into the layer's caches
+void prefill_block(const Block& B, const Dims& d, float* x, int Tn, int pos0, float* kc, float* vc, const float* rcs,
+                   const float* rsn, const PrefillBuf& b) {
+    const int C = d.C, H = d.H, Hkv = d.Hkv, D = d.D, HD = H * d.D, KD = Hkv * d.D, FF = d.FF;
+    const float eps = d.eps;
+    const float* attn_norm = B.attn_norm;
+    const float *q_norm = B.q_norm, *k_norm = B.k_norm, *ffn_norm = B.ffn_norm;
+    {
+        const float* xin = x;
+        float* hh = b.h;
+        void* args[] = {(void*)&xin, (void*)&attn_norm, (void*)&C, (void*)&eps, (void*)&hh};
+        launch(f_rms_rows, (unsigned)Tn, 256, 0, args);
+    }
+    mm(B.q.w, b.h, b.q, HD, C, Tn);
+    mm(B.k.w, b.h, b.k, KD, C, Tn);
+    mm(B.v.w, b.h, b.v, KD, C, Tn);
+    {
+        float *q = b.q, *k = b.k;
+        const float* v = b.v;
+        const float *cs = rcs, *sn = rsn;
+        void* args[] = {(void*)&q, (void*)&k, (void*)&v, (void*)&q_norm, (void*)&k_norm, (void*)&cs, (void*)&sn, (void*)&pos0,
+                        (void*)&kc, (void*)&vc, (void*)&H, (void*)&Hkv, (void*)&D, (void*)&HD, (void*)&KD, (void*)&eps};
+        launch2(f_qk_rows, (unsigned)Tn, (unsigned)(H + Hkv), 256, (unsigned)(D * sizeof(float)), args);
+    }
+    {
+        const float* q = b.q;
+        float* att = b.att;
+        void* args[] = {(void*)&q, (void*)&kc, (void*)&vc, (void*)&att, (void*)&pos0, (void*)&H, (void*)&Hkv, (void*)&D, (void*)&HD};
+        launch2(f_attn_rows, (unsigned)H, (unsigned)Tn, 256, (unsigned)((pos0 + Tn) * sizeof(float)), args);
+    }
+    mm(B.o.w, b.att, b.o, C, HD, Tn);
+    {
+        float* xx = x;
+        const float* y = b.o;
+        int n = Tn * C;
+        void* args[] = {(void*)&xx, (void*)&y, (void*)&n};
+        launch(f_add_rows, (unsigned)((n + 255) / 256), 256, 0, args);
+    }
+    {
+        const float* xin = x;
+        float* hh = b.h;
+        void* args[] = {(void*)&xin, (void*)&ffn_norm, (void*)&C, (void*)&eps, (void*)&hh};
+        launch(f_rms_rows, (unsigned)Tn, 256, 0, args);
+    }
+    mm(B.gate.w, b.h, b.g, FF, C, Tn);
+    mm(B.up.w, b.h, b.u, FF, C, Tn);
+    {
+        float* g = b.g;
+        const float* u = b.u;
+        int n = Tn * FF;
+        void* args[] = {(void*)&g, (void*)&u, (void*)&n};
+        launch(f_silu2, (unsigned)((n + 255) / 256), 256, 0, args);
+    }
+    mm(B.down.w, b.g, b.o, C, FF, Tn);
+    {
+        float* xx = x;
+        const float* y = b.o;
+        int n = Tn * C;
+        void* args[] = {(void*)&xx, (void*)&y, (void*)&n};
+        launch(f_add_rows, (unsigned)((n + 255) / 256), 256, 0, args);
+    }
 }
 
 // cos and sin of pos * theta^(-2i/D) for pos < rows, as the host's rope (double angles, rounded to float)
@@ -1256,12 +1349,15 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
               *pn = pn_h.data(), *rcs = nullptr, *rsn = nullptr, *prcs = nullptr, *prsn = nullptr;
         dev::Work work{};
         int* pos_dev = nullptr;  // the position of the step on the device (the kernels read it)
+        float* pxa = nullptr;    // the prefill's rows on the device (the arena), with their buffers
+        dev::PrefillBuf pb;
         if (dev_on) {
             const int mxC = std::max(C, pd.C), mxHD = std::max(HD, pHD), mxKD = std::max(KD, pKD), mxFF = std::max(d.FF, pd.FF);
             const size_t floats = (size_t)2 * m->n_layer * maxL * KD + (size_t)2 * m->pn_layer * (ncb + 1) * pKD +
                                   (size_t)maxL * (d.D / 2) * 2 + (size_t)(ncb + 1) * (pd.D / 2) * 2 +
-                                  (size_t)(3 * C + V + m->pvocab + 2 * mxC + mxC + C) + (size_t)(2 * mxKD + 2 * mxHD + mxFF) + 1;
-            const size_t slack_allocs = (size_t)2 * m->n_layer + 2 * m->pn_layer + 4 + 14 + 8 + 1;
+                                  (size_t)(3 * C + V + m->pvocab + 2 * mxC + mxC + C) + (size_t)(2 * mxKD + 2 * mxHD + mxFF) + 1 +
+                                  (size_t)P * (3 * C + 2 * HD + 2 * KD + 2 * d.FF);  // the prefill's rows (P at most)
+            const size_t slack_allocs = (size_t)2 * m->n_layer + 2 * m->pn_layer + 4 + 14 + 8 + 1 + 9;
             if (!arena.open(floats * sizeof(float) + 256 * slack_allocs + 4096)) throw std::runtime_error("qwen3tts device: arena");
             for (int l = 0; l < m->n_layer; ++l) {
                 kc[l] = arena.alloc((size_t)maxL * KD);
@@ -1289,6 +1385,15 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
             dev::rope_tables(maxL, d.D, d.theta, rcs, rsn);
             dev::rope_tables(ncb + 1, pd.D, pd.theta, prcs, prsn);
             pos_dev = reinterpret_cast<int*>(arena.alloc(1));
+            pxa = arena.alloc((size_t)P * C);
+            pb.h = arena.alloc((size_t)P * C);
+            pb.q = arena.alloc((size_t)P * HD);
+            pb.k = arena.alloc((size_t)P * KD);
+            pb.v = arena.alloc((size_t)P * KD);
+            pb.att = arena.alloc((size_t)P * HD);
+            pb.o = arena.alloc((size_t)P * C);
+            pb.g = arena.alloc((size_t)P * d.FF);
+            pb.u = arena.alloc((size_t)P * d.FF);
             if (hipStreamCreateWithFlags(&devrun.s, hipStreamNonBlocking) != hipSuccess)
                 throw std::runtime_error("qwen3tts device: the stream");
             dev::stream = devrun.s;
@@ -1308,12 +1413,23 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
         // QWEN3TTS_PROFILE=2: the kernels timed one by one (direct launches, not the graphs)
         if (dev_on && std::getenv("QWEN3TTS_PROFILE") && std::getenv("QWEN3TTS_PROFILE")[0] == '2') dev::ktimes = &kt;
         auto ms_since = [](clk::time_point t) { return std::chrono::duration<double, std::milli>(clk::now() - t).count(); };
-        double t_prefill = 0, t_samp = 0, t_pred = 0, t_tal = 0, t_issue = 0, t_head_wait = 0, t_stack0 = 0;
+        double t_prefill = 0, t_samp = 0, t_pred = 0, t_tal = 0, t_issue = 0, t_head_wait = 0, t_stack0 = 0, t_req_ms = 0;
         const clk::time_point t_setup = clk::now();
         // the prefill (on the host, into the caches). The rows that depend on the voice only (the role, the codec prefix, the
         // reference's text and frames: qwen3tts_build_prefill's first 9 + min(reference text, R) rows) are the same for every
         // request of the voice: their keys and values are cached per voice and copied in; the request's rows follow.
         const int Pv = 9 + std::min(n_ref - 5, R);
+    // the rows through the layers: on the device (the arena's rows) or the host
+        auto prefill_rows = [&](const float* src, int Tn, int pos0) {
+            if (dev_on) {
+                std::memcpy(pxa, src, sizeof(float) * (size_t)Tn * C);
+                for (int l = 0; l < m->n_layer; ++l) dev::prefill_block(m->blk[l], d, pxa, Tn, pos0, kc[l], vc[l], rcs, rsn, pb);
+                if (hipStreamSynchronize(devrun.s) != hipSuccess) throw std::runtime_error("qwen3tts device: the stream failed");
+            } else {
+                std::vector<float> xr(src, src + (size_t)Tn * C);
+                for (int l = 0; l < m->n_layer; ++l) block_step(m->blk[l], d, xr.data(), Tn, pos0, kc[l], vc[l]);
+            }
+        };
         {
             unsigned long long key = 1469598103934665603ull;
             auto mix = [&](const void* p, size_t bytes) {
@@ -1328,7 +1444,6 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
             mix(ref_ids, sizeof(int) * (size_t)n_ref);
             mix(ref_codes, sizeof(int) * (size_t)R * ncb);
             mix(spk, sizeof(float) * (size_t)C);
-            std::vector<float> xp(prefill.begin(), prefill.begin() + (size_t)Pv * C);  // the voice's rows through the layers
             bool hit = false;
             {
                 std::lock_guard<std::mutex> lk(m->prefix_mu);
@@ -1343,7 +1458,7 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
                     }
             }
             if (!hit) {
-                for (int l = 0; l < m->n_layer; ++l) block_step(m->blk[l], d, xp.data(), Pv, 0, kc[l], vc[l]);
+                prefill_rows(prefill.data(), Pv, 0);
                 VoicePrefix vp;
                 vp.key = key;
                 vp.Pv = Pv;
@@ -1358,13 +1473,22 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
                 if (m->prefixes.size() > 8) m->prefixes.erase(m->prefixes.begin());
             }
         }
-        std::vector<float> x(prefill.begin() + (size_t)Pv * C, prefill.begin() + (size_t)P * C);
-        for (int l = 0; l < m->n_layer; ++l) block_step(m->blk[l], d, x.data(), P - Pv, Pv, kc[l], vc[l]);
+        // the request's rows, then the last row's head (the first frame's logits and the predictor's input)
         auto head_host = [&](const float* last) {
             rms_norm(last, 1, C, m->eps, m->out_norm, hid);
             linear(hid, 1, m->codec_head, logits);
         };
-        head_host(x.data() + (size_t)(P - Pv - 1) * C);
+        if (dev_on) {
+            const clk::time_point t_req = clk::now();
+            prefill_rows(prefill.data() + (size_t)Pv * C, P - Pv, Pv);
+            if (prof) t_req_ms = ms_since(t_req);
+            dev::head(pxa + (size_t)(P - Pv - 1) * C, m->out_norm, m->codec_head.w, m->eps, C, hid, logits);
+            if (hipStreamSynchronize(devrun.s) != hipSuccess) throw std::runtime_error("qwen3tts device: the stream failed");
+        } else {
+            std::vector<float> x(prefill.begin() + (size_t)Pv * C, prefill.begin() + (size_t)P * C);
+            for (int l = 0; l < m->n_layer; ++l) block_step(m->blk[l], d, x.data(), P - Pv, Pv, kc[l], vc[l]);
+            head_host(x.data() + (size_t)(P - Pv - 1) * C);
+        }
         t_prefill = ms_since(t_setup);
         int pos = P;
         std::vector<int> history;
@@ -1530,9 +1654,9 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
             dev::ktimes = nullptr;
         }
         if (prof && n_out > 0)
-            std::fprintf(stderr, "qwen3tts profile (%s): %d frames, prefill %.0f ms; per frame: sample %.2f, predictor %.2f "
+            std::fprintf(stderr, "qwen3tts profile (%s): %d frames, prefill %.0f ms (request rows %.0f); per frame: sample %.2f, predictor %.2f "
                          "(stacks issued %.2f, head+wait %.2f, first stack+sync %.2f), talker %.2f ms; talker C %d FF %d (%d layers), predictor C %d FF %d "
-                         "(%d layers, %d codebooks)\n", dev_on ? "gpu" : "cpu", n_out, t_prefill, t_samp / n_out, t_pred / n_out,
+                         "(%d layers, %d codebooks)\n", dev_on ? "gpu" : "cpu", n_out, t_prefill, t_req_ms, t_samp / n_out, t_pred / n_out,
                          t_issue / n_out, t_head_wait / n_out, t_stack0 / n_out, t_tal / n_out, C, d.FF, m->n_layer, pd.C, pd.FF, m->pn_layer, ncb);
         arena.close();
         return n_out;

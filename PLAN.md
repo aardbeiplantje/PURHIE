@@ -39,7 +39,7 @@ Open work, in the order to take it. Each item names its state and the next concr
 ## ▶ Next (audio closed; the new list, 2026-11-15)
 
 Performance:
-6. **Prompt prefill on the GPU.** The voice's prefix is cached (U7), but each request still runs its own rows on the
+6. **Prompt prefill on the GPU: done 2026-11-15 (U8).** The voice's prefix is cached (U7), but each request still runs its own rows on the
    host (about 0.5 s for a 204-frame voice). Start: the rows through qmatvec's batched BF16 GEMM, then the causal
    attention for several rows on the device.
 7. **Matvec kernels to ~230 GB/s.** The predictor and talker stacks run at 175-206 GB/s (U4). Start from the ablation
@@ -621,6 +621,15 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   in and runs its own rows (block_step at the offset). Checks: greedy and sampled generation equal to qwen-tts (the talker
   verifier), the speech verifier and t/65 PASS; a miss and a hit give identical audio (speak called 3 times: 7.1 s, then
   4.3 s, the F32 talker on the host).
+- U8 the talker's prefill on the GPU (2026-11-15). The prompt's rows (the request's, and a voice's prefix on a miss) go
+  through the layers on the device (`dev::prefill_block`, `talker_gpu.hip`): the batched rms norm, the tiled matmul
+  `tk_gemm` (fp32 activations over BF16 weights; a tile of 16 rows by 32 tokens, the chunks of 64 in shared memory), the
+  q/k norms with the rotary and the cache store per row, the causal attention per row (the decode step's attention), the
+  residual adds and the SiLU gate. The last row's head is the decode's. The voice prefix stays cached (U7). Checks: the
+  greedy and the sampled generation equal qwen-tts's (200 frames, BF16 talker on the device), the speech verifier PASS; the
+  host path (QWEN3TTS_DEVICE=cpu) unchanged. Timing (222-frame voice, 188 request rows): 637 ms on the host, 181 ms on the
+  device. The first version (qmatvec's batched product) was not faster: it re-reads each token's activations per output
+  row (266 GB of cache traffic for the prompt). The profile line shows the request rows' time (`request rows`).
 - U1 threads: the host matmuls and convolutions run on the 16 cores (OpenMP over output rows); real-time factors
   measured for the speech (talker frames per second) and the transcription (seconds of audio per second).
 - U2 GPU path (UMA: the GGUF map is pinned, so the GPU reads the same pages): decided after U1 by the measured split;
