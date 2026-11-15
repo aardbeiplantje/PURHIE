@@ -10,8 +10,10 @@
 #include "tokenizer.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -20,6 +22,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <omp.h>
 #include <zlib.h>
 
 namespace {
@@ -52,6 +55,52 @@ struct DecLayer {
     Norm mlp_ln;
     Lin fc1, fc2;
 };
+
+// WHISPER_PROFILE=1: the wall time per stage of a transcription, printed on stderr at its end. Without the variable a
+// timer is one flag test.
+enum ProfKind { P_MEL, P_ENC, P_KV, P_DEC, P_LIN, P_SELF, P_CROSS, P_LN, P_LOGITS, P_CHOOSE, P_N };
+double g_prof_ms[P_N];
+long g_prof_steps = 0;  // decoder steps (the prompt's included)
+
+bool prof_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("WHISPER_PROFILE");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+
+struct ProfTimer {
+    ProfKind k;
+    bool on;
+    std::chrono::steady_clock::time_point t0;
+    explicit ProfTimer(ProfKind kind) : k(kind), on(prof_enabled()) {
+        if (on) t0 = std::chrono::steady_clock::now();
+    }
+    ~ProfTimer() {
+        if (on)
+            g_prof_ms[k] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+};
+
+void prof_reset() {
+    std::memset(g_prof_ms, 0, sizeof g_prof_ms);
+    g_prof_steps = 0;
+}
+
+// One line on stderr: the stages' milliseconds, the decoder's steps and ms per step, and the split of the decoder's time
+void prof_report() {
+    if (!prof_enabled()) return;
+    const double dec = g_prof_ms[P_DEC];
+    const double inner = g_prof_ms[P_LIN] + g_prof_ms[P_SELF] + g_prof_ms[P_CROSS] + g_prof_ms[P_LN] + g_prof_ms[P_LOGITS];
+    std::fprintf(stderr,
+                 "whisper profile: threads=%d mel=%.1f ms encoder=%.1f ms cross_kv=%.1f ms | decoder=%.1f ms over %ld "
+                 "steps (%.3f ms/token): linear=%.1f self_attn=%.1f cross_attn=%.1f layer_norm=%.1f logits=%.1f "
+                 "other=%.1f | choose=%.1f ms\n",
+                 omp_get_max_threads(), g_prof_ms[P_MEL], g_prof_ms[P_ENC], g_prof_ms[P_KV], dec, g_prof_steps,
+                 g_prof_steps ? dec / (double)g_prof_steps : 0.0, g_prof_ms[P_LIN], g_prof_ms[P_SELF],
+                 g_prof_ms[P_CROSS], g_prof_ms[P_LN], g_prof_ms[P_LOGITS], dec - inner, g_prof_ms[P_CHOOSE]);
+}
 
 // The float32 tensor of an exact element count (a missing one is an error unless optional)
 const float* tensor(const gguf_model_t* g, const std::string& name, size_t count, bool optional = false) {
@@ -97,9 +146,15 @@ struct whisper_model {
 
 namespace {
 
+// The multiply-adds from which a loop is shared out over the threads (below it the calling thread runs it alone)
+#ifndef WHISPER_PAR_MACS
+#define WHISPER_PAR_MACS 50000
+#endif
+constexpr long LINEAR_PAR_MACS = WHISPER_PAR_MACS;
+
 // LayerNorm over each row of x [T][C] (population variance, eps inside the root, as torch's)
 void layer_norm(const float* x, int T, int C, float eps, const Norm& n, float* y) {
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static) if ((long)T * C >= WHISPER_PAR_MACS)
     for (int t = 0; t < T; ++t) {
         const float* xr = x + (size_t)t * C;
         float* yr = y + (size_t)t * C;
@@ -113,18 +168,18 @@ void layer_norm(const float* x, int T, int C, float eps, const Norm& n, float* y
     }
 }
 
-// y[t][o] = x[t][:] . w[o][:] + b[o] for the T rows of x [T][in]
+// y[t][o] = x[t][:] . w[o][:] + b[o] for the T rows of x [T][in]. Each (t, o) is one independent dot product summed in
+// the same order, so the pairs are shared out over the threads: a decoder step (T = 1) has only out of them.
 void linear(const float* x, int T, const Lin& L, float* y) {
-#pragma omp parallel for schedule(static)
-    for (int t = 0; t < T; ++t) {
+    const long n = (long)T * L.out;
+#pragma omp parallel for schedule(static) if (n * L.in >= LINEAR_PAR_MACS)
+    for (long r = 0; r < n; ++r) {
+        const int t = (int)(r / L.out), o = (int)(r % L.out);
         const float* xr = x + (size_t)t * L.in;
-        float* yr = y + (size_t)t * L.out;
-        for (int o = 0; o < L.out; ++o) {
-            const float* wr = L.w + (size_t)o * L.in;
-            float acc = L.b ? L.b[o] : 0.0f;
-            for (int i = 0; i < L.in; ++i) acc += xr[i] * wr[i];
-            yr[o] = acc;
-        }
+        const float* wr = L.w + (size_t)o * L.in;
+        float acc = L.b ? L.b[o] : 0.0f;
+        for (int i = 0; i < L.in; ++i) acc += xr[i] * wr[i];
+        y[(size_t)t * L.out + o] = acc;
     }
 }
 
@@ -157,32 +212,33 @@ void attend(const float* q, int Tq, const float* k, const float* v, int Tk, int 
             float* out) {
     const int d = C / H;
     const float scale = 1.0f / std::sqrt((float)d);
-#pragma omp parallel for schedule(static)
-    for (int i = 0; i < Tq; ++i) {
+    // the (query, head) pairs are independent, shared out over the threads (a decoder step has H of them)
+    const long n = (long)Tq * H;
+#pragma omp parallel for schedule(static) if (n * Tk * d >= WHISPER_PAR_MACS)
+    for (long r = 0; r < n; ++r) {
+        const int i = (int)(r / H), h = (int)(r % H);
         std::vector<float> s(Tk);
-        for (int h = 0; h < H; ++h) {
-            const float* qr = q + (size_t)i * C + (size_t)h * d;
-            const int n = causal ? std::min(Tk, i + causal_offset + 1) : Tk;
-            float mx = -INFINITY;
-            for (int j = 0; j < n; ++j) {
-                const float* kr = k + (size_t)j * C + (size_t)h * d;
-                float dot = 0.0f;
-                for (int c = 0; c < d; ++c) dot += qr[c] * kr[c];
-                s[j] = dot * scale;
-                mx = std::max(mx, s[j]);
-            }
-            double sum = 0.0;
-            for (int j = 0; j < n; ++j) {
-                s[j] = std::exp(s[j] - mx);
-                sum += s[j];
-            }
-            float* orow = out + (size_t)i * C + (size_t)h * d;
-            for (int c = 0; c < d; ++c) orow[c] = 0.0f;
-            for (int j = 0; j < n; ++j) {
-                const float p = (float)(s[j] / sum);
-                const float* vr = v + (size_t)j * C + (size_t)h * d;
-                for (int c = 0; c < d; ++c) orow[c] += p * vr[c];
-            }
+        const float* qr = q + (size_t)i * C + (size_t)h * d;
+        const int nk = causal ? std::min(Tk, i + causal_offset + 1) : Tk;
+        float mx = -INFINITY;
+        for (int j = 0; j < nk; ++j) {
+            const float* kr = k + (size_t)j * C + (size_t)h * d;
+            float dot = 0.0f;
+            for (int c = 0; c < d; ++c) dot += qr[c] * kr[c];
+            s[j] = dot * scale;
+            mx = std::max(mx, s[j]);
+        }
+        double sum = 0.0;
+        for (int j = 0; j < nk; ++j) {
+            s[j] = std::exp(s[j] - mx);
+            sum += s[j];
+        }
+        float* orow = out + (size_t)i * C + (size_t)h * d;
+        for (int c = 0; c < d; ++c) orow[c] = 0.0f;
+        for (int j = 0; j < nk; ++j) {
+            const float p = (float)(s[j] / sum);
+            const float* vr = v + (size_t)j * C + (size_t)h * d;
+            for (int c = 0; c < d; ++c) orow[c] += p * vr[c];
         }
     }
 }
@@ -198,6 +254,21 @@ void logits_of(const whisper_model* m, const float* x, float* logits) {
     }
 }
 
+// The decoder's stages with their profile timers (the same calls)
+void linear_p(const float* x, int T, const Lin& L, float* y) {
+    ProfTimer t(P_LIN);
+    linear(x, T, L, y);
+}
+void layer_norm_p(const float* x, int T, int C, float eps, const Norm& n, float* y) {
+    ProfTimer t(P_LN);
+    layer_norm(x, T, C, eps, n, y);
+}
+void attend_p(ProfKind k, const float* q, int Tq, const float* kk, const float* vv, int Tk, int C, int H, bool causal,
+              int causal_offset, float* out) {
+    ProfTimer t(k);
+    attend(q, Tq, kk, vv, Tk, C, H, causal, causal_offset, out);
+}
+
 // The decoder's state for one sequence: the self-attention cache and the cross-attention keys and values
 struct DecState {
     std::vector<std::vector<float>> sk, sv;  // per layer [n_tctx][C]
@@ -206,35 +277,38 @@ struct DecState {
 
 // One decoder step: the token at position pos, its logits into logits [n_vocab]
 void decoder_step(const whisper_model* m, DecState& st, int token, int pos, float* logits) {
+    ProfTimer total(P_DEC);
+    if (prof_enabled()) ++g_prof_steps;
     const int C = m->n_tstate;
     std::vector<float> x(C), h(C), q(C), kk(C), vv(C), a(C), o(C), f(m->n_tffn);
     for (int c = 0; c < C; ++c) x[c] = m->tok_emb[(size_t)token * C + c] + m->dec_pos[(size_t)pos * C + c];
     for (int l = 0; l < m->n_tlayer; ++l) {
         const DecLayer& L = m->dec[l];
         // self-attention over the positions so far (causal)
-        layer_norm(x.data(), 1, C, m->eps, L.attn_ln, h.data());
-        linear(h.data(), 1, L.q, q.data());
-        linear(h.data(), 1, L.k, kk.data());
-        linear(h.data(), 1, L.v, vv.data());
+        layer_norm_p(x.data(), 1, C, m->eps, L.attn_ln, h.data());
+        linear_p(h.data(), 1, L.q, q.data());
+        linear_p(h.data(), 1, L.k, kk.data());
+        linear_p(h.data(), 1, L.v, vv.data());
         std::memcpy(&st.sk[l][(size_t)pos * C], kk.data(), sizeof(float) * C);
         std::memcpy(&st.sv[l][(size_t)pos * C], vv.data(), sizeof(float) * C);
-        attend(q.data(), 1, st.sk[l].data(), st.sv[l].data(), pos + 1, C, m->n_thead, true, pos, a.data());
-        linear(a.data(), 1, L.o, o.data());
+        attend_p(P_SELF, q.data(), 1, st.sk[l].data(), st.sv[l].data(), pos + 1, C, m->n_thead, true, pos, a.data());
+        linear_p(a.data(), 1, L.o, o.data());
         for (int c = 0; c < C; ++c) x[c] += o[c];
         // cross-attention over the encoder output
-        layer_norm(x.data(), 1, C, m->eps, L.cross_ln, h.data());
-        linear(h.data(), 1, L.cq, q.data());
-        attend(q.data(), 1, st.ck[l].data(), st.cv[l].data(), m->n_actx, C, m->n_thead, false, 0, a.data());
-        linear(a.data(), 1, L.co, o.data());
+        layer_norm_p(x.data(), 1, C, m->eps, L.cross_ln, h.data());
+        linear_p(h.data(), 1, L.cq, q.data());
+        attend_p(P_CROSS, q.data(), 1, st.ck[l].data(), st.cv[l].data(), m->n_actx, C, m->n_thead, false, 0, a.data());
+        linear_p(a.data(), 1, L.co, o.data());
         for (int c = 0; c < C; ++c) x[c] += o[c];
         // the feed-forward
-        layer_norm(x.data(), 1, C, m->eps, L.mlp_ln, h.data());
-        linear(h.data(), 1, L.fc1, f.data());
+        layer_norm_p(x.data(), 1, C, m->eps, L.mlp_ln, h.data());
+        linear_p(h.data(), 1, L.fc1, f.data());
         for (int c = 0; c < m->n_tffn; ++c) f[c] = gelu(f[c]);
-        linear(f.data(), 1, L.fc2, o.data());
+        linear_p(f.data(), 1, L.fc2, o.data());
         for (int c = 0; c < C; ++c) x[c] += o[c];
     }
-    layer_norm(x.data(), 1, C, m->eps, m->dec_post, h.data());
+    layer_norm_p(x.data(), 1, C, m->eps, m->dec_post, h.data());
+    ProfTimer lt(P_LOGITS);
     logits_of(m, h.data(), logits);
 }
 
@@ -299,22 +373,30 @@ int decode_tokens(whisper_model_t* m, const float* enc, const int* prompt, int n
     st.ck.assign(m->n_tlayer, std::vector<float>((size_t)T * C));
     st.cv.assign(m->n_tlayer, std::vector<float>((size_t)T * C));
     // the cross-attention keys and values of the encoder output, per layer
-    for (int l = 0; l < m->n_tlayer; ++l) {
-        const DecLayer& L = m->dec[l];
-        linear(enc, T, L.ck, st.ck[l].data());
-        linear(enc, T, L.cv, st.cv[l].data());
+    {
+        ProfTimer t(P_KV);
+        for (int l = 0; l < m->n_tlayer; ++l) {
+            const DecLayer& L = m->dec[l];
+            linear(enc, T, L.ck, st.ck[l].data());
+            linear(enc, T, L.cv, st.cv[l].data());
+        }
     }
     uint64_t rng = seed;
     std::vector<float> logits(m->n_vocab);
     for (int i = 0; i < n_prompt; ++i) decoder_step(m, st, prompt[i], i, logits.data());
     double lp = 0.0, sum = 0.0;
-    int next = choose_token(m, logits.data(), true, temperature, &rng, sum_lp ? &lp : nullptr);
+    int next = 0;
+    {
+        ProfTimer t(P_CHOOSE);
+        next = choose_token(m, logits.data(), true, temperature, &rng, sum_lp ? &lp : nullptr);
+    }
     int n_out = 0, pos = n_prompt;
     while (n_out < max_new && next != m->eot && pos < m->n_tctx) {
         out_tokens[n_out++] = next;
         sum += lp;
         decoder_step(m, st, next, pos, logits.data());
         ++pos;
+        ProfTimer t(P_CHOOSE);
         next = choose_token(m, logits.data(), false, temperature, &rng, sum_lp ? &lp : nullptr);
     }
     if (sum_lp) {
@@ -499,6 +581,7 @@ int whisper_eot(const whisper_model_t* m) { return m ? m->eot : 0; }
 
 int whisper_encode(whisper_model_t* m, const float* mel, float* out) {
     if (!m || !mel || !out) { g_error = "whisper_encode: null argument"; return -1; }
+    ProfTimer prof_t(P_ENC);
     try {
         const int C = m->n_astate, T = m->n_actx, F = WHISPER_N_FRAMES;
         // the conv stem: conv1 (stride 1), conv2 (stride 2), both with GELU; then [T][C] with the positions
@@ -559,7 +642,10 @@ static int transcribe_window(whisper_model_t* m, const float* samples, size_t n,
     const int prompt[4] = {m->sot, lang_id, task_id, notimestamps};
 
     std::vector<float> mel((size_t)80 * WHISPER_N_FRAMES);
-    if (whisper_log_mel(samples, (int)n, 80, mel.data()) != 0) throw std::runtime_error("whisper_log_mel failed");
+    {
+        ProfTimer t(P_MEL);
+        if (whisper_log_mel(samples, (int)n, 80, mel.data()) != 0) throw std::runtime_error("whisper_log_mel failed");
+    }
     std::vector<float> enc((size_t)m->n_actx * m->n_astate);
     if (whisper_encode(m, mel.data(), enc.data()) != 0) throw std::runtime_error(g_error);
     std::vector<int> ids(std::max(1, m->n_tctx - 4));
@@ -662,7 +748,10 @@ static void transcribe_window_ts(whisper_model_t* m, const float* samples, size_
     prompt.push_back(task_id);
 
     std::vector<float> mel((size_t)80 * WHISPER_N_FRAMES);
-    if (whisper_log_mel(samples, (int)n, 80, mel.data()) != 0) throw std::runtime_error("whisper_log_mel failed");
+    {
+        ProfTimer t(P_MEL);
+        if (whisper_log_mel(samples, (int)n, 80, mel.data()) != 0) throw std::runtime_error("whisper_log_mel failed");
+    }
     std::vector<float> enc((size_t)m->n_actx * m->n_astate);
     if (whisper_encode(m, mel.data(), enc.data()) != 0) throw std::runtime_error(g_error);
     // Whisper's temperature fallback: greedy first; a window whose text compresses above compression_ratio_max or whose
@@ -712,6 +801,7 @@ int whisper_transcribe_task(whisper_model_t* m, const float* samples, size_t n, 
         std::string all;
         int tokens = 0;
         m->attempts = 0;
+        prof_reset();
         if (n <= (size_t)WHISPER_CHUNK_SAMPLES) {  // one window: the prompt without timestamps (as before)
             std::string part;
             const int k = transcribe_window(m, samples, n, lang, translate, part);
@@ -738,6 +828,7 @@ int whisper_transcribe_task(whisper_model_t* m, const float* samples, size_t n, 
         if (all.size() + 1 > text_len) { g_error = "whisper_transcribe: the text does not fit"; return -1; }
         std::memcpy(text, all.data(), all.size());
         text[all.size()] = 0;
+        prof_report();
         return tokens;
     } catch (const std::exception& e) {
         g_error = e.what();
