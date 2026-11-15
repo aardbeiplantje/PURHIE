@@ -16,7 +16,6 @@ the 38 GB of IQ downloads (item 2 of the list below) do not fit: local conversio
 The open work as packages. Each is one agent's task with its check; it is done when the check passes and it is committed.
 The lists below keep each item's background.
 - D (item 7) the samplers' sort (28 us a codebook, 55 us for c0). Check: `talker_sample_verify` (exact), the frame's time.
-- F (item 15) the vision tower's stage times (`vision_verify` on `/data/vision-ref`) and its device plan.
 
 The user's decisions: item 12 (prosody across speech pieces) and item 13 (mp3 / opus / aac). Not runnable on this host:
 the Flash measurements (its own MTP block, the PLE reads), `--parallel` and the store on the deployment,
@@ -118,7 +117,15 @@ Not planned:
     CPU random path. The product does not need it: greedy frames match qwen-tts exactly.
 
 Vision (multimodal, not audio):
-15. **Vision tower on the GPU** (V3 onwards: the host float32 ViT). Start after 6-10 if the vision track is picked up.
+15. **Vision tower on the GPU: measured 2026-11-15; the host path made fast instead.** Stage times (`VISION_PROFILE=1`, the
+    reference image: 560 patches, 12 blocks, 16 threads) before: 3.55 s a forward pass (the linears 2.71 s, the MLP's GELU
+    0.48 s in one thread, the merger 0.12 s, the attention 0.14 s). Now 0.76 s: the dot products as SIMD reductions, the
+    GELU, the rotary and the residual adds shared out over the threads, the linears over (row, output) pairs, one score
+    buffer per thread in the attention. Checks: `vision_verify` (cosine 1.000000 in every stage; the largest differences
+    went from 1.1e-5, 2.0e-5 and 9.9e-5 to 6.0e-6, 9.7e-6 and 6.2e-5), `image_verify`, `mm_verify` (the image chat: last
+    logits cosine 0.999987, the 14 reply tokens equal). Left: the linears are 77% of the pass at about 80 GMAC/s (a
+    register-blocked host kernel first). A device path only for much larger images or batches: its gain here is at most
+    0.5 s an image.
 
 Earlier list (2026-11-13), kept for reference:
 
