@@ -34,7 +34,9 @@ Open work, in the order to take it. Each item names its state and the next concr
 5. **Audio** (2026-11-14; S1 and S2 in the audio section). Done: long texts in pieces, the speech pulled per piece (other
    requests between them), wav / pcm / flac and stream for wav and pcm. Open, in order: (a) device frame (U3, U4: 23 ms per frame from 37; open: the matvec kernels at 175 to 206 GB/s
    against 256, and the sampler on the device); (b) whisper
-   long-form by the Whisper seek rule (timestamps, the cut at the last complete segment) and previous-text conditioning;
+   long-form (W4, done 2026-11-15: the seek rule and previous-text conditioning; open: temperature fallback, no forced timestamp rules);
+   (b2) the codec's reference frames decoded on every request (U5: 298 frames for a 204-frame voice, ~5 s of a ~8.7 s request;
+   exact fix: cache the decoder's state per voice; QWEN3TTS_CODEC_CONTEXT=25 is approximate, cosine 0.97);
    (c) whisper GPU path (the encoder's matmuls through sddev); (d) vision tower GPU path (V3 onwards); (e) torch-identical
    sampled frames: not started (the engine's sampler is its own generator; a bit match needs torch's CPU RNG path).
    mp3 / opus / aac: not built (no encoder in the image).
