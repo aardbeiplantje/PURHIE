@@ -56,8 +56,11 @@ Performance:
 8. **Sampler on the device: done 2026-11-15 (U9).** A frame is one sync (after the predictor): c0 and the predictor's
    codebooks are drawn on the device. The frame's time is its GPU work (predictor about 16.5 ms, talker 6.7 ms), so the
    speed-up left is item 7's.
-9. **Codec decoder on the GPU.** About 1.3 s of a 94-frame speech request on the CPU (U5/U6); the convolutions and the
-   transposed ones are the cost (both on the CPU now).
+9. **Codec decoder on the GPU: first version done 2026-11-15 (U10).** The decoder's convolutions (the input convolution,
+   the four blocks, the output) run on the device; 40 frames decode in 186 ms (800 ms on the CPU). Open: the kernels run at
+   about 1.5 TFLOPS (a piece of 32 frames: 105 ms on the device, 36 ms in the host stages before it: the quantizer, the
+   pre-convolution, the transformer, the upsamplers with their ConvNeXt blocks); the output convolution computes 32 rows
+   for its one channel.
 10. **Whisper on the GPU.** The encoder's and decoder's matmuls through sddev (whisper-tiny is small: measure first).
 
 Quality and scope (decisions):
@@ -660,6 +663,20 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   one-sync path: greedy 200 frames equal to qwen-tts, top_k 1 equal to greedy; `qwen3tts_speech_verify` PASS, two runs the
   same WAV, Whisper reads the seed-0 speech back as the test sentence; `t/65-speech.t` 13 pass with a clip voice. Sampled
   frames for a seed changed once more (c0's draw is the device's). The stage times are unchanged (GPU-bound).
+- U10 the codec decoder's convolutions on the device (2026-11-15, item 9; `src/codec_gpu.hip`, the device path in
+  `src/qwen3tts_codec.cpp`; `QWEN3TTS_CODEC_DEVICE=cpu` keeps the host's decoder). From the decoder's input convolution on
+  (about 95% of the multiply-adds): `cd_pad_act` (a layer's padded input: its history, SnakeBeta of the new columns, the
+  next history), `cd_conv` (the causal convolution as a tiled product, 32 rows by 128 columns a block, 2 by 8 outputs a
+  thread, the weights' and inputs' tiles in shared memory per chunk of input channels; the residual add or the next
+  SnakeBeta in its store) and `cd_tconv` (the transposed convolution, rows (channel, phase)). F32 weights read in place
+  (the GGUF mapping registered), the activations in an arena of registered pages (about 110 MB, sized for 32 frames), one
+  sync per piece of 32 frames; the frame-rate stages stay on the host. Every output sums in one order whatever its tile,
+  so pieces give the same bits as one piece on the device too. Checks, on the device and on the host path:
+  `qwen3tts_codec_verify` (cosine 1.0000000, 6e-6 and 8e-6 of the peak against qwen-tts; the host's 7e-6 and 8e-6),
+  `codec_after_verify` (bit-identical after references of 1, 20, 74, 249, 250, 260 frames, the cache hit, a second
+  reference), `codec_encode_verify`, `qwen3tts_speech_verify`, `t/65-speech.t` (13), Whisper reads the speech back. Timing
+  (best of 5): 40 frames 186 ms (CPU 800 ms), 200 frames 0.89 s (CPU 5.2 s). `QWEN3TTS_CODEC_PROFILE=1` prints a piece's
+  host and device times. The three standalone codec tests link the kernel loader and HIP now.
 - U1 threads: the host matmuls and convolutions run on the 16 cores (OpenMP over output rows); real-time factors
   measured for the speech (talker frames per second) and the transcription (seconds of audio per second).
 - U2 GPU path (UMA: the GGUF map is pinned, so the GPU reads the same pages): decided after U1 by the measured split;

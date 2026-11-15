@@ -5,9 +5,15 @@
 #include "qwen3tts_codec.h"
 
 #include "gguf_mmap.h"
+#include "kernel_loader.h"
+
+#include <hip/hip_runtime.h>
+#include <sys/mman.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -289,6 +295,44 @@ struct DecState {
     std::vector<std::vector<float>> tk, tv;  // per transformer block: the keys and values of the cache, [nh][H * D]
 };
 
+// The device path (PLAN.md item 9; codec_gpu.hip): the decoder's convolutions from its input convolution on, in pieces of
+// at most DEV_FRAMES frames (the stream's state makes the pieces exact). The weights are read in place (the GGUF mapping
+// registered read-only); the activations are an arena of registered pages (UMA: the host writes the first input and the
+// histories, the kernels the rest; one sync per piece). QWEN3TTS_CODEC_DEVICE=cpu keeps the host's decoder.
+const int DEV_FRAMES = 32;
+
+struct CodecDev {
+    struct SnakeDev {
+        float *ea = nullptr, *ib = nullptr;  // exp(alpha) and 1 / (exp(beta) + 1e-9) per channel
+    };
+    std::mutex mu;  // one decode on the device at a time
+    hipStream_t stream = nullptr;
+    char* base = nullptr;  // the arena
+    size_t bytes = 0, used = 0;
+    const void* wbase = nullptr;  // the registered GGUF mapping
+    float *xin = nullptr, *u[2] = {nullptr, nullptr}, *p = nullptr, *x1 = nullptr, *z = nullptr, *outw = nullptr;
+    std::vector<float*> tin, tout;  // per layer id: its history in and out [ch][g] (null: no history on the device)
+    SnakeDev bsnake[4], rsnake[4][3][2], osnake;
+    float* alloc(size_t n) {
+        used = (used + 255) & ~(size_t)255;
+        if (used + n * sizeof(float) > bytes) throw std::runtime_error("qwen3tts_codec device: the arena is too small");
+        float* r = reinterpret_cast<float*>(base + used);
+        used += n * sizeof(float);
+        return r;
+    }
+    ~CodecDev() {
+        if (stream) {
+            (void)hipStreamSynchronize(stream);
+            (void)hipStreamDestroy(stream);
+        }
+        if (base) {
+            (void)hipHostUnregister(base);
+            munmap(base, bytes);
+        }
+        if (wbase) (void)hipHostUnregister(const_cast<void*>(wbase));
+    }
+};
+
 struct qwen3tts_codec {
     gguf_model_t* g = nullptr;
     int nq = 0, cb = 0, emb = 0, latent = 0, tfL = 0, tfC = 0, tfH = 0, tfD = 0, tfFF = 0, sw = 0, dec_dim = 0, sr = 24000;
@@ -307,7 +351,9 @@ struct qwen3tts_codec {
     std::unique_ptr<Enc> enc;  // the encoder (absent in a GGUF without enc.* tensors)
     std::mutex cache_mu;       // the references' decoder states (qwen3tts_codec_decode_after), the last few
     std::vector<std::pair<unsigned long long, DecState>> cache;
+    std::unique_ptr<CodecDev> dev;  // the device path's state (absent: the host's decoder)
     ~qwen3tts_codec() {
+        dev.reset();  // (the mapping is unregistered before it is unmapped)
         if (g) gguf_mmap_close(g);
     }
 };
@@ -834,11 +880,229 @@ void tf_stream(const qwen3tts_codec* m, DecState& st, std::vector<float>& x, int
     st.nh = keep;
 }
 
+// The device path's kernels (codec_gpu.co), loaded once per process
+namespace cdev {
+std::mutex mu;
+int state = -1;  // -1: not tried, 0: the host only, 1: loaded
+hipModule_t mod = nullptr;
+hipFunction_t f_pad = nullptr, f_conv = nullptr, f_tconv = nullptr;
+
+bool load() {
+    std::lock_guard<std::mutex> lk(mu);
+    if (state >= 0) return state == 1;
+    state = 0;
+    const char* e = std::getenv("QWEN3TTS_CODEC_DEVICE");
+    if (e && std::string(e) != "gpu") return false;
+    int n = 0;
+    if (hipGetDeviceCount(&n) != hipSuccess || n < 1) return false;
+    if (kernel_module_load(&mod, "codec_gpu.co") != hipSuccess) return false;
+    if (hipModuleGetFunction(&f_pad, mod, "cd_pad_act") != hipSuccess || hipModuleGetFunction(&f_conv, mod, "cd_conv") != hipSuccess ||
+        hipModuleGetFunction(&f_tconv, mod, "cd_tconv") != hipSuccess)
+        return false;
+    state = 1;
+    return true;
+}
+
+void launch(const CodecDev& d, hipFunction_t f, unsigned gx, unsigned gy, unsigned shm, void** args) {
+    if (hipModuleLaunchKernel(f, gx, gy, 1, 256, 1, 1, shm, d.stream, args, nullptr) != hipSuccess)
+        throw std::runtime_error("qwen3tts_codec device: a kernel launch failed");
+}
+
+// dst [ch][g + L] = [tail | act(src [ch][L])], tail_out = its last g columns (cd_pad_act)
+void pad_act(const CodecDev& d, const float* src, int lds, const float* tail, float* dst, float* tail_out, int ch, int L, int g,
+             const CodecDev::SnakeDev* sn) {
+    const int act = sn ? 1 : 0;
+    const float *ea = sn ? sn->ea : nullptr, *ib = sn ? sn->ib : nullptr;
+    void* args[] = {(void*)&src, (void*)&lds, (void*)&tail, (void*)&dst, (void*)&tail_out, (void*)&ch,
+                    (void*)&L,   (void*)&g,   (void*)&act,  (void*)&ea,  (void*)&ib};
+    launch(d, f_pad, (unsigned)((g + L + 255) / 256), (unsigned)ch, 0, args);
+}
+
+// Y [cout][ldy] (T columns) from the padded X [cin][ldx] (cd_conv); mode 0: store, 1: add into Y, 2: SnakeBeta then store
+void conv(const CodecDev& d, const float* X, int ldx, const Conv& C, float* Y, int ldy, int T, int mode,
+          const CodecDev::SnakeDev* sn) {
+    const int KC = C.k == 1 ? 64 : 16;
+    const float *W = C.w, *b = C.b, *ea = sn ? sn->ea : nullptr, *ib = sn ? sn->ib : nullptr;
+    const int cin = C.cin, cout = C.cout, k = C.k, dil = C.dil;
+    void* args[] = {(void*)&X,   (void*)&ldx, (void*)&W, (void*)&b,  (void*)&Y,    (void*)&ldy, (void*)&cin, (void*)&cout,
+                    (void*)&k,   (void*)&dil, (void*)&T, (void*)&KC, (void*)&mode, (void*)&ea,  (void*)&ib};
+    const unsigned shm = (unsigned)((32 * KC * k + KC * (128 + (k - 1) * dil)) * sizeof(float));
+    launch(d, f_conv, (unsigned)((cout + 31) / 32), (unsigned)((T + 127) / 128), shm, args);
+}
+
+// Y [cout][ldy] (T * stride columns) from the padded X [cin][ldx] (cd_tconv)
+void tconv(const CodecDev& d, const float* X, int ldx, const Tconv& C, float* Y, int ldy, int T) {
+    const int KC = 48;
+    const float *W = C.w, *b = C.b;
+    const int cin = C.cin, cout = C.cout, k = C.k, s = C.stride, g = k / s - 1;
+    void* args[] = {(void*)&X,   (void*)&ldx,  (void*)&W, (void*)&b, (void*)&Y, (void*)&ldy,
+                    (void*)&cin, (void*)&cout, (void*)&k, (void*)&s, (void*)&T, (void*)&KC};
+    const unsigned shm = (unsigned)(KC * ((32 / s + 2) * k + 128 + g) * sizeof(float));
+    launch(d, f_tconv, (unsigned)((cout * s + 31) / 32), (unsigned)((T + 127) / 128), shm, args);
+}
+}  // namespace cdev
+
+// The device path's state for a model: the arena sized for DEV_FRAMES frames, the SnakeBeta parameters, the weights'
+// mapping registered. Leaves m->dev absent when the device or the model's shape does not fit (the host's decoder runs).
+void dev_init(qwen3tts_codec* m) {
+    if (!cdev::load() || gguf_n_maps(m->g) != 1) return;
+    if (m->dec_in.groups != 1 || m->out_conv.groups != 1) return;
+    for (int b = 0; b < 4; ++b) {
+        const DecBlock& B = m->dec[b];
+        if (B.up.k != B.up.stride && B.up.k != 2 * B.up.stride) return;
+        for (int r = 0; r < 3; ++r)
+            if (B.res[r].conv2.k != 1 || B.res[r].conv1.groups != 1 || B.res[r].conv2.groups != 1) return;
+    }
+    try {
+        std::unique_ptr<CodecDev> d(new CodecDev());
+        // the buffers' sizes for a piece of DEV_FRAMES frames
+        int L = DEV_FRAMES;
+        for (int s2 = 0; s2 < 2; ++s2) L *= m->up[s2].conv.stride;
+        const int L0 = L, gin = (m->dec_in.k - 1) * m->dec_in.dil;
+        size_t n_xin = (size_t)m->latent * (gin + L0), n_u = (size_t)m->dec_dim * L0, n_p = 0, n_x1 = 0, n_z = 0, n_small = 0;
+        int ch = m->dec_dim, allocs = 8;
+        for (int b = 0; b < 4; ++b) {
+            const DecBlock& B = m->dec[b];
+            const int g = (B.up.k - 1) / B.up.stride;
+            n_p = std::max(n_p, (size_t)ch * (g + L));
+            n_small += (size_t)2 * ch * g + (size_t)2 * ch;
+            L *= B.rate;
+            const int out = B.up.cout;
+            n_u = std::max(n_u, (size_t)out * L);
+            n_z = std::max(n_z, (size_t)out * L);
+            for (int r = 0; r < 3; ++r) {
+                const int g1 = (B.res[r].conv1.k - 1) * B.res[r].conv1.dil;
+                n_x1 = std::max(n_x1, (size_t)out * (g1 + L));
+                n_small += (size_t)2 * out * g1 + (size_t)4 * out;
+            }
+            ch = out;
+            allocs += 4 + 3 * 6;
+        }
+        const int gout = (m->out_conv.k - 1) * m->out_conv.dil;
+        n_x1 = std::max(n_x1, (size_t)ch * (gout + L));
+        n_small += (size_t)2 * ch * gout + (size_t)2 * ch;
+        const size_t floats = n_xin + 2 * n_u + n_p + n_x1 + n_z + (size_t)L + n_small;
+        d->bytes = ((floats * sizeof(float) + (size_t)256 * (allocs + 8) + 4095) / 4096) * 4096;
+        void* mem = mmap(nullptr, d->bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mem == MAP_FAILED) return;
+        if (hipHostRegister(mem, d->bytes, hipExtHostRegisterCoarseGrained) != hipSuccess) {
+            munmap(mem, d->bytes);
+            return;
+        }
+        d->base = static_cast<char*>(mem);
+        d->xin = d->alloc(n_xin);
+        d->u[0] = d->alloc(n_u);
+        d->u[1] = d->alloc(n_u);
+        d->p = d->alloc(n_p);
+        d->x1 = d->alloc(n_x1);
+        d->z = d->alloc(n_z);
+        d->outw = d->alloc((size_t)L);
+        d->tin.assign(L_COUNT, nullptr);
+        d->tout.assign(L_COUNT, nullptr);
+        auto snake_of = [&](const Snake& sn) {
+            CodecDev::SnakeDev sd;
+            sd.ea = d->alloc((size_t)sn.c);
+            sd.ib = d->alloc((size_t)sn.c);
+            for (int c = 0; c < sn.c; ++c) {  // the host's values (snake)
+                sd.ea[c] = std::exp(sn.alpha[c]);
+                sd.ib[c] = 1.0f / (std::exp(sn.beta[c]) + 1e-9f);
+            }
+            return sd;
+        };
+        auto tails = [&](int id, int chn, int g) {
+            if (g <= 0) return;
+            d->tin[id] = d->alloc((size_t)chn * g);
+            d->tout[id] = d->alloc((size_t)chn * g);
+        };
+        ch = m->dec_dim;
+        for (int b = 0; b < 4; ++b) {
+            const int base = L_DEC_BLOCK0 + 7 * b;
+            const DecBlock& B = m->dec[b];
+            tails(base, ch, (B.up.k - 1) / B.up.stride);
+            d->bsnake[b] = snake_of(B.snake);
+            ch = B.up.cout;
+            for (int r = 0; r < 3; ++r) {
+                tails(base + 1 + 2 * r, ch, (B.res[r].conv1.k - 1) * B.res[r].conv1.dil);
+                d->rsnake[b][r][0] = snake_of(B.res[r].act1);
+                d->rsnake[b][r][1] = snake_of(B.res[r].act2);
+            }
+        }
+        tails(L_OUT, ch, gout);
+        d->osnake = snake_of(m->out_snake);
+        size_t map_size = 0;
+        const void* wb = gguf_map_base(m->g, &map_size);
+        if (!wb || hipHostRegister(const_cast<void*>(wb), map_size, hipHostRegisterReadOnly | hipExtHostRegisterCoarseGrained) != hipSuccess)
+            return;
+        d->wbase = wb;
+        if (hipStreamCreateWithFlags(&d->stream, hipStreamNonBlocking) != hipSuccess) return;
+        m->dev = std::move(d);
+    } catch (const std::exception&) {
+        // (the host's decoder runs)
+    }
+}
+
+// The decoder's convolutions of a piece on the device: cur [C][L0] (the upsamplers' output) through the input convolution,
+// the four blocks and the output convolution; wav gets the piece's samples. The histories of these layers pass through
+// the arena (in before the launches, out after the one sync).
+void decode_dev(const qwen3tts_codec* m, DecState& st, const float* cur, int L0, float* wav) {
+    CodecDev& d = *m->dev;
+    std::lock_guard<std::mutex> lk(d.mu);
+    const int C = m->latent, gin = (m->dec_in.k - 1) * m->dec_in.dil;
+    {  // the input convolution's padded input on the host: its history, then cur; its next history is the last columns
+        std::vector<float>& tl = st.tail[L_DEC_IN];
+        const size_t ld = (size_t)gin + L0;
+        for (int c = 0; c < C; ++c) {
+            std::memcpy(d.xin + c * ld, &tl[(size_t)c * gin], sizeof(float) * (size_t)gin);
+            std::memcpy(d.xin + c * ld + gin, cur + (size_t)c * L0, sizeof(float) * (size_t)L0);
+        }
+        for (int c = 0; c < C; ++c) std::memcpy(&tl[(size_t)c * gin], d.xin + c * ld + L0, sizeof(float) * (size_t)gin);
+    }
+    for (int id = L_DEC_BLOCK0; id < L_COUNT; ++id)
+        if (d.tin[id]) std::memcpy(d.tin[id], st.tail[id].data(), sizeof(float) * st.tail[id].size());
+    int ui = 0, L = L0, ch = m->dec_dim;
+    float* dcur = d.u[0];
+    cdev::conv(d, d.xin, gin + L0, m->dec_in, dcur, L0, L0, 0, nullptr);
+    for (int b = 0; b < 4; ++b) {
+        const int base = L_DEC_BLOCK0 + 7 * b;
+        const DecBlock& B = m->dec[b];
+        const int g = (B.up.k - 1) / B.up.stride;
+        cdev::pad_act(d, dcur, L, d.tin[base], d.p, d.tout[base], ch, L, g, &d.bsnake[b]);
+        ui ^= 1;
+        float* up = d.u[ui];
+        cdev::tconv(d, d.p, g + L, B.up, up, L * B.rate, L);
+        L *= B.rate;
+        dcur = up;
+        ch = B.up.cout;
+        for (int r = 0; r < 3; ++r) {
+            const ResUnit& R = B.res[r];
+            const int id = base + 1 + 2 * r, g1 = (R.conv1.k - 1) * R.conv1.dil;
+            cdev::pad_act(d, dcur, L, d.tin[id], d.x1, d.tout[id], ch, L, g1, &d.rsnake[b][r][0]);
+            cdev::conv(d, d.x1, g1 + L, R.conv1, d.z, L, L, 2, &d.rsnake[b][r][1]);
+            cdev::conv(d, d.z, L, R.conv2, dcur, L, L, 1, nullptr);
+        }
+    }
+    const int gout = (m->out_conv.k - 1) * m->out_conv.dil;
+    cdev::pad_act(d, dcur, L, d.tin[L_OUT], d.x1, d.tout[L_OUT], ch, L, gout, &d.osnake);
+    cdev::conv(d, d.x1, gout + L, m->out_conv, d.outw, L, L, 0, nullptr);
+    if (hipStreamSynchronize(d.stream) != hipSuccess) throw std::runtime_error("qwen3tts_codec device: the stream failed");
+    for (int id = L_DEC_BLOCK0; id < L_COUNT; ++id)
+        if (d.tout[id]) std::memcpy(st.tail[id].data(), d.tout[id], sizeof(float) * st.tail[id].size());
+    for (int i = 0; i < L; ++i) wav[i] = std::min(1.0f, std::max(-1.0f, d.outw[i]));
+}
+
 // The decoder on n new frames (codes [n][nq]) from the state st, which it advances; wav gets n * 1920 samples. The same
 // operations as the whole sequence's decode, in the order it does them (see DecState).
 void decode_stream(const qwen3tts_codec* m, DecState& st, const int* codes, int n, float* wav) {
     if (n <= 0) return;
+    if (m->dev && n > DEV_FRAMES) {  // the device path decodes pieces of DEV_FRAMES frames (its arena's size): the same bits
+        const int spf = qwen3tts_codec_samples_per_frame(m);
+        for (int off = 0; off < n; off += DEV_FRAMES)
+            decode_stream(m, st, codes + (size_t)off * m->nq, std::min(DEV_FRAMES, n - off), wav + (size_t)off * spf);
+        return;
+    }
     const int E = m->emb, C = m->latent, TF = m->tfC;
+    const bool prof = std::getenv("QWEN3TTS_CODEC_PROFILE") != nullptr;
+    const std::chrono::steady_clock::time_point t_start = std::chrono::steady_clock::now();
     // the residual quantizer: the first codebook's embeddings through its projection, plus the others' sum through theirs
     std::vector<float> first((size_t)n * E, 0.0f), rest((size_t)n * E, 0.0f);
     for (int t = 0; t < n; ++t) {
@@ -888,6 +1152,16 @@ void decode_stream(const qwen3tts_codec* m, DecState& st, const int* codes, int 
         cur.swap(nxt);
     }
     // the decoder: the input convolution, four blocks (snake, transposed convolution, three residual units), the output
+    if (m->dev) {  // on the device (codec_gpu.hip): the same layers, the histories through the arena
+        const std::chrono::steady_clock::time_point t_dev = std::chrono::steady_clock::now();
+        decode_dev(m, st, cur.data(), L, wav);
+        st.frame0 += n;
+        if (prof)  // QWEN3TTS_CODEC_PROFILE: a piece's stages (stderr)
+            std::fprintf(stderr, "qwen3tts_codec profile (gpu): %d frames: host stages %.1f ms, the device's convolutions %.1f ms\n", n,
+                         std::chrono::duration<double, std::milli>(t_dev - t_start).count(),
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_dev).count());
+        return;
+    }
     std::vector<float> dcur((size_t)m->dec_dim * L);
     stage_conv(st, L_DEC_IN, cur.data(), C, L, m->dec_in, dcur.data());
     int ch = m->dec_dim;
@@ -1078,6 +1352,7 @@ qwen3tts_codec_t* qwen3tts_codec_open(const char* gguf_path) {
         // the encoder, when the GGUF has it (enc.* tensors; a decoder-only GGUF has none)
         size_t enc_bytes = 0;
         if (gguf_get_tensor_ptr(m->g, "enc.sea0.weight", &enc_bytes)) m->enc = load_encoder(m->g, kv);
+        dev_init(m.get());  // the device path, when a device is there (QWEN3TTS_CODEC_DEVICE=cpu: the host's decoder)
         return m.release();
     } catch (const std::exception& e) {
         g_error = e.what();

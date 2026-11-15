@@ -232,14 +232,14 @@ $(SD_TEXT_VERIFY): $(TESTSDIR)/sd_text_verify.cpp $(SRCDIR)/sd.cpp $(SRCDIR)/sd.
 $(SPEAKER_VERIFY): $(TESTSDIR)/speaker_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/qwen3tts.h $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/speaker_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
 
-$(CODEC_ENCODE_VERIFY): $(TESTSDIR)/codec_encode_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
-	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/codec_encode_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
+$(CODEC_ENCODE_VERIFY): $(TESTSDIR)/codec_encode_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kernel_loader.cpp $(OBJDIR)/kernels_embed.o
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/codec_encode_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kernel_loader.cpp $(OBJDIR)/kernels_embed.o $(LDFLAGS) -o $@
 
-$(CODEC_AFTER_VERIFY): $(TESTSDIR)/codec_after_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
-	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/codec_after_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
+$(CODEC_AFTER_VERIFY): $(TESTSDIR)/codec_after_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kernel_loader.cpp $(OBJDIR)/kernels_embed.o
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/codec_after_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kernel_loader.cpp $(OBJDIR)/kernels_embed.o $(LDFLAGS) -o $@
 
-$(QWEN3TTS_CODEC_VERIFY): $(TESTSDIR)/qwen3tts_codec_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
-	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/qwen3tts_codec_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
+$(QWEN3TTS_CODEC_VERIFY): $(TESTSDIR)/qwen3tts_codec_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kernel_loader.cpp $(OBJDIR)/kernels_embed.o
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/qwen3tts_codec_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kernel_loader.cpp $(OBJDIR)/kernels_embed.o $(LDFLAGS) -o $@
 
 $(TALKER_SAMPLE_VERIFY): $(TESTSDIR)/talker_sample_verify.cpp $(SRCDIR)/talker_gpu.hip
 	$(HIPCC) -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ $(TESTSDIR)/talker_sample_verify.cpp -o $@
@@ -365,7 +365,7 @@ uninstall:
 QWEN_SRCS = $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_ops.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/deltanet.cpp $(SRCDIR)/attention.cpp $(SRCDIR)/gpu_ops.cpp $(SRCDIR)/kernel_loader.cpp $(SRCDIR)/glm5_ref.cpp $(SRCDIR)/glm5_gpu.cpp $(SRCDIR)/expert_cpu.cpp $(SRCDIR)/vision.cpp $(SRCDIR)/image.cpp $(SRCDIR)/mrope.cpp $(SRCDIR)/whisper.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/audio.cpp $(SRCDIR)/sd.cpp $(SRCDIR)/sd_device.cpp $(SRCDIR)/minimax_vae.cpp $(SRCDIR)/minimax_dit.cpp $(SRCDIR)/minimax_pipe.cpp $(SRCDIR)/safetensors_mmap.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_speech.cpp
 QWEN_HDRS = $(SRCDIR)/whisper.h $(SRCDIR)/mel.h $(SRCDIR)/qwen3tts.h $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/qwen3tts_speech.h $(SRCDIR)/vision.h $(SRCDIR)/image.h $(SRCDIR)/mrope.h $(SRCDIR)/third_party/stb_image.h $(SRCDIR)/expert_pager.h $(SRCDIR)/expert_cpu.h $(SRCDIR)/qwen_model.h $(SRCDIR)/qwen_ops.h $(SRCDIR)/qmatvec.h $(SRCDIR)/deltanet.h $(SRCDIR)/attention.h $(SRCDIR)/gpu_ops.h $(SRCDIR)/inference_internal.h $(SRCDIR)/kernel_loader.h $(SRCDIR)/inference_log.h $(SRCDIR)/glm5_ref.h $(SRCDIR)/glm5_gpu.h
 # The engine's code objects, embedded in the library (kernels_embed.S, loaded by kernel_loader.cpp)
-ENGINE_COS = $(CODIR)/matvec_q.co $(CODIR)/gpu_ops.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/glm5_gpu.co $(CODIR)/talker_gpu.co $(CODIR)/sd_gpu.co $(CODIR)/minimax_vae.co
+ENGINE_COS = $(CODIR)/matvec_q.co $(CODIR)/gpu_ops.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/glm5_gpu.co $(CODIR)/talker_gpu.co $(CODIR)/sd_gpu.co $(CODIR)/minimax_vae.co $(CODIR)/codec_gpu.co
 
 $(OBJDIR)/kernels_embed.o: $(SRCDIR)/kernels_embed.S $(ENGINE_COS)
 	$(CLANG) -c -DKERNEL_DIR=$(abspath $(CODIR)) $< -o $@
