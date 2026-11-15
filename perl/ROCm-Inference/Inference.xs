@@ -1430,6 +1430,16 @@ _speech_close(h)
     }
 
 int
+_speech_last_gpu(h)
+    IV h
+  CODE:
+    /* 1 when the last speak on this handle's talker ran on the GPU (the device path), 0 on the CPU */
+    speech_handle* s = INT2PTR(speech_handle*, h);
+    RETVAL = s ? qwen3tts_last_gpu(s->m) : 0;
+  OUTPUT:
+    RETVAL
+
+int
 _speech_n_embd(h)
     IV h
   CODE:

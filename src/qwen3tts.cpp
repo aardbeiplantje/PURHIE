@@ -559,6 +559,7 @@ struct qwen3tts_model {
     std::vector<std::string> languages;
     std::unique_ptr<Speaker> spk;       // the speaker encoder (absent in a GGUF without spk.* tensors)
     const void* gpu_base = nullptr;     // the GGUF mapping registered for the device (NULL: host only)
+    int last_gpu = 0;                   // the last generate ran its talker on the GPU (qwen3tts_last_gpu)
     std::vector<int> language_ids;
     Mat text_embd;                      // [text_vocab][text_C]
     Mat codec_embd;                     // [codec_vocab][C]
@@ -961,6 +962,8 @@ void qwen3tts_close(qwen3tts_model_t* model) {
 
 const char* qwen3tts_last_error(void) { return g_error.c_str(); }
 
+int qwen3tts_last_gpu(const qwen3tts_model_t* model) { return model ? model->last_gpu : 0; }
+
 int qwen3tts_n_embd(const qwen3tts_model_t* m) { return m ? m->C : 0; }
 int qwen3tts_n_codebooks(const qwen3tts_model_t* m) { return m ? m->ncb : 0; }
 int qwen3tts_codec_vocab(const qwen3tts_model_t* m) { return m ? m->codec_vocab : 0; }
@@ -1217,6 +1220,7 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
             return -1;
         const int maxL = P + max_frames + 1;
         const bool dev_on = gpu::ready() && m->gpu_base && dev::load();
+        m->last_gpu = dev_on ? 1 : 0;
         if (dev_on && pd.C != C) throw std::runtime_error("qwen3tts device: the predictor's width is not the talker's");
         // one fused talker on the device at a time: the runs share stream 0 and each syncs it (the host's runs are not held)
         std::unique_lock<std::mutex> run_lock(gpu::run_mu, std::defer_lock);
@@ -1471,7 +1475,7 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
         if (prof && n_out > 0)
             std::fprintf(stderr, "qwen3tts profile (%s): %d frames, prefill %.0f ms; per frame: sample %.2f, predictor %.2f "
                          "(stacks issued %.2f, head+wait %.2f, first stack+sync %.2f), talker %.2f ms; talker C %d FF %d (%d layers), predictor C %d FF %d "
-                         "(%d layers, %d codebooks)\n", dev_on ? "device" : "host", n_out, t_prefill, t_samp / n_out, t_pred / n_out,
+                         "(%d layers, %d codebooks)\n", dev_on ? "gpu" : "cpu", n_out, t_prefill, t_samp / n_out, t_pred / n_out,
                          t_issue / n_out, t_head_wait / n_out, t_stack0 / n_out, t_tal / n_out, C, d.FF, m->n_layer, pd.C, pd.FF, m->pn_layer, ncb);
         arena.close();
         return n_out;

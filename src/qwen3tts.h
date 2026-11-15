@@ -19,6 +19,10 @@ qwen3tts_model_t* qwen3tts_open(const char* gguf_path);
 void qwen3tts_close(qwen3tts_model_t* model);
 const char* qwen3tts_last_error(void);
 
+/* 1 when the last qwen3tts_generate on this model ran its talker on the GPU (the device path), 0 when on the CPU (the host
+ * path, and before any run). */
+int qwen3tts_last_gpu(const qwen3tts_model_t* model);
+
 int qwen3tts_n_embd(const qwen3tts_model_t* model);       /* the talker's width: 1024 */
 int qwen3tts_n_codebooks(const qwen3tts_model_t* model);  /* 16 */
 int qwen3tts_codec_vocab(const qwen3tts_model_t* model);  /* 3072 */

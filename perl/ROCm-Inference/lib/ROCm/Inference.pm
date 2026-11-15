@@ -834,6 +834,12 @@ sub speak {
     return wantarray ? ($samples, $frames) : $samples;
 }
 
+# $s->last_gpu: 1 when the last speak ran its talker on the GPU, 0 on the CPU (the host path)
+sub last_gpu {
+    my ($s) = @_;
+    return ROCm::Inference::_speech_last_gpu($s->{h});
+}
+
 sub DESTROY {
     my ($s) = @_;
     ROCm::Inference::_speech_close($s->{h}) if $s->{h};

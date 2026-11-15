@@ -992,6 +992,7 @@ sub speech_step {
             return undef;
         }
         $job->{frames} += $frames;
+        $job->{gpu} = $job->{tts}->last_gpu;  # (the talker's path for this piece: the GPU or the CPU)
         $LOG->info('speech', event => 'piece', msg => sprintf('%d of %d: %d frames, %.2f s, at %.0f ms', $i + 1,
                    scalar @{ $job->{pieces} }, $frames, length($samples) / 4 / 24000,
                    1000 * (Time::HiRes::time() - $job->{t0})));
@@ -1006,9 +1007,9 @@ sub speech_step {
     # all pieces said: the body ends with this round's piece
     $job->{finished} = 1;
     my $secs = length($job->{all}) / 4 / 24000;
-    $LOG->info('request', event => 'speech', msg => sprintf('%s: voice %s, %d pieces, %d frames, %.2f s, %s%s',
+    $LOG->info('request', event => 'speech', msg => sprintf('%s: voice %s, %d pieces, %d frames, %.2f s, %s, talker on the %s%s',
                $job->{tts_name}, $job->{name}, scalar @{ $job->{pieces} }, $job->{frames}, $secs, $job->{fmt},
-               $job->{stream} ? ', streamed' : ''));
+               $job->{gpu} ? 'gpu' : 'cpu', $job->{stream} ? ', streamed' : ''));
     return \$out if $progressive;
     # the file goes out in slices (one per round): Web::Route closes a response with more than its max_pending unsent
     $job->{body} = $job->{fmt} eq 'wav' ? speech_wav16_file($job->{all}) : ROCm::Inference::speech_flac16($job->{all}, 24000);
