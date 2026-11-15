@@ -20,6 +20,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <zlib.h>
+
 namespace {
 
 std::string g_error;
@@ -84,6 +86,9 @@ struct whisper_model {
     const float* dec_pos = nullptr;  // [n_tctx][n_tstate]
     Norm dec_post;
     std::vector<DecLayer> dec;
+    float fallback_cr_max = 2.4f, fallback_lp_min = -1.0f;  // the long form's temperature fallback (whisper_set_fallback)
+    int fallback_keep_last = 0;                              // 1: keep the last attempt when all fail (the reference's rule)
+    int attempts = 0;                                        // the decoder passes of the last long-form call
     ~whisper_model() {
         if (tok) tokenizer_free(tok);
         if (g) gguf_mmap_close(g);
@@ -233,17 +238,95 @@ void decoder_step(const whisper_model* m, DecState& st, int token, int pos, floa
     logits_of(m, h.data(), logits);
 }
 
-int argmax_suppressed(const whisper_model* m, const float* logits, bool begin) {
-    std::vector<float> l(logits, logits + m->n_vocab);
+// splitmix64's next draw (the state advances), as src/qwen3tts.cpp's
+uint64_t splitmix64_next(uint64_t* state) {
+    uint64_t z = (*state += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+// The next token from the logits [n_vocab] after the suppressions (begin: the begin_suppress ones too). temperature <= 0:
+// the first maximum; else a token drawn from softmax(logits / temperature) with the splitmix state rng. lp (may be NULL)
+// receives the chosen token's log-probability: log_softmax of the suppressed logits, not scaled by the temperature.
+int choose_token(const whisper_model* m, const float* logits, bool begin, float temperature, uint64_t* rng, double* lp) {
+    const int V = m->n_vocab;
+    std::vector<float> l(logits, logits + V);
     for (int t : m->suppress)
-        if (t >= 0 && t < m->n_vocab) l[t] = -INFINITY;
+        if (t >= 0 && t < V) l[t] = -INFINITY;
     if (begin)
         for (int t : m->begin_suppress)
-            if (t >= 0 && t < m->n_vocab) l[t] = -INFINITY;
-    int best = 0;
-    for (int v = 1; v < m->n_vocab; ++v)
-        if (l[v] > l[best]) best = v;
-    return best;
+            if (t >= 0 && t < V) l[t] = -INFINITY;
+    const float mx = *std::max_element(l.begin(), l.end());  // finite: the vocabulary has unsuppressed tokens
+    int tok = 0;
+    if (temperature <= 0.0f) {
+        for (int v = 1; v < V; ++v)
+            if (l[v] > l[tok]) tok = v;
+    } else {
+        std::vector<double> w(V);
+        double total = 0.0;
+        for (int v = 0; v < V; ++v) {
+            w[v] = std::exp(((double)l[v] - mx) / temperature);
+            total += w[v];
+        }
+        const double u = (double)(splitmix64_next(rng) >> 11) * (1.0 / 9007199254740992.0);
+        const double target = u * total;
+        double cum = 0.0;
+        for (int v = 0; v < V; ++v) {
+            if (w[v] == 0.0) continue;
+            tok = v;
+            cum += w[v];
+            if (cum > target) break;
+        }
+    }
+    if (lp) {
+        double z = 0.0;
+        for (int v = 0; v < V; ++v) z += std::exp((double)l[v] - mx);
+        *lp = (double)l[tok] - ((double)mx + std::log(z));
+    }
+    return tok;
+}
+
+// The decoding of one window's prompt and tokens (the greedy one at temperature 0): out_tokens receives the tokens after the
+// prompt, without the end-of-transcript token; the count is returned. With sum_lp, *sum_lp is the sum of the log-probabilities
+// of the chosen tokens (the end-of-transcript token included when it was chosen). Throws on failure.
+int decode_tokens(whisper_model_t* m, const float* enc, const int* prompt, int n_prompt, int max_new, float temperature,
+                  uint64_t seed, int* out_tokens, double* sum_lp) {
+    const int C = m->n_tstate, T = m->n_actx;
+    DecState st;
+    st.sk.assign(m->n_tlayer, std::vector<float>((size_t)m->n_tctx * C));
+    st.sv.assign(m->n_tlayer, std::vector<float>((size_t)m->n_tctx * C));
+    st.ck.assign(m->n_tlayer, std::vector<float>((size_t)T * C));
+    st.cv.assign(m->n_tlayer, std::vector<float>((size_t)T * C));
+    // the cross-attention keys and values of the encoder output, per layer
+    for (int l = 0; l < m->n_tlayer; ++l) {
+        const DecLayer& L = m->dec[l];
+        linear(enc, T, L.ck, st.ck[l].data());
+        linear(enc, T, L.cv, st.cv[l].data());
+    }
+    uint64_t rng = seed;
+    std::vector<float> logits(m->n_vocab);
+    for (int i = 0; i < n_prompt; ++i) decoder_step(m, st, prompt[i], i, logits.data());
+    double lp = 0.0, sum = 0.0;
+    int next = choose_token(m, logits.data(), true, temperature, &rng, sum_lp ? &lp : nullptr);
+    int n_out = 0, pos = n_prompt;
+    while (n_out < max_new && next != m->eot && pos < m->n_tctx) {
+        out_tokens[n_out++] = next;
+        sum += lp;
+        decoder_step(m, st, next, pos, logits.data());
+        ++pos;
+        next = choose_token(m, logits.data(), false, temperature, &rng, sum_lp ? &lp : nullptr);
+    }
+    if (sum_lp) {
+        if (next == m->eot) sum += lp;
+        *sum_lp = sum;
+    }
+    return n_out;
+}
+
+// The fallback's seed of a window (its seek position) and attempt: fixed constants mixed with both
+uint64_t fallback_seed(size_t seek, int attempt) {
+    return 0x5EED7E3F00DF00D5ull ^ ((uint64_t)seek * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)(attempt + 1) << 48);
 }
 
 }  // namespace
@@ -382,6 +465,24 @@ int whisper_decode_wav(const unsigned char* d, size_t n, float** samples_out, si
 
 void whisper_free_samples(float* samples) { audio_free(samples); }
 
+void whisper_set_fallback(whisper_model_t* m, float compression_ratio_max, float avg_logprob_min, int keep_last) {
+    if (!m) return;
+    m->fallback_cr_max = compression_ratio_max;
+    m->fallback_lp_min = avg_logprob_min;
+    m->fallback_keep_last = keep_last != 0;
+}
+
+int whisper_fallback_attempts(const whisper_model_t* m) { return m ? m->attempts : 0; }
+
+float whisper_compression_ratio(const char* text, size_t len) {
+    if (!text || len == 0) return 0.0f;
+    uLongf out_len = compressBound((uLong)len);
+    std::vector<Bytef> out(out_len);
+    if (compress2(out.data(), &out_len, reinterpret_cast<const Bytef*>(text), (uLong)len, Z_DEFAULT_COMPRESSION) != Z_OK)
+        return 0.0f;
+    return (float)len / (float)out_len;
+}
+
 int whisper_token_id(const whisper_model_t* m, const char* text) {
     if (!m || !text) return -1;
     const auto it = m->special.find(text);
@@ -439,30 +540,7 @@ int whisper_greedy(whisper_model_t* m, const float* enc, const int* prompt, int 
     }
     if (n_prompt >= m->n_tctx) { g_error = "whisper_greedy: the prompt fills the context"; return -1; }
     try {
-        const int C = m->n_tstate, T = m->n_actx;
-        DecState st;
-        st.sk.assign(m->n_tlayer, std::vector<float>((size_t)m->n_tctx * C));
-        st.sv.assign(m->n_tlayer, std::vector<float>((size_t)m->n_tctx * C));
-        st.ck.assign(m->n_tlayer, std::vector<float>((size_t)T * C));
-        st.cv.assign(m->n_tlayer, std::vector<float>((size_t)T * C));
-        // the cross-attention keys and values of the encoder output, per layer
-        std::vector<float> h((size_t)T * C);
-        for (int l = 0; l < m->n_tlayer; ++l) {
-            const DecLayer& L = m->dec[l];
-            linear(enc, T, L.ck, st.ck[l].data());
-            linear(enc, T, L.cv, st.cv[l].data());
-        }
-        std::vector<float> logits(m->n_vocab);
-        for (int i = 0; i < n_prompt; ++i) decoder_step(m, st, prompt[i], i, logits.data());
-        int next = argmax_suppressed(m, logits.data(), true);
-        int n_out = 0, pos = n_prompt;
-        while (n_out < max_new && next != m->eot && pos < m->n_tctx) {
-            out_tokens[n_out++] = next;
-            decoder_step(m, st, next, pos, logits.data());
-            ++pos;
-            next = argmax_suppressed(m, logits.data(), false);
-        }
-        return n_out;
+        return decode_tokens(m, enc, prompt, n_prompt, max_new, 0.0f, 0, out_tokens, nullptr);
     } catch (const std::exception& e) {
         g_error = e.what();
         return -1;
@@ -525,8 +603,48 @@ struct WindowOut {
     size_t advance = 0;     // samples the seek moves by
 };
 
+// The window's segments from its tokens ids (timestamps included): the text, and how far seek moves (see above)
+static void segment_window(whisper_model_t* m, const std::vector<int>& ids, int ts_begin, bool final_window, size_t window_n,
+                           WindowOut& out) {
+    const size_t k = ids.size();
+    auto is_ts = [&](int i) { return ids[(size_t)i] >= ts_begin; };
+    // the text: the vocabulary's tokens, not the control markers (the end of text and above) and not the timestamps
+    auto is_text = [&](int i) { return ids[(size_t)i] < m->eot; };
+    // the segments: the consecutive timestamps close one (openai's rule), and a window ending on a timestamp closes its last one
+    std::vector<size_t> cuts;  // the token index after each pair of consecutive timestamps
+    for (int i = 1; i < (int)k; ++i)
+        if (is_ts(i - 1) && is_ts(i)) cuts.push_back((size_t)i);
+    const bool single_end = k >= 2 && !is_ts((int)k - 2) && is_ts((int)k - 1);
+    out.text.clear();
+    if (!cuts.empty()) {
+        std::vector<size_t> slices = cuts;
+        if (single_end) slices.push_back(k);
+        size_t last = 0;
+        for (size_t cur : slices) {
+            for (size_t i = last; i < cur; ++i)
+                if (is_text((int)i)) out.text.push_back(ids[i]);
+            last = cur;
+        }
+        if (final_window) {  // the clip's end: an open tail is text too
+            for (size_t i = last; i < k; ++i)
+                if (is_text((int)i)) out.text.push_back(ids[i]);
+            out.advance = window_n;
+        } else if (single_end) {
+            out.advance = window_n;
+        } else {
+            const size_t last_ts = (size_t)(ids[last - 1] - ts_begin);  // the window's last closed segment ends here (20 ms units)
+            out.advance = last_ts * 320;  // 0.02 s at 16 kHz
+        }
+    } else {
+        for (size_t i = 0; i < k; ++i)
+            if (is_text((int)i)) out.text.push_back(ids[i]);
+        out.advance = window_n;
+    }
+    if (out.advance == 0) out.advance = window_n;  // (a seek always moves)
+}
+
 static void transcribe_window_ts(whisper_model_t* m, const float* samples, size_t n, const std::string& lang, bool translate,
-                                 const std::vector<int>& prev, bool final_window, WindowOut& out) {
+                                 const std::vector<int>& prev, bool final_window, size_t seek, WindowOut& out) {
     const int lang_id = whisper_token_id(m, lang.c_str());
     const int task_id = whisper_token_id(m, translate ? "<|translate|>" : "<|transcribe|>");
     const int startofprev = whisper_token_id(m, "<|startofprev|>");
@@ -547,48 +665,41 @@ static void transcribe_window_ts(whisper_model_t* m, const float* samples, size_
     if (whisper_log_mel(samples, (int)n, 80, mel.data()) != 0) throw std::runtime_error("whisper_log_mel failed");
     std::vector<float> enc((size_t)m->n_actx * m->n_astate);
     if (whisper_encode(m, mel.data(), enc.data()) != 0) throw std::runtime_error(g_error);
+    // Whisper's temperature fallback: greedy first; a window whose text compresses above compression_ratio_max or whose
+    // average log-probability (the sum over the chosen tokens and the end-of-transcript token, divided by their count + 1)
+    // is below avg_logprob_min is decoded again at the next temperature; the first attempt that passes is taken.
+    // When every attempt fails, the default (keep_last 0) keeps the attempt with the highest average log-probability (the
+    // lowest temperature on a tie). This differs from the reference, which keeps the last attempt (keep_last 1): audio
+    // that is genuinely repetitive or hard keeps its greedy text, while a real loop still gets the higher temperatures to
+    // escape it.
+    static const float temps[6] = {0.0f, 0.2f, 0.4f, 0.6f, 0.8f, 1.0f};
     const int room = m->n_tctx - (int)prompt.size() - 1;
-    std::vector<int> ids((size_t)std::max(1, room));
-    const int k = whisper_greedy(m, enc.data(), prompt.data(), (int)prompt.size(), (int)ids.size(), ids.data());
-    if (k < 0) throw std::runtime_error(g_error);
-    ids.resize((size_t)k);
-
-    auto is_ts = [&](int i) { return ids[(size_t)i] >= ts_begin; };
-    // the text: the vocabulary's tokens, not the control markers (the end of text and above) and not the timestamps
-    auto is_text = [&](int i) { return ids[(size_t)i] < m->eot; };
-    const size_t window_n = n;
-    // the segments: the consecutive timestamps close one (openai's rule), and a window ending on a timestamp closes its last one
-    std::vector<size_t> cuts;  // the token index after each pair of consecutive timestamps
-    for (int i = 1; i < k; ++i)
-        if (is_ts(i - 1) && is_ts(i)) cuts.push_back((size_t)i);
-    const bool single_end = k >= 2 && !is_ts(k - 2) && is_ts(k - 1);
-    out.text.clear();
-    if (!cuts.empty()) {
-        std::vector<size_t> slices = cuts;
-        if (single_end) slices.push_back((size_t)k);
-        size_t last = 0;
-        for (size_t cur : slices) {
-            for (size_t i = last; i < cur; ++i)
-                if (is_text((int)i)) out.text.push_back(ids[i]);
-            last = cur;
+    std::vector<int> ids, best_ids;
+    double best_avg = -INFINITY;
+    for (int a = 0; a < 6; ++a) {
+        ids.assign((size_t)std::max(1, room), 0);
+        double sum_lp = 0.0;
+        const int k = decode_tokens(m, enc.data(), prompt.data(), (int)prompt.size(), (int)ids.size(), temps[a],
+                                    fallback_seed(seek, a), ids.data(), &sum_lp);
+        ids.resize((size_t)k);
+        ++m->attempts;
+        std::vector<int> text_ids;
+        for (int id : ids)
+            if (id < m->eot) text_ids.push_back(id);
+        const std::string text = detok(m, text_ids);
+        const float ratio = whisper_compression_ratio(text.data(), text.size());
+        const double avg_lp = sum_lp / (k + 1.0);
+        const bool needs_fallback = ratio > m->fallback_cr_max || avg_lp < (double)m->fallback_lp_min;
+        if (!needs_fallback || (m->fallback_keep_last && a == 5)) {
+            segment_window(m, ids, ts_begin, final_window, n, out);
+            return;
         }
-        if (final_window) {  // the clip's end: an open tail is text too
-            for (size_t i = last; i < (size_t)k; ++i)
-                if (is_text((int)i)) out.text.push_back(ids[i]);
-            out.advance = window_n;
-        } else if (single_end) {
-            out.advance = window_n;
-        } else {
-            const size_t last_ts = (size_t)(ids[last - 1] - ts_begin);  // the window's last closed segment ends here (20 ms units)
-            out.advance = last_ts * 320;  // 0.02 s at 16 kHz
+        if (avg_lp > best_avg) {  // (strictly greater: the lowest temperature wins a tie)
+            best_avg = avg_lp;
+            best_ids = ids;
         }
-    } else {
-        for (int i = 0; i < k; ++i)
-            if (is_text(i)) out.text.push_back(ids[(size_t)i]);
-        out.advance = window_n;
     }
-    if (out.advance == 0) out.advance = window_n;  // (a seek always moves)
-    (void)translate;
+    segment_window(m, best_ids, ts_begin, final_window, n, out);
 }
 
 int whisper_transcribe_task(whisper_model_t* m, const float* samples, size_t n, const char* language, const char* task,
@@ -600,6 +711,7 @@ int whisper_transcribe_task(whisper_model_t* m, const float* samples, size_t n, 
         const std::string lang = std::string("<|") + (language && *language ? language : "en") + "|>";
         std::string all;
         int tokens = 0;
+        m->attempts = 0;
         if (n <= (size_t)WHISPER_CHUNK_SAMPLES) {  // one window: the prompt without timestamps (as before)
             std::string part;
             const int k = transcribe_window(m, samples, n, lang, translate, part);
@@ -615,7 +727,7 @@ int whisper_transcribe_task(whisper_model_t* m, const float* samples, size_t n, 
                 const bool last = remain <= (size_t)WHISPER_CHUNK_SAMPLES;
                 const size_t len = last ? remain : (size_t)WHISPER_CHUNK_SAMPLES;
                 WindowOut w;
-                transcribe_window_ts(m, samples + seek, len, lang, translate, prev, last, w);
+                transcribe_window_ts(m, samples + seek, len, lang, translate, prev, last, seek, w);
                 all += detok(m, w.text);
                 tokens += (int)w.text.size();
                 prev.insert(prev.end(), w.text.begin(), w.text.end());

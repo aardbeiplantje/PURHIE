@@ -54,6 +54,17 @@ int whisper_transcribe(whisper_model_t* model, const float* samples, size_t n, c
 int whisper_transcribe_task(whisper_model_t* model, const float* samples, size_t n, const char* language, const char* task,
                             char* text, size_t text_len);
 
+/* The long form's temperature fallback (per window): a window whose text compresses above compression_ratio_max (zlib)
+ * or whose average log-probability is below avg_logprob_min is decoded again at the temperatures 0.2, 0.4, 0.6, 0.8,
+ * 1.0 (sampled, deterministically); the first attempt that passes is taken. When every attempt fails, keep_last 0 (the
+ * default) takes the attempt with the highest average log-probability (the lowest temperature on a tie), keep_last 1
+ * takes the last attempt as the reference does. The defaults are 2.4, -1.0 and 0. */
+void whisper_set_fallback(whisper_model_t* model, float compression_ratio_max, float avg_logprob_min, int keep_last);
+/* The decoder passes (the windows' attempts) of the last whisper_transcribe_task, or 0. */
+int whisper_fallback_attempts(const whisper_model_t* model);
+/* The compression ratio of UTF-8 text: its bytes over the bytes of its zlib stream (Python's zlib.compress). */
+float whisper_compression_ratio(const char* text, size_t len);
+
 #ifdef __cplusplus
 }
 #endif
