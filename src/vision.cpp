@@ -6,7 +6,10 @@
 #include "gguf_mmap.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <stdexcept>
@@ -23,6 +26,51 @@ namespace {
 std::string g_err;
 
 void set_err(const std::string& s) { g_err = s; }
+
+// VISION_PROFILE=1: the wall time per stage of a forward pass (vision_encode), printed on stderr at its end. Without
+// the variable a timer is one flag test.
+enum ProfKind { P_PATCH, P_POS, P_ROPE, P_LIN, P_ATT, P_NORM, P_ROPE_APPLY, P_ACT, P_MERGE, P_N };
+double g_prof_ms[P_N];
+
+bool prof_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("VISION_PROFILE");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+
+struct ProfTimer {
+    ProfKind k;
+    bool on;
+    std::chrono::steady_clock::time_point t0;
+    explicit ProfTimer(ProfKind kind) : k(kind), on(prof_enabled()) {
+        if (on) t0 = std::chrono::steady_clock::now();
+    }
+    ~ProfTimer() {
+        if (on)
+            g_prof_ms[k] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+};
+
+int prof_threads() {
+#ifdef _OPENMP
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
+}
+
+// One line on stderr: the threads and the stages' milliseconds (the blocks' linears, attention, norms and the
+// rotary application, summed over the blocks)
+void prof_report(int blocks) {
+    if (!prof_enabled()) return;
+    std::fprintf(stderr,
+                 "vision profile: threads=%d blocks=%d patch_embed=%.2f ms pos_embed+rotary_setup=%.2f ms | "
+                 "linear=%.2f attention=%.2f layer_norm=%.2f rotary=%.2f gelu=%.2f | merger=%.2f ms\n",
+                 prof_threads(), blocks, g_prof_ms[P_PATCH], g_prof_ms[P_POS] + g_prof_ms[P_ROPE], g_prof_ms[P_LIN],
+                 g_prof_ms[P_ATT], g_prof_ms[P_NORM], g_prof_ms[P_ROPE_APPLY], g_prof_ms[P_ACT], g_prof_ms[P_MERGE]);
+}
 
 struct VBlock {
     const float *ln1_w, *ln1_b, *ln2_w, *ln2_b;
@@ -58,18 +106,36 @@ const float* tensor(const vision_model* vm, const std::string& name, size_t coun
     return static_cast<const float*>(p);
 }
 
-// y[n][o] = b[o] + sum_i W[o][i] * x[n][i], over n rows
+// Loops over this many elements or more are shared out over the threads; smaller ones stay serial
+constexpr long VISION_PAR_ELEMS = 16384;
+// The same for the multiply-adds of a matrix product (as whisper.cpp's WHISPER_PAR_MACS)
+constexpr long VISION_PAR_MACS = 50000;
+
+// x[i] += y[i] over n elements (the residual adds), shared out over the threads when there are many
+void add_into(float* x, const float* y, size_t n) {
+#pragma omp parallel for schedule(static) if ((long)n >= VISION_PAR_ELEMS)
+    for (long i = 0; i < (long)n; ++i) x[i] += y[i];
+}
+
+// The dot product of a and b over n floats, summed in SIMD lanes (the order of the additions differs from a serial sum
+// in the last bits only), as whisper.cpp's dot_f32
+inline float dot_f32(const float* a, const float* b, int n) {
+    float acc = 0.f;
+#pragma omp simd reduction(+ : acc)
+    for (int i = 0; i < n; ++i) acc += a[i] * b[i];
+    return acc;
+}
+
+// y[n][o] = b[o] + sum_i W[o][i] * x[n][i], over n rows. The bias is added after the dot product. Each (row, output)
+// pair is one independent dot product, so the pairs are shared out over the threads (the merger has only a few rows).
 void linear(const float* W, const float* b, const float* x, float* y, int n, int in_dim, int out_dim) {
-#pragma omp parallel for schedule(static)
-    for (int r = 0; r < n; ++r) {
+    const long pairs = (long)n * out_dim;
+#pragma omp parallel for schedule(static) if (pairs * in_dim >= VISION_PAR_MACS)
+    for (long p = 0; p < pairs; ++p) {
+        const int r = (int)(p / out_dim), o = (int)(p % out_dim);
         const float* xr = x + (size_t)r * in_dim;
-        float* yr = y + (size_t)r * out_dim;
-        for (int o = 0; o < out_dim; ++o) {
-            const float* wr = W + (size_t)o * in_dim;
-            float acc = 0.f;
-            for (int i = 0; i < in_dim; ++i) acc += wr[i] * xr[i];
-            yr[o] = acc + (b ? b[o] : 0.f);
-        }
+        const float* wr = W + (size_t)o * in_dim;
+        y[(size_t)r * out_dim + o] = dot_f32(wr, xr, in_dim) + (b ? b[o] : 0.f);
     }
 }
 
@@ -210,13 +276,19 @@ int vision_encode(vision_model_t* vm, const float* pixels, int h, int w, float* 
 
         // patch embedding: a Linear over the pixel rows. The image processor writes them in merge order already
         // (Qwen2VLImageProcessor's patch reshape), the order of row_of / col_of above.
+        if (prof_enabled()) std::memset(g_prof_ms, 0, sizeof g_prof_ms);
         std::vector<float> x((size_t)N * D), tmp((size_t)N * D);
-        linear(vm->patch_w, vm->patch_b, pixels, x.data(), N, vm->in_dim, D);
+        {
+            ProfTimer pt(P_PATCH);
+            linear(vm->patch_w, vm->patch_b, pixels, x.data(), N, vm->in_dim, D);
+        }
         if (stage) stage("patch_embed", x.data(), N, D, ud);
 
         // position embedding: the learned n_side x n_side table bilinearly interpolated to h x w, as
         // fast_pos_embed_interpolate: four corners weighted, summed in that order
         const int S = vm->n_side;
+        {
+        ProfTimer pt_pos(P_POS);
         for (int t = 0; t < N; ++t) {
             const int hh = row_of[t], ww = col_of[t];
             const float hi = linspace_at(hh, h, (float)(S - 1)), wi = linspace_at(ww, w, (float)(S - 1));
@@ -234,6 +306,7 @@ int vision_encode(vision_model_t* vm, const float* pixels, int h, int w, float* 
                 xr[c] = xr[c] + (((p0 + p1) + p2) + p3);
             }
         }
+        }
 
         // 2-D rotary: the frequencies of the row and the column (hd / 4 each), concatenated and doubled as
         // rotate_half needs: cos / sin per token and head dimension
@@ -241,6 +314,8 @@ int vision_encode(vision_model_t* vm, const float* pixels, int h, int w, float* 
         std::vector<float> cosv((size_t)N * hd), sinv((size_t)N * hd);
         std::vector<float> inv(nf);
         for (int j = 0; j < nf; ++j) inv[j] = 1.f / std::pow(10000.f, (float)(2 * j) / (float)half);
+        {
+        ProfTimer pt_rope(P_ROPE);
         for (int t = 0; t < N; ++t) {
             const float fr = (float)row_of[t], fc = (float)col_of[t];
             for (int j = 0; j < nf; ++j) {
@@ -256,71 +331,109 @@ int vision_encode(vision_model_t* vm, const float* pixels, int h, int w, float* 
                 sinv[(size_t)t * hd + 3 * nf + j] = sinv[(size_t)t * hd + nf + j];
             }
         }
+        }
 
         std::vector<float> h1((size_t)N * D), qkv((size_t)N * 3 * D), att((size_t)N * D), mlp((size_t)N * vm->n_ff);
         const float scale = 1.f / std::sqrt((float)hd);
         for (int l = 0; l < vm->depth; ++l) {
             const VBlock& k = vm->blocks[l];
-            layernorm(x.data(), h1.data(), N, D, k.ln1_w, k.ln1_b, vm->eps);
-            linear(k.qkv_w, k.qkv_b, h1.data(), qkv.data(), N, D, 3 * D);
-            // rotary on q and k (the qkv rows are [q (H x hd), k, v]), in place
-            for (int t = 0; t < N; ++t) {
-                float* row = &qkv[(size_t)t * 3 * D];
-                for (int which = 0; which < 2; ++which)
-                    for (int hh = 0; hh < H; ++hh) {
-                        float* v = row + which * D + hh * hd;
-                        float r[256];
-                        for (int d = 0; d < hd; ++d) r[d] = d < half ? -v[d + half] : v[d - half];
-                        for (int d = 0; d < hd; ++d) {
-                            const float c = cosv[(size_t)t * hd + d], s = sinv[(size_t)t * hd + d];
-                            v[d] = v[d] * c + r[d] * s;
-                        }
-                    }
+            {
+                ProfTimer pt(P_NORM);
+                layernorm(x.data(), h1.data(), N, D, k.ln1_w, k.ln1_b, vm->eps);
             }
-            // full attention within the image, per head
-#pragma omp parallel for schedule(static) collapse(2)
-            for (int hh = 0; hh < H; ++hh)
-                for (int i = 0; i < N; ++i) {
-                    std::vector<float> sc(N);
-                    const float* q = &qkv[(size_t)i * 3 * D + hh * hd];
-                    float mx = -INFINITY;
-                    for (int j = 0; j < N; ++j) {
-                        const float* kk = &qkv[(size_t)j * 3 * D + D + hh * hd];
-                        float s = 0.f;
-                        for (int d = 0; d < hd; ++d) s += q[d] * kk[d];
-                        sc[j] = s * scale;
-                        mx = std::max(mx, sc[j]);
-                    }
-                    float sum = 0.f;
-                    for (int j = 0; j < N; ++j) { sc[j] = std::exp(sc[j] - mx); sum += sc[j]; }
-                    float* o = &att[(size_t)i * D + hh * hd];
-                    for (int d = 0; d < hd; ++d) o[d] = 0.f;
-                    for (int j = 0; j < N; ++j) {
-                        const float p = sc[j] / sum;
-                        const float* vv = &qkv[(size_t)j * 3 * D + 2 * D + hh * hd];
-                        for (int d = 0; d < hd; ++d) o[d] += p * vv[d];
-                    }
+            {
+                ProfTimer pt(P_LIN);
+                linear(k.qkv_w, k.qkv_b, h1.data(), qkv.data(), N, D, 3 * D);
+            }
+            // rotary on q and k (the qkv rows are [q (H x hd), k, v]), in place
+            {
+                ProfTimer pt(P_ROPE_APPLY);
+#pragma omp parallel for schedule(static) if ((long)N * D >= VISION_PAR_ELEMS)
+                for (int t = 0; t < N; ++t) {
+                    float* row = &qkv[(size_t)t * 3 * D];
+                    for (int which = 0; which < 2; ++which)
+                        for (int hh = 0; hh < H; ++hh) {
+                            float* v = row + which * D + hh * hd;
+                            float r[256];
+                            for (int d = 0; d < hd; ++d) r[d] = d < half ? -v[d + half] : v[d - half];
+                            for (int d = 0; d < hd; ++d) {
+                                const float c = cosv[(size_t)t * hd + d], s = sinv[(size_t)t * hd + d];
+                                v[d] = v[d] * c + r[d] * s;
+                            }
+                        }
                 }
-            linear(k.out_w, k.out_b, att.data(), tmp.data(), N, D, D);
-            for (size_t i = 0; i < x.size(); ++i) x[i] += tmp[i];
+            }
+            {
+                ProfTimer pt(P_ATT);
+                // full attention within the image, per head. The score buffer is one per thread, not one per query.
+#pragma omp parallel
+                {
+                    std::vector<float> sc(N);
+                    #pragma omp for schedule(static) collapse(2)
+                    for (int hh = 0; hh < H; ++hh)
+                        for (int i = 0; i < N; ++i) {
+                            const float* q = &qkv[(size_t)i * 3 * D + hh * hd];
+                            float mx = -INFINITY;
+                            for (int j = 0; j < N; ++j) {
+                                const float* kk = &qkv[(size_t)j * 3 * D + D + hh * hd];
+                                sc[j] = dot_f32(q, kk, hd) * scale;
+                                mx = std::max(mx, sc[j]);
+                            }
+                            float sum = 0.f;
+                            for (int j = 0; j < N; ++j) { sc[j] = std::exp(sc[j] - mx); sum += sc[j]; }
+                            float* o = &att[(size_t)i * D + hh * hd];
+                            for (int d = 0; d < hd; ++d) o[d] = 0.f;
+                            for (int j = 0; j < N; ++j) {
+                                const float p = sc[j] / sum;
+                                const float* vv = &qkv[(size_t)j * 3 * D + 2 * D + hh * hd];
+                                for (int d = 0; d < hd; ++d) o[d] += p * vv[d];
+                            }
+                        }
+                }
+            }
+            {
+                ProfTimer pt(P_LIN);
+                linear(k.out_w, k.out_b, att.data(), tmp.data(), N, D, D);
+            }
+            add_into(x.data(), tmp.data(), x.size());
 
-            layernorm(x.data(), h1.data(), N, D, k.ln2_w, k.ln2_b, vm->eps);
-            linear(k.up_w, k.up_b, h1.data(), mlp.data(), N, D, vm->n_ff);
-            for (float& v : mlp) v = vm->gelu_tanh ? gelu_tanh(v) : gelu_exact(v);
-            linear(k.down_w, k.down_b, mlp.data(), tmp.data(), N, vm->n_ff, D);
-            for (size_t i = 0; i < x.size(); ++i) x[i] += tmp[i];
+            {
+                ProfTimer pt(P_NORM);
+                layernorm(x.data(), h1.data(), N, D, k.ln2_w, k.ln2_b, vm->eps);
+            }
+            {
+                ProfTimer pt(P_LIN);
+                linear(k.up_w, k.up_b, h1.data(), mlp.data(), N, D, vm->n_ff);
+            }
+            {
+                ProfTimer pt(P_ACT);
+                const long n_mlp = (long)mlp.size();
+#pragma omp parallel for schedule(static) if (n_mlp >= VISION_PAR_ELEMS)
+                for (long i = 0; i < n_mlp; ++i) mlp[i] = vm->gelu_tanh ? gelu_tanh(mlp[i]) : gelu_exact(mlp[i]);
+            }
+            {
+                ProfTimer pt(P_LIN);
+                linear(k.down_w, k.down_b, mlp.data(), tmp.data(), N, vm->n_ff, D);
+            }
+            add_into(x.data(), tmp.data(), x.size());
             if (l == 0 && stage) stage("block0", x.data(), N, D, ud);
         }
 
         // the merger: LayerNorm per patch, then the m x m patches of a block concatenated and projected
-        layernorm(x.data(), h1.data(), N, D, vm->post_w, vm->post_b, vm->eps);
         const int M = D * m * m, G = N / (m * m);
         std::vector<float> cat((size_t)G * M), f1((size_t)G * M);
-        std::memcpy(cat.data(), h1.data(), sizeof(float) * (size_t)N * D);  // rows of a block are consecutive: same bytes
-        linear(vm->fc1_w, vm->fc1_b, cat.data(), f1.data(), G, M, M);
-        for (float& v : f1) v = gelu_exact(v);
-        linear(vm->fc2_w, vm->fc2_b, f1.data(), out, G, M, vm->n_out);
+        {
+            ProfTimer pt(P_MERGE);
+            layernorm(x.data(), h1.data(), N, D, vm->post_w, vm->post_b, vm->eps);
+            std::memcpy(cat.data(), h1.data(), sizeof(float) * (size_t)N * D);  // rows of a block are consecutive: same bytes
+            linear(vm->fc1_w, vm->fc1_b, cat.data(), f1.data(), G, M, M);
+            const long n_f1 = (long)f1.size();
+#pragma omp parallel for schedule(static) if (n_f1 >= VISION_PAR_ELEMS)
+            for (long i = 0; i < n_f1; ++i) f1[i] = gelu_exact(f1[i]);
+            linear(vm->fc2_w, vm->fc2_b, f1.data(), out, G, M, vm->n_out);
+        }
         if (stage) stage("merged", out, G, vm->n_out, ud);
+        prof_report(vm->depth);
         return 0;
     } catch (const std::exception& e) {
         set_err(e.what());
