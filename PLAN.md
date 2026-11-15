@@ -628,7 +628,9 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   residual adds and the SiLU gate. The last row's head is the decode's. The voice prefix stays cached (U7). Checks: the
   greedy and the sampled generation equal qwen-tts's (200 frames, BF16 talker on the device), the speech verifier PASS; the
   host path (QWEN3TTS_DEVICE=cpu) unchanged. Timing (222-frame voice, 188 request rows): 637 ms on the host, 181 ms on the
-  device. The first version (qmatvec's batched product) was not faster: it re-reads each token's activations per output
+  device. The server (rocm-hip 90d89ad, the 204-frame voice): the first request 7.4 s (was 11.1), the next 1.9 s (was 5.5),
+  the transcription correct; the output is no longer byte-identical to the earlier one (the prefill sums in another order).
+  The first version (qmatvec's batched product) was not faster: it re-reads each token's activations per output
   row (266 GB of cache traffic for the prompt). The profile line shows the request rows' time (`request rows`).
 - U1 threads: the host matmuls and convolutions run on the 16 cores (OpenMP over output rows); real-time factors
   measured for the speech (talker frames per second) and the transcription (seconds of audio per second).
