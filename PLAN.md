@@ -15,8 +15,6 @@ the 38 GB of IQ downloads (item 2 of the list below) do not fit: local conversio
 
 The open work as packages. Each is one agent's task with its check; it is done when the check passes and it is committed.
 The lists below keep each item's background.
-- A (item 11) Whisper's temperature fallback on the long-form windows. Check: `whisper_verify`, a new
-  `whisper_fallback_verify`, t/64 and t/66.
 - C (item 9) the codec on the device: the time per layer, the output convolution's tile (one channel in a 32-row tile),
   the host stages (36 ms a piece). Check: the three codec verifiers, the pieces bit-identical.
 - D (item 7) the samplers' sort (28 us a codebook, 55 us for c0). Check: `talker_sample_verify` (exact), the frame's time.
@@ -87,8 +85,16 @@ Performance:
 10. **Whisper on the GPU.** The encoder's and decoder's matmuls through sddev (whisper-tiny is small: measure first).
 
 Quality and scope (decisions):
-11. **Whisper temperature fallback.** A repetition loop in one window is not caught (W4). Implement the standard rule:
-    retry the window at a higher temperature when the compression ratio or the average log-probability is out of range.
+11. **Whisper temperature fallback: done 2026-11-15.** A long-form window whose text compresses above 2.4 (zlib) or whose
+    average log-probability is below -1.0 is decoded again at the temperatures 0.2 to 1.0 (sampled, a splitmix seed from
+    the window's position and the attempt); the first attempt that passes is taken. When every attempt fails the engine
+    keeps the one with the highest average log-probability (the reference keeps the last: an option,
+    `whisper_set_fallback(..., keep_last)`): a window that is repetitive by its content (the test clip: one sentence five
+    times, ratio 4.1) keeps its greedy text, where the reference's rule gave the temperature-1.0 sample. Clips of 30 s or
+    less are unchanged. Checks: `whisper_verify` (identical output), `whisper_fallback_verify` (the ratios, the long clip
+    unchanged, the sampled passes deterministic; 2 minutes), t/64 (17) and t/66 (4). Cost: each attempt is a decoder pass
+    of the window (about 2 s for 93 tokens on the host: 21 ms a token), so such a window takes six passes (t/66's long clip
+    23 s, was 7 s): the decoder's speed is item 10's.
 12. **Prosody across speech pieces.** Each sentence piece is a separate talker run (pieces joined with 0.2 s of silence),
     so the prosody restarts at each piece. Decide: keep, or condition each piece on the previous one's frames.
 13. **mp3, opus and aac.** Refused with 400 (no encoder in the image). Decide: add an encoder to the image, or keep refusing.
@@ -558,8 +564,8 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   and its last 224 tokens); seek moves to the end of the last complete segment (consecutive timestamps close one; a window
   ending in an open segment moves seek to its last timestamp; no timestamps: the whole window); control markers are not
   text. A clip of 30 s or less keeps the no-timestamps decoding (its verified text is unchanged: whisper_verify PASS). Checks:
-  t/66 with a 37.6 s clip (the sentence six times, 0.5 s apart): the sentence six times, 127 text tokens. Open: no temperature
-  fallback (a repeat loop in a window is not caught), the timestamp rules are not forced (the decoder's own choices).
+  t/66 with a 37.6 s clip (the sentence six times, 0.5 s apart): the sentence six times, 127 text tokens. The temperature
+  fallback is item 11 (done 2026-11-15). Open: the timestamp rules are not forced (the decoder's own choices).
 - W1 whisper long-form: audio over 30 s is cut at the quietest point before each 30 s window and the texts joined. (Replaced
   by W4 below.)
 - W2 translate: `task` translate (the `<|translate|>` token in the prompt) through the endpoint.
