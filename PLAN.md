@@ -31,15 +31,38 @@ Open work, in the order to take it. Each item names its state and the next concr
    point at the non-block tensors' sensitivity; not chased).
 4. **ComfyUI backend** (milestone 1 next: the component API, verified on sd-turbo). `/comfyui` is mounted again
    (28 files, about 167 GB, 7.9 GB free: converting to GGUF needs space on `/data`).
-5. **Audio** (2026-11-14; S1 and S2 in the audio section). Done: long texts in pieces, the speech pulled per piece (other
-   requests between them), wav / pcm / flac and stream for wav and pcm. Open, in order: (a) device frame (U3, U4: 23 ms per frame from 37; open: the matvec kernels at 175 to 206 GB/s
-   against 256, and the sampler on the device); (b) whisper
-   long-form (W4, done 2026-11-15: the seek rule and previous-text conditioning; open: temperature fallback, no forced timestamp rules);
-   (b2) the codec's reference frames decoded on every request (U5: 298 frames for a 204-frame voice, ~5 s of a ~8.7 s request;
-   done 2026-11-15, U6: the decoder's state cached per voice, exact);
-   (c) whisper GPU path (the encoder's matmuls through sddev); (d) vision tower GPU path (V3 onwards); (e) torch-identical
-   sampled frames: not started (the engine's sampler is its own generator; a bit match needs torch's CPU RNG path).
-   mp3 / opus / aac: not built (no encoder in the image).
+5. **Audio: closed 2026-11-15** (functionally complete; the audio section above has the details). Speech: voices from
+   audio, long texts in pieces, pulled per piece, wav / pcm / flac and stream for wav and pcm, the codec's reference
+   state and the talker's voice prefix cached per voice. Transcription: long-form by the Whisper seek rule (W4). Open
+   items moved to the new list below.
+
+## ▶ Next (audio closed; the new list, 2026-11-15)
+
+Performance:
+6. **Prompt prefill on the GPU.** The voice's prefix is cached (U7), but each request still runs its own rows on the
+   host (about 0.5 s for a 204-frame voice). Start: the rows through qmatvec's batched BF16 GEMM, then the causal
+   attention for several rows on the device.
+7. **Matvec kernels to ~230 GB/s.** The predictor and talker stacks run at 175-206 GB/s (U4). Start from the ablation
+   benchmark (`bench_stack`, not committed: recreate from the U4 notes) and the access-pattern results.
+8. **Sampler on the device.** The predictor's 15 syncs per frame are the sampler's: the top-k draw on the device would
+   remove them (the RNG is splitmix, a fixed function).
+9. **Codec decoder on the GPU.** About 1.3 s of a 94-frame speech request on the CPU (U5/U6); the convolutions and the
+   transposed ones are the cost (both on the CPU now).
+10. **Whisper on the GPU.** The encoder's and decoder's matmuls through sddev (whisper-tiny is small: measure first).
+
+Quality and scope (decisions):
+11. **Whisper temperature fallback.** A repetition loop in one window is not caught (W4). Implement the standard rule:
+    retry the window at a higher temperature when the compression ratio or the average log-probability is out of range.
+12. **Prosody across speech pieces.** Each sentence piece is a separate talker run (pieces joined with 0.2 s of silence),
+    so the prosody restarts at each piece. Decide: keep, or condition each piece on the previous one's frames.
+13. **mp3, opus and aac.** Refused with 400 (no encoder in the image). Decide: add an encoder to the image, or keep refusing.
+
+Not planned:
+14. **Torch-identical sampled frames.** The engine's sampler is its own generator (splitmix); a bit match would need torch's
+    CPU random path. The product does not need it: greedy frames match qwen-tts exactly.
+
+Vision (multimodal, not audio):
+15. **Vision tower on the GPU** (V3 onwards: the host float32 ViT). Start after 6-10 if the vision track is picked up.
 
 Earlier list (2026-11-13), kept for reference:
 
