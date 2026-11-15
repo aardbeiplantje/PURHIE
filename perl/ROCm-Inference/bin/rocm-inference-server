@@ -1878,7 +1878,7 @@ X-LLamaCPP-Id-slot header of the opencode fixups). See L<ROCm::Inference::Log>.
 
 C<POST /v1/audio/transcriptions> (with C<--whisper>): a C<multipart/form-data> body with the audio in the part C<file>
 (a WAV: PCM 8, 16, 24 or 32 bits, or 32-bit float, any channels and rate; any length: clips over 30 s are transcribed in
-windows, each cut at a quiet point), and the parts C<language> (a code such as C<en>, the default; the model's languages),
+windows, seek at the last complete segment, each window conditioned on the text so far), and the parts C<language> (a code such as C<en>, the default; the model's languages),
 C<task> (C<transcribe>, the default, or C<translate>: into English) and C<response_format> (C<json>, the default,
 C<{"text": ...}>; or C<text>, the plain text). C<model> is accepted and ignored. The text has no leading or trailing space.
 

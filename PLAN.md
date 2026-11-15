@@ -493,7 +493,15 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   1.2 s. All TTS verifiers pass on the BF16 talker (qwen3tts_verify, speaker_verify, speech verify, the codec's
   encode and decode). The F32 talker stays at /data/audio-ref/tts/qwen3tts-talker-f32.gguf (3.6 GB). Open: the whisper
   and vision host kernels still use the old loops (U1), the GPU path (U2).
-- W1 whisper long-form: audio over 30 s is cut at the quietest point before each 30 s window and the texts joined.
+- W4 whisper long-form by the seek rule (2026-11-15, the open item of W1/W3): a clip over 30 s is decoded as Whisper's
+  sequential decoding: each window (at most 30 s from seek) with timestamps, conditioned on the previous text (<|startofprev|>
+  and its last 224 tokens); seek moves to the end of the last complete segment (consecutive timestamps close one; a window
+  ending in an open segment moves seek to its last timestamp; no timestamps: the whole window); control markers are not
+  text. A clip of 30 s or less keeps the no-timestamps decoding (its verified text is unchanged: whisper_verify PASS). Checks:
+  t/66 with a 37.6 s clip (the sentence six times, 0.5 s apart): the sentence six times, 127 text tokens. Open: no temperature
+  fallback (a repeat loop in a window is not caught), the timestamp rules are not forced (the decoder's own choices).
+- W1 whisper long-form: audio over 30 s is cut at the quietest point before each 30 s window and the texts joined. (Replaced
+  by W4 below.)
 - W2 translate: `task` translate (the `<|translate|>` token in the prompt) through the endpoint.
 - W3 other languages: a French and a Chinese clip (qwen-tts speech, the Whisper reference from transformers) with the
   engine's tokens equal to transformers' greedy tokens under the same language token.

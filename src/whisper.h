@@ -48,8 +48,8 @@ int whisper_token_id(const whisper_model_t* model, const char* text);
 int whisper_transcribe(whisper_model_t* model, const float* samples, size_t n, const char* language, char* text,
                        size_t text_len);
 
-/* The same for clips of any length (long-form, PLAN.md W1): windows of at most 30 s, each cut at a quiet point of its last
- * 10 s, the texts joined. task: "transcribe" (the language's own text) or "translate" (into English, the <|translate|>
+/* The same for clips of any length (long-form, PLAN.md W1): Whisper's sequential decoding: windows of at most 30 s, decoded
+ * with timestamps and conditioned on the text so far; seek moves to the end of the last complete segment, the texts joined. task: "transcribe" (the language's own text) or "translate" (into English, the <|translate|>
  * token), NULL for transcribe. Returns the total tokens, or -1. */
 int whisper_transcribe_task(whisper_model_t* model, const float* samples, size_t n, const char* language, const char* task,
                             char* text, size_t text_len);

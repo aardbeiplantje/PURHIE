@@ -1,4 +1,4 @@
-# Whisper beyond the English clip (PLAN.md W1-W3): long-form audio (windows of 30 s cut at quiet points) and the translate
+# Whisper beyond the English clip (PLAN.md W1-W3): long-form audio (windows of 30 s, the timestamp seek) and the translate
 # task, against the transformers references. Env-gated; without the variables the file skips.
 #   ROCM_INFERENCE_TEST_WHISPER   a Whisper GGUF (rocm-convert of a multilingual checkpoint: whisper-tiny)
 #   ROCM_INFERENCE_TEST_LONG_WAV  a WAV of the English clip repeated (over 30 s; text: ROCM_INFERENCE_TEST_LONG_COUNT x the sentence)

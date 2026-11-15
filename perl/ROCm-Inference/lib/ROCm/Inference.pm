@@ -538,7 +538,7 @@ sub new {
 }
 
 # $w->transcribe($wav, language => 'en', task => 'transcribe' | 'translate'): any length of audio (long-form: windows of
-# 30 s, cut at quiet points); the text in UTF-8
+# 30 s, decoded with timestamps and conditioned on the text so far, seek at the last complete segment); the text in UTF-8
 sub transcribe {
     my ($w, $wav, %o) = @_;
     my ($text, $n) = ROCm::Inference::_whisper_transcribe($w->{h}, $wav, $o{language}, $o{task});

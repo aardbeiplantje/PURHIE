@@ -501,21 +501,94 @@ static int transcribe_window(whisper_model_t* m, const float* samples, size_t n,
     return k;
 }
 
-// Where a long clip is cut: the quietest 0.1 s frame in the last 10 s of a 30 s window (so no word is cut mid-way when the
-// clip has a pause there), or the window's end when the clip has no pause before it.
-static size_t quiet_cut(const float* x, size_t n, size_t begin, size_t end) {
-    const size_t frame = 1600;  // 0.1 s at 16 kHz
-    size_t best = end;
-    double best_e = INFINITY;
-    for (size_t f = begin; f + frame <= end; f += frame) {
-        double e = 0.0;
-        for (size_t i = f; i < f + frame; ++i) e += (double)x[i] * x[i];
-        if (e < best_e) {
-            best_e = e;
-            best = f + frame / 2;
-        }
+// The text of token ids (the tokenizer's detokenization; the buffer grows to fit)
+static std::string detok(whisper_model_t* m, const std::vector<int>& ids) {
+    if (ids.empty()) return std::string();
+    std::vector<char> buf(64 + 8 * ids.size());
+    int len = tokenizer_detokenize(m->tok, const_cast<int*>(ids.data()), (int)ids.size(), buf.data(), (int)buf.size());
+    if (len < 0) throw std::runtime_error("whisper: detokenize failed");
+    if ((size_t)len >= buf.size()) {
+        buf.assign((size_t)len + 1, 0);
+        len = tokenizer_detokenize(m->tok, const_cast<int*>(ids.data()), (int)ids.size(), buf.data(), (int)buf.size());
     }
-    return std::min(best, n);
+    if (len < 0) throw std::runtime_error("whisper: detokenize failed");
+    return std::string(buf.data(), (size_t)len);
+}
+
+// The long form (a clip over 30 s), as Whisper's sequential decoding: each window (at most 30 s from seek) is decoded WITH
+// timestamps, conditioned on the previous text (<|startofprev|> and its last tokens, up to 224), and seek moves to the end
+// of the last complete segment of the window: a pair of timestamps (the consecutive ones) closes a segment. A window whose
+// output ends in an open segment moves seek to its last timestamp; a window with no pair of timestamps moves it by the
+// whole window. The last window (up to 30 s) is taken whole.
+struct WindowOut {
+    std::vector<int> text;  // the accepted text tokens (no timestamps)
+    size_t advance = 0;     // samples the seek moves by
+};
+
+static void transcribe_window_ts(whisper_model_t* m, const float* samples, size_t n, const std::string& lang, bool translate,
+                                 const std::vector<int>& prev, bool final_window, WindowOut& out) {
+    const int lang_id = whisper_token_id(m, lang.c_str());
+    const int task_id = whisper_token_id(m, translate ? "<|translate|>" : "<|transcribe|>");
+    const int startofprev = whisper_token_id(m, "<|startofprev|>");
+    const int ts_begin = whisper_token_id(m, "<|0.00|>");
+    if (lang_id < 0) throw std::runtime_error("whisper_transcribe: unknown language " + lang);
+    if (task_id < 0 || startofprev < 0 || ts_begin < 0) throw std::runtime_error("whisper: no timestamp or prev tokens in the vocabulary");
+    std::vector<int> prompt;
+    if (!prev.empty()) {
+        const size_t keep = std::min<size_t>(prev.size(), 224);
+        prompt.push_back(startofprev);
+        prompt.insert(prompt.end(), prev.end() - keep, prev.end());
+    }
+    prompt.push_back(m->sot);
+    prompt.push_back(lang_id);
+    prompt.push_back(task_id);
+
+    std::vector<float> mel((size_t)80 * WHISPER_N_FRAMES);
+    if (whisper_log_mel(samples, (int)n, 80, mel.data()) != 0) throw std::runtime_error("whisper_log_mel failed");
+    std::vector<float> enc((size_t)m->n_actx * m->n_astate);
+    if (whisper_encode(m, mel.data(), enc.data()) != 0) throw std::runtime_error(g_error);
+    const int room = m->n_tctx - (int)prompt.size() - 1;
+    std::vector<int> ids((size_t)std::max(1, room));
+    const int k = whisper_greedy(m, enc.data(), prompt.data(), (int)prompt.size(), (int)ids.size(), ids.data());
+    if (k < 0) throw std::runtime_error(g_error);
+    ids.resize((size_t)k);
+
+    auto is_ts = [&](int i) { return ids[(size_t)i] >= ts_begin; };
+    // the text: the vocabulary's tokens, not the control markers (the end of text and above) and not the timestamps
+    auto is_text = [&](int i) { return ids[(size_t)i] < m->eot; };
+    const size_t window_n = n;
+    // the segments: the consecutive timestamps close one (openai's rule), and a window ending on a timestamp closes its last one
+    std::vector<size_t> cuts;  // the token index after each pair of consecutive timestamps
+    for (int i = 1; i < k; ++i)
+        if (is_ts(i - 1) && is_ts(i)) cuts.push_back((size_t)i);
+    const bool single_end = k >= 2 && !is_ts(k - 2) && is_ts(k - 1);
+    out.text.clear();
+    if (!cuts.empty()) {
+        std::vector<size_t> slices = cuts;
+        if (single_end) slices.push_back((size_t)k);
+        size_t last = 0;
+        for (size_t cur : slices) {
+            for (size_t i = last; i < cur; ++i)
+                if (is_text((int)i)) out.text.push_back(ids[i]);
+            last = cur;
+        }
+        if (final_window) {  // the clip's end: an open tail is text too
+            for (size_t i = last; i < (size_t)k; ++i)
+                if (is_text((int)i)) out.text.push_back(ids[i]);
+            out.advance = window_n;
+        } else if (single_end) {
+            out.advance = window_n;
+        } else {
+            const size_t last_ts = (size_t)(ids[last - 1] - ts_begin);  // the window's last closed segment ends here (20 ms units)
+            out.advance = last_ts * 320;  // 0.02 s at 16 kHz
+        }
+    } else {
+        for (int i = 0; i < k; ++i)
+            if (is_text(i)) out.text.push_back(ids[(size_t)i]);
+        out.advance = window_n;
+    }
+    if (out.advance == 0) out.advance = window_n;  // (a seek always moves)
+    (void)translate;
 }
 
 int whisper_transcribe_task(whisper_model_t* m, const float* samples, size_t n, const char* language, const char* task,
@@ -525,20 +598,30 @@ int whisper_transcribe_task(whisper_model_t* m, const float* samples, size_t n, 
     if (task && !translate && std::string(task) != "transcribe") { g_error = "whisper_transcribe: task transcribe or translate"; return -1; }
     try {
         const std::string lang = std::string("<|") + (language && *language ? language : "en") + "|>";
-        // the clip in windows of at most 30 s: each window's end at a quiet point of its last 10 s
-        const size_t window = (size_t)WHISPER_CHUNK_SAMPLES, quiet_from = window - 10 * 16000;
         std::string all;
         int tokens = 0;
-        size_t pos = 0;
-        while (pos < n) {
-            size_t end = n - pos <= window ? n : pos + quiet_cut(samples + pos, n - pos, quiet_from, window);
-            if (end <= pos) end = std::min(n, pos + window);
+        if (n <= (size_t)WHISPER_CHUNK_SAMPLES) {  // one window: the prompt without timestamps (as before)
             std::string part;
-            const int k = transcribe_window(m, samples + pos, end - pos, lang, translate, part);
+            const int k = transcribe_window(m, samples, n, lang, translate, part);
             if (k < 0) return -1;
-            all += part;
-            tokens += k;
-            pos = end;
+            all = part;
+            tokens = k;
+        } else {
+            // the long form: seek through the clip, each window conditioned on the text so far
+            std::vector<int> prev;
+            size_t seek = 0;
+            while (seek < n) {
+                const size_t remain = n - seek;
+                const bool last = remain <= (size_t)WHISPER_CHUNK_SAMPLES;
+                const size_t len = last ? remain : (size_t)WHISPER_CHUNK_SAMPLES;
+                WindowOut w;
+                transcribe_window_ts(m, samples + seek, len, lang, translate, prev, last, w);
+                all += detok(m, w.text);
+                tokens += (int)w.text.size();
+                prev.insert(prev.end(), w.text.begin(), w.text.end());
+                if (prev.size() > 224) prev.erase(prev.begin(), prev.end() - 224);
+                seek += std::min(w.advance, remain);
+            }
         }
         if (all.size() + 1 > text_len) { g_error = "whisper_transcribe: the text does not fit"; return -1; }
         std::memcpy(text, all.data(), all.size());
