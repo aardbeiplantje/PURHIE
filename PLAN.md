@@ -589,7 +589,9 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   `tests/codec_after_verify.cpp` (`make build/codec_after_verify`): references of 1, 20, 74, 249, 250, 260 frames, a cache
   hit and a second reference, each bit-identical to the whole sequence's decode: PASS. The codec verifier and the speech
   verifier PASS. Timing (local, BF16 talker, 40 frames of made-from-clip): speak 3.3 s -> 2.1 s on a cache hit (the first
-  call 4.6 s, with the reference decoded).
+  call 4.6 s, with the reference decoded). The server (rocm-hip 4a1f52f, the 204-frame voice): the first request 11.2 s (the
+  reference decoded), the next 5.6 s (was 8.7 s), both byte-identical to the earlier output. Open: the talker's prefill (0.74 s
+  in the container) is per request; a voice's prefix could be cached like the decoder's state.
 - U1 threads: the host matmuls and convolutions run on the 16 cores (OpenMP over output rows); real-time factors
   measured for the speech (talker frames per second) and the transcription (seconds of audio per second).
 - U2 GPU path (UMA: the GGUF map is pinned, so the GPU reads the same pages): decided after U1 by the measured split;
