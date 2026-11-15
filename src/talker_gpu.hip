@@ -370,12 +370,11 @@ tk_gemm(const uint16_t *W, const float *X, float *Y, int K, int N, int T) {
     }
 }
 
-// The codebook sampler on the device (qwen3tts.cpp's sample_token, in the device's order): the top_k most likely of the n
-// logits, by (logit descending, index ascending) (top_k 0: all n), drawn from their softmax at the temperature with the
-// splitmix state in *state (advanced once, as the host's); temperature <= 0: the first maximum. One block of 1024 threads
-// sorts the logits in LDS (a bitonic network; n <= TK_SMAX). The token goes to *tok_out. With next, the token's row of the
-// table (BF16 [rows][C]) goes to row (the predictor's next input) and *pos advances (the predictor's next stack reads it).
-#define TK_SMAX 2048
+// The samplers on the device (qwen3tts.cpp's sample_token, in the device's order): the top_k most likely of the n logits, by
+// (logit descending, index ascending) (top_k 0: all n), drawn from their softmax at the temperature with the splitmix state
+// in *state (advanced once, as the host's); temperature <= 0: the first maximum. One block of 1024 threads sorts the logits
+// in LDS (a bitonic network; n <= TK_SMAX).
+#define TK_SMAX 4096
 
 __device__ __forceinline__ bool tk_before(float va, int ia, float vb, int ib) { return va > vb || (va == vb && ia < ib); }
 
@@ -386,21 +385,9 @@ __device__ __forceinline__ uint64_t tk_next_u64(uint64_t *state) {
     return z ^ (z >> 31);
 }
 
-extern "C" __global__ void __launch_bounds__(1024)
-tk_sample_next(const float *logits, int n, float temperature, int top_k, uint64_t *state, int *tok_out,
-               const uint16_t *table, int C, float *row, int *pos, int next) {
-    __shared__ float sv[TK_SMAX], ev[TK_SMAX];
-    __shared__ int si[TK_SMAX];
-    __shared__ int tok_s;
-    const int tid = threadIdx.x;
-    int NP = 1;
-    while (NP < n) NP <<= 1;
-    for (int i = tid; i < NP; i += 1024) {
-        sv[i] = i < n ? logits[i] : -INFINITY;
-        si[i] = i < n ? i : 0x7fffffff;
-    }
-    __syncthreads();
-    // the bitonic sort into the "before" order: sv[0] is the largest, ties the lowest index
+// sv / si [NP] (NP a power of two; filled, with a barrier after) sorted into the "before" order: sv[0] is the largest,
+// ties the lowest index (a bitonic network, a barrier after each round)
+__device__ __forceinline__ void tk_sort(float *sv, int *si, int NP, int tid) {
     for (int k = 2; k <= NP; k <<= 1)
         for (int j = k >> 1; j > 0; j >>= 1) {
             for (int i = tid; i < NP; i += 1024) {
@@ -420,6 +407,11 @@ tk_sample_next(const float *logits, int n, float temperature, int top_k, uint64_
             }
             __syncthreads();
         }
+}
+
+// the draw from the sorted logits (after tk_sort): thread 0 leaves the token in *tok_s; ends with a barrier
+__device__ __forceinline__ void tk_draw(const float *sv, const int *si, float *ev, int n, float temperature, int top_k,
+                                        uint64_t *state, int tid, int *tok_s) {
     const bool draw = temperature > 0.0f && sv[0] > -INFINITY;
     const int K = (top_k > 0 && top_k < n) ? top_k : n;
     if (draw)
@@ -444,10 +436,30 @@ tk_sample_next(const float *logits, int n, float temperature, int top_k, uint64_
                 }
             }
         }
-        tok_s = tok;
-        *tok_out = tok;
+        *tok_s = tok;
     }
     __syncthreads();
+}
+
+// A codebook of the code predictor: the token of logits [n] goes to *tok_out. With next, the token's row of the table
+// (BF16 [rows][C]) goes to row (the predictor's next input) and *pos advances (the predictor's next stack reads it).
+extern "C" __global__ void __launch_bounds__(1024)
+tk_sample_next(const float *logits, int n, float temperature, int top_k, uint64_t *state, int *tok_out,
+               const uint16_t *table, int C, float *row, int *pos, int next) {
+    __shared__ float sv[TK_SMAX], ev[TK_SMAX];
+    __shared__ int si[TK_SMAX];
+    __shared__ int tok_s;
+    const int tid = threadIdx.x;
+    int NP = 1;
+    while (NP < n) NP <<= 1;
+    for (int i = tid; i < NP; i += 1024) {
+        sv[i] = i < n ? logits[i] : -INFINITY;
+        si[i] = i < n ? i : 0x7fffffff;
+    }
+    __syncthreads();
+    tk_sort(sv, si, NP, tid);
+    tk_draw(sv, si, ev, n, temperature, top_k, state, tid, &tok_s);
+    if (tid == 0) *tok_out = tok_s;
     if (next) {
         const uint16_t *src = table + (size_t)tok_s * C;
         for (int i = tid; i < C; i += 1024) row[i] = tk_bf16(src[i]);
@@ -455,9 +467,42 @@ tk_sample_next(const float *logits, int n, float temperature, int top_k, uint64_
     }
 }
 
-// row = table[tok] (BF16 [rows][C]) as floats, and *pos advances: the predictor's first input is the codec embedding of c0
-extern "C" __global__ void __launch_bounds__(256) tk_gather_row(const uint16_t *table, int tok, int C, float *row, int *pos) {
-    const uint16_t *src = table + (size_t)tok * C;
+// The talker's first codebook (c0) of a frame: the logits [n] processed as qwen-tts does (the repetition penalty once per
+// token already drawn: seen [n] flags; the range from sup_lo suppressed except eos; eos suppressed too unless allow_eos),
+// then the draw. The token goes to *tok_out and its seen flag is set; *ppos is reset (the code predictor's position for
+// the frame that follows).
+extern "C" __global__ void __launch_bounds__(1024)
+tk_sample_c0(const float *logits, int n, float temperature, int top_k, uint64_t *state, int *tok_out, int *seen, float rep,
+             int sup_lo, int eos, int allow_eos, int *ppos) {
+    __shared__ float sv[TK_SMAX], ev[TK_SMAX];
+    __shared__ int si[TK_SMAX];
+    __shared__ int tok_s;
+    const int tid = threadIdx.x;
+    int NP = 1;
+    while (NP < n) NP <<= 1;
+    for (int i = tid; i < NP; i += 1024) {
+        const int ii = i < n ? i : n - 1;  // (the loads are unconditional)
+        float l = logits[ii];
+        const int was = seen[ii];
+        if (was) l = l < 0.0f ? l * rep : l / rep;
+        if (i >= n || (ii >= sup_lo && ii != eos) || (ii == eos && !allow_eos)) l = -INFINITY;
+        sv[i] = l;
+        si[i] = i < n ? i : 0x7fffffff;
+    }
+    __syncthreads();
+    tk_sort(sv, si, NP, tid);
+    tk_draw(sv, si, ev, n, temperature, top_k, state, tid, &tok_s);
+    if (tid == 0) {
+        *tok_out = tok_s;
+        seen[tok_s] = 1;
+        *ppos = 0;
+    }
+}
+
+// row = table[*tok] (BF16 [rows][C]) as floats, and *pos advances: the predictor's second input is the codec embedding of
+// c0 (the token is read on the device: c0 is drawn there)
+extern "C" __global__ void __launch_bounds__(256) tk_gather_row(const uint16_t *table, const int *tok, int C, float *row, int *pos) {
+    const uint16_t *src = table + (size_t)(*tok) * C;
     for (int i = threadIdx.x; i < C; i += blockDim.x) row[i] = tk_bf16(src[i]);
     if (threadIdx.x == 0) *pos += 1;
 }

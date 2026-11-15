@@ -1,9 +1,10 @@
-// talker_sample_verify: the code predictor's sampler on the device (talker_gpu.hip's tk_sample_next and tk_gather_row) against
+// talker_sample_verify: the samplers on the device (talker_gpu.hip's tk_sample_next, tk_sample_c0 and tk_gather_row) against
 // a host reference of the same rule: the top_k most likely of the logits by (logit descending, index ascending) (top_k 0:
 // all), the draw from their float softmax at the temperature with the cumulative sum in double, the splitmix state advanced
 // once per draw (temperature <= 0: the first maximum, no draw). Checks 3000 random rows (vocabularies 2048, 2000, 100, 7, 1;
 // temperatures 0, 0.7, 1, 1.3; top_k 0, 1, 50, 2; ties and -inf entries), the advanced state, the position's increment and
-// the gathered row (BF16 to float).
+// the gathered row (BF16 to float); then 600 rows of the first codebook's draw (3072 logits: the repetition penalty on the
+// seen tokens, the suppressed range except eos, eos allowed or not, the token's seen flag, the position's reset).
 //
 //   talker_sample_verify [talker_gpu.co]   (default build/co/talker_gpu.co, the kernel object of the make target)
 #include <hip/hip_runtime.h>
@@ -71,8 +72,9 @@ int main(int argc, char** argv) {
     const char* co = argc > 1 ? argv[1] : "build/co/talker_gpu.co";
     hipModule_t mod;
     CHECK(hipModuleLoad(&mod, co));
-    hipFunction_t fs, fg;
+    hipFunction_t fs, fg, fc;
     CHECK(hipModuleGetFunction(&fs, mod, "tk_sample_next"));
+    CHECK(hipModuleGetFunction(&fc, mod, "tk_sample_c0"));
     CHECK(hipModuleGetFunction(&fg, mod, "tk_gather_row"));
 
     const int C = 1024, ROWS = 2048;
@@ -151,15 +153,81 @@ int main(int argc, char** argv) {
                             got, st_after == st_host ? "equal" : "differs", pos_after);
         }
     }
-    // the gather alone (tk_gather_row): a row of the table as floats, and the position advances
+    // the first codebook's draw (tk_sample_c0) against the host's processing of the logits, then the same reference draw
+    int c0_trials = 0, c0_fails = 0;
+    {
+        const int n = 3072, sup_lo = n - 1024;
+        int* d_seen;
+        float* d_lg3;
+        CHECK(hipMalloc(&d_seen, n * sizeof(int)));
+        CHECK(hipMalloc(&d_lg3, n * sizeof(float)));
+        for (int trial = 0; trial < 600; ++trial) {
+            const float T = Ts[trial % 4];
+            const int top_k = tks[(trial / 4) % 4];
+            const float rep = trial % 3 == 0 ? 1.05f : 1.3f;
+            const int eos = sup_lo + (int)(rng() % 1024);
+            const int allow_eos = (trial / 2) % 2;
+            std::vector<float> lg(n);
+            for (int i = 0; i < n; ++i) lg[i] = nd(rng);
+            if (trial % 7 == 3)
+                for (int i = 0; i < n; ++i) lg[i] = std::round(lg[i]);
+            if (trial % 5 == 0) lg[eos] = 20.0f;  // eos the most likely: drawn when allowed, never when not
+            std::vector<int> seen(n, 0);
+            const int n_seen = (int)(rng() % 200);
+            for (int i = 0; i < n_seen; ++i) seen[rng() % n] = 1;
+            std::vector<float> pl(lg);
+            for (int i = 0; i < n; ++i)
+                if (seen[i]) pl[i] = pl[i] < 0.0f ? pl[i] * rep : pl[i] / rep;
+            for (int v = sup_lo; v < n; ++v)
+                if (v != eos) pl[v] = -INFINITY;
+            if (!allow_eos) pl[eos] = -INFINITY;
+            uint64_t st_host = rng(), st_dev = st_host;
+            const int want = ref_sample(pl, T, top_k, st_host);
+            const int pos = 9;
+            CHECK(hipMemcpy(d_lg3, lg.data(), n * sizeof(float), hipMemcpyHostToDevice));
+            CHECK(hipMemcpy(d_seen, seen.data(), n * sizeof(int), hipMemcpyHostToDevice));
+            CHECK(hipMemcpy(d_state, &st_dev, sizeof(uint64_t), hipMemcpyHostToDevice));
+            CHECK(hipMemcpy(d_pos, &pos, sizeof(int), hipMemcpyHostToDevice));
+            float* lgp = d_lg3;
+            uint64_t* stp = d_state;
+            int *tokp = d_tok, *seenp = d_seen, *posp = d_pos;
+            void* args[] = {(void*)&lgp, (void*)&n, (void*)&T, (void*)&top_k, (void*)&stp, (void*)&tokp, (void*)&seenp,
+                            (void*)&rep, (void*)&sup_lo, (void*)&eos, (void*)&allow_eos, (void*)&posp};
+            CHECK(hipModuleLaunchKernel(fc, 1, 1, 1, 1024, 1, 1, 0, nullptr, args, nullptr));
+            CHECK(hipDeviceSynchronize());
+            int got = -1, pos_after = -1;
+            uint64_t st_after = 0;
+            std::vector<int> seen_after(n);
+            CHECK(hipMemcpy(&got, d_tok, sizeof(int), hipMemcpyDeviceToHost));
+            CHECK(hipMemcpy(&st_after, d_state, sizeof(uint64_t), hipMemcpyDeviceToHost));
+            CHECK(hipMemcpy(&pos_after, d_pos, sizeof(int), hipMemcpyDeviceToHost));
+            CHECK(hipMemcpy(seen_after.data(), d_seen, n * sizeof(int), hipMemcpyDeviceToHost));
+            if (want >= 0 && want < n) seen[want] = 1;
+            const bool ok = got == want && st_after == st_host && pos_after == 0 && seen_after == seen &&
+                            (allow_eos || got != eos);
+            c0_trials++;
+            if (!ok) {
+                c0_fails++;
+                if (c0_fails <= 10)
+                    std::printf("c0 trial %d T %.1f top_k %d eos %d (%s): want %d got %d, state %s, position %d\n", trial, T, top_k,
+                                eos, allow_eos ? "allowed" : "suppressed", want, got, st_after == st_host ? "equal" : "differs",
+                                pos_after);
+            }
+        }
+        (void)hipFree(d_seen);
+        (void)hipFree(d_lg3);
+        std::printf("first codebook: %d rows, %d mismatches %s\n", c0_trials, c0_fails, c0_fails ? "FAIL" : "ok");
+        fails += c0_fails;
+    }
+    // the gather alone (tk_gather_row): the row of the token on the device as floats, and the position advances
     {
         const int tok = 777, pos = 3, C_ = C;
-        int tokv = tok;
         uint16_t* tabp = d_table;
         float* rowp = d_row;
-        int* posp = d_pos;
+        int *posp = d_pos, *tokp = d_tok;
         CHECK(hipMemcpy(d_pos, &pos, sizeof(int), hipMemcpyHostToDevice));
-        void* args[] = {(void*)&tabp, (void*)&tokv, (void*)&C_, (void*)&rowp, (void*)&posp};
+        CHECK(hipMemcpy(d_tok, &tok, sizeof(int), hipMemcpyHostToDevice));
+        void* args[] = {(void*)&tabp, (void*)&tokp, (void*)&C_, (void*)&rowp, (void*)&posp};
         CHECK(hipModuleLaunchKernel(fg, 1, 1, 1, 256, 1, 1, 0, nullptr, args, nullptr));
         CHECK(hipDeviceSynchronize());
         std::vector<float> row(C);

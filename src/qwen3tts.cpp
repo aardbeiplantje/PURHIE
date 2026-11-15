@@ -599,7 +599,7 @@ hipFunction_t f_qkv = nullptr, f_qk = nullptr, f_attn = nullptr, f_oproj = nullp
               f_head = nullptr;
 hipFunction_t f_rms_rows = nullptr, f_qk_rows = nullptr, f_attn_rows = nullptr, f_add_rows = nullptr, f_silu2 = nullptr,
               f_gemm = nullptr;
-hipFunction_t f_sample = nullptr, f_gather = nullptr;  // the codebook sampler and the row gather (talker_gpu.hip)
+hipFunction_t f_sample = nullptr, f_sample_c0 = nullptr, f_gather = nullptr;  // the samplers and the row gather (talker_gpu.hip)
 hipStream_t stream = nullptr;  // the run's stream (graph capture needs one: not the null stream)
 
 bool load() {
@@ -607,11 +607,11 @@ bool load() {
     if (kernel_module_load(&mod, "talker_gpu.co") != hipSuccess) return false;
     hipFunction_t* fns[] = {&f_qkv,    &f_qk,       &f_attn,   &f_oproj,  &f_gateup,   &f_down,
                             &f_head,   &f_rms_rows, &f_qk_rows, &f_attn_rows, &f_add_rows, &f_silu2, &f_gemm,
-                            &f_sample, &f_gather};
+                            &f_sample, &f_sample_c0, &f_gather};
     const char* names[] = {"tk_qkv",     "tk_qk_rope_kv", "tk_attn", "tk_oproj_add", "tk_gateup", "tk_down_add",
                            "tk_head",    "tk_rms_rows",   "tk_qk_rows", "tk_attn_rows", "tk_add_rows", "tk_silu_mul2",
-                           "tk_gemm",    "tk_sample_next", "tk_gather_row"};
-    for (int i = 0; i < 15; ++i)
+                           "tk_gemm",    "tk_sample_next", "tk_sample_c0", "tk_gather_row"};
+    for (int i = 0; i < 16; ++i)
         if (hipModuleGetFunction(fns[i], mod, names[i]) != hipSuccess) return false;
     return true;
 }
@@ -686,6 +686,7 @@ const char* kernel_name(hipFunction_t f) {
     if (f == f_down) return "tk_down_add";
     if (f == f_head) return "tk_head";
     if (f == f_sample) return "tk_sample_next";
+    if (f == f_sample_c0) return "tk_sample_c0";
     if (f == f_gather) return "tk_gather_row";
     return "?";
 }
@@ -770,7 +771,7 @@ void head(const float* x, const float* norm_w, const Mat& W, float eps, int C, f
 void sample_next(const float* logits, int n, float temperature, int top_k, uint64_t* state, int* tok_out, const Mat& table,
                  float* row, int* pos, bool next) {
     if (!table.h) throw std::runtime_error("qwen3tts device: a table is not BF16");
-    if (n > 2048) throw std::runtime_error("qwen3tts device: the sampler's vocabulary is over 2048");
+    if (n > 4096) throw std::runtime_error("qwen3tts device: the sampler's vocabulary is over 4096");
     const uint16_t* Th = table.h;
     const int C = table.cols, nx = next ? 1 : 0;
     const float* lg = logits;
@@ -779,13 +780,26 @@ void sample_next(const float* logits, int n, float temperature, int top_k, uint6
     launch(f_sample, 1, 1024, 0, args);
 }
 
-// row = table[tok] as floats, and *pos advances (talker_gpu.hip's tk_gather_row): the predictor's first input is c0's embedding
-void gather_row(const Mat& table, int tok, float* row, int* pos) {
+// row = table[*tok] as floats, and *pos advances (talker_gpu.hip's tk_gather_row): the predictor's second input is the codec
+// embedding of c0, which is drawn on the device
+void gather_row(const Mat& table, const int* tok, float* row, int* pos) {
     if (!table.h) throw std::runtime_error("qwen3tts device: a table is not BF16");
     const uint16_t* Th = table.h;
     const int C = table.cols;
     void* args[] = {(void*)&Th, (void*)&tok, (void*)&C, (void*)&row, (void*)&pos};
     launch(f_gather, 1, 256, 0, args);
+}
+
+// the frame's first codebook on the device (talker_gpu.hip's tk_sample_c0): the talker's logits [n] with the repetition
+// penalty (seen [n]: the tokens drawn so far), the range from sup_lo suppressed except eos, eos allowed or not; the token
+// to *tok_out (its seen flag set), *ppos reset for the predictor
+void sample_c0(const float* logits, int n, float temperature, int top_k, uint64_t* state, int* tok_out, int* seen, float rep,
+               int sup_lo, int eos, bool allow_eos, int* ppos) {
+    if (n > 4096) throw std::runtime_error("qwen3tts device: the sampler's vocabulary is over 4096");
+    const int ae = allow_eos ? 1 : 0;
+    void* args[] = {(void*)&logits, (void*)&n, (void*)&temperature, (void*)&top_k, (void*)&state, (void*)&tok_out,
+                    (void*)&seen, (void*)&rep, (void*)&sup_lo, (void*)&eos, (void*)&ae, (void*)&ppos};
+    launch(f_sample_c0, 1, 1024, 0, args);
 }
 
 // The prefill (the talker's prompt rows through the layers, on the device): the batched forms of the decode step's kernels.
@@ -1350,7 +1364,7 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
                                    &P, trailing.data(), maxT, &nt, pad.data()) != 0)
             return -1;
         const int maxL = P + max_frames + 1;
-        const bool dev_on = gpu::ready() && m->gpu_base && m->pvocab <= 2048 && dev::load();  // (the sampler's limit)
+        const bool dev_on = gpu::ready() && m->gpu_base && m->pvocab <= 4096 && V <= 4096 && dev::load();  // (the samplers' limit)
         m->last_gpu = dev_on ? 1 : 0;
         if (dev_on && pd.C != C) throw std::runtime_error("qwen3tts device: the predictor's width is not the talker's");
         // one fused talker on the device at a time: the runs share stream 0 and each syncs it (the host's runs are not held)
@@ -1378,16 +1392,18 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
         dev::Work work{};
         int* pos_dev = nullptr;  // the position of the step on the device (the kernels read it)
         uint64_t* rng_dev = nullptr;  // the predictor's sampler state on the device (splitmix, as the host's rng)
-        int* frame_dev = nullptr;     // the frame's codes, written on the device (the predictor's samples)
+        int* frame_dev = nullptr;     // the frame's codes, written on the device (c0 and the predictor's samples)
+        int* ppos_dev = nullptr;      // the code predictor's position (reset by c0's draw, advanced by its kernels)
+        int* seen_dev = nullptr;      // [V] flags: the c0 tokens drawn so far (the repetition penalty's set)
         float* pxa = nullptr;    // the prefill's rows on the device (the arena), with their buffers
         dev::PrefillBuf pb;
         if (dev_on) {
             const int mxC = std::max(C, pd.C), mxHD = std::max(HD, pHD), mxKD = std::max(KD, pKD), mxFF = std::max(d.FF, pd.FF);
             const size_t floats = (size_t)2 * m->n_layer * maxL * KD + (size_t)2 * m->pn_layer * (ncb + 1) * pKD +
                                   (size_t)maxL * (d.D / 2) * 2 + (size_t)(ncb + 1) * (pd.D / 2) * 2 +
-                                  (size_t)(3 * C + V + m->pvocab + 2 * mxC + mxC + C) + (size_t)(2 * mxKD + 2 * mxHD + mxFF) + 1 + 2 + (size_t)ncb +
+                                  (size_t)(3 * C + V + m->pvocab + 2 * mxC + mxC + C) + (size_t)(2 * mxKD + 2 * mxHD + mxFF) + 1 + 2 + (size_t)ncb + 1 + (size_t)V +
                                   (size_t)P * (3 * C + 2 * HD + 2 * KD + 2 * d.FF);  // the prefill's rows (P at most)
-            const size_t slack_allocs = (size_t)2 * m->n_layer + 2 * m->pn_layer + 4 + 14 + 8 + 1 + 9 + 2;
+            const size_t slack_allocs = (size_t)2 * m->n_layer + 2 * m->pn_layer + 4 + 14 + 8 + 1 + 9 + 4;
             if (!arena.open(floats * sizeof(float) + 256 * slack_allocs + 4096)) throw std::runtime_error("qwen3tts device: arena");
             for (int l = 0; l < m->n_layer; ++l) {
                 kc[l] = arena.alloc((size_t)maxL * KD);
@@ -1402,10 +1418,10 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
             prcs = arena.alloc((size_t)(ncb + 1) * (pd.D / 2));
             prsn = arena.alloc((size_t)(ncb + 1) * (pd.D / 2));
             xrow = arena.alloc(C);
-            hid = arena.alloc(C);
             logits = arena.alloc(V);
             plogits = arena.alloc(m->pvocab);
             pin = arena.alloc(mxC);
+            hid = pin;  // the talker's head writes its normed output there: the predictor's first row
             pn = arena.alloc(pd.C);
             work.q = arena.alloc(mxHD);
             work.k = arena.alloc(mxKD);
@@ -1417,6 +1433,8 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
             pos_dev = reinterpret_cast<int*>(arena.alloc(1));
             rng_dev = reinterpret_cast<uint64_t*>(arena.alloc(2));
             frame_dev = reinterpret_cast<int*>(arena.alloc((size_t)ncb));
+            ppos_dev = reinterpret_cast<int*>(arena.alloc(1));
+            seen_dev = reinterpret_cast<int*>(arena.alloc((size_t)V));
             pxa = arena.alloc((size_t)P * C);
             pb.h = arena.alloc((size_t)P * C);
             pb.q = arena.alloc((size_t)P * HD);
@@ -1554,7 +1572,7 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
         };
         if (dev_on && !dev::ktimes) {
             devrun.gpred = capture([&]() {
-                for (int l = 0; l < m->pn_layer; ++l) dev::block(m->pblk[l], pd, pin, pkc[l], pvc[l], pos_dev, ncb + 1, prcs, prsn, work);
+                for (int l = 0; l < m->pn_layer; ++l) dev::block(m->pblk[l], pd, pin, pkc[l], pvc[l], ppos_dev, ncb + 1, prcs, prsn, work);
             });
             devrun.gtalk = capture([&]() {
                 for (int l = 0; l < m->n_layer; ++l) dev::block(m->blk[l], d, xrow, kc[l], vc[l], pos_dev, maxL, rcs, rsn, work);
@@ -1568,28 +1586,35 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
         auto pred_stack = [&]() {  // one token of the predictor at the device's position, through its layers (pin in place)
             const clk::time_point t0 = clk::now();
             run(devrun.gpred, [&]() {
-                for (int l = 0; l < m->pn_layer; ++l) dev::block(m->pblk[l], pd, pin, pkc[l], pvc[l], pos_dev, ncb + 1, prcs, prsn, work);
+                for (int l = 0; l < m->pn_layer; ++l) dev::block(m->pblk[l], pd, pin, pkc[l], pvc[l], ppos_dev, ncb + 1, prcs, prsn, work);
             });
             if (prof) t_issue += ms_since(t0);
         };
+        if (dev_on) {  // the device's sampler state: no token drawn yet, the run's seed
+            std::memset(seen_dev, 0, sizeof(int) * (size_t)V);
+            *rng_dev = rng;
+        }
         for (int t = 0; t < max_frames; ++t) {
             const clk::time_point t_frame = clk::now();
-            // the talker's logits, processed as qwen-tts does (repetition penalty, the suppressed range, the minimum)
-            std::vector<float> lg(logits, logits + V);
-            // (once per distinct token, as the transformers' processor: its scatter over the unique ids)
-            std::vector<int> seen(history);
-            std::sort(seen.begin(), seen.end());
-            seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
-            for (int h : seen) {
-                float& l = lg[h];
-                l = l < 0.0f ? l * s->repetition_penalty : l / s->repetition_penalty;
+            int c0 = -1;  // (the device path draws it on the device: frame_dev[0])
+            if (!dev_on) {
+                // the talker's logits, processed as qwen-tts does (repetition penalty, the suppressed range, the minimum)
+                std::vector<float> lg(logits, logits + V);
+                // (once per distinct token, as the transformers' processor: its scatter over the unique ids)
+                std::vector<int> seen(history);
+                std::sort(seen.begin(), seen.end());
+                seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
+                for (int h : seen) {
+                    float& l = lg[h];
+                    l = l < 0.0f ? l * s->repetition_penalty : l / s->repetition_penalty;
+                }
+                for (int v = V - 1024; v < V; ++v)
+                    if (v != eos) lg[v] = -INFINITY;
+                if (t < 2) lg[eos] = -INFINITY;
+                c0 = sample_token(lg.data(), V, s->temperature, s->top_k, &rng);
+                if (c0 == eos) break;
+                history.push_back(c0);
             }
-            for (int v = V - 1024; v < V; ++v)
-                if (v != eos) lg[v] = -INFINITY;
-            if (t < 2) lg[eos] = -INFINITY;
-            const int c0 = sample_token(lg.data(), V, s->temperature, s->top_k, &rng);
-            if (c0 == eos) break;
-            history.push_back(c0);
             const clk::time_point t_after_sample = clk::now();
             if (prof) t_samp += std::chrono::duration<double, std::milli>(t_after_sample - t_frame).count();
             // the code predictor: the rows H, E(c0), then each new codebook's embedding; the output row k gives codebook k
@@ -1620,28 +1645,28 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
                     }
                 }
             } else {
-                // the same on the device, with no sync per codebook: the position, the sampler's state and the codes are the
-                // device's (pos_dev, rng_dev, frame_dev); the stacks, the heads, the samples and the next rows are launches on
-                // the stream, and the host syncs once, for the frame's codes
-                std::memcpy(pin, hid, sizeof(float) * C);
-                *pos_dev = 0;
-                *rng_dev = rng;
-                frame_dev[0] = c0;
-                pred_stack();                                      // position 0: the talker's output (pin)
-                dev::gather_row(m->codec_embd, c0, pin, pos_dev);  // position 1: the codec embedding of c0
+                // the same on the device, with one sync per frame: the talker's graph of the previous step is still on the
+                // stream, so nothing here reads the device's memory before the sync. c0's draw (the logits' processing as
+                // above, on the device) resets the predictor's position; the stacks, the heads, the samples and the next
+                // rows follow as launches (the position, the sampler's state and the codes are the device's: ppos_dev,
+                // rng_dev, frame_dev). pin holds the talker's normed output (its head wrote it).
+                dev::sample_c0(logits, V, s->temperature, s->top_k, rng_dev, frame_dev, seen_dev, s->repetition_penalty,
+                               V - 1024, eos, t >= 2, ppos_dev);
+                pred_stack();                                             // position 0: the talker's output (pin)
+                dev::gather_row(m->codec_embd, frame_dev, pin, ppos_dev);  // position 1: the codec embedding of c0
                 pred_stack();
                 for (int k = 1; k < ncb; ++k) {
                     dev::head(pin, m->pred_out_norm, m->pred_head[k - 1].w, m->eps, pd.C, pn, plogits);
                     const bool next = k + 1 < ncb;  // the sample's row (codebook k's embedding) is the next stack's input
                     dev::sample_next(plogits, m->pvocab, s->sub_temperature, s->sub_top_k, rng_dev, frame_dev + k,
-                                     m->pred_embd[k - 1], pin, pos_dev, next);
+                                     m->pred_embd[k - 1], pin, ppos_dev, next);
                     if (next) pred_stack();
                 }
                 const clk::time_point tw = clk::now();
                 sync();
                 if (prof) t_head_wait += ms_since(tw);
-                for (int k = 1; k < ncb; ++k) frame[k] = frame_dev[k];
-                rng = *rng_dev;
+                for (int k = 0; k < ncb; ++k) frame[k] = frame_dev[k];
+                if (frame[0] == eos) break;  // (the predictor ran for nothing: one stack's time at the end of a run)
             }
             if (prof) t_pred += std::chrono::duration<double, std::milli>(clk::now() - t_after_sample).count();
             std::memcpy(out_codes + (size_t)n_out * ncb, frame.data(), sizeof(int) * ncb);
@@ -1658,7 +1683,7 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
                     dev::head(xrow, m->out_norm, m->codec_head.w, m->eps, C, hid, logits);
                 });
                 ++pos;
-                sync();
+                if (prof) sync();  // (for the profile's stage times; a run syncs once per frame, after the predictor)
             } else {
                 for (int l = 0; l < m->n_layer; ++l) block_step(m->blk[l], d, xrow, 1, pos, kc[l], vc[l]);
                 ++pos;

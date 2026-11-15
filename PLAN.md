@@ -48,9 +48,9 @@ Performance:
    LDS-only barrier so they stay in flight: the stack 1170 us against 938 us. The in-order vmcnt makes the norm's global
    reads wait for those weights; with the loads moved back after the norm (same dot code) it is 1000 us, so the grouping
    of the dot costs about 60 us on its own. Not retried: the early loads. Open: more bytes in flight without the VGPR cost.
-8. **Sampler on the device: done 2026-11-15 (U9).** The predictor's per-codebook syncs are gone. Open: the talker's head
-   and the host's draw of c0 (the repetition penalty, the suppressed range) still need a sync each frame; c0 on the device
-   would make one sync per frame. The predictor's time is its GPU work (about 16.5 ms per frame), so the speed-up is item 7's.
+8. **Sampler on the device: done 2026-11-15 (U9).** A frame is one sync (after the predictor): c0 and the predictor's
+   codebooks are drawn on the device. The frame's time is its GPU work (predictor about 16.5 ms, talker 6.7 ms), so the
+   speed-up left is item 7's.
 9. **Codec decoder on the GPU.** About 1.3 s of a 94-frame speech request on the CPU (U5/U6); the convolutions and the
    transposed ones are the cost (both on the CPU now).
 10. **Whisper on the GPU.** The encoder's and decoder's matmuls through sddev (whisper-tiny is small: measure first).
@@ -647,6 +647,14 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   draw maps the same u to the sorted order); the rule is the same. Timing, predictor per frame (200 frames): idle 16.80 ms
   before, 16.70 after (the syncs cost nothing when the GPU is the bound); with every core busy (32 busy-loop processes)
   31.7 and 34.7 ms before, 18.3 and 17.6 ms after: the old per-codebook syncs were exposed to host scheduling.
+  c0 on the device too (same day): `tk_sample_c0` draws the first codebook from the talker's logits with qwen-tts's
+  processing on the device (the repetition penalty by seen flags, the suppressed range except eos, eos from frame 2 on) and
+  resets the predictor's own position (`ppos_dev`); the talker's head writes its normed output into the predictor's first
+  row; the talker's graph of a step is not waited for. One sync per frame (QWEN3TTS_PROFILE adds one after the talker's
+  graph, for its stage times). Checks: `talker_sample_verify` with 600 rows of c0 (0 mismatches); `qwen3tts_verify` on the
+  one-sync path: greedy 200 frames equal to qwen-tts, top_k 1 equal to greedy; `qwen3tts_speech_verify` PASS, two runs the
+  same WAV, Whisper reads the seed-0 speech back as the test sentence; `t/65-speech.t` 13 pass with a clip voice. Sampled
+  frames for a seed changed once more (c0's draw is the device's). The stage times are unchanged (GPU-bound).
 - U1 threads: the host matmuls and convolutions run on the 16 cores (OpenMP over output rows); real-time factors
   measured for the speech (talker frames per second) and the transcription (seconds of audio per second).
 - U2 GPU path (UMA: the GGUF map is pinned, so the GPU reads the same pages): decided after U1 by the measured split;
