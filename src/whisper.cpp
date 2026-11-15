@@ -168,8 +168,17 @@ void layer_norm(const float* x, int T, int C, float eps, const Norm& n, float* y
     }
 }
 
-// y[t][o] = x[t][:] . w[o][:] + b[o] for the T rows of x [T][in]. Each (t, o) is one independent dot product summed in
-// the same order, so the pairs are shared out over the threads: a decoder step (T = 1) has only out of them.
+// The dot product of a and b over n floats, summed in SIMD lanes (the order of the additions differs from a serial sum
+// in the last bits only), as the talker's dot_f32
+inline float dot_f32(const float* a, const float* b, int n) {
+    float acc = 0.0f;
+#pragma omp simd reduction(+ : acc)
+    for (int i = 0; i < n; ++i) acc += a[i] * b[i];
+    return acc;
+}
+
+// y[t][o] = x[t][:] . w[o][:] + b[o] for the T rows of x [T][in]. Each (t, o) is one independent dot product, so the
+// pairs are shared out over the threads: a decoder step (T = 1) has only out of them. The bias is added after the dot.
 void linear(const float* x, int T, const Lin& L, float* y) {
     const long n = (long)T * L.out;
 #pragma omp parallel for schedule(static) if (n * L.in >= LINEAR_PAR_MACS)
@@ -177,8 +186,7 @@ void linear(const float* x, int T, const Lin& L, float* y) {
         const int t = (int)(r / L.out), o = (int)(r % L.out);
         const float* xr = x + (size_t)t * L.in;
         const float* wr = L.w + (size_t)o * L.in;
-        float acc = L.b ? L.b[o] : 0.0f;
-        for (int i = 0; i < L.in; ++i) acc += xr[i] * wr[i];
+        const float acc = dot_f32(xr, wr, L.in) + (L.b ? L.b[o] : 0.0f);
         y[(size_t)t * L.out + o] = acc;
     }
 }
@@ -193,13 +201,15 @@ void conv1d(const float* x, int C_in, int T_in, const float* w, const float* b, 
     for (int co = 0; co < C_out; ++co) {
         for (int t = 0; t < T_out; ++t) {
             float acc = b ? b[co] : 0.0f;
-            for (int ci = 0; ci < C_in; ++ci) {
-                const float* wr = w + ((size_t)co * C_in + ci) * K;
-                const float* xr = x + (size_t)ci * T_in;
-                for (int k = 0; k < K; ++k) {
-                    const int i = t * stride + k - pad;
-                    if (i >= 0 && i < T_in) acc += wr[k] * xr[i];
-                }
+            for (int k = 0; k < K; ++k) {
+                const int i = t * stride + k - pad;
+                if (i < 0 || i >= T_in) continue;
+                const float* wk = w + (size_t)co * C_in * K + k;
+                const float* xi = x + i;
+                float s = 0.0f;
+#pragma omp simd reduction(+ : s)
+                for (int ci = 0; ci < C_in; ++ci) s += wk[(size_t)ci * K] * xi[(size_t)ci * T_in];
+                acc += s;
             }
             y[(size_t)co * T_out + t] = acc;
         }
@@ -223,9 +233,7 @@ void attend(const float* q, int Tq, const float* k, const float* v, int Tk, int 
         float mx = -INFINITY;
         for (int j = 0; j < nk; ++j) {
             const float* kr = k + (size_t)j * C + (size_t)h * d;
-            float dot = 0.0f;
-            for (int c = 0; c < d; ++c) dot += qr[c] * kr[c];
-            s[j] = dot * scale;
+            s[j] = dot_f32(qr, kr, d) * scale;
             mx = std::max(mx, s[j]);
         }
         double sum = 0.0;
@@ -248,9 +256,7 @@ void logits_of(const whisper_model* m, const float* x, float* logits) {
 #pragma omp parallel for schedule(static)
     for (int v = 0; v < m->n_vocab; ++v) {
         const float* er = m->tok_emb + (size_t)v * m->n_tstate;
-        float acc = 0.0f;
-        for (int c = 0; c < m->n_tstate; ++c) acc += x[c] * er[c];
-        logits[v] = acc;
+        logits[v] = dot_f32(x, er, m->n_tstate);
     }
 }
 
