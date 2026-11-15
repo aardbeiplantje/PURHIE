@@ -14,14 +14,28 @@ with three exceptions: `/hf/Qwen3.5-0.8B` and `/hf/Qwen3.5-4B` are gone (the vis
 the 38 GB of IQ downloads (item 2 of the list below) do not fit: local conversions instead.
 
 The open work as packages. Each is one agent's task with its check; it is done when the check passes and it is committed.
-The lists below keep each item's background.
-- D (item 7) the samplers' sort (28 us a codebook, 55 us for c0). Check: `talker_sample_verify` (exact), the frame's time.
+The lists below keep each item's background. Done on 2026-11-15, each recorded in its item: A (item 11, Whisper's
+temperature fallback), B (item 2 of the 2026-11-14 list, the IQ types on the GPU), C (item 9, the codec's time per layer),
+E and E2 (item 10, Whisper's host path), F (item 15, the vision tower's host path), G (the tests' reply checks). Not
+started: D (item 7, the samplers' sort: a rank sort needs a second launch per codebook, about 18 us against 28 us, under
+1% of a frame).
+
+Next packages:
+- H the split-invariance tests demand bit-exactness (Open leads, quality: `store_verify.sh`, `seq_verify`,
+  `generate_verify`), on Qwen3-0.6B and Qwen3.5-4B.
+- I the converter's model-card keys (`general.license`, base model, size label, and the rest of upstream's card keys), byte
+  for byte as `convert_hf_to_gguf.py` writes them (`tests/convert_verify.sh` compares them "aside" today).
+- J the vision tower's linears register-blocked on the host (77% of the 0.76 s pass).
+- K the codec's host stages overlapped with the device's work or moved to its kernels (36 ms of a 142 ms piece).
+- L (the user's decision first: quality) the code predictor's weights as Q8_0 on the device: half the bytes of the 2.5 GB
+  the predictor reads a frame, so the frame's 22.8 ms could reach about 15 ms. To measure before any default: the greedy
+  codes' agreement with the BF16 predictor and the speech.
 
 The user's decisions: item 12 (prosody across speech pieces) and item 13 (mp3 / opus / aac). Not runnable on this host:
 the Flash measurements (its own MTP block, the PLE reads), `--parallel` and the store on the deployment,
 `events_test MODEL DRAFT`, nginx's X-Remote-User header (the docker repository). Larger and not packaged yet: the ComfyUI
-component API (milestone 1), speculative decoding under `--parallel` (three stages), FP8 as a weight type, the
-converter's `general.*` model-card keys, raw completions' prompt arrays and logprobs.
+component API (milestone 1), speculative decoding under `--parallel` (three stages), FP8 as a weight type, raw
+completions' prompt arrays and logprobs.
 
 ## ▶ Next (2026-11-14, kept current)
 
