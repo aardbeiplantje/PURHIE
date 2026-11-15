@@ -574,8 +574,9 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   204 frames), so a request with a 204-frame voice decodes 298 frames: most of its time (the container: 14 s for 94 frames,
   of which the talker's stages about 3 s). Now: the codec's convolutions (blocks of 8 output rows and 256 samples) and its
   transposed convolutions (phase-wise causal filters: the strided scatter was not vectorized). Bit-identical output (codec
-  verify PASS, speech output max difference 0). One codec call on 40 frames: 1108 -> 647 ms at 16 threads; 14.1 -> ~7 s
-  at 1 thread. Tried and not used: decoding only the last 25 reference frames as context (the codec's attention window is
+  verify PASS, speech output max difference 0). One codec call on 40 frames: 1108 -> 558 ms at 16 threads (the convolution
+  with a 4 x 64 block in registers); 14.1 -> ~7 s at 1 thread. The server's request for the 204-frame voice: 14 -> 8.7 s, and
+  its output is byte-identical to the earlier output (the codec change is exact end to end). Tried and not used: decoding only the last 25 reference frames as context (the codec's attention window is
   250 frames: the waveform changes, cosine 0.973; its words are the same; QWEN3TTS_CODEC_CONTEXT=25 keeps it as an option).
   Open: a streamed decoder with the reference's state cached per voice would make the reference free and stay exact.
 - U1 threads: the host matmuls and convolutions run on the 16 cores (OpenMP over output rows); real-time factors
