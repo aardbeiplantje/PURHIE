@@ -17,8 +17,6 @@ The open work as packages. Each is one agent's task with its check; it is done w
 The lists below keep each item's background.
 - A (item 11) Whisper's temperature fallback on the long-form windows. Check: `whisper_verify`, a new
   `whisper_fallback_verify`, t/64 and t/66.
-- B (item 2 of the 2026-11-14 list) IQ4_NL, IQ2_S, IQ2_XS, IQ1_S and IQ1_M on the GPU: `matvec_verify` on local conversions
-  of `q35-0.8b-bf16.gguf`.
 - C (item 9) the codec on the device: the time per layer, the output convolution's tile (one channel in a 32-row tile),
   the host stages (36 ms a piece). Check: the three codec verifiers, the pieces bit-identical.
 - D (item 7) the samplers' sort (28 us a codebook, 55 us for c0). Check: `talker_sample_verify` (exact), the frame's time.
@@ -46,8 +44,11 @@ Open work, in the order to take it. Each item names its state and the next concr
    default, the mixed Q8_0 stays supported as an option). Rebuild it from the BF16 GGUF with
    `perl -Iblib/lib -Iblib/arch bin/rocm-convert -r plain -t '^blocks\.(0|1|48|49)\.=keep' -t '^(token_refiner|condition_proj|video_patch_proj|time_embedder|final_layer)=keep' dit-bf16.gguf dit-q8mix.gguf q8_0`
    (run in perl/ROCm-Inference). `mm_open` takes any DiT GGUF path, and the device decode makes it run at BF16 speed.
-2. **IQ types on the GPU** (matvec kernels exist; checked only for IQ2_XXS and IQ4_XS): IQ4_NL, IQ2_S, IQ2_XS, IQ1_S,
-   IQ1_M on real Hugging Face files (redponike and unsloth repos; about 38 GB of downloads, one file at a time).
+2. **IQ types on the GPU: checked 2026-11-15.** `matvec_verify` passes for IQ4_NL, IQ2_S, IQ2_XS, IQ1_S and IQ1_M (and
+   again for IQ2_XXS, IQ4_XS, IQ3_XXS, IQ3_S) on local conversions of `/data/vision-ref/q35-0.8b-bf16.gguf`
+   (`rocm-convert -r plain`, uniform weights; 164 to 447 MB, 19 to 101 s each): the float path within 1.3e-7 of the CPU
+   decode, the int8 path within 2.6e-8, the batched path (11 tokens) exact. The check takes the first matrix of each type
+   (here the token embedding, 248320 x 1024). Not run: files from Hugging Face (about 38 GB of downloads; 19 GB free).
 3. **MiniMax quantization, remaining**: FP8 not measured (the engine has no FP8 weight type to write: needs an encoder
    and its operand path). DiT drift from block 30 (engine error grows against the fp32 chain; the mixed-recipe results
    point at the non-block tensors' sensitivity; not chased).
@@ -147,7 +148,7 @@ Earlier list (2026-11-13), kept for reference:
    quantized encoders that clear the bar are Q5_1 (0.9982-0.9987), Q5_0 (0.9978-0.9983) and Q8_0 (0.9998-0.9999).
    GPU matvec on a real Hugging Face file (`matvec_verify` on redponike's Qwen3-VL-32B-Instruct-IQ4_XS.gguf, 17.7 GB): IQ4_XS
    passes (worst relative error 3e-8; int8 path 1e-8; batched exact), and the same file's q5_K and q6_K pass. Not yet run on
-   the GPU: IQ4_NL, IQ2_S, IQ2_XS, IQ1_S, IQ1_M (the encoders and the CPU decoders exist for all of them). Legacy
+   the GPU then: IQ4_NL, IQ2_S, IQ2_XS, IQ1_S, IQ1_M (run on 2026-11-15: item 2 of the 2026-11-14 list). Legacy
    and K-quant full-matrix reference behaviour: ggml weighs Q4_0 etc. by an imatrix when given; the verifier passes none
    to those types. rocm-convert accepts all of them as targets (file types as ggml's; S variants where a type has none). The residency goal (the pipeline keeps the text encoder and the DiT both mapped)
    is what a small text encoder buys: Q8_0 (35 GB) plus the DiT (66 GB) fit in the 124 GB of RAM at once.
