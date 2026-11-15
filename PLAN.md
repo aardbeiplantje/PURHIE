@@ -4,6 +4,34 @@
 > Finished work, with its measurements, is in the git history (this file was pruned of it on 2026-11-05, 2026-11-06
 > and 2026-11-12).
 
+## ▶ Next (verified 2026-11-15: the work packages)
+
+Verified on 2026-11-15 against the repository and this host. The 118 paths and the 11 make targets this file names exist,
+with three exceptions: `/hf/Qwen3.5-0.8B` and `/hf/Qwen3.5-4B` are gone (the vision checks run from `/data/vision-ref`:
+`q35-0.8b-mmproj.gguf`, `q35-0.8b-bf16.gguf`, `q35-0.8b/`); the BF16 talker is `/models/qwen3tts-talker.gguf` (with
+`qwen3tts-codec.gguf`, `whisper-tiny.gguf` and `voices/`; the references stay under `/data/audio-ref`); and
+`/data/minimax-ref/te/mm_te_ref.py` is gone. Free disk: `/data` and `/models` 17 GB, `/hf` 34 GB, `/comfyui` 88 GB, so
+the 38 GB of IQ downloads (item 2 of the list below) do not fit: local conversions instead.
+
+The open work as packages. Each is one agent's task with its check; it is done when the check passes and it is committed.
+The lists below keep each item's background.
+- A (item 11) Whisper's temperature fallback on the long-form windows. Check: `whisper_verify`, a new
+  `whisper_fallback_verify`, t/64 and t/66.
+- B (item 2 of the 2026-11-14 list) IQ4_NL, IQ2_S, IQ2_XS, IQ1_S and IQ1_M on the GPU: `matvec_verify` on local conversions
+  of `q35-0.8b-bf16.gguf`.
+- C (item 9) the codec on the device: the time per layer, the output convolution's tile (one channel in a 32-row tile),
+  the host stages (36 ms a piece). Check: the three codec verifiers, the pieces bit-identical.
+- D (item 7) the samplers' sort (28 us a codebook, 55 us for c0). Check: `talker_sample_verify` (exact), the frame's time.
+- E (item 10) Whisper's stage times on the host, to decide on a device path (only whisper-tiny is on this host).
+- F (item 15) the vision tower's stage times (`vision_verify` on `/data/vision-ref`) and its device plan.
+- G tests: t/60's "is 91 prime" check (fails on Qwen3-0.6B), the secondary-colours regex of t/10 and t/20.
+
+The user's decisions: item 12 (prosody across speech pieces) and item 13 (mp3 / opus / aac). Not runnable on this host:
+the Flash measurements (its own MTP block, the PLE reads), `--parallel` and the store on the deployment,
+`events_test MODEL DRAFT`, nginx's X-Remote-User header (the docker repository). Larger and not packaged yet: the ComfyUI
+component API (milestone 1), speculative decoding under `--parallel` (three stages), FP8 as a weight type, the
+converter's `general.*` model-card keys, raw completions' prompt arrays and logprobs.
+
 ## ▶ Next (2026-11-14, kept current)
 
 Open work, in the order to take it. Each item names its state and the next concrete step.
@@ -13,13 +41,8 @@ Open work, in the order to take it. Each item names its state and the next concr
    mixed Q8_0 DiT (`MMDIT_CHECK_DEQUANT=1`, no mismatch); the 2048 canvas 0.991640 (= the CPU-decode run); wall time
    129.5 s against 134.7 s for BF16 on the same run (the file is smaller). ROCmFP4 and its FAST variant are on the device too
    (`mm_dequant_fp4_bf16`; 2026-11-14): bit-exact against the CPU decoder (`MMDIT_CHECK_DEQUANT=1`, full ROCmFP4 DiT, 18.6 GB),
-   the canvas 0.783152 (= the CPU-decode run), wall 128.9 s. Still open: the int8 WMMA route (quantizes activations: a different numerical path, not measured). The earlier note: the batched kernel
-   (`qmatvec_launch_batch`) runs at ~1.4 TFLOP/s against 15-25 for the BF16 kernels, so the quantized DiT decoded its
-   weights on the CPU every call. Now: `mm_dequant_q8_0_bf16` (src/minimax_vae.hip) decodes Q8_0 linears on the device
-   into the BF16 scratch and the BF16 kernels run the matmul. Its numerics equal the CPU decode bit for bit (checked by
-   `MMDIT_CHECK_DEQUANT=1`, to run). Next: that check on the mixed Q8_0 DiT, the canvas number (must equal the CPU-decode
-   Q8 run), then the time per step. Then ROCmFP4 on the device (same pattern), and the int8 WMMA route for comparison (it
-   quantizes the activations: a different numerical path, measured separately). Benchmark (`bench_qbatch.cpp`, not committed, in the session scratch under /tmp): the batched Q8_0 matmul 1.4 TFLOP/s, BF16 15-25.
+   the canvas 0.783152 (= the CPU-decode run), wall 128.9 s. Still open: the int8 WMMA route (quantizes activations: a different numerical path, not measured). The
+   batched quantized kernel (`qmatvec_launch_batch`) runs at ~1.4 TFLOP/s against 15-25 for the BF16 kernels: not used here.
 1. **DiT mixed Q8_0 recipe** (measured, 0.991640 at 38.4 GB against BF16 0.992087; decided 2026-11-14: BF16 stays the
    default, the mixed Q8_0 stays supported as an option). Rebuild it from the BF16 GGUF with
    `perl -Iblib/lib -Iblib/arch bin/rocm-convert -r plain -t '^blocks\.(0|1|48|49)\.=keep' -t '^(token_refiner|condition_proj|video_patch_proj|time_embedder|final_layer)=keep' dit-bf16.gguf dit-q8mix.gguf q8_0`
@@ -238,15 +261,16 @@ nemotron_h_moe, llama and glm5-next (GLM-5.3-Flash, its experts paged from disk)
 UMA. Surfaces: the C API (`libinference.so`), the Perl XS module ROCm::Inference (Minijinja templates),
 rocm-inference-server (OpenAI-compatible: chat, raw completions, embeddings, `--models-dir`, `--parallel`), and
 `bin/rocm-convert`. Regression suite: `make regress` / `make regress-full`. Deployed by the user's
-llama.cpp-rocm-gfx1151-docker (branch rocm-inference), which builds rocm-hip from GitHub `main` (a rebuild needs a
-new `CACHEBUST` to take new commits). Design: ARCHITECTURE.md; measurements: git history.
+llama.cpp-rocm-gfx1151-docker (a submodule here since 2026-11-15), which builds rocm-hip from GitHub `main`: its watcher
+takes a fresh `CACHEBUST` per build, and a build is started by touching its `.build-trigger` (AGENTS.md). Design:
+ARCHITECTURE.md; measurements: git history.
 
 10. **Multimodal and audio (section below, 2026-11-13)**: audio done through the voice clone from new audio, long-form
    and translate; the talker's fused device block is the default (U2: 44 ms per frame against 51 to 55 on the host); the
    image path is on the GPU (I6: 3.3 s per 512 x 512 image against 28 s on the host; the reference image was noise before,
-   corrected). Open: the device frame's launches and syncs, the VAE's convolutions (the GEMM), MiniMax-H3-Image (inspect
-   the checkout, the license) and the vision tower's device path. The ComfyUI safetensors question: converted by rocm-convert as F16/BF16 GGUF (the engine reads
-   them in place; sd-turbo is done that way).
+   corrected). The speech frame is one sync and its codec decodes on the device (U9, U10); MiniMax-H3-Image runs (its
+   section below). Open: the sd VAE's convolutions (the GEMM) and the vision tower's device path. The ComfyUI safetensors
+   question: converted by rocm-convert as F16/BF16 GGUF (the engine reads them in place; sd-turbo is done that way).
 
 ## Qwen3.8-Flash-Next
 
