@@ -16,8 +16,6 @@ the 38 GB of IQ downloads (item 2 of the list below) do not fit: local conversio
 The open work as packages. Each is one agent's task with its check; it is done when the check passes and it is committed.
 The lists below keep each item's background.
 - D (item 7) the samplers' sort (28 us a codebook, 55 us for c0). Check: `talker_sample_verify` (exact), the frame's time.
-- E2 (item 10) Whisper's host dot products vectorized (the encoder is 1.5 s a window, about 23 GFLOP/s on 16 cores).
-  Check: `whisper_verify` (the encoder within its tolerance, the 21 tokens equal), `whisper_fallback_verify`, t/64, t/66.
 - F (item 15) the vision tower's stage times (`vision_verify` on `/data/vision-ref`) and its device plan.
 
 The user's decisions: item 12 (prosody across speech pieces) and item 13 (mp3 / opus / aac). Not runnable on this host:
@@ -86,15 +84,19 @@ Performance:
    quarter of the decode: run the next piece's while the device works, or move the pre-convolution and the upsamplers to
    the kernels); the kernel-7 inner loop. A 40-frame request spends about 0.9 s in the talker: the codec is no longer the
    larger part.
-10. **Whisper on the GPU: measured 2026-11-15, the host first.** Stage times (`WHISPER_PROFILE=1`, whisper-tiny, the 5.9 s
-    clip in a 30 s window, 16 threads): the encoder 1.5 s, the cross-attention keys and values 0.17 s, the mel 0.03 s, a
-    decoder token 18.3 ms. The decoder's linears and attention were shared out over the time steps, which is one in
-    decoding, so each ran on one thread: now over the output elements (and the query-head pairs), above 50000
-    multiply-adds, bit-identical. A decoder token 3.5 ms (best of 3); `whisper_fallback_verify` 44 s (was 115 s), t/66's
-    long clip 12 s (was 23 s). What is left of a window is the encoder (about 80%; 17 GMAC in 1.5 s is about 23 GFLOP/s:
-    its dot products are scalar, summed in order) and, per token, the vocabulary product (1.8 ms of the 3.5). Next:
-    vectorized dot products on the host (package E2: the bits change, the checks' tolerances hold them); a device path
-    for the encoder only if that is not enough (a larger Whisper would need it; only whisper-tiny is on this host).
+10. **Whisper on the GPU: measured 2026-11-15; the host path made fast instead.** Stage times (`WHISPER_PROFILE=1`,
+    whisper-tiny, one 30 s window, 16 threads) before: the encoder 1.5 s, the cross-attention keys and values 0.17 s, a
+    decoder token 18.3 ms. Two causes, both on the host: the decoder's linears and attention were shared out over the time
+    steps (one in decoding), so each ran on one thread (now over the output elements and the query-head pairs, above 50000
+    multiply-adds: bit-identical, 3.5 ms a token); and the dot products were scalar sums in order (now SIMD reductions in
+    `linear`, the attention's scores, the vocabulary product and the convolution stem: the last bits change, the encoder's
+    difference to the reference went from 6.3e-5 to 2.6e-5 of the peak, the 21 greedy tokens equal). Now: the encoder
+    0.39 s, the keys and values 0.007 s, a decoder token 1.5 to 1.9 ms; `whisper_fallback_verify` 14.5 s (115 s at the
+    start), t/66's long clip 3.8 s (23 s with the fallback's six passes before). Checks: `whisper_verify`,
+    `whisper_fallback_verify`, t/64 (17), t/66 (4: the French transcription and translation still equal transformers').
+    Left on the host: the encoder at about 45 GMAC/s (its attention allocates a score vector per query and head: about
+    9000 allocations a call), the decoder's cross-attention (six query-head pairs: six threads) and the vocabulary product
+    (80 MB of F32 a token: memory-bound). A device path only for a larger Whisper (only whisper-tiny is on this host).
 
 Quality and scope (decisions):
 11. **Whisper temperature fallback: done 2026-11-15.** A long-form window whose text compresses above 2.4 (zlib) or whose
