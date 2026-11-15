@@ -547,6 +547,14 @@ std::unique_ptr<Speaker> load_speaker(gguf_model_t* g, const std::function<int(c
     return sp;
 }
 
+// A voice's prefix of the prefill (the role, the codec prefix, the reference's text and frames: the rows that do not depend on
+// the request's text): the keys and values of each layer for its rows, reused by every request of the voice
+struct VoicePrefix {
+    unsigned long long key = 0;
+    int Pv = 0;
+    std::vector<std::vector<float>> K, V;  // per layer: [Pv][KD]
+};
+
 struct qwen3tts_model {
     gguf_model_t* g = nullptr;
     tokenizer_t* tok = nullptr;  // the GGUF's vocabulary (NULL: none)
@@ -559,6 +567,8 @@ struct qwen3tts_model {
     std::vector<std::string> languages;
     std::unique_ptr<Speaker> spk;       // the speaker encoder (absent in a GGUF without spk.* tensors)
     const void* gpu_base = nullptr;     // the GGUF mapping registered for the device (NULL: host only)
+    std::mutex prefix_mu;               // the voices' prefixes (qwen3tts_generate), the last few
+    std::vector<VoicePrefix> prefixes;
     int last_gpu = 0;                   // the last generate ran its talker on the GPU (qwen3tts_last_gpu)
     std::vector<int> language_ids;
     Mat text_embd;                      // [text_vocab][text_C]
@@ -1300,14 +1310,61 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
         auto ms_since = [](clk::time_point t) { return std::chrono::duration<double, std::milli>(clk::now() - t).count(); };
         double t_prefill = 0, t_samp = 0, t_pred = 0, t_tal = 0, t_issue = 0, t_head_wait = 0, t_stack0 = 0;
         const clk::time_point t_setup = clk::now();
-        // the prefill (on the host, into the caches)
-        std::vector<float> x(prefill.begin(), prefill.begin() + (size_t)P * C);
-        for (int l = 0; l < m->n_layer; ++l) block_step(m->blk[l], d, x.data(), P, 0, kc[l], vc[l]);
+        // the prefill (on the host, into the caches). The rows that depend on the voice only (the role, the codec prefix, the
+        // reference's text and frames: qwen3tts_build_prefill's first 9 + min(reference text, R) rows) are the same for every
+        // request of the voice: their keys and values are cached per voice and copied in; the request's rows follow.
+        const int Pv = 9 + std::min(n_ref - 5, R);
+        {
+            unsigned long long key = 1469598103934665603ull;
+            auto mix = [&](const void* p, size_t bytes) {
+                const unsigned char* b = static_cast<const unsigned char*>(p);
+                for (size_t i = 0; i < bytes; ++i) {
+                    key ^= b[i];
+                    key *= 1099511628211ull;
+                }
+            };
+            mix(text_ids, sizeof(int) * 3);  // the role
+            mix(&language_id, sizeof(int));
+            mix(ref_ids, sizeof(int) * (size_t)n_ref);
+            mix(ref_codes, sizeof(int) * (size_t)R * ncb);
+            mix(spk, sizeof(float) * (size_t)C);
+            std::vector<float> xp(prefill.begin(), prefill.begin() + (size_t)Pv * C);  // the voice's rows through the layers
+            bool hit = false;
+            {
+                std::lock_guard<std::mutex> lk(m->prefix_mu);
+                for (const VoicePrefix& vp : m->prefixes)
+                    if (vp.key == key && vp.Pv == Pv) {
+                        for (int l = 0; l < m->n_layer; ++l) {
+                            std::memcpy(kc[l], vp.K[l].data(), sizeof(float) * vp.K[l].size());
+                            std::memcpy(vc[l], vp.V[l].data(), sizeof(float) * vp.V[l].size());
+                        }
+                        hit = true;
+                        break;
+                    }
+            }
+            if (!hit) {
+                for (int l = 0; l < m->n_layer; ++l) block_step(m->blk[l], d, xp.data(), Pv, 0, kc[l], vc[l]);
+                VoicePrefix vp;
+                vp.key = key;
+                vp.Pv = Pv;
+                vp.K.resize(m->n_layer);
+                vp.V.resize(m->n_layer);
+                for (int l = 0; l < m->n_layer; ++l) {
+                    vp.K[l].assign(kc[l], kc[l] + (size_t)Pv * KD);
+                    vp.V[l].assign(vc[l], vc[l] + (size_t)Pv * KD);
+                }
+                std::lock_guard<std::mutex> lk(m->prefix_mu);
+                m->prefixes.push_back(std::move(vp));
+                if (m->prefixes.size() > 8) m->prefixes.erase(m->prefixes.begin());
+            }
+        }
+        std::vector<float> x(prefill.begin() + (size_t)Pv * C, prefill.begin() + (size_t)P * C);
+        for (int l = 0; l < m->n_layer; ++l) block_step(m->blk[l], d, x.data(), P - Pv, Pv, kc[l], vc[l]);
         auto head_host = [&](const float* last) {
             rms_norm(last, 1, C, m->eps, m->out_norm, hid);
             linear(hid, 1, m->codec_head, logits);
         };
-        head_host(x.data() + (size_t)(P - 1) * C);
+        head_host(x.data() + (size_t)(P - Pv - 1) * C);
         t_prefill = ms_since(t_setup);
         int pos = P;
         std::vector<int> history;

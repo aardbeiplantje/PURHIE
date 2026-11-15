@@ -591,7 +591,13 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   verifier PASS. Timing (local, BF16 talker, 40 frames of made-from-clip): speak 3.3 s -> 2.1 s on a cache hit (the first
   call 4.6 s, with the reference decoded). The server (rocm-hip 4a1f52f, the 204-frame voice): the first request 11.2 s (the
   reference decoded), the next 5.6 s (was 8.7 s), both byte-identical to the earlier output. Open: the talker's prefill (0.74 s
-  in the container) is per request; a voice's prefix could be cached like the decoder's state.
+  in the container) was per request; now U7: the voice's prefix rows cached (below).
+- U7 the talker's prefill per voice (2026-11-15). The rows that depend on the voice only (the role, the codec prefix, the
+  reference's text and frames: 9 + min(reference text, R) rows) keep their keys and values per layer in a per-model cache (the
+  last 8 voices, keyed by the role, the language, the reference ids and codes, the speaker embedding); a request copies them
+  in and runs its own rows (block_step at the offset). Checks: greedy and sampled generation equal to qwen-tts (the talker
+  verifier), the speech verifier and t/65 PASS; a miss and a hit give identical audio (speak called 3 times: 7.1 s, then
+  4.3 s, the F32 talker on the host).
 - U1 threads: the host matmuls and convolutions run on the 16 cores (OpenMP over output rows); real-time factors
   measured for the speech (talker frames per second) and the transcription (seconds of audio per second).
 - U2 GPU path (UMA: the GGUF map is pinned, so the GPU reads the same pages): decided after U1 by the measured split;
