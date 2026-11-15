@@ -106,6 +106,7 @@ AUDIO_VERIFY = $(BINDIR)/audio_verify  # the band-limited resampler and the WAV 
 AUDIO_FLAC_VERIFY = $(BINDIR)/audio_flac_verify  # the FLAC encoder on test signals (tests/audio_flac_verify.cpp; decoded with libsndfile in the check)
 QWEN3TTS_VERIFY = $(BINDIR)/qwen3tts_verify  # the TTS talker and code predictor vs qwen-tts (tests/qwen3tts_verify.cpp)
 QWEN3TTS_CODEC_VERIFY = $(BINDIR)/qwen3tts_codec_verify  # the TTS codec's decoder vs qwen-tts (tests/qwen3tts_codec_verify.cpp)
+CODEC_AFTER_VERIFY = $(BINDIR)/codec_after_verify  # the codec's decode after a reference (the cached state) vs the whole sequence (tests/codec_after_verify.cpp)
 QWEN3TTS_SPEECH_VERIFY = $(BINDIR)/qwen3tts_speech_verify  # the TTS speech (sampling, codec, the cut) vs its checks (tests/qwen3tts_speech_verify.cpp)
 MROPE_VERIFY    = $(BINDIR)/mrope_verify  # Qwen3.5's M-RoPE positions vs transformers (tests/mrope_verify.cpp)
 VISION_VERIFY   = $(BINDIR)/vision_verify  # the vision tower vs transformers (tests/vision_verify.cpp; reference: /data/vision-ref)
@@ -232,6 +233,9 @@ $(SPEAKER_VERIFY): $(TESTSDIR)/speaker_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDI
 
 $(CODEC_ENCODE_VERIFY): $(TESTSDIR)/codec_encode_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/codec_encode_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
+
+$(CODEC_AFTER_VERIFY): $(TESTSDIR)/codec_after_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/codec_after_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
 
 $(QWEN3TTS_CODEC_VERIFY): $(TESTSDIR)/qwen3tts_codec_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/qwen3tts_codec_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp -o $@
@@ -559,4 +563,4 @@ verify_minimal: $(TEST_TARGET)
 	./$(TEST_TARGET) 2>&1 || echo "Test exited with code $?"
 
 # Last, so that every variable above is defined when its prerequisites are expanded
-all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(EXPERT_CPU_BENCH) $(VISION_VERIFY) $(MROPE_VERIFY) $(MM_VERIFY) $(IMAGE_VERIFY) $(MEL_VERIFY) $(WHISPER_VERIFY) $(AUDIO_VERIFY) $(AUDIO_FLAC_VERIFY) $(QWEN3TTS_VERIFY) $(QWEN3TTS_CODEC_VERIFY) $(QWEN3TTS_SPEECH_VERIFY) $(SPEAKER_VERIFY) $(SD_TEXT_VERIFY) $(SD_VAE_VERIFY) $(SD_UNET_VERIFY) $(SD_IMAGE_VERIFY) $(MM_TE_VERIFY) $(MM_VAE_VERIFY) $(MM_DIT_VERIFY) $(CODEC_ENCODE_VERIFY) $(HEAD_Q8_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(ATTN_DECODE_VERIFY) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(PERPLEXITY) $(PASSKEY) $(GENERATE_VERIFY) $(EVENTS_TEST) $(GEMMA4_VERIFY) $(SEQ_VERIFY) $(EMBED_VERIFY) $(QWEN4EXP_VERIFY) $(GLM5NEXT_VERIFY) $(MTP_VERIFY) $(MTP_OWN_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY) $(CAPI_SMOKE) $(STORE_VERIFY) $(SPLIT_VERIFY) $(ATTN_SPLIT_VERIFY) $(ATTN_BENCH)
+all: $(WMMA_TARGET) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(EXPERT_CPU_BENCH) $(VISION_VERIFY) $(MROPE_VERIFY) $(MM_VERIFY) $(IMAGE_VERIFY) $(MEL_VERIFY) $(WHISPER_VERIFY) $(AUDIO_VERIFY) $(AUDIO_FLAC_VERIFY) $(CODEC_AFTER_VERIFY) $(QWEN3TTS_VERIFY) $(QWEN3TTS_CODEC_VERIFY) $(QWEN3TTS_SPEECH_VERIFY) $(SPEAKER_VERIFY) $(SD_TEXT_VERIFY) $(SD_VAE_VERIFY) $(SD_UNET_VERIFY) $(SD_IMAGE_VERIFY) $(MM_TE_VERIFY) $(MM_VAE_VERIFY) $(MM_DIT_VERIFY) $(CODEC_ENCODE_VERIFY) $(HEAD_Q8_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(ATTN_DECODE_VERIFY) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(PERPLEXITY) $(PASSKEY) $(GENERATE_VERIFY) $(EVENTS_TEST) $(GEMMA4_VERIFY) $(SEQ_VERIFY) $(EMBED_VERIFY) $(QWEN4EXP_VERIFY) $(GLM5NEXT_VERIFY) $(MTP_VERIFY) $(MTP_OWN_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY) $(CAPI_SMOKE) $(STORE_VERIFY) $(SPLIT_VERIFY) $(ATTN_SPLIT_VERIFY) $(ATTN_BENCH)

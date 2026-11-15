@@ -13,6 +13,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -277,6 +278,17 @@ struct Enc {
 
 }  // namespace
 
+// The decoder as a stream (decode_stream). Every layer is causal, and each output sums its inputs in the same order whatever
+// piece of the frames it is computed in, so the frames can be decoded in pieces, the state carrying what the next piece
+// reads: for each causal layer the last columns of its input (its receptive field's past), for the transformer the keys and
+// values of the last sw - 1 frames of each block, and the index of the next frame. Pieces give the same bits as one piece.
+struct DecState {
+    long long frame0 = 0;                    // the next frame's index (the rope's position and the window's start)
+    int nh = 0;                              // the frames in the transformer's cache (at most sw - 1)
+    std::vector<std::vector<float>> tail;    // per causal layer (the L_* ids): its input's last g columns, [ch][g]
+    std::vector<std::vector<float>> tk, tv;  // per transformer block: the keys and values of the cache, [nh][H * D]
+};
+
 struct qwen3tts_codec {
     gguf_model_t* g = nullptr;
     int nq = 0, cb = 0, emb = 0, latent = 0, tfL = 0, tfC = 0, tfH = 0, tfD = 0, tfFF = 0, sw = 0, dec_dim = 0, sr = 24000;
@@ -293,6 +305,8 @@ struct qwen3tts_codec {
     Snake out_snake;
     Conv out_conv;
     std::unique_ptr<Enc> enc;  // the encoder (absent in a GGUF without enc.* tensors)
+    std::mutex cache_mu;       // the references' decoder states (qwen3tts_codec_decode_after), the last few
+    std::vector<std::pair<unsigned long long, DecState>> cache;
     ~qwen3tts_codec() {
         if (g) gguf_mmap_close(g);
     }
@@ -642,95 +656,164 @@ std::vector<int> enc_encode(const Enc& e, const float* x, size_t n, long* T_out)
 namespace {
 
 // The frames' samples: the quantizer, the pre-conv, the transformer, the upsamplers, the decoder, the clamp. codes [n][nq]
-void decode_frames(const qwen3tts_codec* m, const int* codes, int n, float* wav) {
-    const int E = m->emb, C = m->latent, TF = m->tfC;
-    // the residual quantizer: the first codebook's embeddings through its projection, plus the others' sum through theirs
-    std::vector<float> first((size_t)n * E, 0.0f), rest((size_t)n * E, 0.0f);
-    for (int t = 0; t < n; ++t) {
-        for (int q = 0; q < m->nq; ++q) {
-            const int id = codes[(size_t)t * m->nq + q];
-            if (id < 0 || id >= m->cb) throw std::runtime_error("qwen3tts_codec: code out of range");
-            const float* row = m->emb_tables[q].data() + (size_t)id * E;
-            float* dst = q == 0 ? &first[(size_t)t * E] : &rest[(size_t)t * E];
-            for (int e = 0; e < E; ++e) dst[e] += row[e];
+// the layers' ids in the state (causal layers; each decoder block's transposed convolution, then its residual units' convs)
+enum : int { L_PRE = 0, L_UP0 = 1, L_UP0_DW = 2, L_UP1 = 3, L_UP1_DW = 4, L_DEC_IN = 5, L_DEC_BLOCK0 = 6, L_OUT = 34, L_COUNT = 35 };
+
+// the state of the stream at its start: zero histories (the start of the sequence: the zero left padding of each layer)
+void init_state(const qwen3tts_codec* m, DecState& st) {
+    st.frame0 = 0;
+    st.nh = 0;
+    st.tk.assign(m->tf.size(), {});
+    st.tv.assign(m->tf.size(), {});
+    st.tail.assign(L_COUNT, {});
+    auto set = [&](int id, int ch, int g) { st.tail[id].assign((size_t)ch * (size_t)g, 0.0f); };
+    set(L_PRE, m->tfC, (m->pre_conv.k - 1) * m->pre_conv.dil);
+    for (int s2 = 0; s2 < 2; ++s2) {
+        set(L_UP0 + 2 * s2, m->latent, (m->up[s2].conv.k - 1) / m->up[s2].conv.stride);
+        set(L_UP0_DW + 2 * s2, m->up[s2].cnx.dim, (m->up[s2].cnx.dw.k - 1) * m->up[s2].cnx.dw.dil);
+    }
+    set(L_DEC_IN, m->latent, (m->dec_in.k - 1) * m->dec_in.dil);
+    int ch_in = m->dec_dim;
+    for (int b = 0; b < 4; ++b) {
+        const int base = L_DEC_BLOCK0 + 7 * b;
+        const DecBlock& B = m->dec[b];
+        set(base, ch_in, (B.up.k - 1) / B.up.stride);
+        const int ch = B.up.cout;
+        for (int r = 0; r < 3; ++r) {
+            set(base + 1 + 2 * r, ch, (B.res[r].conv1.k - 1) * B.res[r].conv1.dil);
+            set(base + 2 + 2 * r, ch, (B.res[r].conv2.k - 1) * B.res[r].conv2.dil);
         }
+        ch_in = ch;
     }
-    std::vector<float> qf((size_t)n * TF), qr((size_t)n * TF), qsum((size_t)n * TF);
-    linear(first.data(), n, m->out_first, qf.data());
-    linear(rest.data(), n, m->out_rest, qr.data());
-    for (size_t i = 0; i < qsum.size(); ++i) qsum[i] = qf[i] + qr[i];
-    // [T][512] -> [512][T] for the causal convolution
-    std::vector<float> xc((size_t)TF * n), pre((size_t)C * n);
-    for (int t = 0; t < n; ++t)
-        for (int c = 0; c < TF; ++c) xc[(size_t)c * n + t] = qsum[(size_t)t * TF + c];
-    conv_causal(xc.data(), n, m->pre_conv, pre.data());
-    // the transformer: [T][1024] -> in -> 8 blocks -> norm -> out, then [1024][T]
-    std::vector<float> x((size_t)n * TF), h((size_t)n * TF), tmp((size_t)n * TF);
-    {
-        std::vector<float> xt((size_t)n * C);
-        for (int t = 0; t < n; ++t)
-            for (int c = 0; c < C; ++c) xt[(size_t)t * C + c] = pre[(size_t)c * n + t];
-        linear(xt.data(), n, m->tf_in, x.data());
+    set(L_OUT, ch_in, (m->out_conv.k - 1) * m->out_conv.dil);
+}
+
+// y [cout][T]: the causal convolution of the new columns x [ch][T], with the layer's history in its state
+void stage_conv(DecState& st, int id, const float* x, int ch, int T, const Conv& C, float* y) {
+    const int g = (C.k - 1) * C.dil;
+    std::vector<float>& tl = st.tail[id];
+    std::vector<float> X((size_t)ch * (g + T));
+    for (int c = 0; c < ch; ++c) {
+        std::memcpy(&X[(size_t)c * (g + T)], &tl[(size_t)c * g], sizeof(float) * (size_t)g);
+        std::memcpy(&X[(size_t)c * (g + T) + g], x + (size_t)c * T, sizeof(float) * (size_t)T);
     }
-    const int D = m->tfD, H = m->tfH, FF = m->tfFF;
-    const float scale = 1.0f / std::sqrt((float)D);
-    std::vector<float> q((size_t)n * H * D), k((size_t)n * H * D), v((size_t)n * H * D), a((size_t)n * H * D),
-        o((size_t)n * TF), g((size_t)n * FF), u((size_t)n * FF);
-    for (const TfBlock& B : m->tf) {
-        // the rms norm of each row (eps 1e-5), with the weight
-        auto rms = [&](const float* in, const float* w, float* out) {
+    std::vector<float> Y((size_t)C.cout * (g + T));
+    conv_causal(X.data(), g + T, C, Y.data());
+    for (int o = 0; o < C.cout; ++o)
+        std::memcpy(y + (size_t)o * T, &Y[(size_t)o * (g + T) + g], sizeof(float) * (size_t)T);
+    for (int c = 0; c < ch; ++c)  // the new history: the input's last g columns
+        std::memcpy(&tl[(size_t)c * g], &X[(size_t)c * (g + T) + T], sizeof(float) * (size_t)g);
+}
+
+// y [cout][T * stride]: the transposed convolution of the new columns (each output depends on the inputs up to its own)
+void stage_tconv(DecState& st, int id, const float* x, int ch, int T, const Tconv& C, float* y) {
+    const int s = C.stride, g = (C.k - 1) / s;
+    std::vector<float>& tl = st.tail[id];
+    std::vector<float> X((size_t)ch * (g + T));
+    for (int c = 0; c < ch; ++c) {
+        std::memcpy(&X[(size_t)c * (g + T)], &tl[(size_t)c * g], sizeof(float) * (size_t)g);
+        std::memcpy(&X[(size_t)c * (g + T) + g], x + (size_t)c * T, sizeof(float) * (size_t)T);
+    }
+    std::vector<float> Y((size_t)C.cout * (g + T) * s);
+    conv_transpose(X.data(), g + T, C, Y.data());
+    for (int o = 0; o < C.cout; ++o)
+        std::memcpy(y + (size_t)o * T * s, &Y[(size_t)o * (g + T) * s + (size_t)g * s], sizeof(float) * (size_t)T * s);
+    for (int c = 0; c < ch; ++c)
+        std::memcpy(&tl[(size_t)c * g], &X[(size_t)c * (g + T) + T], sizeof(float) * (size_t)g);
+}
+
+// the ConvNeXt block on the new columns x [dim][T] (in place), with its depthwise convolution's history
+void stage_convnext(DecState& st, int id, float* x, int T, const CNX& B) {
+    const int D = B.dim, g = (B.dw.k - 1) * B.dw.dil;
+    std::vector<float>& tl = st.tail[id];
+    std::vector<float> X((size_t)D * (g + T));
+    for (int c = 0; c < D; ++c) {
+        std::memcpy(&X[(size_t)c * (g + T)], &tl[(size_t)c * g], sizeof(float) * (size_t)g);
+        std::memcpy(&X[(size_t)c * (g + T) + g], x + (size_t)c * T, sizeof(float) * (size_t)T);
+    }
+    for (int c = 0; c < D; ++c)
+        std::memcpy(&tl[(size_t)c * g], &X[(size_t)c * (g + T) + T], sizeof(float) * (size_t)g);
+    convnext(X.data(), g + T, B);
+    for (int c = 0; c < D; ++c)
+        std::memcpy(x + (size_t)c * T, &X[(size_t)c * (g + T) + g], sizeof(float) * (size_t)T);
+}
+
+// the rms norm of each of the n rows [TF] (the transformer's norm: the double sum of squares, eps)
+void rms_rows(const float* in, int n, int TF, const float* w, float eps, float* out) {
 #pragma omp parallel for schedule(static)
-            for (int t = 0; t < n; ++t) {
-                const float* r = in + (size_t)t * TF;
-                double ss = 0.0;
-                for (int c = 0; c < TF; ++c) ss += (double)r[c] * r[c];
-                const float inv = 1.0f / std::sqrt((float)(ss / TF) + m->tf_eps);
-                for (int c = 0; c < TF; ++c) out[(size_t)t * TF + c] = r[c] * inv * w[c];
-            }
-        };
-        rms(x.data(), B.attn_norm, h.data());
+    for (int t = 0; t < n; ++t) {
+        const float* r = in + (size_t)t * TF;
+        double ss = 0.0;
+        for (int c = 0; c < TF; ++c) ss += (double)r[c] * r[c];
+        const float inv = 1.0f / std::sqrt((float)(ss / TF) + eps);
+        for (int c = 0; c < TF; ++c) out[(size_t)t * TF + c] = r[c] * inv * w[c];
+    }
+}
+
+// the transformer over the n new frames x [n][TF] (in place): each block's keys and values are the cache's (the last
+// sw - 1 frames) followed by the new frames'; query t attends to the keys of the last sw frames up to itself
+void tf_stream(const qwen3tts_codec* m, DecState& st, std::vector<float>& x, int n) {
+    const int TF = m->tfC, D = m->tfD, H = m->tfH, FF = m->tfFF, HD = H * D, sw = m->sw;
+    const int nh = st.nh, nc = nh + n, keep = std::min(sw - 1, nc);
+    const int base = (int)st.frame0 - nh;  // the absolute index of the cache's first frame
+    const float scale = 1.0f / std::sqrt((float)D);
+    std::vector<float> h((size_t)n * TF), q((size_t)n * HD), k((size_t)n * HD), v((size_t)n * HD), a((size_t)n * HD),
+        o((size_t)n * TF), g((size_t)n * FF), u((size_t)n * FF);
+    std::vector<float> Kc((size_t)nc * HD), Vc((size_t)nc * HD);
+    for (size_t bi = 0; bi < m->tf.size(); ++bi) {
+        const TfBlock& B = m->tf[bi];
+        rms_rows(x.data(), n, TF, B.attn_norm, m->tf_eps, h.data());
         linear(h.data(), n, B.q, q.data());
         linear(h.data(), n, B.k, k.data());
         linear(h.data(), n, B.v, v.data());
-        // rope (standard, theta 1e4) on q and k: pairs (i, i + D / 2)
+        // rope (standard, theta 1e4) on q and k at the absolute positions: pairs (i, i + D / 2)
 #pragma omp parallel for schedule(static)
-        for (int t = 0; t < n; ++t)
+        for (int i = 0; i < n; ++i) {
+            const double tp = (double)(st.frame0 + i);
             for (int hh = 0; hh < H; ++hh)
                 for (int hk = 0; hk < 2; ++hk) {
-                    float* r = (hk == 0 ? q.data() : k.data()) + ((size_t)t * H + hh) * D;
-                    for (int i = 0; i < D / 2; ++i) {
-                        const double f = (double)t * std::pow((double)m->tf_theta, -2.0 * i / D);
-                        const float c = (float)std::cos(f), s = (float)std::sin(f);
-                        const float x1 = r[i], x2 = r[i + D / 2];
-                        r[i] = x1 * c - x2 * s;
-                        r[i + D / 2] = x2 * c + x1 * s;
+                    float* r = (hk == 0 ? q.data() : k.data()) + ((size_t)i * H + hh) * D;
+                    for (int d = 0; d < D / 2; ++d) {
+                        const double f = tp * std::pow((double)m->tf_theta, -2.0 * d / D);
+                        const float c = (float)std::cos(f), s2 = (float)std::sin(f);
+                        const float x1 = r[d], x2 = r[d + D / 2];
+                        r[d] = x1 * c - x2 * s2;
+                        r[d + D / 2] = x2 * c + x1 * s2;
                     }
                 }
+        }
+        if (nh) {
+            std::memcpy(Kc.data(), st.tk[bi].data(), sizeof(float) * (size_t)nh * HD);
+            std::memcpy(Vc.data(), st.tv[bi].data(), sizeof(float) * (size_t)nh * HD);
+        }
+        std::memcpy(Kc.data() + (size_t)nh * HD, k.data(), sizeof(float) * (size_t)n * HD);
+        std::memcpy(Vc.data() + (size_t)nh * HD, v.data(), sizeof(float) * (size_t)n * HD);
         // causal attention with the sliding window (key j visible to query t when t - j < window)
 #pragma omp parallel for schedule(static)
-        for (int t = 0; t < n; ++t) {
-            std::vector<float> sc(t + 1);
-            const int j0 = std::max(0, t - m->sw + 1);
+        for (int i = 0; i < n; ++i) {
+            const int tabs = (int)st.frame0 + i;
+            const int jc0 = std::max(0, tabs - sw + 1) - base, jc1 = nh + i;  // the keys, as indices of the combined arrays
+            std::vector<float> sc((size_t)(jc1 - jc0 + 1));
             for (int hh = 0; hh < H; ++hh) {
-                const float* qr = q.data() + ((size_t)t * H + hh) * D;
+                const float* qr = q.data() + ((size_t)i * H + hh) * D;
                 float mx = -INFINITY;
-                for (int j = j0; j <= t; ++j) {
-                    const float* kr = k.data() + ((size_t)j * H + hh) * D;
+                for (int jc = jc0; jc <= jc1; ++jc) {
+                    const float* kr = Kc.data() + ((size_t)jc * H + hh) * D;
                     float dot = 0.0f;
                     for (int c = 0; c < D; ++c) dot += qr[c] * kr[c];
-                    sc[j] = dot * scale;
-                    mx = std::max(mx, sc[j]);
+                    sc[(size_t)(jc - jc0)] = dot * scale;
+                    mx = std::max(mx, sc[(size_t)(jc - jc0)]);
                 }
                 double sum = 0.0;
-                for (int j = j0; j <= t; ++j) {
-                    sc[j] = std::exp(sc[j] - mx);
-                    sum += sc[j];
+                for (int jc = jc0; jc <= jc1; ++jc) {
+                    sc[(size_t)(jc - jc0)] = std::exp(sc[(size_t)(jc - jc0)] - mx);
+                    sum += sc[(size_t)(jc - jc0)];
                 }
-                float* orow = a.data() + ((size_t)t * H + hh) * D;
+                float* orow = a.data() + ((size_t)i * H + hh) * D;
                 for (int c = 0; c < D; ++c) orow[c] = 0.0f;
-                for (int j = j0; j <= t; ++j) {
-                    const float p = (float)(sc[j] / sum);
-                    const float* vr = v.data() + ((size_t)j * H + hh) * D;
+                for (int jc = jc0; jc <= jc1; ++jc) {
+                    const float p = (float)(sc[(size_t)(jc - jc0)] / sum);
+                    const float* vr = Vc.data() + ((size_t)jc * H + hh) * D;
                     for (int c = 0; c < D; ++c) orow[c] += p * vr[c];
                 }
             }
@@ -738,26 +821,58 @@ void decode_frames(const qwen3tts_codec* m, const int* codes, int n, float* wav)
         linear(a.data(), n, B.o, o.data());
         for (int t = 0; t < n; ++t)
             for (int c = 0; c < TF; ++c) x[(size_t)t * TF + c] += B.attn_scale[c] * o[(size_t)t * TF + c];
-        rms(x.data(), B.ffn_norm, h.data());
+        rms_rows(x.data(), n, TF, B.ffn_norm, m->tf_eps, h.data());
         linear(h.data(), n, B.gate, g.data());
         linear(h.data(), n, B.up, u.data());
         for (size_t i = 0; i < g.size(); ++i) g[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];  // SiLU(gate) * up
         linear(g.data(), n, B.down, o.data());
         for (int t = 0; t < n; ++t)
             for (int c = 0; c < TF; ++c) x[(size_t)t * TF + c] += B.ffn_scale[c] * o[(size_t)t * TF + c];
+        st.tk[bi].assign(Kc.begin() + (size_t)(nc - keep) * HD, Kc.end());
+        st.tv[bi].assign(Vc.begin() + (size_t)(nc - keep) * HD, Vc.end());
     }
-    // the final norm and the output projection: [T][512] -> [T][1024] -> [1024][T]
+    st.nh = keep;
+}
+
+// The decoder on n new frames (codes [n][nq]) from the state st, which it advances; wav gets n * 1920 samples. The same
+// operations as the whole sequence's decode, in the order it does them (see DecState).
+void decode_stream(const qwen3tts_codec* m, DecState& st, const int* codes, int n, float* wav) {
+    if (n <= 0) return;
+    const int E = m->emb, C = m->latent, TF = m->tfC;
+    // the residual quantizer: the first codebook's embeddings through its projection, plus the others' sum through theirs
+    std::vector<float> first((size_t)n * E, 0.0f), rest((size_t)n * E, 0.0f);
+    for (int t = 0; t < n; ++t) {
+        for (int qq = 0; qq < m->nq; ++qq) {
+            const int id = codes[(size_t)t * m->nq + qq];
+            if (id < 0 || id >= m->cb) throw std::runtime_error("qwen3tts_codec: code out of range");
+            const float* row = m->emb_tables[qq].data() + (size_t)id * E;
+            float* dst = qq == 0 ? &first[(size_t)t * E] : &rest[(size_t)t * E];
+            for (int e = 0; e < E; ++e) dst[e] += row[e];
+        }
+    }
+    std::vector<float> qf((size_t)n * TF), qr((size_t)n * TF), qsum((size_t)n * TF);
+    linear(first.data(), n, m->out_first, qf.data());
+    linear(rest.data(), n, m->out_rest, qr.data());
+    for (size_t i = 0; i < qsum.size(); ++i) qsum[i] = qf[i] + qr[i];
+    // [T][TF] -> [TF][T] for the causal convolution
+    std::vector<float> xc((size_t)TF * n), pre((size_t)C * n);
+    for (int t = 0; t < n; ++t)
+        for (int c = 0; c < TF; ++c) xc[(size_t)c * n + t] = qsum[(size_t)t * TF + c];
+    stage_conv(st, L_PRE, xc.data(), TF, n, m->pre_conv, pre.data());
+    // the transformer: [T][C] -> in -> the blocks -> [T][TF]
+    std::vector<float> x((size_t)n * TF);
+    {
+        std::vector<float> xt((size_t)n * C);
+        for (int t = 0; t < n; ++t)
+            for (int c = 0; c < C; ++c) xt[(size_t)t * C + c] = pre[(size_t)c * n + t];
+        linear(xt.data(), n, m->tf_in, x.data());
+    }
+    tf_stream(m, st, x, n);
+    // the final norm and the output projection: [T][TF] -> [T][C] -> [C][T]
     std::vector<float> cur((size_t)C * n);
     {
         std::vector<float> nrm((size_t)n * TF);
-#pragma omp parallel for schedule(static)
-        for (int t = 0; t < n; ++t) {
-            const float* r = &x[(size_t)t * TF];
-            double ss = 0.0;
-            for (int c = 0; c < TF; ++c) ss += (double)r[c] * r[c];
-            const float inv = 1.0f / std::sqrt((float)(ss / TF) + m->tf_eps);
-            for (int c = 0; c < TF; ++c) nrm[(size_t)t * TF + c] = r[c] * inv * m->tf_norm[c];
-        }
+        rms_rows(x.data(), n, TF, m->tf_norm, m->tf_eps, nrm.data());
         std::vector<float> outp((size_t)n * C);
         linear(nrm.data(), n, m->tf_out, outp.data());
         for (int t = 0; t < n; ++t)
@@ -765,23 +880,24 @@ void decode_frames(const qwen3tts_codec* m, const int* codes, int n, float* wav)
     }
     // the upsamplers (ratio 2 each): transposed convolution, then the ConvNeXt block
     int L = n;
-    for (int s = 0; s < 2; ++s) {
+    for (int s2 = 0; s2 < 2; ++s2) {
         std::vector<float> nxt((size_t)C * L * 2);
-        conv_transpose(cur.data(), L, m->up[s].conv, nxt.data());
+        stage_tconv(st, L_UP0 + 2 * s2, cur.data(), C, L, m->up[s2].conv, nxt.data());
         L *= 2;
-        convnext(nxt.data(), L, m->up[s].cnx);
+        stage_convnext(st, L_UP0_DW + 2 * s2, nxt.data(), L, m->up[s2].cnx);
         cur.swap(nxt);
     }
     // the decoder: the input convolution, four blocks (snake, transposed convolution, three residual units), the output
     std::vector<float> dcur((size_t)m->dec_dim * L);
-    conv_causal(cur.data(), L, m->dec_in, dcur.data());
+    stage_conv(st, L_DEC_IN, cur.data(), C, L, m->dec_in, dcur.data());
     int ch = m->dec_dim;
     for (int b = 0; b < 4; ++b) {
+        const int base = L_DEC_BLOCK0 + 7 * b;
         const DecBlock& B = m->dec[b];
         snake(dcur.data(), ch, L, B.snake);
         const int out = B.up.cout;
         std::vector<float> up((size_t)out * L * B.rate);
-        conv_transpose(dcur.data(), L, B.up, up.data());
+        stage_tconv(st, base, dcur.data(), ch, L, B.up, up.data());
         L *= B.rate;
         dcur.swap(up);
         ch = out;
@@ -789,16 +905,24 @@ void decode_frames(const qwen3tts_codec* m, const int* codes, int n, float* wav)
             const ResUnit& R = B.res[r];
             std::vector<float> y = dcur, z((size_t)ch * L);
             snake(y.data(), ch, L, R.act1);
-            conv_causal(y.data(), L, R.conv1, z.data());
+            stage_conv(st, base + 1 + 2 * r, y.data(), ch, L, R.conv1, z.data());
             snake(z.data(), ch, L, R.act2);
-            conv_causal(z.data(), L, R.conv2, y.data());
+            stage_conv(st, base + 2 + 2 * r, z.data(), ch, L, R.conv2, y.data());
             for (size_t i = 0; i < dcur.size(); ++i) dcur[i] += y[i];
         }
     }
     snake(dcur.data(), ch, L, m->out_snake);
     std::vector<float> outw((size_t)L);
-    conv_causal(dcur.data(), L, m->out_conv, outw.data());
+    stage_conv(st, L_OUT, dcur.data(), ch, L, m->out_conv, outw.data());
     for (int i = 0; i < L; ++i) wav[i] = std::min(1.0f, std::max(-1.0f, outw[i]));
+    st.frame0 += n;
+}
+
+// the whole piece of frames at once (from the start of the sequence)
+void decode_frames(const qwen3tts_codec* m, const int* codes, int n, float* wav) {
+    DecState st;
+    init_state(m, st);
+    decode_stream(m, st, codes, n, wav);
 }
 
 }  // namespace
@@ -996,6 +1120,59 @@ int qwen3tts_codec_decode(qwen3tts_codec_t* m, const int* codes, int T, float** 
         }
         *wav = out;
         *n_out = written;
+        return 0;
+    } catch (const std::exception& e) {
+        g_error = e.what();
+        return -1;
+    }
+}
+
+// the reference frames' hash (the cache's key): FNV-1a over the codes, and the count
+static unsigned long long codes_key(const int* p, size_t n, int R) {
+    unsigned long long h = 1469598103934665603ull;
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(p);
+    for (size_t i = 0; i < n * sizeof(int); ++i) {
+        h ^= b[i];
+        h *= 1099511628211ull;
+    }
+    return h ^ (static_cast<unsigned long long>(R) * 0x9E3779B97F4A7C15ull);
+}
+
+int qwen3tts_codec_decode_after(qwen3tts_codec_t* m, const int* ref_codes, int R, const int* codes, int T, float** wav,
+                                size_t* n_out) {
+    if (!m || (!ref_codes && R > 0) || R < 0 || !codes || T <= 0 || !wav || !n_out) {
+        g_error = "qwen3tts_codec_decode_after: bad arguments";
+        return -1;
+    }
+    try {
+        const int S = qwen3tts_codec_samples_per_frame(m);
+        const unsigned long long key = codes_key(ref_codes, (size_t)R * m->nq, R);
+        DecState st;
+        bool hit = false;
+        {
+            std::lock_guard<std::mutex> lk(m->cache_mu);
+            for (const auto& e : m->cache)
+                if (e.first == key) {
+                    st = e.second;
+                    hit = true;
+                    break;
+                }
+        }
+        if (!hit) {  // the reference decoded once: its samples are the context's, not the output's
+            init_state(m, st);
+            if (R > 0) {
+                std::vector<float> ctx((size_t)R * S);
+                decode_stream(m, st, ref_codes, R, ctx.data());
+            }
+            std::lock_guard<std::mutex> lk(m->cache_mu);
+            m->cache.emplace_back(key, st);
+            if (m->cache.size() > 8) m->cache.erase(m->cache.begin());
+        }
+        float* out = static_cast<float*>(std::malloc(sizeof(float) * (size_t)T * S));
+        if (!out) throw std::runtime_error("qwen3tts_codec_decode_after: no memory");
+        decode_stream(m, st, codes, T, out);
+        *wav = out;
+        *n_out = (size_t)T * S;
         return 0;
     } catch (const std::exception& e) {
         g_error = e.what();

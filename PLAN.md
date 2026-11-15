@@ -36,7 +36,7 @@ Open work, in the order to take it. Each item names its state and the next concr
    against 256, and the sampler on the device); (b) whisper
    long-form (W4, done 2026-11-15: the seek rule and previous-text conditioning; open: temperature fallback, no forced timestamp rules);
    (b2) the codec's reference frames decoded on every request (U5: 298 frames for a 204-frame voice, ~5 s of a ~8.7 s request;
-   exact fix: cache the decoder's state per voice; QWEN3TTS_CODEC_CONTEXT=25 is approximate, cosine 0.97);
+   done 2026-11-15, U6: the decoder's state cached per voice, exact);
    (c) whisper GPU path (the encoder's matmuls through sddev); (d) vision tower GPU path (V3 onwards); (e) torch-identical
    sampled frames: not started (the engine's sampler is its own generator; a bit match needs torch's CPU RNG path).
    mp3 / opus / aac: not built (no encoder in the image).
@@ -579,8 +579,17 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   verify PASS, speech output max difference 0). One codec call on 40 frames: 1108 -> 558 ms at 16 threads (the convolution
   with a 4 x 64 block in registers); 14.1 -> ~7 s at 1 thread. The server's request for the 204-frame voice: 14 -> 8.7 s, and
   its output is byte-identical to the earlier output (the codec change is exact end to end). Tried and not used: decoding only the last 25 reference frames as context (the codec's attention window is
-  250 frames: the waveform changes, cosine 0.973; its words are the same; QWEN3TTS_CODEC_CONTEXT=25 keeps it as an option).
+  250 frames: the waveform changes, cosine 0.973; its words are the same; not used: superseded by U6, which is exact).
   Open: a streamed decoder with the reference's state cached per voice would make the reference free and stay exact.
+- U6 the codec's reference state cached per voice (2026-11-15). The decoder is a stream: each layer is causal, so the
+  frames decode in pieces with a state (the causal layers' input histories; the transformer's keys and values of the last
+  sw - 1 frames; the next frame's index), bit for bit as at once (`decode_stream`, `DecState`). A voice's reference is
+  decoded once (`qwen3tts_codec_decode_after`, keyed by the codes' hash, the last 8 kept), and each request decodes only
+  its own frames. Checks: the stream decodes 40 and 300 frames bit-identically to the previous decoder (saved outputs);
+  `tests/codec_after_verify.cpp` (`make build/codec_after_verify`): references of 1, 20, 74, 249, 250, 260 frames, a cache
+  hit and a second reference, each bit-identical to the whole sequence's decode: PASS. The codec verifier and the speech
+  verifier PASS. Timing (local, BF16 talker, 40 frames of made-from-clip): speak 3.3 s -> 2.1 s on a cache hit (the first
+  call 4.6 s, with the reference decoded).
 - U1 threads: the host matmuls and convolutions run on the 16 cores (OpenMP over output rows); real-time factors
   measured for the speech (talker frames per second) and the transcription (seconds of audio per second).
 - U2 GPU path (UMA: the GGUF map is pinned, so the GPU reads the same pages): decided after U1 by the measured split;

@@ -28,6 +28,14 @@ int qwen3tts_codec_sample_rate(const qwen3tts_codec_t* codec); /* 24000 */
 int qwen3tts_codec_decode(qwen3tts_codec_t* codec, const int* codes, int T, float** wav, size_t* n_out);
 void qwen3tts_codec_free_wav(float* wav);
 
+/* The samples of T frames of codes that follow R reference frames (the voice's codes): the reference's decoder state is
+ * computed once per distinct reference and cached (the last few), so a request decodes only its own frames. Bit for bit the
+ * samples the whole sequence (the references then the frames) decodes to, after the references' share. The state's
+ * history is the decoder's (each layer's receptive field, the transformer's window): a reference of any length is exact.
+ * wav: malloc'd (free with qwen3tts_codec_free_wav). Returns 0, or -1 (qwen3tts_codec_last_error). */
+int qwen3tts_codec_decode_after(qwen3tts_codec_t* codec, const int* ref_codes, int R, const int* codes, int T, float** wav,
+                                size_t* n_out);
+
 /* The encoder (T6 of PLAN.md; qwen-tts's speech tokenizer encode): the codes of samples at 24 kHz (n of them, float in [-1, 1]):
  * *codes receives T x n_quantizers ints, frame-major (free with qwen3tts_codec_free_codes), T = ceil(n / samples_per_frame)
  * frames (the encoder's, cut to that count, as qwen-tts does). Needs the GGUF's enc.* tensors. Returns 0, or -1. */
