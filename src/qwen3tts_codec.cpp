@@ -1059,17 +1059,34 @@ void decode_dev(const qwen3tts_codec* m, DecState& st, const float* cur, int L0,
     }
     for (int id = L_DEC_BLOCK0; id < L_COUNT; ++id)
         if (d.tin[id]) std::memcpy(d.tin[id], st.tail[id].data(), sizeof(float) * st.tail[id].size());
+    // QWEN3TTS_CODEC_PROFILE=2: a sync after each launch and the wall time per layer kind (the piece's table on stderr)
+    const char* pe = std::getenv("QWEN3TTS_CODEC_PROFILE");
+    const bool lay = pe && std::string(pe) == "2";
+    enum { K_IN = 0, K_OPAD = 21, K_OCONV = 22, K_N = 23 };  // block b: K_BLK + 5 b + (0 pad, 1 tconv, 2 res pad, 3 conv1, 4 conv2)
+    const int K_BLK = 1;
+    double ms[K_N] = {0};
+    std::chrono::steady_clock::time_point t_last = std::chrono::steady_clock::now();
+    auto tick = [&](int kind) {
+        if (!lay) return;
+        if (hipStreamSynchronize(d.stream) != hipSuccess) throw std::runtime_error("qwen3tts_codec device: the stream failed");
+        const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+        ms[kind] += std::chrono::duration<double, std::milli>(now - t_last).count();
+        t_last = now;
+    };
     int ui = 0, L = L0, ch = m->dec_dim;
     float* dcur = d.u[0];
     cdev::conv(d, d.xin, gin + L0, m->dec_in, dcur, L0, L0, 0, nullptr);
+    tick(K_IN);
     for (int b = 0; b < 4; ++b) {
-        const int base = L_DEC_BLOCK0 + 7 * b;
+        const int base = L_DEC_BLOCK0 + 7 * b, kb = K_BLK + 5 * b;
         const DecBlock& B = m->dec[b];
         const int g = (B.up.k - 1) / B.up.stride;
         cdev::pad_act(d, dcur, L, d.tin[base], d.p, d.tout[base], ch, L, g, &d.bsnake[b]);
+        tick(kb);
         ui ^= 1;
         float* up = d.u[ui];
         cdev::tconv(d, d.p, g + L, B.up, up, L * B.rate, L);
+        tick(kb + 1);
         L *= B.rate;
         dcur = up;
         ch = B.up.cout;
@@ -1077,16 +1094,30 @@ void decode_dev(const qwen3tts_codec* m, DecState& st, const float* cur, int L0,
             const ResUnit& R = B.res[r];
             const int id = base + 1 + 2 * r, g1 = (R.conv1.k - 1) * R.conv1.dil;
             cdev::pad_act(d, dcur, L, d.tin[id], d.x1, d.tout[id], ch, L, g1, &d.rsnake[b][r][0]);
+            tick(kb + 2);
             cdev::conv(d, d.x1, g1 + L, R.conv1, d.z, L, L, 2, &d.rsnake[b][r][1]);
+            tick(kb + 3);
             cdev::conv(d, d.z, L, R.conv2, dcur, L, L, 1, nullptr);
+            tick(kb + 4);
         }
     }
     const int gout = (m->out_conv.k - 1) * m->out_conv.dil;
     cdev::pad_act(d, dcur, L, d.tin[L_OUT], d.x1, d.tout[L_OUT], ch, L, gout, &d.osnake);
+    tick(K_OPAD);
     cdev::conv(d, d.x1, gout + L, m->out_conv, d.outw, L, L, 0, nullptr);
+    tick(K_OCONV);
     if (hipStreamSynchronize(d.stream) != hipSuccess) throw std::runtime_error("qwen3tts_codec device: the stream failed");
     for (int id = L_DEC_BLOCK0; id < L_COUNT; ++id)
         if (d.tout[id]) std::memcpy(st.tail[id].data(), d.tout[id], sizeof(float) * st.tail[id].size());
+    if (lay) {  // QWEN3TTS_CODEC_PROFILE=2: the piece's table (ms)
+        std::fprintf(stderr, "qwen3tts_codec layers (gpu, ms): in conv %.2f\n", ms[K_IN]);
+        for (int b = 0; b < 4; ++b) {
+            const double* k = ms + K_BLK + 5 * b;
+            std::fprintf(stderr, "  block %d: pad+act %.2f, tconv %.2f, res pad+act %.2f, res conv1 %.2f, res conv2 %.2f\n", b, k[0],
+                         k[1], k[2], k[3], k[4]);
+        }
+        std::fprintf(stderr, "  out: pad+act %.2f, conv %.2f\n", ms[K_OPAD], ms[K_OCONV]);
+    }
     for (int i = 0; i < L; ++i) wav[i] = std::min(1.0f, std::max(-1.0f, d.outw[i]));
 }
 
