@@ -1,6 +1,7 @@
 // Speech (qwen3tts_speech.h): the chat ids of the text and the reference transcript, the sampled frames, then the codec.
 #include "qwen3tts_speech.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -38,16 +39,22 @@ int qwen3tts_speak(qwen3tts_model_t* model, qwen3tts_codec_t* codec, const char*
         if (T < 0) throw std::runtime_error(qwen3tts_last_error());
         *n_frames = T;
         if (T == 0) return 0;
-        // the reference's frames, then the talker's, decoded together; the reference's share of the samples cut off
+        // the reference's last frames as the left context, then the talker's, decoded together; the context's share of the
+        // samples cut off. 25 frames: qwen-tts's chunked decode's left context (the whole reference, the same output as its
+        // speak, at R + T frames: QWEN3TTS_CODEC_CONTEXT=0). A voice's reference is 74 to 204 frames: decoding all of it
+        // for every request was most of a request's time.
         const int ncb = qwen3tts_n_codebooks(model);
         if (ncb != 16) throw std::runtime_error("qwen3tts_speak: the codec frames are not 16 codebooks");
-        std::vector<int> all((size_t)(R + T) * ncb);
-        std::memcpy(all.data(), ref_codes, sizeof(int) * (size_t)R * ncb);
-        std::memcpy(all.data() + (size_t)R * ncb, codes.data(), sizeof(int) * (size_t)T * ncb);
+        const char* cv = std::getenv("QWEN3TTS_CODEC_CONTEXT");
+        const int ctx_max = cv ? std::atoi(cv) : 0;
+        const int ctx = ctx_max <= 0 ? R : std::min(R, ctx_max);
+        std::vector<int> all((size_t)(ctx + T) * ncb);
+        std::memcpy(all.data(), ref_codes + (size_t)(R - ctx) * ncb, sizeof(int) * (size_t)ctx * ncb);
+        std::memcpy(all.data() + (size_t)ctx * ncb, codes.data(), sizeof(int) * (size_t)T * ncb);
         float* full = nullptr;
         size_t n = 0;
-        if (qwen3tts_codec_decode(codec, all.data(), R + T, &full, &n) != 0) throw std::runtime_error(qwen3tts_codec_last_error());
-        const size_t cut = (size_t)((double)R / (double)(R + T) * (double)n);
+        if (qwen3tts_codec_decode(codec, all.data(), ctx + T, &full, &n) != 0) throw std::runtime_error(qwen3tts_codec_last_error());
+        const size_t cut = (size_t)((double)ctx / (double)(ctx + T) * (double)n);
         const size_t keep = n - cut;
         float* out = (float*)std::malloc(sizeof(float) * (keep ? keep : 1));
         if (!out) {

@@ -110,20 +110,38 @@ void linear(const float* x, int T, const Lin& L, float* y) {
 void conv_causal(const float* x, int T, const Conv& C, float* y) {
     const int pad = (C.k - 1) * C.dil;
     if (C.groups == 1) {
-#pragma omp parallel for schedule(static)
-        for (int o = 0; o < C.cout; ++o) {
-            float* yr = y + (size_t)o * T;
-            const float bias = C.b ? C.b[o] : 0.0f;
-            for (int t = 0; t < T; ++t) yr[t] = bias;
-            for (int c = 0; c < C.cin; ++c) {
-                const float* xr = x + (size_t)c * T;
-                const float* wr = C.w + ((size_t)o * C.cin + c) * C.k;
-                for (int k = 0; k < C.k; ++k) {
-                    const int sh = k * C.dil - pad;  // y[t] += w * x[t + sh] where 0 <= t + sh < T
-                    const float w = wr[k];
-                    const int t0 = std::max(0, -sh), t1 = std::min(T, T - sh);
+        // blocks of 4 output rows and 256 time steps: the block's sums stay in cache over the input channels and the taps
+        // (the row-by-row form read and wrote each output row once per tap). Every output sums in the order it always did
+        // (its bias, then the input channels, then the taps), so the result is the same bits.
+        constexpr int MO = 8, TC = 256;
+        const int nob = (C.cout + MO - 1) / MO, ntb = (T + TC - 1) / TC;
+#pragma omp parallel for schedule(static) collapse(2)
+        for (int ob = 0; ob < nob; ++ob) {
+            for (int tb = 0; tb < ntb; ++tb) {
+                const int o0 = ob * MO, no = std::min(MO, C.cout - o0);
+                const int t0 = tb * TC, nt = std::min(TC, T - t0);
+                float acc[MO][TC];
+                for (int j = 0; j < no; ++j) {
+                    const float bias = C.b ? C.b[o0 + j] : 0.0f;
+                    for (int t = 0; t < nt; ++t) acc[j][t] = bias;
+                }
+                for (int c = 0; c < C.cin; ++c) {
+                    const float* xr = x + (size_t)c * T;
+                    for (int k = 0; k < C.k; ++k) {
+                        const int sh = k * C.dil - pad;  // acc[j][t] += w * x[t + sh] where 0 <= t + sh < T
+                        const int a0 = std::max(t0, -sh), a1 = std::min(t0 + nt, T - sh);
+                        if (a0 >= a1) continue;
+                        for (int j = 0; j < no; ++j) {
+                            const float w = C.w[((size_t)(o0 + j) * C.cin + c) * C.k + k];
+                            float* ar = acc[j] - t0;
 #pragma omp simd
-                    for (int t = t0; t < t1; ++t) yr[t] += w * xr[t + sh];
+                            for (int t = a0; t < a1; ++t) ar[t] += w * xr[t + sh];
+                        }
+                    }
+                }
+                for (int j = 0; j < no; ++j) {
+                    float* yr = y + (size_t)(o0 + j) * T;
+                    for (int t = 0; t < nt; ++t) yr[t0 + t] = acc[j][t];
                 }
             }
         }
@@ -150,21 +168,29 @@ void conv_causal(const float* x, int T, const Conv& C, float* y) {
 // Output u sums x[t] * w[j] over the (t, j) with t * s + j = u; per output channel, the inputs' rows are scattered in
 // (the inner loop over t).
 void conv_transpose(const float* x, int T, const Tconv& C, float* y) {
-    const int L = T * C.stride;
+    // y[t * stride + r] for each phase r: the taps j = r + m * stride land on it from the input t - m, so each phase is a causal
+    // filter over the input (contiguous, vectorized; the stride-scattered form was not). Every output sums in the order it
+    // always did (its bias, then the input channels, then the taps in order), so the result is the same bits.
+    const int s = C.stride, L = T * s;
 #pragma omp parallel for schedule(static)
     for (int o = 0; o < C.cout; ++o) {
         float* yr = y + (size_t)o * L;
         const float bias = C.b ? C.b[o] : 0.0f;
-        for (int u = 0; u < L; ++u) yr[u] = bias;
-        for (int c = 0; c < C.cin; ++c) {
-            const float* xr = x + (size_t)c * T;
-            const float* wr = C.w + ((size_t)c * C.cout + o) * C.k;
-            for (int j = 0; j < C.k; ++j) {
-                const float w = wr[j];
-                // (the outputs past T * stride are trimmed: the taps that land there are dropped)
-                const int tmax = std::min(T, (L - j + C.stride - 1) / C.stride);
-                for (int t = 0; t < tmax; ++t) yr[(size_t)t * C.stride + j] += w * xr[t];
+        std::vector<float> acc((size_t)T);
+        for (int r = 0; r < s; ++r) {
+            for (int t = 0; t < T; ++t) acc[(size_t)t] = bias;
+            for (int c = 0; c < C.cin; ++c) {
+                const float* xr = x + (size_t)c * T;
+                const float* wr = C.w + ((size_t)c * C.cout + o) * C.k;
+                for (int m = 0; r + m * s < C.k; ++m) {
+                    const float w = wr[r + m * s];
+                    // acc[t] += w * x[t - m] for t >= m (the taps that reach past the output's end are not needed)
+                    float* ar = acc.data();
+#pragma omp simd
+                    for (int t = m; t < T; ++t) ar[t] += w * xr[t - m];
+                }
             }
+            for (int t = 0; t < T; ++t) yr[(size_t)t * s + r] = acc[(size_t)t];
         }
     }
 }

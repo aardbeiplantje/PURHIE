@@ -570,6 +570,14 @@ items of A1-A4 and T1-T4, in order, each a commit with its check here as history
   108 VGPRs per thread (the activations' reads), and capping the registers at 64 spilled (1850 us). Engine (45 frames of
   made-from-clip): predictor 17.0 ms, talker 6.2 ms: 23.2 ms per frame, down from 37.3 at the start of U3. The
   predictor's floor at 256 GB/s is about 10 ms, the talker's about 3.5 ms. Open: the matvec kernels at 175 to 206 GB/s.
+- U5 the codec on the CPU (2026-11-15): a speech request decodes the voice's reference frames with the generated ones (74 to
+  204 frames), so a request with a 204-frame voice decodes 298 frames: most of its time (the container: 14 s for 94 frames,
+  of which the talker's stages about 3 s). Now: the codec's convolutions (blocks of 8 output rows and 256 samples) and its
+  transposed convolutions (phase-wise causal filters: the strided scatter was not vectorized). Bit-identical output (codec
+  verify PASS, speech output max difference 0). One codec call on 40 frames: 1108 -> 647 ms at 16 threads; 14.1 -> ~7 s
+  at 1 thread. Tried and not used: decoding only the last 25 reference frames as context (the codec's attention window is
+  250 frames: the waveform changes, cosine 0.973; its words are the same; QWEN3TTS_CODEC_CONTEXT=25 keeps it as an option).
+  Open: a streamed decoder with the reference's state cached per voice would make the reference free and stay exact.
 - U1 threads: the host matmuls and convolutions run on the 16 cores (OpenMP over output rows); real-time factors
   measured for the speech (talker frames per second) and the transcription (seconds of audio per second).
 - U2 GPU path (UMA: the GGUF map is pinned, so the GPU reads the same pages): decided after U1 by the measured split;
