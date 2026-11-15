@@ -56,8 +56,8 @@ The image's build files are the submodule `llama.cpp-rocm-gfx1151-docker` (its o
 rocm-hip from origin `main` into the image, so push rocm-hip before a build. On a fresh clone:
 `git submodule update --init llama.cpp-rocm-gfx1151-docker`.
 
-The build runs through the watcher, which runs in the user's shell, not the agent's: in that directory,
-`./build-watch.sh` waits for `.build-trigger`, then runs `docker buildx bake --pull` and appends the output to
-`build-watch.log`. To start a build, from the rocm-hip root: `touch llama.cpp-rocm-gfx1151-docker/.build-trigger`, then
-wait for `done, exit N` in `build-watch.log`. The touch does nothing while no watcher is running, so check that a
-`build-watch.sh` process exists first. The image runs nothing by itself.
+To trigger an image build, touch the trigger from the rocm-hip root: `touch llama.cpp-rocm-gfx1151-docker/.build-trigger`.
+Do not run `build-watch.sh` yourself: the watcher runs in the user's shell. It waits for the trigger, runs
+`docker buildx bake --pull`, and appends the output to `build-watch.log` (in that directory). The build is done when that
+log has `done, exit N`. Before touching, check that a watcher is running with `ps -eo args | grep '[b]uild-watch.sh'`. If
+none is, say so and leave the trigger in place: the next watcher start builds. The image runs nothing by itself.
