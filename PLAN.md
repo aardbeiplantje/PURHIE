@@ -16,7 +16,8 @@ the 38 GB of IQ downloads (item 2 of the list below) do not fit: local conversio
 The open work as packages. Each is one agent's task with its check; it is done when the check passes and it is committed.
 The lists below keep each item's background.
 - D (item 7) the samplers' sort (28 us a codebook, 55 us for c0). Check: `talker_sample_verify` (exact), the frame's time.
-- E (item 10) Whisper's stage times on the host, to decide on a device path (only whisper-tiny is on this host).
+- E2 (item 10) Whisper's host dot products vectorized (the encoder is 1.5 s a window, about 23 GFLOP/s on 16 cores).
+  Check: `whisper_verify` (the encoder within its tolerance, the 21 tokens equal), `whisper_fallback_verify`, t/64, t/66.
 - F (item 15) the vision tower's stage times (`vision_verify` on `/data/vision-ref`) and its device plan.
 
 The user's decisions: item 12 (prosody across speech pieces) and item 13 (mp3 / opus / aac). Not runnable on this host:
@@ -85,7 +86,15 @@ Performance:
    quarter of the decode: run the next piece's while the device works, or move the pre-convolution and the upsamplers to
    the kernels); the kernel-7 inner loop. A 40-frame request spends about 0.9 s in the talker: the codec is no longer the
    larger part.
-10. **Whisper on the GPU.** The encoder's and decoder's matmuls through sddev (whisper-tiny is small: measure first).
+10. **Whisper on the GPU: measured 2026-11-15, the host first.** Stage times (`WHISPER_PROFILE=1`, whisper-tiny, the 5.9 s
+    clip in a 30 s window, 16 threads): the encoder 1.5 s, the cross-attention keys and values 0.17 s, the mel 0.03 s, a
+    decoder token 18.3 ms. The decoder's linears and attention were shared out over the time steps, which is one in
+    decoding, so each ran on one thread: now over the output elements (and the query-head pairs), above 50000
+    multiply-adds, bit-identical. A decoder token 3.5 ms (best of 3); `whisper_fallback_verify` 44 s (was 115 s), t/66's
+    long clip 12 s (was 23 s). What is left of a window is the encoder (about 80%; 17 GMAC in 1.5 s is about 23 GFLOP/s:
+    its dot products are scalar, summed in order) and, per token, the vocabulary product (1.8 ms of the 3.5). Next:
+    vectorized dot products on the host (package E2: the bits change, the checks' tolerances hold them); a device path
+    for the encoder only if that is not enough (a larger Whisper would need it; only whisper-tiny is on this host).
 
 Quality and scope (decisions):
 11. **Whisper temperature fallback: done 2026-11-15.** A long-form window whose text compresses above 2.4 (zlib) or whose
