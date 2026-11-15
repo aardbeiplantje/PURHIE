@@ -50,3 +50,14 @@ Or for all source files at once:
 ```bash
 find src tests -name '*.cpp' -o -name '*.h' -o -name '*.hpp' -o -name '*.hip' | xargs sed -i 's/[[:space:]]*$//'
 ```
+## Container image
+
+The image's build files are the submodule `llama.cpp-rocm-gfx1151-docker` (its own repo, `main`). Its Dockerfile clones
+rocm-hip from origin `main` into the image, so push rocm-hip before a build. On a fresh clone:
+`git submodule update --init llama.cpp-rocm-gfx1151-docker`.
+
+The build runs through the watcher, which runs in the user's shell, not the agent's: in that directory,
+`./build-watch.sh` waits for `.build-trigger`, then runs `docker buildx bake --pull` and appends the output to
+`build-watch.log`. To start a build, from the rocm-hip root: `touch llama.cpp-rocm-gfx1151-docker/.build-trigger`, then
+wait for `done, exit N` in `build-watch.log`. The touch does nothing while no watcher is running, so check that a
+`build-watch.sh` process exists first. The image runs nothing by itself.

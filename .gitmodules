@@ -1,3 +1,6 @@
 [submodule "perl-minijinja-xs"]
 	path = perl-minijinja-xs
 	url = https://github.com/aardbeiplantje/perl-minijinja-xs.git
+[submodule "llama.cpp-rocm-gfx1151-docker"]
+	path = llama.cpp-rocm-gfx1151-docker
+	url = git@github.com:aardbeiplantje/llama.cpp-rocm-gfx1151-docker
