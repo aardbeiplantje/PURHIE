@@ -1,7 +1,8 @@
 #!/bin/sh
 # convert_verify.sh [dir]: bin/rocm-convert against llama.cpp's convert_hf_to_gguf.py, byte for byte, for every
 # architecture it converts.
-# 1. Converted as BF16 by both, the same tensors (names, types, shapes, bytes) and metadata (model-card keys aside;
+# 1. Converted as BF16 by both, the same tensors (names, types, shapes, bytes) and metadata (model-card keys aside,
+#    but for the releases, whose card is compared too: README.md's front matter, the directory's name;
 #    ssm_a = -exp(A_log) and llama3's rope_freqs may differ by 1 ulp an element: torch's exp and pow are MKL's):
 #    - releases: Qwen3-0.6B, Qwen2.5-0.5B-Instruct, Qwen3.5-0.8B (Gated DeltaNet, its MTP layer), embeddinggemma-300m
 #      (F32, SentencePiece);
@@ -85,10 +86,12 @@ for m in "$DATA/qwen3-0.6b:qwen3" "$DATA/Qwen2.5-0.5B-Instruct:qwen2" "$DATA/Qwe
          "$T/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16:nemotronh" "$T/NVIDIA-Nemotron-3-Super-120B-A12B-BF16:nemotronsuper" \
          "$T/gemma-4-26B-A4B-it:gemma4" "$DIR/glm-tiny:glm" "$DIR/ds-tiny:deepseek4:f32"; do
     src=${m%%:*}; rest=${m#*:}; tag=${rest%%:*}; f32=${rest#"$tag"}
+    # the card keys are compared for the releases (the tiny checkpoints' and the GLM's are not)
+    case $tag in qwen3|qwen2|qwen35|embgemma) CARD= ;; *) CARD=--ignore-card ;; esac
     up "$src" "$DIR/$tag-ref.gguf"
     $CONV "$src" "$DIR/$tag-ours.gguf" bf16-ref || rc=1
     printf '%s, BF16: ' "$tag"
-    $CMP --ignore-card --ulp "$ULP" "$DIR/$tag-ours.gguf" "$DIR/$tag-ref.gguf" | tail -1 | grep 'no differences' || rc=1
+    $CMP $CARD --ulp "$ULP" "$DIR/$tag-ours.gguf" "$DIR/$tag-ref.gguf" | tail -1 | grep 'no differences' || rc=1
     [ "$tag" = glm ] && continue  # FP8: below
     $CONV "$src" "$DIR/$tag-fast.gguf" fast || rc=1
     if [ -n "$f32" ]; then  # F32 or FP8: their BF16 rounds it (DeepSeek: Q8_0), so against our F32 GGUF
@@ -98,7 +101,7 @@ for m in "$DATA/qwen3-0.6b:qwen3" "$DATA/Qwen2.5-0.5B-Instruct:qwen2" "$DATA/Qwe
         $CONV "$DIR/$tag-ref.gguf" "$DIR/$tag-ref-fast.gguf" fast || rc=1
     fi
     printf '%s, FAST directly vs from the GGUF: ' "$tag"
-    $CMP --ignore-card --ulp "$ULP" "$DIR/$tag-fast.gguf" "$DIR/$tag-ref-fast.gguf" | tail -1 | grep 'no differences' || rc=1
+    $CMP $CARD --ulp "$ULP" "$DIR/$tag-fast.gguf" "$DIR/$tag-ref-fast.gguf" | tail -1 | grep 'no differences' || rc=1
     find "$DIR" -name "$tag-*.gguf*" -delete
 done
 # A git clone with LFS whose working tree has only pointer files (no checkout): read from .git/lfs/objects
@@ -109,7 +112,8 @@ $CONV "$DIR/glm-tiny" "$DIR/glm-ours.gguf" bf16-ref || rc=1
   GIT_LFS_SKIP_SMUDGE=1 git clone -q lfs-src lfs-clone && cd lfs-clone && git lfs fetch > /dev/null ) || rc=1
 $CONV --name 'Glm Tiny' "$DIR/lfs-clone" "$DIR/glm-lfs.gguf" bf16-ref || rc=1
 printf 'glm, from LFS pointers vs from the files: '
-$CMP "$DIR/glm-lfs.gguf" "$DIR/glm-ours.gguf" | tail -1 | grep 'no differences' || rc=1
+# (the card keys come from the directory's name: lfs-clone here, glm-tiny there)
+$CMP --ignore-card "$DIR/glm-lfs.gguf" "$DIR/glm-ours.gguf" | tail -1 | grep 'no differences' || rc=1
 $CONV "$DIR/glm-tiny" "$DIR/glm-f32.gguf" f32 || rc=1
 $CONV "$DIR/glm-f32.gguf" "$DIR/glm-f32-fast.gguf" fast || rc=1
 $CONV "$DIR/glm-tiny" "$DIR/glm-fast.gguf" fast || rc=1
