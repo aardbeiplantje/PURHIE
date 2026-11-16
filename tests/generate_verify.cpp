@@ -229,6 +229,7 @@ int main(int argc, char** argv) {
             inference_get_logits(m, ids.data(), out.data());
             return rc;
         };
+        inference_set_lm_head_q8(m, 0);  // the default head is the int8 copy: the float head is the reference
         int rc = logits_of_prompt(f0);
         const int on = inference_set_lm_head_q8(m, 1);
         rc |= logits_of_prompt(q);

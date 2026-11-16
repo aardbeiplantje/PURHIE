@@ -14,9 +14,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -57,6 +59,43 @@ static std::vector<int32_t> run(inference_stream_t* st, std::string* text = null
         if (rc <= 0) break;
     }
     return out;
+}
+
+// A greedy reply is compared token by token with the same prompt's alone reply. The batched and the single-row kernels
+// sum in different orders (the WMMA matmuls read the activations in 16 bits), so where the alone run's two best logits
+// are within kNearTie a reply may take the other one: the first difference must be such a near-tie, and the token
+// must be one of the two. The logits come from a replay of the alone reply on a sequence of its own.
+static const double kNearTie = 0.1;
+static bool same_or_near_tie(inference_model_t* m, const std::vector<int32_t>& prompt, const std::vector<int32_t>& alone,
+                             const std::vector<int32_t>& got, const char* who) {
+    size_t k = 0;
+    while (k < got.size() && k < alone.size() && got[k] == alone[k]) ++k;
+    if (k == alone.size() && got.size() == alone.size()) return true;
+    if (k >= got.size() || k >= alone.size()) return false;
+    const int cur = inference_seq_current(m);
+    const int q = inference_seq_new(m);
+    inference_seq_select(m, q);
+    inference_reset(m);
+    inference_prefill(m, prompt.data(), (int)prompt.size());
+    int next = 0;
+    for (size_t i = 0; i < k; ++i) inference_decode_token(m, alone[i], &next);
+    const int V = inference_vocab_size(m);
+    std::vector<float> lg(V);
+    std::vector<int32_t> ids(V);
+    std::iota(ids.begin(), ids.end(), 0);
+    inference_get_logits(m, ids.data(), lg.data());
+    int b1 = 0, b2 = -1;
+    for (int v = 1; v < V; ++v) {
+        if (lg[v] > lg[b1]) { b2 = b1; b1 = v; }
+        else if (b2 < 0 || lg[v] > lg[b2]) b2 = v;
+    }
+    const double gap = lg[b1] - lg[b2];
+    const bool tie = gap < kNearTie && (got[k] == b1 || got[k] == b2);
+    inference_seq_select(m, cur);
+    inference_seq_free(m, q);
+    printf("  %s: the first difference at token %d, the alone run's two best logits %.4f apart (%s)\n", who, (int)k, gap,
+           tie ? "a near-tie: accepted" : "not a near-tie");
+    return tie;
 }
 
 int main(int argc, char** argv) {
@@ -177,7 +216,9 @@ int main(int argc, char** argv) {
         int k = 0;
         while (k < (int)got[i].size() && k < (int)alone[i]->size() && got[i][k] == (*alone[i])[k]) ++k;
         printf("  batched %d: %d of %d tokens as alone\n", i, k, (int)alone[i]->size());
-        same += got[i] == *alone[i];
+        char who[32];
+        snprintf(who, sizeof who, "batched %d", i);
+        same += same_or_near_tie(m, *prompts[i], *alone[i], got[i], who);
         inference_stream_free(bs[i]);
         inference_seq_free(m, bq[i]);
     }
@@ -216,14 +257,15 @@ int main(int argc, char** argv) {
         char w[200];
         snprintf(w, sizeof w, "chunked prompt (%d tokens, all left to the steps: %s): %d steps without a token (%d), "
                  "then a's tokens; b's tokens meanwhile", L, pre_x == L && reused_x == 0 ? "yes" : "NO", silent, want);
-        const bool tok_ok = gx[0] == a0 && gx[1] == b0;
+        const bool tok_ok = same_or_near_tie(m, pa, a0, gx[0], "chunked a") &&
+                            same_or_near_tie(m, pb, b0, gx[1], "chunked b");
         check(silent == want && pre_x == L && tok_ok && (int)gx[0].size() == N && (int)gx[1].size() == N, w);
         for (int i = 0; i < 2; ++i) inference_stream_free(sx[i]);
         inference_seq_free(m, qx);
         inference_seq_free(m, qy);
         inference_seq_select(m, 0);
     }
-    check(same == 3, "batched: each sequence's tokens = alone");
+    check(same == 3, "batched: each sequence's tokens = alone (a first difference only at a near-tie)");
 
     // speed: n_batch sequences of G tokens, stepped in turn vs batched
     const int NB = argc > 3 ? atoi(argv[3]) : 8, G = 64;
