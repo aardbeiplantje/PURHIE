@@ -455,6 +455,15 @@ Open leads, when it is picked up again:
   to the next, and in the test render `description` came before `name` (Python: `name` first). Whether GLM's tool calls
   suffer is not measured. Fix: keep each object's key order in the Perl data (ordered pairs from the JSON parser) and
   render `tojson` in that order.
+- Memory (found 2026-11-16; the user: "uses all memory"). The deployed GLM runs the GPU path with the expert pager on
+  (the file is over 3/4 of memory; `run.sh` sets no `INFERENCE_*` variable). `make_expert_pager` mlocks and registers
+  experts up to what is available at load, less the rest of the model and 16 GB, so almost all memory is pinned by
+  design. The server then calls `kv_cache_init` for every model (`--kv-budget`, default 16 GB), which registers every
+  KV slot at once: an untouched 1 GB sparse `/dev/shm` slot becomes 1 GB resident on `hipHostRegister`
+  (`pin_test`, 2026-11-16), so the KV is pinned at load whatever the conversation length. `INFERENCE_CPU_ONLY=1` pins
+  no experts (page cache only, reclaimable) but still pins the KV. Leads: register KV slots on first use (helps every
+  model); cap the expert pins (`INFERENCE_EXPERT_PIN_MB`, not set in `run.sh`); skip the KV pin in CPU-only mode.
+  Measure on the host: `VmLck`, `RssAnon`, `RssFile`, `RssShmem` in `/proc/<server pid>/status`.
 - The MTP block (blk.45) as draft head: not bound yet; `index_share_for_mtp_iteration` means the draft shares the
   main index, so the verify path's rollback has to roll the index back too. Its experts are registered with the
   rest (3.6 GB).
