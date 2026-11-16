@@ -1402,7 +1402,7 @@ inference_model_t* inference_load_model_ex(const char* gguf_path, const inferenc
 }
 
 static kv_cache_config_t mtp_kv_config(const inference_model* m, int n_ctx) {
-    return kv_cache_config_t{1, n_ctx, m->n_embd, m->head_dim, m->n_head, m->n_head_kv, 0, m->kv_type};
+    return kv_cache_config_t{1, n_ctx, m->n_embd, m->head_dim, m->n_head, m->n_head_kv, 0, m->kv_type, 1};
 }
 
 static void free_mtp(inference_model* m) {
@@ -1635,12 +1635,13 @@ int inference_kv_cache_init(inference_model_t* m, int n_ctx) {
         }
         if (R > 0) {
             cfg = kv_cache_config_t{std::max(1, n_glob), n_ctx, m->n_embd, glob_hd, m->n_head, glob_kv, 0, m->kv_type};
-            const kv_cache_config_t rcfg{n_ring, R, m->n_embd, ring_hd, m->n_head, ring_kv, R, m->kv_type};
+            const kv_cache_config_t rcfg{n_ring, R, m->n_embd, ring_hd, m->n_head, ring_kv, R, m->kv_type, 1};
             m->kvc_swa = kv_cache_create("/dev/shm", &rcfg);
             if (!m->kvc_swa) { set_error("kv_cache_create (sliding-window ring) failed"); return -1; }
             m->kv_cfg_swa = rcfg;
         }
     }
+    cfg.register_on_use = 1;  // the blocks a context reaches are registered as the attention reaches them (kv_cache.h)
     m->kvc = kv_cache_create("/dev/shm", &cfg);
     if (!m->kvc) { set_error("kv_cache_create failed"); return -1; }
     m->kv_cfg = cfg;

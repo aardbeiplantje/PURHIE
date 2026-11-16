@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -44,6 +45,11 @@ struct inference_kv_cache {
     // The store directory is not in memory (a disk): the slots stay in dir (/dev/shm) and a published block is a
     // copy written there (kv_cache_set_dir)
     bool copy_publish = false;
+    // Registration (kv_cache.h register_on_use): slot_reg[i] 1 when slot i is registered; reg_prefix: slots
+    // [0, reg_prefix) are all registered. lazy: a slot is registered by kv_cache_reserve, not at creation
+    bool lazy = false;
+    std::vector<char> slot_reg;
+    int reg_prefix = 0;
 };
 
 namespace {
@@ -89,24 +95,35 @@ bool in_memory_dir(const char* dir) {
 
 char* slot_addr(const inference_kv_cache_t* c, int slot) { return (char*)c->base + (size_t)slot * c->block_bytes; }
 
-// Map fd at slot's address (MAP_FIXED over whatever is there) and register it for the GPU. A file opened read-only
-// (a shared block) is mapped and registered read-only: a stray write faults instead of corrupting it.
-bool map_slot(inference_kv_cache_t* c, int slot, int fd, bool was_registered) {
-    char* a = slot_addr(c, slot);
-    const bool ro = (fcntl(fd, F_GETFL) & O_ACCMODE) == O_RDONLY;
-    if (was_registered) (void)hipHostUnregister(a);
-    if (mmap(a, c->block_bytes, ro ? PROT_READ : PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) {
-        INFER_LOG("kv_cache: mmap slot %d: %s\n", slot, strerror(errno));
-        return false;
-    }
-    // Coarse-grained: GPU-cacheable, coherent with the CPU at kernel boundaries and syncs. Still zero-copy.
-    const hipError_t st = hipHostRegister(a, c->block_bytes,
+// Register slot's block for the GPU: coarse-grained (GPU-cacheable, coherent with the CPU at kernel boundaries and
+// syncs; still zero-copy). A block of a read-only file is registered read-only: a stray GPU write faults.
+bool register_slot(inference_kv_cache_t* c, int slot, bool ro) {
+    const hipError_t st = hipHostRegister(slot_addr(c, slot), c->block_bytes,
                                           hipExtHostRegisterCoarseGrained | (ro ? hipHostRegisterReadOnly : 0));
     if (st != hipSuccess) {
         INFER_LOG("kv_cache: hipHostRegister slot %d: %s\n", slot, hipGetErrorString(st));
         return false;
     }
+    c->slot_reg[slot] = 1;
     return true;
+}
+
+// Map fd at slot's address (MAP_FIXED over whatever is there), registered now (reg_now) or by kv_cache_reserve. A
+// registered slot is unregistered first: it is being remapped. A file opened read-only (a shared block) is mapped
+// read-only: a stray write faults instead of corrupting it.
+bool map_slot(inference_kv_cache_t* c, int slot, int fd, bool reg_now) {
+    char* a = slot_addr(c, slot);
+    const bool ro = (fcntl(fd, F_GETFL) & O_ACCMODE) == O_RDONLY;
+    if (c->slot_reg[slot]) {
+        (void)hipHostUnregister(a);
+        c->slot_reg[slot] = 0;
+        if (slot < c->reg_prefix) c->reg_prefix = slot;
+    }
+    if (mmap(a, c->block_bytes, ro ? PROT_READ : PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) {
+        INFER_LOG("kv_cache: mmap slot %d: %s\n", slot, strerror(errno));
+        return false;
+    }
+    return reg_now ? register_slot(c, slot, ro) : true;
 }
 
 } // namespace
@@ -174,16 +191,24 @@ inference_kv_cache_t *kv_cache_create(const char *shm_path, const kv_cache_confi
     if (c->base == MAP_FAILED) { INFER_LOG("kv_cache: reserve: %s\n", strerror(errno)); delete c; return nullptr; }
     c->slot_fd.assign(n_slots, -1);
     c->slot_shared.assign(n_slots, 0);
+    c->slot_reg.assign(n_slots, 0);
+    c->lazy = f.register_on_use != 0;
     for (int i = 0; i < n_slots; ++i) {
         bool publishable;
         c->slot_fd[i] = new_slot_file(c, &publishable);
-        if (c->slot_fd[i] < 0 || !map_slot(c, i, c->slot_fd[i], false)) {
+        if (c->slot_fd[i] < 0 || !map_slot(c, i, c->slot_fd[i], !c->lazy)) {
             INFER_LOG("kv_cache: slot %d in %s failed\n", i, c->dir.c_str());
             if (c->slot_fd[i] >= 0) close(c->slot_fd[i]);
             c->slot_fd[i] = -1;
             kv_cache_free(c);
             return nullptr;
         }
+    }
+    c->reg_prefix = c->lazy ? 0 : n_slots;
+    if (c->lazy) {  // the device view is checked when the first block is registered (kv_cache_reserve)
+        c->dev_base = c->base;
+        c->zero_copy_ok = true;
+        return c;
     }
 
     void* dev = nullptr;
@@ -203,8 +228,8 @@ inference_kv_cache_t *kv_cache_create(const char *shm_path, const kv_cache_confi
 void kv_cache_free(inference_kv_cache_t *c) {
     if (!c) return;
     if (c->base && c->base != MAP_FAILED) {
-        for (size_t i = 0; i < c->slot_fd.size(); ++i)
-            if (c->slot_fd[i] >= 0) (void)hipHostUnregister(slot_addr(c, (int)i));
+        for (size_t i = 0; i < c->slot_reg.size(); ++i)
+            if (c->slot_reg[i]) (void)hipHostUnregister(slot_addr(c, (int)i));
         munmap(c->base, c->total_bytes);
     }
     for (int fd : c->slot_fd)
@@ -213,6 +238,26 @@ void kv_cache_free(inference_kv_cache_t *c) {
 }
 
 int kv_cache_n_slots(const inference_kv_cache_t *c) { return c ? (int)c->slot_fd.size() : 0; }
+
+int kv_cache_reserve(inference_kv_cache_t *c, int n_positions) {
+    if (!c) return -1;
+    const int n_slots = (int)c->slot_fd.size();
+    const int need = n_positions <= 0 ? 0 : std::min(n_slots, (n_positions + c->block_tokens - 1) >> c->block_shift);
+    for (int i = c->reg_prefix; i < need; ++i) {
+        if (c->slot_reg[i]) continue;
+        const bool ro = (fcntl(c->slot_fd[i], F_GETFL) & O_ACCMODE) == O_RDONLY;
+        if (!register_slot(c, i, ro)) return -1;
+        if (i == 0) {  // the device view of the mapping: the host address on this UMA (checked once)
+            void* dev = nullptr;
+            if (hipHostGetDevicePointer(&dev, c->base, 0) == hipSuccess) {
+                c->dev_base = dev;
+                c->zero_copy_ok = dev == c->base;
+            }
+        }
+    }
+    while (c->reg_prefix < n_slots && c->slot_reg[c->reg_prefix]) ++c->reg_prefix;
+    return 0;
+}
 
 int kv_cache_slot_shared(const inference_kv_cache_t *c, int slot) {
     return c && slot >= 0 && slot < (int)c->slot_fd.size() ? c->slot_shared[slot] : 0;

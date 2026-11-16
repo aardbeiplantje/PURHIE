@@ -20,6 +20,9 @@ gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day b
 34 GB, `/comfyui` 88 GB: no downloads, one converted file at a time. No ffmpeg on this host (the image gets one).
 
 **Done** (each recorded in its item below):
+- 2026-11-16, memory at load: the GLM state's rows and the KV slots are registered as they are used, not at load; CPU-only
+  mode allocates no GPU state; `run.sh` caps the expert pins at 64 GB (`INFERENCE_EXPERT_PIN_MB`). Details: the GLM
+  section, "Memory". `kv_verify` gained the lazy checks (its GPU self-test runs from `build/co`).
 - 2026-11-16, the chat templates: GLM-5.3-Flash's template failed with "chat_render: unexpected keyword arguments", since
   it calls `tojson(ensure_ascii=False)` and the filter takes no keyword arguments. `_tojson_args` in
   `perl/ROCm-Inference/lib/ROCm/Inference.pm` writes the tojson calls as the filter takes them (ensure_ascii=False goes:
@@ -96,6 +99,14 @@ gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day b
     Not on this host: decide only if the user has such storage.
 12. **`t/95-quantize.t` test 10 fails ("Q6_K cannot (decoded only)"), on HEAD as well (checked 2026-11-16).** It is in the
     quantizer (`Convert.pm`), not the chat code: find whether the test or the Q6_K check is wrong, then fix that.
+13. **Memory on the deployment (2026-11-16).** After the lazy GLM state and the 64 GB expert cap: measure `VmLck`,
+    `RssAnon`, `RssFile` and `RssShmem` of the server (`/proc/<pid>/status`) at a long conversation, and the speed against
+    the cap (the default was unlimited; 4.3-7.6 tok/s). Then decide whether 64 GB stays.
+14. **Failing checks that predate the memory change (HEAD, 2026-11-16).** `t/45-store-lru.t` tests 4, 5 and 10 (the store
+    holds more than the chain needs; no eviction); `seq_verify` on Qwen3.5-0.8B (the chunked prompt, the batched sequences
+    equal to alone) and `generate_verify` on it (`inference_set_lm_head_q8`: the logits after switching the Q8 head off
+    differ). Same messages on HEAD. The sliding-window ring (Gemma-4) and the MTP draft path are not covered by the
+    lazy-KV tests here (no such model files on this host).
 
 **Decided by the user (2026-11-16):** item 12: the speech pieces keep their own prosody (no conditioning on the previous
 piece: closed). Item 13: ffmpeg is added (package M). Package L: built as an option.
@@ -455,15 +466,21 @@ Open leads, when it is picked up again:
   to the next, and in the test render `description` came before `name` (Python: `name` first). Whether GLM's tool calls
   suffer is not measured. Fix: keep each object's key order in the Perl data (ordered pairs from the JSON parser) and
   render `tojson` in that order.
-- Memory (found 2026-11-16; the user: "uses all memory"). The deployed GLM runs the GPU path with the expert pager on
-  (the file is over 3/4 of memory; `run.sh` sets no `INFERENCE_*` variable). `make_expert_pager` mlocks and registers
-  experts up to what is available at load, less the rest of the model and 16 GB, so almost all memory is pinned by
-  design. The server then calls `kv_cache_init` for every model (`--kv-budget`, default 16 GB), which registers every
-  KV slot at once: an untouched 1 GB sparse `/dev/shm` slot becomes 1 GB resident on `hipHostRegister`
-  (`pin_test`, 2026-11-16), so the KV is pinned at load whatever the conversation length. `INFERENCE_CPU_ONLY=1` pins
-  no experts (page cache only, reclaimable) but still pins the KV. Leads: register KV slots on first use (helps every
-  model); cap the expert pins (`INFERENCE_EXPERT_PIN_MB`, not set in `run.sh`); skip the KV pin in CPU-only mode.
-  Measure on the host: `VmLck`, `RssAnon`, `RssFile`, `RssShmem` in `/proc/<server pid>/status`.
+- Memory (the user: "uses all memory"; found and fixed 2026-11-16, not yet measured on the real model). The deployed GLM
+  runs the GPU path with the expert pager on (the file is over 3/4 of memory; `run.sh` had no `INFERENCE_*` variable).
+  Before the fix, what it pinned at load: (1) the experts, mlocked and registered up to the budget (what is available
+  at load less the rest of the model and 16 GB: by design, and the default); (2) `GlmState`, every row of the context
+  at once: about 38 KB a position at 12 MLA layers, so 40 GB at the trained 1,048,576 positions the server gives GLM
+  (`/dev/shm/glm5_state.bin`, `mem.alloc` registers the whole file); (3) the same state again in CPU-only mode, which
+  does not use it. The KV cache of GLM is a one-layer stand-in (128 bytes a position), not the cause. Fixed (same day):
+  the per-position rows are `LazyRows`, registered in 2 MB steps as `reserve(pos0 + T)` reaches them (tiny GLM: output
+  byte-identical); CPU-only allocates none of the GPU state; `run.sh` passes `INFERENCE_EXPERT_PIN_MB` (default 65536,
+  64 GB: the expert pins are capped; the speed cost of fewer GPU experts is not measured). The KV slots of the other
+  models are registered as the attention reaches them (`kv_cache_reserve`, `register_on_use`): a Qwen3-0.6B cache of
+  32768 positions pinned 3.8 GB at creation, now 0.18 GB. Checks: `kv_verify` (eager and lazy), `generate_verify`,
+  `seq_verify`, `store_verify`, the Perl model tests (11 files, 1532 tests), `glm5next_verify` (GPU and CPU-only).
+  Measured with `mem_probe` (a probe of `VmLck`, `RssAnon`, `RssFile`, `RssShmem` and the system figures at each stage).
+  Still to measure: the deployed GLM at a long conversation (the pinned rows and the page cache for the CPU experts).
 - The MTP block (blk.45) as draft head: not bound yet; `index_share_for_mtp_iteration` means the draft shares the
   main index, so the verify path's rollback has to roll the index back too. Its experts are registered with the
   rest (3.6 GB).

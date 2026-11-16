@@ -106,6 +106,75 @@ struct ShmRegion {
     }
 };
 
+// Arrays whose rows follow the position (GlmState's latents, indexer keys, gates and pooled keys): one file, each array
+// starting on a 2 MB boundary, not registered at once. reserve(pos_end) registers each array's rows up to pos_end, in
+// 2 MB steps: a context pins the rows its positions use, not all of its n_ctx rows. A GPU read of an unregistered page
+// hangs the GPU, so the forward pass calls reserve() before its kernels run.
+struct LazyRows {
+    static constexpr size_t STEP = (size_t)2 << 20;
+    struct Arr {
+        float** ptr;          // the array's base (set by alloc)
+        size_t row_bytes;     // one row: floats * 4
+        size_t div;           // row of position p: p / div (pooled keys: one row per KP positions)
+        size_t alloc_bytes;   // the array's bytes, rounded to STEP
+        size_t reg = 0;       // bytes registered from its start
+    };
+    void* base = nullptr;
+    size_t total = 0;
+    std::vector<Arr> arr;
+    std::vector<std::pair<void*, size_t>> regs;  // every registered piece (unregistered by free)
+
+    // floats[i] per row, rows[i] rows, row i of position p is p / div[i]: arrays at ptrs[i]
+    bool alloc(const char* path, const std::vector<size_t>& floats, const std::vector<size_t>& rows,
+               const std::vector<size_t>& div, const std::vector<float**>& ptrs) {
+        std::vector<size_t> off(ptrs.size());
+        total = 0;
+        for (size_t i = 0; i < ptrs.size(); ++i) {
+            off[i] = total;
+            total += (rows[i] * floats[i] * sizeof(float) + STEP - 1) / STEP * STEP;
+        }
+        int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) return false;
+        const bool sized = ftruncate(fd, (off_t)total) == 0;
+        void* p = sized ? mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
+        close(fd);
+        unlink(path);
+        if (p == MAP_FAILED) return false;
+        base = p;
+        arr.clear();
+        for (size_t i = 0; i < ptrs.size(); ++i) {
+            *ptrs[i] = (float*)((char*)p + off[i]);
+            arr.push_back({ptrs[i], floats[i] * sizeof(float), div[i],
+                           (rows[i] * floats[i] * sizeof(float) + STEP - 1) / STEP * STEP});
+        }
+        return true;
+    }
+
+    // Registers the rows position pos_end - 1 needs (every array), in 2 MB steps. False: a registration failed
+    bool reserve(int pos_end) {
+        if (pos_end <= 0) return true;
+        for (Arr& a : arr) {
+            const size_t rows = (size_t)(pos_end - 1) / a.div + 1;
+            const size_t need = std::min(a.alloc_bytes, (rows * a.row_bytes + STEP - 1) / STEP * STEP);
+            if (need <= a.reg) continue;
+            char* p = (char*)*a.ptr + a.reg;
+            if (hipHostRegister(p, need - a.reg, hipExtHostRegisterCoarseGrained) != hipSuccess) return false;
+            regs.push_back({p, need - a.reg});
+            a.reg = need;
+        }
+        return true;
+    }
+
+    void free() {
+        if (!base) return;
+        for (const auto& r : regs) (void)hipHostUnregister(r.first);
+        regs.clear();
+        munmap(base, total);
+        base = nullptr;
+        arr.clear();
+    }
+};
+
 // Per-token activations
 // Per-forward activations for up to B tokens (one micro-batch of a prefill; B = 1 row is used when
 // generating). Each array holds B rows of the per-token size given in brackets.
@@ -371,6 +440,7 @@ struct GlmState {
     static constexpr int GLM_MLA_ROWS = 64;
     std::vector<float*> conv, S, latent, ik, ig, pooled, ape;  // by layer (nullptr where none)
     ShmRegion mem;
+    LazyRows rows_mem;  // latent, ik, ig, pooled: registered by reserve() as the positions reach them
 
     bool alloc(const inference_model* m, int ctx, int rows) {
         const int E = m->n_embd, HCE = m->hc_mult * E, H = m->n_head, HD = m->kda_head_dim, DI = H * HD;
@@ -393,17 +463,24 @@ struct GlmState {
         const int L = m->n_layer;
         conv.assign(L, nullptr), S.assign(L, nullptr), latent.assign(L, nullptr), ik.assign(L, nullptr),
             ig.assign(L, nullptr), pooled.assign(L, nullptr), ape.assign(L, nullptr);
+        // The rows that follow the position (latents, indexer keys, gates, pooled keys: one row per KP positions for
+        // the pooled) are LazyRows: registered as the positions reach them. The rest is registered now.
+        std::vector<size_t> lf, lr, ld;
+        std::vector<float**> lp;
+        auto lazy = [&](size_t floats, size_t n, size_t div, float** p) {
+            lf.push_back(floats), lr.push_back(n), ld.push_back(div), lp.push_back(p);
+        };
         for (int l = 0; l < L; ++l) {
             const LayerWeights& W = m->layers[l];
             if (W.kind == LAYER_KDA) {
                 sz.push_back(3 * (size_t)DI * NC), pt.push_back(&conv[l]);
                 sz.push_back((size_t)H * HD * HD), pt.push_back(&S[l]);
             } else if (W.kind == LAYER_MLA_DSA) {
-                sz.push_back((size_t)ctx * KL), pt.push_back(&latent[l]);
+                lazy(KL, (size_t)ctx, 1, &latent[l]);
                 if (W.ix_full) {
-                    sz.push_back((size_t)ctx * ID), pt.push_back(&ik[l]);
-                    sz.push_back((size_t)ctx * ID), pt.push_back(&ig[l]);
-                    sz.push_back((size_t)np * ID), pt.push_back(&pooled[l]);
+                    lazy(ID, (size_t)ctx, 1, &ik[l]);
+                    lazy(ID, (size_t)ctx, 1, &ig[l]);
+                    lazy(ID, (size_t)np, KP, &pooled[l]);
                     sz.push_back((size_t)KP * ID), pt.push_back(&ape[l]);
                 }
             }
@@ -411,6 +488,7 @@ struct GlmState {
         if (!mem.alloc("/dev/shm/glm5_state.bin", sz.data(), (float** const*)pt.data(), sz.size(),
                        hipExtHostRegisterCoarseGrained))
             return false;
+        if (!rows_mem.alloc("/dev/shm/glm5_state_rows.bin", lf, lr, ld, lp)) return false;
         for (size_t r = 0; r < b; ++r)
             for (int h = 0; h < H; ++h) hids[r * H + h] = h;
         for (int l = 0; l < L; ++l)  // the indexer's ape, decoded once
@@ -433,7 +511,10 @@ struct GlmState {
         return hipSuccess;
     }
 
-    void free() { mem.free(); }
+    void free() {
+        mem.free();
+        rows_mem.free();
+    }
 };
 
 struct QwenModel {
@@ -701,7 +782,10 @@ struct QwenModel {
                 qwen_set_error("cannot load glm5_gpu.co");
                 return false;
             }
-            if (!glm.alloc(eng, n_ctx, s.B)) {
+            // INFERENCE_CPU_ONLY: the CPU pass keeps its own state (forward_glm5_cpu): nothing of the GPU's to allocate
+            if (eng->cpu_only) {
+                glm.n_ctx = n_ctx;
+            } else if (!glm.alloc(eng, n_ctx, s.B)) {
                 qwen_set_error("GLM-5.3 state allocation failed");
                 return false;
             }
@@ -856,6 +940,10 @@ struct QwenModel {
                 o.bq = L.bq, o.bk = L.bk, o.bv = L.bv;
                 o.rope_norm = L.rope_norm ? 1 : 0;
                 o.freq_factors = L.rope_ff;
+                if (kv_cache_reserve(kvc, pos + Tr) != 0) {
+                    qwen_set_error("KV cache: registering the blocks failed");
+                    return false;
+                }
                 return check(attention_forward_opts(s.qfull + r * L.Wq.N, s.k + r * L.Wk.N, s.v + r * L.Wv.N, L.q_norm,
                                                     L.k_norm, K, V, kv_cache_block_shift(kvc),
                                                     kv_cache_block_stride(kvc), HQ, HKV, eng->n_rot, pos, Tr,
@@ -1433,6 +1521,10 @@ struct QwenModel {
                 o.window = L.window;
                 o.scale = emb ? 0.0f : 1.0f;
                 o.bidir = emb ? 1 : 0;
+                if (kv_cache_reserve(kvc, pos + Tr) != 0) {
+                    qwen_set_error("KV cache: registering the blocks failed");
+                    return false;
+                }
                 return check(attention_forward_opts(s.qfull + r * L.Wq.N, s.k + r * L.Wk.N,
                                                     L.v_from_k ? s.k + r * L.Wk.N : s.v + r * L.Wv.N, L.q_norm,
                                                     L.k_norm, K, V, kv_cache_block_shift(kvc),
@@ -1667,6 +1759,10 @@ struct QwenModel {
                 o.kv_stride = kv_cache_row_halves(kvc);
                 o.kv_quant = kv_cache_type(kvc);
                 o.no_qk_norm = 1;  // and no RoPE (n_rot 0)
+                if (kv_cache_reserve(kvc, pos + Tr) != 0) {
+                    qwen_set_error("KV cache: registering the blocks failed");
+                    return false;
+                }
                 return check(attention_forward_opts(s.qfull + r * L.Wq.N, s.k + r * L.Wk.N, s.v + r * L.Wv.N, nullptr,
                                                     nullptr, K, V, kv_cache_block_shift(kvc),
                                                     kv_cache_block_stride(kvc), HQ, L.n_head_kv, 0, pos, Tr,
@@ -2114,6 +2210,10 @@ struct QwenModel {
         const int E = eng->n_embd, V = eng->vocab_size, HC = eng->hc_mult;
         if (bat || spec_mid || all_out) { qwen_set_error("glm5-next: batched sequences / drafts not supported yet"); return -1; }
         if (pos0 + T > glm.n_ctx) { qwen_set_error("positions %d..%d past the context", pos0, pos0 + T - 1); return -1; }
+        if (!glm.rows_mem.reserve(pos0 + T)) {
+            qwen_set_error("GLM-5.3 state: registering its rows failed");
+            return -1;
+        }
         prof.start();
         if (!sync()) return -1;  // the CPU writes the streams below
         for (int t = 0; t < T; ++t) {

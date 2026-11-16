@@ -72,6 +72,7 @@ exec docker run \
     -e ROCM_DRAFT=${ROCM_DRAFT:-} \
     -e ROCM_STORE=${ROCM_STORE:-$([ -n "$ROCM_STORE_DIR" ] && echo /kvstore)} \
     -e ROCM_ARGS="${ROCM_ARGS:-}" \
+    -e INFERENCE_EXPERT_PIN_MB=${INFERENCE_EXPERT_PIN_MB:-65536} \
     $([ -n "$QMATVEC_PREFILL_SPLIT_VARIANT" ] && echo "-e QMATVEC_PREFILL_SPLIT_VARIANT=$QMATVEC_PREFILL_SPLIT_VARIANT") \
     $DOCKER_OPTS \
         $DOCKER_IMAGE \

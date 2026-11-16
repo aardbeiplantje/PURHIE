@@ -40,6 +40,8 @@ typedef struct {
     int block_tokens;  /* positions per block, a power of two; 0: KV_CACHE_DEFAULT_BLOCK */
     int kv_type;       /* KV_CACHE_F16 (0), KV_CACHE_Q8_0 or KV_CACHE_Q4_0: rows of int8 / 4-bit values then an fp16
                           scale per 32 (d_kv a multiple of 256; attention_opts.kv_quant, the same numbers) */
+    int register_on_use; /* 0: every block is registered (pinned) at creation. 1: a block is registered when
+                          kv_cache_reserve() reaches it, so a context's unused positions take no memory */
 } kv_cache_config_t;
 
 #define KV_CACHE_F16 0
@@ -77,6 +79,11 @@ void  *kv_cache_device_ptr(const inference_kv_cache_t *c);
 
 /* True when hipHostGetDevicePointer returned the host address (UMA identity holds here). */
 bool   kv_cache_zero_copy_ok(const inference_kv_cache_t *c);
+
+/* register_on_use caches: register (pin) the blocks that positions [0, n_positions) use, the ones not yet registered.
+   Call before any GPU kernel reads or writes those positions: a GPU read of an unregistered page hangs the GPU. Returns
+   0, -1 when a registration fails. A cache created without register_on_use: a no-op. */
+int  kv_cache_reserve(inference_kv_cache_t *c, int n_positions);
 
 /* Row p of layer l: d_kv contiguous __half values inside the mapped file. NULL if out of range. */
 __half        *kv_cache_k_row(inference_kv_cache_t *c, int layer, int pos);

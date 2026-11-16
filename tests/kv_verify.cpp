@@ -45,6 +45,18 @@ static void report(const char* what, bool ok) {
     if (!ok) g_failures++;
 }
 
+// The shared memory this process holds resident (bytes): a cache's block is in it once registered (or touched)
+static long long rss_shmem_bytes() {
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[256];
+    long long kb = -1;
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, "RssShmem:", 9)) { kb = atoll(line + 9); break; }
+    fclose(f);
+    return kb * 1024;
+}
+
 // Load a pre-compiled kernel module from a .co file by symbol name.
 static bool load_kernel(const char* co_path, const char* func_name, hipModule_t& mod_out, hipFunction_t& func_out) {
     int kfd = open(co_path, O_RDONLY);
@@ -237,6 +249,28 @@ int main(int argc, char* argv[]) {
             unlink(path);
             kv_cache_free(sc);
         }
+    }
+
+    // register_on_use (kv_cache.h): a block takes memory when kv_cache_reserve reaches it, not at creation. The
+    // resident memory of this process (RssShmem) is the check: 8 layers x 256 positions x 1024 values x 2 (K, V) x
+    // 2 bytes = 8 MB a block, a 16384-position cache of 64 blocks (512 MB)
+    {
+        kv_cache_config_t lc{8, 16384, 1024, 128, 8, 8, 0, KV_CACHE_F16, 1};
+        const long long mb = 1 << 20, block = 8 * mb;
+        const long long before = rss_shmem_bytes();
+        inference_kv_cache_t* lazy = kv_cache_create("/dev/shm", &lc);
+        if (!lazy) { fprintf(stderr, "lazy kv_cache_create failed\n"); return 1; }
+        const long long created = rss_shmem_bytes() - before;
+        report("lazy cache takes no memory at creation", created < 16 * mb);
+        report("reserve(0) and reserve(256) take one block", kv_cache_reserve(lazy, 0) == 0 &&
+               kv_cache_reserve(lazy, 256) == 0 && rss_shmem_bytes() - before - created >= block - mb &&
+               rss_shmem_bytes() - before - created <= block + mb);
+        const long long one = rss_shmem_bytes();
+        report("reserve(257) takes the second block", kv_cache_reserve(lazy, 257) == 0 &&
+               rss_shmem_bytes() - one >= block - mb && rss_shmem_bytes() - one <= block + mb);
+        report("reserve(16384) takes the rest (the whole cache)", kv_cache_reserve(lazy, 16384) == 0 &&
+               rss_shmem_bytes() - before >= 64 * block - 8 * mb);
+        kv_cache_free(lazy);
     }
 
     if (g_failures == 0) {
