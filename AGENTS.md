@@ -52,13 +52,12 @@ find src tests -name '*.cpp' -o -name '*.h' -o -name '*.hpp' -o -name '*.hip' | 
 ```
 ## Container image
 
-The image's build files are the submodule `llama.cpp-rocm-gfx1151-docker` (its own repo, `main`). Its Dockerfile clones
-rocm-hip from origin `main` into the image, so push rocm-hip before a build. On a fresh clone:
-`git submodule update --init llama.cpp-rocm-gfx1151-docker`.
+The image is built from this repository's `Dockerfile` (`docker-bake.hcl`, the image `local/ai/purhie-gfx1151:latest`).
+Its ROCm build clones rocm-hip from GitHub `main`, so push before a build. The image's own files are `app.sh`,
+`nginx.conf` and the runtime packages; `.dockerignore` keeps the build context small.
 
-To trigger an image build, touch the trigger from the rocm-hip root: `touch llama.cpp-rocm-gfx1151-docker/.build-trigger`.
-The user runs `build-watch.sh` in that directory, in their shell: it waits for the trigger, runs
-`docker buildx bake --pull`, and appends the output to `build-watch.log`. The build is done when that log has
-`done, exit N`. The user also runs `image-watch.sh` to restart the container. Do not run either watcher yourself, and do
-not check whether they are running: you cannot see the user's shell. Touch the trigger and report. The image runs nothing
-by itself.
+To trigger an image build, touch the trigger from the repository root: `touch .build-trigger`. The user runs
+`build-watch.sh` here, in their shell: it waits for the trigger, runs `docker buildx bake --pull`, and appends the
+output to `build-watch.log`. The build is done when that log has `done, exit N`. The user also runs `image-watch.sh`
+to restart the container. Do not run either watcher yourself, and do not check whether they are running: you cannot
+see the user's shell. Touch the trigger and report. The image runs nothing by itself.
