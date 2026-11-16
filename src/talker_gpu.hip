@@ -225,6 +225,138 @@ tk_down_add(const float *g, const uint16_t *Wd, float *x, int FF, int C) {
     if (lane == 0) x[row] += acc;
 }
 
+// ---- Q8_0 rows (the code predictor's blocks in the predq8 file): ggml's layout, a row of K values is K/32 blocks of 34
+// bytes (an fp16 scale, then 32 int8 values). Lane l of the 32-lane group takes the blocks l, l + 32, ... of the row, so a
+// lane takes K / 1024 blocks (K = 1024, 2048 or 3072: the widths of the predictor). The block's bytes start at an even
+// offset, not a multiple of 16: the 16-byte pieces are read with memcpy (the compiler's wide loads, see the notes in the
+// report) and every load is unconditional, as in tk_row_dot.
+
+// the fp16 bits as a float (sign, exponent, mantissa; zero and subnormals exact); the inputs are finite (no inf / nan)
+__device__ __forceinline__ float tk_f16(uint16_t h) {
+    const uint32_t e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
+    const float mag = e == 0 ? (float)m * (1.0f / 16777216.0f) : __uint_as_float(((e + 112u) << 23) | (m << 13));
+    return (h & 0x8000u) ? -mag : mag;
+}
+
+struct tk_q8blk {
+    uint16_t d;   // the scale (fp16 bits)
+    uint4 a, b;   // the 32 int8 values: a holds 0 .. 15, b holds 16 .. 31
+};
+
+__device__ __forceinline__ tk_q8blk tk_q8_load(const uint8_t *p) {
+    tk_q8blk r;
+    __builtin_memcpy(&r.d, p, 2);
+    __builtin_memcpy(&r.a, p + 2, 16);
+    __builtin_memcpy(&r.b, p + 18, 16);
+    return r;
+}
+
+// the scale times the sum of the block's 32 int8 values times the matching activations (xb [32]), summed in index order
+__device__ __forceinline__ float tk_q8_dot(const tk_q8blk &q, const float *xb) {
+    const uint32_t w[8] = {q.a.x, q.a.y, q.a.z, q.a.w, q.b.x, q.b.y, q.b.z, q.b.w};
+    // the activations as float4 (the block's 32 floats start at a multiple of 128 bytes: one wide LDS read per 4)
+    const float4 *x4 = reinterpret_cast<const float4 *>(__builtin_assume_aligned(xb, 16));
+    float s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const float4 xv = x4[k];
+        s += xv.x * (float)(int8_t)(w[k] & 0xFFu);
+        s += xv.y * (float)(int8_t)((w[k] >> 8) & 0xFFu);
+        s += xv.z * (float)(int8_t)((w[k] >> 16) & 0xFFu);
+        s += xv.w * (float)(int8_t)((w[k] >> 24) & 0xFFu);
+    }
+    return tk_f16(q.d) * s;
+}
+
+// S = K / 1024 blocks per lane: all of a lane's blocks are loaded before their sums (in block order)
+template <int S>
+__device__ __forceinline__ float tk_row_dot_q8s(const uint8_t *wr, const float *xs, int lane) {
+    tk_q8blk v[S];
+#pragma unroll
+    for (int s = 0; s < S; ++s) v[s] = tk_q8_load(wr + 34 * (size_t)(lane + 32 * s));
+    float acc = 0.0f;
+#pragma unroll
+    for (int s = 0; s < S; ++s) acc += tk_q8_dot(v[s], xs + 32 * (lane + 32 * s));
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor(acc, o);
+    return acc;
+}
+
+// the dot product of one Q8_0 row of n values (n = 1024, 2048 or 3072) with xs [n], by one 32-lane group
+__device__ __forceinline__ float tk_row_dot_q8(const uint8_t *wr, const float *xs, int n, int lane) {
+    switch (n / 1024) {  // (uniform: the row width is the launch's)
+        case 1: return tk_row_dot_q8s<1>(wr, xs, lane);
+        case 2: return tk_row_dot_q8s<2>(wr, xs, lane);
+        default: return tk_row_dot_q8s<3>(wr, xs, lane);
+    }
+}
+
+// the bytes of one Q8_0 row of n values
+__device__ __forceinline__ size_t tk_q8_row_bytes(int n) { return (size_t)(n / 32) * 34; }
+
+// tk_qkv with Q8_0 weights (the same rows, grid and prologue)
+extern "C" __global__ void __launch_bounds__(TK_THREADS)
+tk_qkv_q8(const float *x, const float *nw, const uint8_t *Wq, const uint8_t *Wk, const uint8_t *Wv, int C, int nq, int nk,
+          int nv, float eps, float *q, float *k, float *v) {
+    extern __shared__ float xs[];
+    __shared__ float red[TK_THREADS];
+    tk_rms_lds(x, nw, C, eps, xs, red);
+    const int row = blockIdx.x * TK_ROWS + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (row >= nq + nk + nv) return;
+    const size_t rb = tk_q8_row_bytes(C);
+    const uint8_t *W;
+    float *out;
+    if (row < nq) {
+        W = Wq + (size_t)row * rb;
+        out = q + row;
+    } else if (row < nq + nk) {
+        W = Wk + (size_t)(row - nq) * rb;
+        out = k + (row - nq);
+    } else {
+        W = Wv + (size_t)(row - nq - nk) * rb;
+        out = v + (row - nq - nk);
+    }
+    const float acc = tk_row_dot_q8(W, xs, C, lane);
+    if (lane == 0) *out = acc;
+}
+
+// tk_oproj_add with Q8_0 weights
+extern "C" __global__ void __launch_bounds__(TK_THREADS)
+tk_oproj_add_q8(const float *att, const uint8_t *Wo, float *x, int K, int C) {
+    extern __shared__ float xs[];
+    for (int i = threadIdx.x; i < K; i += TK_THREADS) xs[i] = att[i];
+    __syncthreads();
+    const int row = blockIdx.x * TK_ROWS + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (row >= C) return;
+    const float acc = tk_row_dot_q8(Wo + (size_t)row * tk_q8_row_bytes(K), xs, K, lane);
+    if (lane == 0) x[row] += acc;
+}
+
+// tk_gateup with Q8_0 weights (the gate's and the up's rows are two dot products here)
+extern "C" __global__ void __launch_bounds__(TK_THREADS)
+tk_gateup_q8(const float *x, const float *nw, const uint8_t *Wg, const uint8_t *Wu, int C, int FF, float eps, float *g) {
+    extern __shared__ float xs[];
+    __shared__ float red[TK_THREADS];
+    tk_rms_lds(x, nw, C, eps, xs, red);
+    const int row = blockIdx.x * TK_ROWS + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (row >= FF) return;
+    const size_t rb = tk_q8_row_bytes(C);
+    const float gate = tk_row_dot_q8(Wg + (size_t)row * rb, xs, C, lane);
+    const float up = tk_row_dot_q8(Wu + (size_t)row * rb, xs, C, lane);
+    if (lane == 0) g[row] = gate / (1.0f + expf(-gate)) * up;
+}
+
+// tk_down_add with Q8_0 weights
+extern "C" __global__ void __launch_bounds__(TK_THREADS)
+tk_down_add_q8(const float *g, const uint8_t *Wd, float *x, int FF, int C) {
+    extern __shared__ float xs[];
+    for (int i = threadIdx.x; i < FF; i += TK_THREADS) xs[i] = g[i];
+    __syncthreads();
+    const int row = blockIdx.x * TK_ROWS + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (row >= C) return;
+    const float acc = tk_row_dot_q8(Wd + (size_t)row * tk_q8_row_bytes(FF), xs, FF, lane);
+    if (lane == 0) x[row] += acc;
+}
+
 // out[r] = Wh[r] . rms(x) * nw for the rows of a head (the codec head, the predictor's heads); normed (optional) gets rms(x) * nw.
 // Dynamic shared memory: C floats
 extern "C" __global__ void __launch_bounds__(TK_THREADS)

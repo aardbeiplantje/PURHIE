@@ -234,13 +234,18 @@ Mat mat_of(const gguf_model_t* g, const std::string& name, int rows, int cols, b
 }
 
 
-// The device path reads the talker's and the predictor's matrices as BF16 in place: a GGUF with F32 matrices (the
-// talker-f32 file) runs on the host. A matrix is a tensor with two or more rows (the norms and biases are vectors).
-bool bf16_matrices(const gguf_model_t* g) {
+// The device path reads the talker's and the predictor's matrices in place: BF16, except the code predictor's blocks
+// (pred.blk.*), which may be Q8_0 (the predq8 file). A GGUF with F32 matrices (the talker-f32 file) runs on the host. A
+// matrix is a tensor with two or more rows (the norms and biases are vectors).
+bool device_matrices(const gguf_model_t* g) {
     for (int64_t i = 0; i < gguf_n_tensors(g); ++i) {
         const char* name = gguf_tensor_name(g, i);
         if (strncmp(name, "talker.", 7) && strncmp(name, "pred.", 5)) continue;
-        if (gguf_tensor_ne(g, i)[1] > 1 && gguf_tensor_type(g, i) != 30) return false;  // 30: ggml's BF16
+        if (gguf_tensor_ne(g, i)[1] <= 1) continue;  // not a matrix
+        const int type = gguf_tensor_type(g, i);
+        if (type == 30) continue;  // ggml's BF16
+        if (type == kGgmlQ8_0 && !strncmp(name, "pred.blk.", 9)) continue;
+        return false;
     }
     return true;
 }
@@ -638,6 +643,7 @@ hipFunction_t f_qkv = nullptr, f_qk = nullptr, f_attn = nullptr, f_oproj = nullp
 hipFunction_t f_rms_rows = nullptr, f_qk_rows = nullptr, f_attn_rows = nullptr, f_add_rows = nullptr, f_silu2 = nullptr,
               f_gemm = nullptr;
 hipFunction_t f_sample = nullptr, f_sample_c0 = nullptr, f_gather = nullptr;  // the samplers and the row gather (talker_gpu.hip)
+hipFunction_t f_qkv_q8 = nullptr, f_oproj_q8 = nullptr, f_gateup_q8 = nullptr, f_down_q8 = nullptr;  // the Q8_0 matvecs
 hipStream_t stream = nullptr;  // the run's stream (graph capture needs one: not the null stream)
 
 bool load() {
@@ -645,11 +651,12 @@ bool load() {
     if (kernel_module_load(&mod, "talker_gpu.co") != hipSuccess) return false;
     hipFunction_t* fns[] = {&f_qkv,    &f_qk,       &f_attn,   &f_oproj,  &f_gateup,   &f_down,
                             &f_head,   &f_rms_rows, &f_qk_rows, &f_attn_rows, &f_add_rows, &f_silu2, &f_gemm,
-                            &f_sample, &f_sample_c0, &f_gather};
+                            &f_sample, &f_sample_c0, &f_gather, &f_qkv_q8, &f_oproj_q8, &f_gateup_q8, &f_down_q8};
     const char* names[] = {"tk_qkv",     "tk_qk_rope_kv", "tk_attn", "tk_oproj_add", "tk_gateup", "tk_down_add",
                            "tk_head",    "tk_rms_rows",   "tk_qk_rows", "tk_attn_rows", "tk_add_rows", "tk_silu_mul2",
-                           "tk_gemm",    "tk_sample_next", "tk_sample_c0", "tk_gather_row"};
-    for (int i = 0; i < 16; ++i)
+                           "tk_gemm",    "tk_sample_next", "tk_sample_c0", "tk_gather_row",
+                           "tk_qkv_q8",  "tk_oproj_add_q8", "tk_gateup_q8", "tk_down_add_q8"};
+    for (int i = 0; i < 20; ++i)
         if (hipModuleGetFunction(fns[i], mod, names[i]) != hipSuccess) return false;
     return true;
 }
@@ -726,6 +733,10 @@ const char* kernel_name(hipFunction_t f) {
     if (f == f_sample) return "tk_sample_next";
     if (f == f_sample_c0) return "tk_sample_c0";
     if (f == f_gather) return "tk_gather_row";
+    if (f == f_qkv_q8) return "tk_qkv_q8";
+    if (f == f_oproj_q8) return "tk_oproj_add_q8";
+    if (f == f_gateup_q8) return "tk_gateup_q8";
+    if (f == f_down_q8) return "tk_down_add_q8";
     return "?";
 }
 
@@ -741,13 +752,22 @@ void block(const Block& B, const Dims& d, float* x, float* kc, float* vc, const 
     const int C = d.C, H = d.H, Hkv = d.Hkv, D = d.D, FF = d.FF;
     const int KD = Hkv * D, HD = H * D;
     const float eps = d.eps;
-    if (!B.q.w.h || !B.k.w.h || !B.v.w.h || !B.o.w.h || !B.gate.w.h || !B.up.w.h || !B.down.w.h)
-        throw std::runtime_error("qwen3tts device: a matrix is not BF16");
+    // the block's seven matrices are all BF16 or all Q8_0 (the predictor's blocks of the predq8 file)
+    const bool q8 = B.q.w.q != nullptr;
+    const bool ok = q8 ? B.k.w.q && B.v.w.q && B.o.w.q && B.gate.w.q && B.up.w.q && B.down.w.q
+                       : B.q.w.h && B.k.w.h && B.v.w.h && B.o.w.h && B.gate.w.h && B.up.w.h && B.down.w.h;
+    if (!ok) throw std::runtime_error("qwen3tts device: a block's matrices are not all BF16 or all Q8_0");
     if (C % 1024 || HD % 1024 || FF % 1024 || KD % 2)
         throw std::runtime_error("qwen3tts device: the widths must be multiples of 1024 (talker_gpu.hip's row loops)");
+    if (q8 && (C > 3072 || HD > 3072 || FF > 3072))
+        throw std::runtime_error("qwen3tts device: a Q8_0 row is at most 3072 values (talker_gpu.hip)");
     const float* attn_norm = B.attn_norm;
-    const uint16_t *Wq = B.q.w.h, *Wk = B.k.w.h, *Wv = B.v.w.h, *Wo = B.o.w.h, *Wg = B.gate.w.h, *Wu = B.up.w.h,
-                   *Wd = B.down.w.h;
+    // the weights' pointers: BF16 (uint16_t) or Q8_0 (uint8_t); the kernel is chosen with them
+    const void *Wq = q8 ? (const void*)B.q.w.q : (const void*)B.q.w.h, *Wk = q8 ? (const void*)B.k.w.q : (const void*)B.k.w.h,
+               *Wv = q8 ? (const void*)B.v.w.q : (const void*)B.v.w.h, *Wo = q8 ? (const void*)B.o.w.q : (const void*)B.o.w.h,
+               *Wg = q8 ? (const void*)B.gate.w.q : (const void*)B.gate.w.h,
+               *Wu = q8 ? (const void*)B.up.w.q : (const void*)B.up.w.h,
+               *Wd = q8 ? (const void*)B.down.w.q : (const void*)B.down.w.h;
     const float *q_norm = B.q_norm, *k_norm = B.k_norm, *ffn_norm = B.ffn_norm;
     {  // the attention's norm, then q, k and v (one launch: the rows of the three matrices)
         const float* xin = x;
@@ -756,7 +776,7 @@ void block(const Block& B, const Dims& d, float* x, float* kc, float* vc, const 
         const int rows = nq + nk + nv;
         void* args[] = {(void*)&xin, (void*)&attn_norm, (void*)&Wq, (void*)&Wk, (void*)&Wv, (void*)&C, (void*)&nq,
                         (void*)&nk, (void*)&nv, (void*)&eps, (void*)&q, (void*)&k, (void*)&v};
-        launch(f_qkv, (unsigned)((rows + 7) / 8), 256, (unsigned)(C * sizeof(float)), args);
+        launch(q8 ? f_qkv_q8 : f_qkv, (unsigned)((rows + 7) / 8), 256, (unsigned)(C * sizeof(float)), args);
     }
     {  // the q and k heads' norms and rotary, the cache row of this position
         float *q = w.q, *k = w.k;
@@ -774,18 +794,18 @@ void block(const Block& B, const Dims& d, float* x, float* kc, float* vc, const 
     {  // x += Wo att
         const float* att = w.att;
         void* args[] = {(void*)&att, (void*)&Wo, (void*)&x, (void*)&HD, (void*)&C};
-        launch(f_oproj, (unsigned)((C + 7) / 8), 256, (unsigned)(HD * sizeof(float)), args);
+        launch(q8 ? f_oproj_q8 : f_oproj, (unsigned)((C + 7) / 8), 256, (unsigned)(HD * sizeof(float)), args);
     }
     {  // the FFN: g = SiLU(Wg rms(x)) * (Wu rms(x))
         const float* xin = x;
         float* g = w.g;
         void* args[] = {(void*)&xin, (void*)&ffn_norm, (void*)&Wg, (void*)&Wu, (void*)&C, (void*)&FF, (void*)&eps, (void*)&g};
-        launch(f_gateup, (unsigned)((FF + 7) / 8), 256, (unsigned)(C * sizeof(float)), args);
+        launch(q8 ? f_gateup_q8 : f_gateup, (unsigned)((FF + 7) / 8), 256, (unsigned)(C * sizeof(float)), args);
     }
     {  // x += Wd g
         const float* g = w.g;
         void* args[] = {(void*)&g, (void*)&Wd, (void*)&x, (void*)&FF, (void*)&C};
-        launch(f_down, (unsigned)((C + 7) / 8), 256, (unsigned)(FF * sizeof(float)), args);
+        launch(q8 ? f_down_q8 : f_down, (unsigned)((C + 7) / 8), 256, (unsigned)(FF * sizeof(float)), args);
     }
 }
 
@@ -1109,8 +1129,8 @@ qwen3tts_model_t* qwen3tts_open(const char* gguf_path) {
             m->pblk.push_back(block_of("pred.blk." + std::to_string(l) + ".", m->pC, m->pH, m->pHkv, m->pD, m->pFF, true));
         m->pred_out_norm = tensor(m->g, "pred.out_norm.weight", m->pC);
         m->tok = tokenizer_load_from_gguf(m->g);  // (NULL when the GGUF has no vocabulary)
-        // the device path: the GGUF's mapping registered (one mapping: an unsplit file; BF16 matrices, see bf16_matrices)
-        if (gguf_n_maps(m->g) == 1 && bf16_matrices(m->g)) {
+        // the device path: the GGUF's mapping registered (one mapping: an unsplit file; BF16 or Q8_0 matrices, see device_matrices)
+        if (gguf_n_maps(m->g) == 1 && device_matrices(m->g)) {
             size_t map_size = 0;
             const void* base = gguf_map_base(m->g, &map_size);
             if (gpu::map(base, map_size)) m->gpu_base = base;
