@@ -4,6 +4,7 @@
 // 16 positions per frame). The rotary is the standard one: the talker's M-RoPE with its three position axes equal (text
 // only, no padding) is the same rotation.
 #include "qwen3tts.h"
+#include "hip_check.h"
 
 #include "gguf_mmap.h"
 #include "mel.h"
@@ -709,11 +710,11 @@ void launch2(hipFunction_t f, unsigned gx, unsigned gy, unsigned threads, unsign
 void launch(hipFunction_t f, unsigned blocks, unsigned threads, unsigned shm, void** args) {
     if (ktimes) {
         KTime k{f, nullptr, nullptr};
-        hipEventCreate(&k.a);
-        hipEventCreate(&k.b);
-        hipEventRecord(k.a, 0);
+        HIP_CHECK(hipEventCreate(&k.a));
+        HIP_CHECK(hipEventCreate(&k.b));
+        HIP_CHECK(hipEventRecord(k.a, 0));
         const hipError_t e = hipModuleLaunchKernel(f, blocks, 1, 1, threads, 1, 1, shm, stream, args, nullptr);
-        hipEventRecord(k.b, 0);
+        HIP_CHECK(hipEventRecord(k.b, 0));
         ktimes->push_back(k);
         if (e != hipSuccess) throw std::runtime_error("qwen3tts device: a kernel launch failed");
         return;
@@ -1435,9 +1436,9 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
             hipStream_t s = nullptr;
             hipGraphExec_t gtalk = nullptr, gpred = nullptr;
             ~DevRun() {
-                if (gtalk) hipGraphExecDestroy(gtalk);
-                if (gpred) hipGraphExecDestroy(gpred);
-                if (s) hipStreamDestroy(s);
+                if (gtalk) HIP_WARN(hipGraphExecDestroy(gtalk));
+                if (gpred) HIP_WARN(hipGraphExecDestroy(gpred));
+                if (s) HIP_WARN(hipStreamDestroy(s));
                 dev::stream = nullptr;
             }
         } devrun;
@@ -1620,13 +1621,13 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
                 body();
             } catch (...) {
                 hipGraph_t tmp = nullptr;
-                (void)hipStreamEndCapture(devrun.s, &tmp);
-                if (tmp) hipGraphDestroy(tmp);
+                HIP_WARN(hipStreamEndCapture(devrun.s, &tmp));
+                if (tmp) HIP_WARN(hipGraphDestroy(tmp));
                 throw;
             }
             if (hipStreamEndCapture(devrun.s, &g) != hipSuccess) throw std::runtime_error("qwen3tts device: graph capture");
             if (hipGraphInstantiate(&e, g, nullptr, nullptr, 0) != hipSuccess) throw std::runtime_error("qwen3tts device: graph");
-            hipGraphDestroy(g);
+            HIP_WARN(hipGraphDestroy(g));
             return e;
         };
         if (dev_on && !dev::ktimes) {
@@ -1751,17 +1752,17 @@ int qwen3tts_generate(qwen3tts_model_t* m, const int* text_ids, int n_text, cons
             if (prof) t_tal += std::chrono::duration<double, std::milli>(clk::now() - t_talker).count();
         }
         if (dev::ktimes) {  // the kernels' device time per frame
-            hipDeviceSynchronize();
+            HIP_CHECK(hipDeviceSynchronize());
             struct Sum { double ms = 0; long n = 0; };
             std::map<std::string, Sum> sums;
             for (auto& k : *dev::ktimes) {
                 float ms = 0;
-                hipEventElapsedTime(&ms, k.a, k.b);
+                HIP_CHECK(hipEventElapsedTime(&ms, k.a, k.b));
                 Sum& sm = sums[dev::kernel_name(k.f)];
                 sm.ms += ms;
                 sm.n += 1;
-                hipEventDestroy(k.a);
-                hipEventDestroy(k.b);
+                HIP_WARN(hipEventDestroy(k.a));
+                HIP_WARN(hipEventDestroy(k.b));
             }
             dev::ktimes->clear();
             for (auto& kv : sums)
