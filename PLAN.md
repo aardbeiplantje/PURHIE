@@ -4,130 +4,80 @@
 > Finished work, with its measurements, is in the git history (this file was pruned of it on 2026-11-05, 2026-11-06
 > and 2026-11-12).
 
-## ▶ Next (verified 2026-11-15; progress and TODO, kept current: 2026-11-16)
+## ▶ Next (2026-11-16: the open items)
 
 How the work runs (the user, 2026-11-15): this file is verified against the repository and the host, then each open item
 is a package: one Haiku agent's task in its own worktree, with exact files, commands, data paths and a check. The main
 session briefs it, reviews its commit, reruns the check on `main`, then commits, pushes and touches the image's build
-trigger (AGENTS.md). Timing packages run alone on the machine. An agent commits early: a worktree with no changes is
-removed when its agent stops, and a resumed agent then lands in the main checkout.
+trigger (AGENTS.md). Timing packages run alone on the machine. (This session worked inline: the agent rule was not asked
+for; the user can say which items to hand to agents.)
 
-The host (2026-11-15): the 118 paths and the 11 make targets this file names exist, with three exceptions:
-`/hf/Qwen3.5-0.8B` and `/hf/Qwen3.5-4B` are gone (the vision checks run from `/data/vision-ref`: `q35-0.8b-mmproj.gguf`,
-`q35-0.8b-bf16.gguf`, `q35-0.8b/`); the BF16 talker is `/models/qwen3tts-talker.gguf` (with `qwen3tts-codec.gguf`,
-`whisper-tiny.gguf` and `voices/`; the references stay under `/data/audio-ref`); `/data/minimax-ref/te/mm_te_ref.py` is
-gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day before; not this work's files), `/hf`
-34 GB, `/comfyui` 88 GB: no downloads, one converted file at a time. No ffmpeg on this host (the image gets one).
+The host (2026-11-16): `ffmpeg` 6.1.1 is installed here (apt, the user's go-ahead). `nginx` is not installed here: its
+configuration was tested with unpacked trixie-era packages (`nginx -t`, the Lua and Perl modules, the fixup on a stub
+backend) and the image build runs `nginx -t` itself (passed, 2026-11-16 19:42 by the watcher's clock). Free disk:
+`/data` and `/models` (one filesystem) 5.5 GB of 1007 GB; `/hf` 34 GB; `/comfyui` 88 GB. Models here: `/models` has
+Gemma-4 26B (`gemma-4-26B-A4B-it-Q4_0_ROCMFP4.gguf`: sliding-window ring), Qwen3.5-4B, Qwen3.6-35B and Qwen3.8-27B (each
+with MTP tensors), Qwen3.8-Flash-Next (123 GB), GLM-5.3-Flash (171 GB), Nemotron-3 (Nano, Super), Qwen3-0.6B, Qwen3.5-0.8B,
+the speech files (`qwen3tts-talker.gguf`, `qwen3tts-talker-f32.gguf`, `/data/predq8/...` the Q8_0 predictor, codec,
+whisper-tiny, `voices/`) and EmbeddingGemma.
 
-**Done** (each recorded in its item below):
-- 2026-11-16, the vision tower's linears in 4x2 blocks (TODO 5: 2x on that stage, `vision_verify` passes) and the
-  `t/95` Q6_K check (TODO 12). The TODO 14 failures diagnosed (decisions open). Details in those items.
-- 2026-11-16, memory at load: the GLM state's rows and the KV slots are registered as they are used, not at load; CPU-only
-  mode allocates no GPU state; `run.sh` caps the expert pins at 64 GB (`INFERENCE_EXPERT_PIN_MB`). Details: the GLM
-  section, "Memory". `kv_verify` gained the lazy checks (its GPU self-test runs from `build/co`).
-- 2026-11-16, the chat templates: GLM-5.3-Flash's template failed with "chat_render: unexpected keyword arguments", since
-  it calls `tojson(ensure_ascii=False)` and the filter takes no keyword arguments. `_tojson_args` in
-  `perl/ROCm-Inference/lib/ROCm/Inference.pm` writes the tojson calls as the filter takes them (ensure_ascii=False goes:
-  the filter keeps non-ASCII text already; indent=N positional). GLM's full template renders with a tool definition, a
-  tool call and its result (checked on `/models/GLM-5.3-Flash-FAST.gguf`'s template); t/15 has three new cases (21 of 21).
-- 2026-11-16, the speech and the Q8_0 predictor: mp3, opus and aac on `/v1/audio/speech` through ffmpeg (item 13;
-  `--ffmpeg`, `ROCM_FFMPEG`; `c17f950`, merged in `cd058e5`: 36 of 36 format tests with a stub, t/65 13 of 13, t/64 17 of
-  17). The Q8_0 predictor on the device (item 16, L2, `93281dc`): the predictor takes 12.4 ms a frame on that file (BF16
-  16.3 ms); the speech check passes. The model-card keys of `rocm-convert` (package I, `2c4676a`): the four releases'
-  metadata identical to upstream's; re-run here on Qwen2.5-0.5B-Instruct: 36 of 36 keys.
-- 2026-11-16, the image: the llama.cpp remnants removed (`39f1b8c`); the build context fixed (`8251416`, `339e3ae`: `.git`,
-  `.claude`, `MiniMax-H3-Image`, build outputs, `llama.cpp`, editor backups excluded); ffmpeg in the runtime (`ce89090`);
-  `/version` again (`44be8f7`). The build now passes: exit 0 at 13:32 and 13:38, the nginx configuration test ok, the
-  `/version` stage shows the rocm-hip commit. The build's warnings: the discarded HIP results (13, in `qwen3tts.cpp`) are
-  checked now (`70fa01a`, `src/hip_check.h`); the expert pager's initialiser order fixed (`137a699`). The build's other
-  notes are the `src/sd.cpp` loop-vectorisation messages (TODO 8).
-- 2026-11-16, serving: `image-watch.sh` (`021e2c4`) and `serve.sh` (`2944bb1`, `2c29978`): on a new image the watcher stops
-  the container and exits, and `serve.sh` runs its own file again (an edit takes effect with the next build). Ctrl-C
-  stops it. Tested with a fake docker. The deployed service (checked 2026-11-16 at 13:38, before the restart): 11 models,
-  the voice `test`, WAV speech 115 KB in 2 s, the transcription back to the input, mp3 (ID3, Lavf 61.7.1), opus (Ogg), aac
-  (ADTS).
-- 2026-11-16, earlier: package H (the split-invariance tests demand bit-exactness, `fbc876f`, `89ed4a0`); package L1 (the
-  Q8_0 predictor's file, loader and host path: `8ee0c10`, `e7cf085`) and L1b (its sampling distributions: 2.3% total
-  variation on average, `9080a12`); the Whisper temperature fallback (item 11, `c9605c4`); the Whisper host path (E, E2,
-  `b71ac94`, `7f11ec4`: a decoder token 3.5 to 1.7 ms, the encoder 1.5 to 0.39 s); the vision tower's host path (F,
-  `b31d693`: 3.55 to 0.76 s a pass); the codec's time per layer (C, `dfef8b6`); the IQ types on the GPU (B: all nine pass,
-  `2508c19`); the tests' reply checks (G, `d29b798`).
-- 2026-11-15: item 8 (the samplers on the device: one sync a frame), item 7's first gains (a predictor stack 940 to
-  905 us), item 9 first version (the codec's convolutions on the device: 40 frames in 190 ms, 800 ms on the CPU).
+**Open items, in order** (the user picks what to start; each has its check):
+1. **Lazy KV on the sliding-window ring (Gemma-4).** The KV registration change (`74fda6e`) covers the ring's cache too, but
+   nothing has run through it. Check: `generate_verify`, `seq_verify` and `store_verify` on the Gemma-4 26B file, and the
+   sliding-window output against the same run before the change (build the HEAD of `74fda6e`^ in a worktree). Fix what fails.
+2. **Lazy KV on the MTP draft path.** The draft cache registers as the draft attends (`kv_cache_reserve` in the same
+   attention launch). Check: `mtp_verify` and `events_test MODEL DRAFT` on `Qwen3.5-4B-ROCMFP4.gguf` (2.9 GB), the tokens
+   against the eager build (`74fda6e`^). Fix what fails.
+3. **The deployed service on the new image.** The watcher restarts the container from the 19:42 image. Check: `GET
+   /rocm/v1/models`, one short chat through `/rocm/` (the fixup: `conv_id` and `id_slot` added), one short speech request.
+   The user runs these, or the agent runs the GETs if the user allows it.
+4. **GLM-5.3 on the CPU in the deployment.** The CPU path is the one in use now (`INFERENCE_CPU_ONLY`: about 2.9 tok/s in the
+   earlier measurement, with the expert pages in the page cache). Measure tokens per second and `VmLck`, `RssAnon`,
+   `RssFile`, `RssShmem` during a real conversation; then decide whether CPU speed work is worth it.
+5. **Request logs.** `app.pm` writes every request body to `/tmp/request-logs` in the container, with no size limit or
+   rotation. The user said it is intended; a cap or rotation is a decision for the user.
+6. **`tests/convert_verify.sh` in full.** Blocked on disk: 5.5 GB free on the filesystem that `/models` shares. The run
+   needs several GB more. The user frees space, or names a directory for the outputs.
+7. **The full regression (`make regress`)** on the models here, after items 1 and 2.
+8. **Codec host stages** (36 ms of a 142 ms piece; the talker dominates a request). Overlap or move to the kernels: low
+   value, not started.
+   Leads (not started): the q/k norm and rotary inside the attention, the norm once per layer, and the sampler's sort (a
+   rank sort over several blocks, about 10 us against 28 us a codebook: under 1% of a frame). The Q8_0 predictor reads its
+   activations as `float4` from shared memory, which assumes a 16-byte alignment: a toolchain change shows first in the
+   predictor's device timing and its codes.
+9. **Whisper's encoder** (520 ms per window; the cost is spread over the linears, the attention's weighted sum, the GELU and
+   the stem convolutions; the two attempts gave no gain). Low value, not started.
+10. **Alpamayo 2 Edge.** The licence is confirmed (OpenMDW-1.1 weights, Apache-2.0 code). The modeling code is on GitHub
+    `NVlabs/alpamayo2-edge`, outside this session's GitHub scope: blocked until the user attaches the repo. The weights
+    (`nvidia/Alpamayo2-Edge` on Hugging Face, about 5.4 GB in BF16, 907 tensors in two shards; read from the headers with range
+    requests, nothing downloaded): the language model is 28 layers, hidden 2048, 16 query / 8 KV heads of 128, an ungated
+    `relu2` MLP (fc1 9216, fc2 back; no gate projection), no q/k norm, M-RoPE `[24, 20, 20]` (theta 1e8), vocab 135168, an
+    untied head. The vision tower is not Qwen3.5's: 27 layers, hidden 1152, 16 heads, MLP 4304 (gelu tanh), biases on every
+    linear, LayerNorm eps 1e-6, learned absolute positions (256, a 16x16 grid), patch 16 (768 inputs). The projector: LayerNorm
+    1152, the 2x2 merge (4608), fc1 11520, fc2 2048. The action expert: 28 layers, hidden 512, 16 / 8 heads of 128, MLP 3840
+    `relu2`, non-causal attention reading the VLM's keys and values; `action_in_proj` (a per-waypoint encoder over 60 inputs,
+    Fourier features), `action_out_proj` 512 to 2. The modeling code (flow matching and its guidance, the attention mode, the
+    action space, the trajectory tokenizer) is what the reads need.
+11. **Watch or table:** Qwen4 (not on Hugging Face yet: noted); Qwen3.8-2.4T-A95B (tabled); the memory measurement of the
+    deployment's GPU pins (tabled: GLM runs on the CPU).
+12. **Clear by hand:** `/data/iqtest` (336 KB of logs), and `nginx.conf~` in the repository root (the user's editor backup,
+    excluded from the image; git lists it as untracked).
 
-**In progress:** nothing running. The waiting parts are on the user's side (TODO 1 and 2).
+**Done 2026-11-16 (the detail is in the items above and in git):** `edbbd32` the Q8_0 predictor talker is loaded after the
+BF16 one by its tensors (not its name), and `t/64-multipart.t` split out of `t/64-audio.t`; `bcefaa3` and `bb64c61` the nginx
+configuration, the fixup files, and the three nginx modules the Dockerfile was missing; `c9a1e9f` the LRU test over the limit
+(a stale block the store can evict); `bb5de99` the near-tie check in `seq_verify` (WMMA stays on) and `generate_verify`'s
+float-head baseline; `f620560` one `HIP_CHECK` (`src/hip_check.h`) and the silenced `sd.cpp` remarks; `3e6bb1f` `lib/perl`
+tracked; `0827a97` TODO 5 (the vision linears, 2x on that stage) and `abcd8a1` `t/95` (Q6_K encodes); `74fda6e` the GLM state
+and the KV slots registered as used, CPU-only allocates no GPU state, `INFERENCE_EXPERT_PIN_MB` capped in `run.sh` at 64 GB.
+Earlier in the session: the chat templates (`_tojson_args`, `t/15`), ffmpeg in the image and `t/69` 37 of 37 with the real
+encoders, the image's `/version` and the watcher, the serve and the watch, and the packages H, L1 and L1b (see git).
 
-**TODO** (in order):
-1. **Done (the user, 2026-11-16):** the deployed container's image and `/version` checked.
-2. **Done (the user, 2026-11-16):** `build-watch.sh` restarted in the user's shell; its builds now carry the project commit.
-3. **Done 2026-11-16:** ffmpeg 6.1.1 installed on this host (`apt`, with the user's go-ahead). `t/69-speech-formats.t`
-   passes 37 of 37 with `ROCM_INFERENCE_TEST_FFMPEG=/usr/bin/ffmpeg`, including the real encoders (tests 31 to 36).
-4. **The Q8_0 predictor talker: BF16 by default, Q8_0 allowed (the user, 2026-11-16).** A `--models-dir` with several
-   talkers loads the BF16 one, then one with Q8_0 matrices (the predictor's recipe), then an F32 one: the rank is the
-   tensors' bytes (`talker_rank` in `bin/rocm-inference-server`). The name sort had put `talker-predq8` before
-   `talker.gguf` (`-` sorts before `.`), so a directory with both would have loaded the Q8_0 file. `t/65-talker.t` (3
-   checks: BF16 before Q8_0, the same in either listing order, Q8_0 before F32); `t/65-speech.t` 13 of 13 with the Q8_0
-   talker (speech through the server). The POD says which talker is used.
-5. **J, done 2026-11-16 (`vision.cpp`'s `linear`: blocks of 4 rows and 2 outputs).** The linear stage of `vision_verify`
-   falls from 720-740 ms to 290-325 ms a pass (same load, alternating runs); the pass is 2x faster on that stage and the
-   check passes (cosine 1.0). A 4x4 block was tried and fails the check (an OpenMP reduction over array elements: wrong
-   sums), not kept. The same blocking on Whisper's linears gave no gain (encoder 577 ms against 522 ms, minimum of 5):
-   see item 8(d).
-6. K: the codec's host stages (36 ms of a 142 ms piece: the quantizer's sums, the pre-convolution, the 8-layer transformer
-   and the two upsamplers all run on the host before `decode_dev`). Overlapping them with the device would save at most one
-   such stage per piece boundary (about 30 ms), and the talker takes about 0.9 s of a 40-frame request: not started. The
-   transformer and the upsamplers on the device are the larger change.
-7. `tests/convert_verify.sh` in full, with the card keys compared: **blocked on disk (2026-11-16).** `/data` (also
-   `/models`, the same filesystem) has 5.5 GB free of 1007 GB; the run needs several GB more and the upstream checkout and
-   torch environment. Not started, so the deployment's files are not at risk: free space on `/data`, or say where the
-   outputs may go. Item 7's leads (the q/k norm and rotary inside the attention, the norm once per layer) and D (the
-   samplers' sort, about 18 us against 28 us a codebook: under 1% of a frame) are not started.
-8. Cleanup, done 2026-11-16 (the user's decisions): (a) `HIP_CHECK` is one definition in `src/hip_check.h` (throws with
-   the call, its file and line; the tests and demos include it, the two-argument calls keep the call text); (b) `sd.cpp`'s
-   vectorizer remarks silenced by a scoped pragma (`-Wpass-failed`, with the reason in the file); (c) `lib/perl` is tracked
-   (`.gitkeep`: a fresh clone needs the directory for the Dockerfile's `COPY lib`; the user's `lib/` work is in the working
-   copy, not committed); (d) host-path leftovers, measured and not pursued: Whisper's encoder (520 ms per window; the
-   linears, the attention's weighted sum in a scalar loop, the GELU's `erf` calls, the naive stem convolutions; a
-   per-pair score buffer and a 4x2 blocked linear gave no gain, reverted), its decoder's cross-attention and vocabulary
-   product, the codec's kernel-7 loop; (e) `~/rocm-hip.git` is not on this host.
-9. **NVIDIA Alpamayo 2 Edge: the licence is confirmed (the user, 2026-11-16); the modeling code is the blocker.** The
-   weights (OpenMDW-1.1) are on Hugging Face (`nvidia/Alpamayo2-Edge`, about 5.4 GB in BF16, two shards, 907 tensors);
-   the config and the tensor headers were read with range requests, the weights not downloaded. The layout: the language
-   model is 28 layers, hidden 2048, 16 query / 8 KV heads of 128, an ungated `relu2` MLP (fc1 9216, fc2 back; no gate
-   projection), no q/k norm, M-RoPE `[24, 20, 20]` (theta 1e8), vocab 135168 with an untied head. The vision tower is not
-   Qwen3.5's: 27 layers, hidden 1152, 16 heads, MLP 4304 (gelu tanh), biases on every linear, LayerNorm with eps 1e-6, a
-   16x16 grid of learned absolute positions (256), patch 16 (768 inputs). The projector: LayerNorm 1152, the 2x2 merge
-   (4608), fc1 11520, fc2 2048. The action expert: 28 layers, hidden 512, 16 / 8 heads of 128, MLP 3840 `relu2`, non-causal
-   attention that reads the VLM's keys and values; `action_in_proj` (a per-waypoint encoder over 60 inputs, Fourier
-   features), `action_out_proj` 512 to 2. Not in the Hugging Face repo: its `.py` files; PyPI has no package. The
-   modeling code (the flow matching and its guidance settings, the attention mode, the action space, the trajectory
-   tokenizer) is in GitHub `NVlabs/alpamayo2-edge`, which is outside this session's GitHub scope: to continue, the user
-   attaches that repo (or allows it), then the reads and the reference checks begin.
-10. **Qwen4: not there yet (the user noted it, 2026-11-16).** No `Qwen4` repository in the Qwen organisation on Hugging
-    Face. The newest series is Qwen3.8 (`Qwen3.8-Flash-Next`, the engine's qwen4exp, is its preview). When a Qwen4
-    repository appears, read its `config.json` first: if its `architectures` is one the engine runs (qwen35moe, qwen4exp),
-    it is a registry entry; if not, it is a new architecture to analyse.
-11. **Qwen3.8-2.4T-A95B: tabled (the user, 2026-11-16).** The engine can run the architecture (`Qwen3_5MoeForCausalLM`,
-    92 layers, 512 experts with 10 active), but the size (about 1.2 TB at 4 bits) is beyond this host's memory and disk.
-12. **`t/95-quantize.t`: done 2026-11-16.** The test still asserted that Q6_K was decode-only; its native encoder came in
-    `7062531` (verified byte-identical to ggml). The test now asserts that Q6_K encodes and that Q8_K (an activation
-    format) does not. 35 of 35 pass.
-13. **Memory on the deployment: tabled (the user, 2026-11-16).** GLM-5.3 runs on the CPU now, so the GPU expert pins
-    and the GLM state no longer apply to it; the CPU-only path allocates no GPU state (`74fda6e`). The 64 GB expert cap in
-    `run.sh` stays as a default for GPU runs.
-14. **Failing checks that predate the memory change: resolved 2026-11-16 (the user's decisions).**
-    (a) `t/45-store-lru.t`: the store keeps what the chain needs and drops superseded prompt ends itself, so the test now
-    adds a stale block older than the rest and checks that LRU takes exactly that block (`c9a1e9f`); Qwen3-0.6B and
-    Qwen3.5-0.8B pass, eager and lazy snapshots.
-    (b) Qwen3.5-0.8B batched or chunked replies: WMMA stays on for speed; a first difference that is a near-tie
-    (the two best alone logits within 0.1, the batched token one of them) is accepted, with the logits from a replay
-    of the alone reply (`bb5de99`). `seq_verify` passes on both models; `generate_verify`'s head check was starting from
-    the default Q8 head: it now sets the float head first, and the restore is exact.
-    Not covered by the lazy-KV tests here: the sliding-window ring (Gemma-4) and the MTP draft path (no such model files
-    on this host).
+**Items 1 to 14 of the previous list** (2026-11-16) are done, moved, or tabled, as recorded above: 1 to 4 and 12 to 14
+done; 5 and 8 done; 6, 7 and 9 to 11 are in the open list; 13 tabled.
 
-**Decided by the user (2026-11-16):** item 12: the speech pieces keep their own prosody (no conditioning on the previous
-piece: closed). Item 13: ffmpeg is added (package M). Package L: built as an option.
+**Decided by the user (2026-11-16):** the speech pieces keep their own prosody (closed); ffmpeg is in the image (package M);
+package L (the Q8_0 predictor) is an option: BF16 by default, Q8_0 allowed.
 
 Not runnable on this host: the Flash measurements (its own MTP block, the PLE reads), `--parallel` and the store on the
 deployment, `events_test MODEL DRAFT`, nginx's X-Remote-User header (the docker repository). Larger and not packaged yet:
