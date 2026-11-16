@@ -838,12 +838,16 @@ sub special_vocab {
     my $tj = $self->{tokenizer} //= json_file(File::Spec->catfile($dir, 'tokenizer.json'));
     my $tc = json_file(File::Spec->catfile($dir, 'tokenizer_config.json'));
     my @types = qw(bos eos unk sep pad cls mask);
-    my (%ids, %add, $merges, %norm, $template, $clean);
+    my (%ids, @ids_order, %add, $merges, %norm, $template, $clean);
+    # the first id given for a type wins; the ids are written in the order they were first given (SpecialVocab's
+    # special_token_ids: the tokenizer_config's, then config.json's)
     my $set = sub {
         my ($typ, $id) = @_;
         return unless defined $id && !ref $id && !is_bool($id) && $id =~ /^\d+$/;
         return if exists $ids{$typ};
-        $ids{$typ} = $id if $id < $n_vocab;
+        return unless $id < $n_vocab;
+        $ids{$typ} = $id;
+        push @ids_order, $typ;
     };
     if ($tj) {
         if ($opt{merges} and my $m = $tj->{model}{merges}) {
@@ -955,7 +959,7 @@ sub special_vocab {
     my %key = (bos => 'bos_token_id', eos => 'eos_token_id', unk => 'unknown_token_id', sep => 'seperator_token_id',
                pad => 'padding_token_id', cls => 'cls_token_id', mask => 'mask_token_id', eot => 'eot_token_id',
                eom => 'eom_token_id');
-    for my $typ (@types) { $self->kv("tokenizer.ggml.$key{$typ}", U32, $ids{$typ}) if exists $ids{$typ} }
+    for my $typ (@ids_order) { $self->kv("tokenizer.ggml.$key{$typ}", U32, $ids{$typ}) }
     for my $typ (qw(bos eos unk sep pad cls mask eot eom)) {
         $self->kv("tokenizer.ggml.add_${typ}_token", BOOL, $add{$typ}) if exists $add{$typ};
     }
