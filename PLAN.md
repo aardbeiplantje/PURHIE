@@ -20,6 +20,8 @@ gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day b
 34 GB, `/comfyui` 88 GB: no downloads, one converted file at a time. No ffmpeg on this host (the image gets one).
 
 **Done** (each recorded in its item below):
+- 2026-11-16, the vision tower's linears in 4x2 blocks (TODO 5: 2x on that stage, `vision_verify` passes) and the
+  `t/95` Q6_K check (TODO 12). The TODO 14 failures diagnosed (decisions open). Details in those items.
 - 2026-11-16, memory at load: the GLM state's rows and the KV slots are registered as they are used, not at load; CPU-only
   mode allocates no GPU state; `run.sh` caps the expert pins at 64 GB (`INFERENCE_EXPERT_PIN_MB`). Details: the GLM
   section, "Memory". `kv_verify` gained the lazy checks (its GPU self-test runs from `build/co`).
@@ -66,16 +68,30 @@ gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day b
 4. The Q8_0 predictor for users: the `rocm-convert` recipe is in item 16 and the server takes the file through `--tts`
    (`--models-dir` prefers the BF16 talker, and stays so). BF16 stays the default. Watch the float4 alignment note in
    item 16 (a toolchain change would show in the predictor's timing and codes first).
-5. J: the vision tower's linears register-blocked on the host (77% of the 0.76 s pass).
-6. K: the codec's host stages overlapped with the device's work or moved to its kernels (36 ms of a 142 ms piece).
-7. `tests/convert_verify.sh` in full, with the card keys compared (needs several GB free on `/data`: about 6 GB at the last
-   check). Item 7's leads (the q/k norm and rotary inside the attention, the norm once per layer) and D (the samplers' sort,
-   about 18 us against 28 us a codebook: under 1% of a frame).
-8. Cleanup: (a) the per-file `HIP_CHECK` copies in `tests/` and some `src/` demos could use `src/hip_check.h` (asked; the user
-   has not answered); (b) `src/sd.cpp`'s loop-vectorisation notes in each build; (c) the Dockerfile's `COPY lib` (the
-   directory has no tracked files now; the build passes); (d) the host-path leftovers: Whisper's encoder attention
-   (a score vector per query and head), its decoder's cross-attention (six threads) and vocabulary product (memory-bound);
-   the codec's kernel-7 inner loop; (e) `~/rocm-hip.git` needs `git pull`: its older `run.sh` and Dockerfile are behind.
+5. **J, done 2026-11-16 (`vision.cpp`'s `linear`: blocks of 4 rows and 2 outputs).** The linear stage of `vision_verify`
+   falls from 720-740 ms to 290-325 ms a pass (same load, alternating runs); the pass is 2x faster on that stage and the
+   check passes (cosine 1.0). A 4x4 block was tried and fails the check (an OpenMP reduction over array elements: wrong
+   sums), not kept. The same blocking on Whisper's linears gave no gain (encoder 577 ms against 522 ms, minimum of 5):
+   see item 8(d).
+6. K: the codec's host stages (36 ms of a 142 ms piece: the quantizer's sums, the pre-convolution, the 8-layer transformer
+   and the two upsamplers all run on the host before `decode_dev`). Overlapping them with the device would save at most one
+   such stage per piece boundary (about 30 ms), and the talker takes about 0.9 s of a 40-frame request: not started. The
+   transformer and the upsamplers on the device are the larger change.
+7. `tests/convert_verify.sh` in full, with the card keys compared: **blocked on disk (2026-11-16).** `/data` (also
+   `/models`, the same filesystem) has 5.5 GB free of 1007 GB; the run needs several GB more and the upstream checkout and
+   torch environment. Not started, so the deployment's files are not at risk: free space on `/data`, or say where the
+   outputs may go. Item 7's leads (the q/k norm and rotary inside the attention, the norm once per layer) and D (the
+   samplers' sort, about 18 us against 28 us a codebook: under 1% of a frame) are not started.
+8. Cleanup: (a) the per-file `HIP_CHECK` copies in `tests/` and some `src/` demos could use `src/hip_check.h` (asked; the
+   user has not answered); (b) `src/sd.cpp`'s build warnings are the vectorizer's remarks (`-Rpass-missed=loop-vectorize`
+   with `-mavx2 ... -fopenmp`): loops with mixed fp16/fp32 conversions, early exits or calls, plus the `omp simd` loops
+   that do not vectorize; not fixed (a build flag would hide them: the user's call); (c) the Dockerfile's `COPY lib` (the
+   directory has no tracked files now; the build passes); (d) the host-path leftovers: Whisper's encoder (2026-11-16,
+   measured: 520 ms per window; the linears 10.6 GMAC, the attention's weighted sum 7 GMAC in a scalar loop, 9.2 million
+   `erf` calls in the GELU, the naive stem convolutions 0.9 GMAC; a per-pair score buffer and a 4x2 blocked linear were
+   both measured and gave no gain, reverted), its decoder's cross-attention (six threads) and vocabulary product
+   (memory-bound); the codec's kernel-7 inner loop; (e) `~/rocm-hip.git` (not on this host) needs `git pull`: its older
+   `run.sh` and Dockerfile are behind.
 9. **NVIDIA Alpamayo 2 Edge (analysed 2026-11-16; released 2026-11-10; HF `nvidia/Alpamayo2-Edge`).** A driving
    vision-language-action model: weights OpenMDW-1.1, code Apache-2.0 (the license to confirm with the user, as for MiniMax).
    Config: the language model `cosmos3_edge_text` is dense (28 layers, hidden 2048, 16 query / 8 KV heads, MLP 9216, vocab
@@ -97,16 +113,28 @@ gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day b
     layers. The engine can run the architecture; the size cannot: 2.4 trillion parameters is about 1.2 TB at 4 bits
     against 128 GB of memory and 17 GB free on `/models`. It needs the expert pager (as GLM-5.3) and a disk of its own.
     Not on this host: decide only if the user has such storage.
-12. **`t/95-quantize.t` test 10 fails ("Q6_K cannot (decoded only)"), on HEAD as well (checked 2026-11-16).** It is in the
-    quantizer (`Convert.pm`), not the chat code: find whether the test or the Q6_K check is wrong, then fix that.
+12. **`t/95-quantize.t`: done 2026-11-16.** The test still asserted that Q6_K was decode-only; its native encoder came in
+    `7062531` (verified byte-identical to ggml). The test now asserts that Q6_K encodes and that Q8_K (an activation
+    format) does not. 35 of 35 pass.
 13. **Memory on the deployment (2026-11-16).** After the lazy GLM state and the 64 GB expert cap: measure `VmLck`,
     `RssAnon`, `RssFile` and `RssShmem` of the server (`/proc/<pid>/status`) at a long conversation, and the speed against
     the cap (the default was unlimited; 4.3-7.6 tok/s). Then decide whether 64 GB stays.
-14. **Failing checks that predate the memory change (HEAD, 2026-11-16).** `t/45-store-lru.t` tests 4, 5 and 10 (the store
-    holds more than the chain needs; no eviction); `seq_verify` on Qwen3.5-0.8B (the chunked prompt, the batched sequences
-    equal to alone) and `generate_verify` on it (`inference_set_lm_head_q8`: the logits after switching the Q8 head off
-    differ). Same messages on HEAD. The sliding-window ring (Gemma-4) and the MTP draft path are not covered by the
-    lazy-KV tests here (no such model files on this host).
+14. **Failing checks that predate the memory change (HEAD, 2026-11-16): diagnosed, one open decision.**
+    (a) `t/45-store-lru.t` tests 4, 5 and 10: the eager run's store holds exactly the bytes the test's limit asks for
+    (`bytes > need` is false by equality), since the store deletes superseded prompt ends when it writes them: nothing is
+    over the limit, so LRU has nothing to evict. The scenario's premise (superseded snapshots on disk) no longer holds:
+    the test or the store's rule needs a decision (the user).
+    (b) `seq_verify` and `generate_verify` on Qwen3.5-0.8B (UD-Q8_K_XL: F16 attn_q, ffn and ssm matrices, Q8_0 others;
+    Qwen3-0.6B, all Q8_0, passes): a batch of prompts of lengths 30 and 16 diverges at step 11, from a logit gap of 0.032
+    (510 at 15.6757 against token 1 at 15.6435). Prefilling the same prompt in one call, in chunks of 5, or token by token
+    gives identical logits here (`cut_probe`); the stream batch of two identical prompts matches alone
+    (`batch_probe`); the divergence needs the matmul WMMA path on (`QMATVEC_NO_WMMA_MM=1` clears it; the flash attention
+    switch does not). It is a near-tie flipped by a rounding difference in the batched F16 path, not corrupted state, but
+    the batched logits themselves are not measured: `inference_forward_batch` is a stub in this build. Open: whether the
+    engine should make batched F16 rows bit-identical to a single row (a cost to the WMMA speed), or the test should accept
+    near-ties (the user's call). `generate_verify`'s `inference_set_lm_head_q8` check fails the same way on HEAD.
+    The sliding-window ring (Gemma-4) and the MTP draft path are not covered by the lazy-KV tests here (no such model
+    files on this host).
 
 **Decided by the user (2026-11-16):** item 12: the speech pieces keep their own prosody (no conditioning on the previous
 piece: closed). Item 13: ffmpeg is added (package M). Package L: built as an option.
