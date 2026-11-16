@@ -51,10 +51,12 @@ merged here):
    samplers' sort (not started: about 18 us against 28 us a codebook, under 1% of a frame).
 7. Leftovers on the host paths: Whisper's encoder attention (a score vector allocated per query and head), its
    decoder's cross-attention (six threads) and vocabulary product (memory-bound); the codec's kernel-7 inner loop.
-8. **The image (commit 39f1b8c, 2026-11-16):** the llama.cpp remnants are out (nginx's llama upstream and fixup hooks,
-   `lib/perl/llama.pm`, `lib/lua/fixup.lua`, the Vulkan and CMake packages, the GGML environment). The build is NOT verified:
-   it was not run here (no docker in this session), and the failing step is not known. Next: the failing step's output
-   (the tail of `build-watch.log` where the watcher runs) decides the next fix. `run.sh` (the host launcher) still names
+8. **The image (commits 39f1b8c and 8251416, 2026-11-16).** The llama.cpp remnants are out (nginx's llama upstream and
+   fixup hooks, `lib/perl/llama.pm`, `lib/lua/fixup.lua`, the Vulkan and CMake packages, the GGML environment). The first
+   real build log (the user's, 2026-11-16) showed: every ROCm stage cached and fine; the failure was the build context:
+   `.dockerignore` (`*` with a few re-includes) excluded `nginx.conf` and `app.sh`, so their COPY steps failed. Fixed in
+   8251416. The user's checkout still had an older Dockerfile (`COPY lib`): it needs `git pull`. Not yet verified: the
+   build after the pull (the `nginx -t` step and the runtime's `ldd` check come after the COPYs). `run.sh` (the host launcher) still names
    llama (`LLAMA_DOCKER_IMAGE`, the `llama` container and volume): to change with the user's launch scripts.
 9. **NVIDIA Alpamayo 2 Edge (analysed 2026-11-16; released 2026-11-10; HF `nvidia/Alpamayo2-Edge`).** A driving
    vision-language-action model: weights OpenMDW-1.1, code Apache-2.0 (the license to confirm with the user, as for MiniMax).
