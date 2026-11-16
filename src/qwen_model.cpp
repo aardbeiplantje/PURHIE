@@ -2726,11 +2726,17 @@ struct QwenModel {
                 m->inv = !getenv("QMATVEC_PREFILL_SPLIT_VARIANT");
                 qmatvec_set_prefill(m->inv);
                 attention_set_prefill(m->inv && m->eng->kvc ? kv_cache_n_ctx(m->eng->kvc) : 0);
+                // Gemma-4's activations do not survive 16 bits: its prefill keeps the fp32 kernels (no WMMA matmul,
+                // no flash attention); its logits then equal token by token decoding's (tests/prefill_vs_decode)
+                qmatvec_set_prefill_fp32(m->inv && m->eng->gemma4);
+                attention_set_prefill_fp32(m->inv && m->eng->gemma4);
             }
             ~Mode() {
                 m->inv = false;
                 qmatvec_set_prefill(0);
                 attention_set_prefill(0);
+                qmatvec_set_prefill_fp32(0);
+                attention_set_prefill_fp32(0);
             }
         } mode(this);
         for (int done = 0; done < n;) {

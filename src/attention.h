@@ -100,6 +100,8 @@ typedef struct {
 // ATTN_MAX_SPLITS)), not per batch, so that a token's attention is the same however its prompt was cut into batches.
 // ATTN_PREFILL_RMIN: a larger smallest range (tuning)
 void attention_set_prefill(int n_ctx);
+// With prefill on: 1 keeps attn_flash off for the batches (the non-flash kernels' order; Gemma-4's prefill needs it).
+void attention_set_prefill_fp32(int on);
 
 hipError_t attention_forward_opts(const float* qfull, const float* k, const float* v, const float* q_norm,
                                   const float* k_norm, __half* K, __half* V, int kv_shift, long long kv_bstride,

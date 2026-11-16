@@ -45,6 +45,8 @@ hipError_t qmatvec_launch(int type, const void *W, size_t row_bytes, const float
 // was cut into batches. QMATVEC_PREFILL_SPLIT_VARIANT set: never on (A/B). Off: decoding, verify passes, batched decoding.
 void qmatvec_set_prefill(int on);
 int qmatvec_prefill(void);
+// With prefill on: 1 keeps the WMMA matmuls off (the matvec kernels' order, fp32 activations; Gemma-4's prefill needs it).
+void qmatvec_set_prefill_fp32(int on);
 
 hipError_t qmatvec_launch_batch(int type, const void *W, size_t row_bytes, const float *x, float *y, int N, int K,
                                 int T, hipStream_t stream);

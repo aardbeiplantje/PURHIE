@@ -68,9 +68,15 @@ whisper-tiny, `voices/`) and EmbeddingGemma.
 12. **Clear by hand:** `/data/iqtest` (336 KB of logs), and `nginx.conf~` in the repository root (the user's editor backup,
     excluded from the image; git lists it as untracked).
 
-13. **New, from items 1 and 2 (2026-11-16, both builds):** (a) Gemma-4 26B: prefill against token-by-token decoding differs by
-    16 logits (cosine 0.994), and the streamed greedy tokens differ from `inference_generate_ex`'s; its chat checks assume
-    Qwen's template. (b) `events_test`: fixed. The one-shot prefill split at its checkpoint reported each segment's length as
+13. **New, from items 1 and 2 (2026-11-16, both builds):** (a) **Done 2026-11-16: Gemma-4's prefill keeps fp32 (the user's
+    decision).** Its prefill differed from token-by-token decoding by 8.4 logits, with a changed top token. The cause is two
+    16-bit paths: the WMMA matmul (fp16 activations) and flash attention. Either one alone leaves the gap (6.8 and 8.3), and
+    both off give 0. For a Gemma model, prefill now turns both off (`qmatvec_set_prefill_fp32`, `attention_set_prefill_fp32`,
+    set in qwen_model's prefill mode). `generate_verify`'s prefill checks pass (562 tokens, and micro-batches). The cost: Gemma
+    prefill runs at about 620 tok/s instead of 1840 on 562 tokens (3x slower). Qwen is unchanged (same logits, same speed).
+    Tabled as nice to have: the streamed greedy tokens differ from `inference_generate_ex`'s (the stream check), and the two
+    chat checks assume Qwen's end token and template (`generate_verify` now fails 3 checks, down from 5). (b) `events_test`:
+    fixed. The one-shot prefill split at its checkpoint reported each segment's length as
     PREFILL_PROGRESS's total, so the progress covered the first segment only; it now reports the whole call. The test's
     prompt also gets a 256-row prefill batch, so it splits. Passes on the tiny draft pair and on Qwen3-0.6B.
 

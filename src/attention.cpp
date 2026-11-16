@@ -38,6 +38,9 @@ static const int kFlashMinT = 16;
 // `g_prefill_chunk` (a range past a token's own adds an exact zero in the combine), so that a token's attention does
 // not depend on how its prompt was cut into batches. 0: off (decoding, verify passes)
 static int g_prefill_chunk = 0;
+// Prefill of a model whose activations do not survive 16 bits (Gemma-4: attention_set_prefill_fp32): no attn_flash, so
+// that the prefill's attention is summed like the token by token decoding's
+static int g_prefill_fp32 = 0;
 // attn_flash splits a token's positions until the launch has this many workgroups (4 per WGP of the 20)
 static const long long kFlashWgs = 160;
 static bool g_flash_off = false;
@@ -121,6 +124,8 @@ hipError_t attention_forward(const float* qfull, const float* k, const float* v,
     return attention_forward_opts(qfull, k, v, q_norm, k_norm, K, V, kv_shift, kv_bstride, n_q, n_kv, n_rot, pos0, T,
                                   freq_base, eps, q, part_ml, part_acc, out, &o, q8, stream);
 }
+
+void attention_set_prefill_fp32(int on) { g_prefill_fp32 = on; }
 
 void attention_set_prefill(int n_ctx) {
     if (n_ctx <= 0 || getenv("QMATVEC_PREFILL_SPLIT_VARIANT")) { g_prefill_chunk = 0; return; }
@@ -207,7 +212,7 @@ hipError_t attention_forward_opts(const float* qfull, const float* k, const floa
     else if (g_flash_h1t4[hi][kq]) flash = g_flash_h1t4[hi][kq], nh = 1, tt = 4;
     // waves per (head, token tile): attention.hip's ATTN_FLASH_SP (2 for D 256, which splits its dims over them)
     const int sp = D == 256 && ds == 1 ? 2 : 1;
-    if ((T >= kFlashMinT || g_prefill_chunk > 0) && !g_flash_off && flash) {
+    if ((T >= kFlashMinT || g_prefill_chunk > 0) && !g_flash_off && !g_prefill_fp32 && flash) {
         // Ranges of positions per token (each a multiple of 16 positions, at most ATTN_MAX_SPLITS): only as many
         // as it takes to give the GPU ~kFlashWgs workgroups. A prefill batch has enough without splitting, and
         // every split costs partial results written and merged (one split: Gemma-4 prefill +10%, Qwen3.6 +4%);
