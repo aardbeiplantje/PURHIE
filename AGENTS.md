@@ -1,14 +1,11 @@
 # Agents
 
-This is a proof-of-concept integrating two features into [llama.cpp](https://github.com/ggml-org/llama.cpp):
+This is a standalone inference engine for AMD ROCm (gfx1151, Strix Halo, zero-copy UMA). It began as a proof of concept
+for HIP/ROCm mmap model loading and ROCmFP4 quantization. An earlier forked-llama.cpp snapshot is archived on the
+`q4_0_rocmfp4_q8_1` branch. No llama.cpp code is linked. A local `llama.cpp/` directory holds reference oracle builds
+only: it is git-ignored and not part of the repository.
 
-1. **HIP/ROCm mmap support** — memory-mapped model loading on AMD GPUs via HIP runtime
-2. **ROCmFP4 quantization** — native FP4 quantization with FP16 activations on ROCm (ftype 107/108)
-
-Similar in spirit to [blazux/qwen3.8-Flash-DGX](https://github.com/blazux/qwen3.8-Flash-DGX), which adds mmap() support for n-gram MoE Qwen3.8-Flash models in vLLM, but targeting llama.cpp's GGUF format with ROCm hardware acceleration.
-
-Today the repository is a standalone inference engine (no llama.cpp code is linked; `llama.cpp/` is a reference
-oracle only): see `ARCHITECTURE.md` for how it is built. See `PLAN.md` for current status and roadmap. **On any request involving progress, next steps, or work planning, read `PLAN.md` first** to understand what is done and what remains. Do not read it for git maintenance or one-off code changes that don't affect the project trajectory.
+See `ARCHITECTURE.md` for how it is built. See `PLAN.md` for current status and roadmap. **On any request involving progress, next steps, or work planning, read `PLAN.md` first** to understand what is done and what remains. Do not read it for git maintenance or one-off code changes that don't affect the project trajectory.
 
 ## Branches
 
@@ -53,8 +50,9 @@ find src tests -name '*.cpp' -o -name '*.h' -o -name '*.hpp' -o -name '*.hip' | 
 ## Container image
 
 The image is built from this repository's `Dockerfile` (`docker-bake.hcl`, the image `local/ai/purhie-gfx1151:latest`).
-Its ROCm build clones rocm-hip from GitHub `main`, so push before a build. The image's own files are `app.sh`,
-`nginx.conf` and the runtime packages; `.dockerignore` keeps the build context small. The image carries `/version`
+Its ROCm build clones rocm-hip from GitHub `main` with `--recurse-submodules` (the `perl-minijinja-xs` submodule
+included), so push before a build. The image's own files are `app.sh`, `nginx.conf`, `lib/` (the Perl and Lua request
+code, copied to `/app/lib`) and the runtime packages; `.dockerignore` keeps the build context small. The image carries `/version`
 (the rocm-hip commit, and this project's commit when `build-watch.sh` passes it).
 
 To trigger an image build, touch the trigger from the repository root: `touch .build-trigger`. The user runs
