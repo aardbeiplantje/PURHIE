@@ -368,7 +368,7 @@ nemotron_h_moe, llama and glm5-next (GLM-5.3-Flash, its experts paged from disk)
 UMA. Surfaces: the C API (`libinference.so`), the Perl XS module ROCm::Inference (Minijinja templates),
 rocm-inference-server (OpenAI-compatible: chat, raw completions, embeddings, `--models-dir`, `--parallel`), and
 `bin/rocm-convert`. Regression suite: `make regress` / `make regress-full`. Deployed by the user's
-llama.cpp-rocm-gfx1151-docker (a submodule here since 2026-11-15), which builds rocm-hip from GitHub `main`: its watcher
+llama.cpp-rocm-gfx1151-docker (its build files are in this repository's Dockerfile since 2026-11-16: the llama.cpp submodule was removed), which builds rocm-hip from GitHub `main`: its watcher
 takes a fresh `CACHEBUST` per build, and a build is started by touching its `.build-trigger` (AGENTS.md). Design:
 ARCHITECTURE.md; measurements: git history.
 
