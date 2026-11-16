@@ -18,7 +18,8 @@ is(ROCm::Inference::quant_row_size($FAST, 4096), 4096 / 32 * 17, 'FAST: 17 bytes
 is(ROCm::Inference::quant_row_size($FP4, 4096), 4096 / 32 * 18, 'ROCmFP4: 18 bytes a block of 32');
 is(ROCm::Inference::quant_row_size($Q8_0, 100), 0, 'Q8_0: 100 values are not whole blocks');
 ok(ROCm::Inference::quant_can_encode($_), (gguf_type_info($_))[0] . ' can be encoded') for $F32, $F16, $BF16, $Q8_0, $FP4, $FAST;
-ok(!ROCm::Inference::quant_can_encode(gguf_type_id('q6_K')), 'Q6_K cannot (decoded only)');
+ok(ROCm::Inference::quant_can_encode(gguf_type_id('q6_K')), 'Q6_K can be encoded (native encoder, 7062531)');
+ok(!ROCm::Inference::quant_can_encode(gguf_type_id('q8_K')), 'Q8_K cannot (decoded only: an activation format)');
 
 # Exact cases: F16 / BF16 of representable values, Q8_0 of a block with max 127, FAST of zeros
 my @v = map { ($_ - 16) / 4 } 0 .. 31;  # -4 .. 3.75 in quarters: exact in F16 and BF16
