@@ -26,7 +26,7 @@
 #include "gguf_mmap.h"
 
 struct ExpertPager {
-    ExpertPager(gguf_model_t* g, size_t budget_bytes) : gguf(g), budget(budget_bytes) {}
+    ExpertPager(gguf_model_t* g, size_t budget_bytes) : budget(budget_bytes), gguf(g) {}
 
     // The n experts of expert_bytes each at data: their units (-1: nothing of them is a whole page)
     int add_tensor(const void* data, size_t expert_bytes, int n);
