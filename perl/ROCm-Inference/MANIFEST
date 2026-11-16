@@ -35,6 +35,7 @@ t/64-audio.t
 t/65-speech.t
 t/66-whisper-long.t
 t/67-image.t
+t/69-speech-formats.t
 t/62-server-log.t
 t/65-models-dir.t
 t/70-stage.t
