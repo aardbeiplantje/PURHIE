@@ -2,6 +2,7 @@ use strict;
 use warnings;
 use Test::More;
 use File::Temp qw(tempdir);
+use File::Copy qw(copy);
 
 use ROCm::Inference qw(:all);
 use ROCm::Inference::Store qw(store_evict store_files store_usage);
@@ -73,17 +74,23 @@ for my $lazy (0, 1) {
         }
     }
 
-    # the store over its limit: room for the subagent's files and the main conversation's chain with two snapshots,
-    # not for the main agent's older snapshots (one per request: where each prompt ended)
-    my $kvb = store_stats($m)->{block_bytes};
-    my ($rst) = map { $_->{bytes} } grep { $_->{name} =~ /\.rst\z/ } store_files($dir);
-    my $subs = 0;
-    $subs += $_->{bytes} for grep { !$before{ $_->{name} } } store_files($dir);
-    my $need = $subs + int($main_len / $B) * $kvb + 2 * ($rst // 0);
+    # the store over its limit: what it holds now is what the main conversation needs (its chain and the snapshots
+    # the store keeps, the subagent's files too). The store already drops a superseded prompt end when it writes the
+    # next one, so nothing older is left to go; a stale block of an earlier conversation, older than all the rest,
+    # is added on top (a copy of one of the chain's blocks under a name of its own). LRU must take it first, and only it
+    my ($need) = store_usage($dir);
+    my ($src) = grep { $_->{name} =~ /\.kvb\z/ } store_files($dir);
+    die "no block file to copy" unless $src;
+    my $stale = sprintf('%064x', 0xf00d0000 + $$) . '.kvb';
+    copy($src->{path}, "$dir/$stale") or die "copy: $!";
+    my $oldest = (sort { $a <=> $b } map { $_->{mtime} } store_files($dir))[0];
+    utime $oldest - 3600, $oldest - 3600, "$dir/$stale" or die "utime: $!";
     my ($bytes) = store_usage($dir);
-    ok($bytes > $need, sprintf('the store (%.1f MB) holds more than the main chain needs (%.1f MB)', $bytes / 2**20, $need / 2**20));
+    ok($bytes > $need, sprintf('the store (%.1f MB) holds the stale block on top of the %.1f MB it keeps',
+                               $bytes / 2**20, $need / 2**20));
     my @gone = store_evict($dir, max_bytes => $need);
-    ok(@gone > 0 || $lazy, scalar(@gone) . ' files evicted');
+    is_deeply(\@gone, [$stale], 'LRU: the stale block goes first, nothing of the chain');
+    ok(store_usage($dir) <= $need, 'the store is within its limit');
 
     # the main agent resumes: its prefix comes back from the store
     $main .= "\nTurn 7: the user asks for a summary.";
