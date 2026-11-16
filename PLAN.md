@@ -82,16 +82,14 @@ gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day b
    torch environment. Not started, so the deployment's files are not at risk: free space on `/data`, or say where the
    outputs may go. Item 7's leads (the q/k norm and rotary inside the attention, the norm once per layer) and D (the
    samplers' sort, about 18 us against 28 us a codebook: under 1% of a frame) are not started.
-8. Cleanup: (a) the per-file `HIP_CHECK` copies in `tests/` and some `src/` demos could use `src/hip_check.h` (asked; the
-   user has not answered); (b) `src/sd.cpp`'s build warnings are the vectorizer's remarks (`-Rpass-missed=loop-vectorize`
-   with `-mavx2 ... -fopenmp`): loops with mixed fp16/fp32 conversions, early exits or calls, plus the `omp simd` loops
-   that do not vectorize; not fixed (a build flag would hide them: the user's call); (c) the Dockerfile's `COPY lib` (the
-   directory has no tracked files now; the build passes); (d) the host-path leftovers: Whisper's encoder (2026-11-16,
-   measured: 520 ms per window; the linears 10.6 GMAC, the attention's weighted sum 7 GMAC in a scalar loop, 9.2 million
-   `erf` calls in the GELU, the naive stem convolutions 0.9 GMAC; a per-pair score buffer and a 4x2 blocked linear were
-   both measured and gave no gain, reverted), its decoder's cross-attention (six threads) and vocabulary product
-   (memory-bound); the codec's kernel-7 inner loop; (e) `~/rocm-hip.git` (not on this host) needs `git pull`: its older
-   `run.sh` and Dockerfile are behind.
+8. Cleanup, done 2026-11-16 (the user's decisions): (a) `HIP_CHECK` is one definition in `src/hip_check.h` (throws with
+   the call, its file and line; the tests and demos include it, the two-argument calls keep the call text); (b) `sd.cpp`'s
+   vectorizer remarks silenced by a scoped pragma (`-Wpass-failed`, with the reason in the file); (c) `lib/perl` is tracked
+   (`.gitkeep`: a fresh clone needs the directory for the Dockerfile's `COPY lib`; the user's `lib/` work is in the working
+   copy, not committed); (d) host-path leftovers, measured and not pursued: Whisper's encoder (520 ms per window; the
+   linears, the attention's weighted sum in a scalar loop, the GELU's `erf` calls, the naive stem convolutions; a
+   per-pair score buffer and a 4x2 blocked linear gave no gain, reverted), its decoder's cross-attention and vocabulary
+   product, the codec's kernel-7 loop; (e) `~/rocm-hip.git` is not on this host.
 9. **NVIDIA Alpamayo 2 Edge: the licence is confirmed (the user, 2026-11-16); the modeling code is the blocker.** The
    weights (OpenMDW-1.1) are on Hugging Face (`nvidia/Alpamayo2-Edge`, about 5.4 GB in BF16, two shards, 907 tensors);
    the config and the tensor headers were read with range requests, the weights not downloaded. The layout: the language
@@ -117,22 +115,16 @@ gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day b
 13. **Memory on the deployment: tabled (the user, 2026-11-16).** GLM-5.3 runs on the CPU now, so the GPU expert pins
     and the GLM state no longer apply to it; the CPU-only path allocates no GPU state (`74fda6e`). The 64 GB expert cap in
     `run.sh` stays as a default for GPU runs.
-14. **Failing checks that predate the memory change (HEAD, 2026-11-16): diagnosed, one open decision.**
-    (a) `t/45-store-lru.t` tests 4, 5 and 10: the eager run's store holds exactly the bytes the test's limit asks for
-    (`bytes > need` is false by equality), since the store deletes superseded prompt ends when it writes them: nothing is
-    over the limit, so LRU has nothing to evict. The scenario's premise (superseded snapshots on disk) no longer holds:
-    the test or the store's rule needs a decision (the user).
-    (b) `seq_verify` and `generate_verify` on Qwen3.5-0.8B (UD-Q8_K_XL: F16 attn_q, ffn and ssm matrices, Q8_0 others;
-    Qwen3-0.6B, all Q8_0, passes): a batch of prompts of lengths 30 and 16 diverges at step 11, from a logit gap of 0.032
-    (510 at 15.6757 against token 1 at 15.6435). Prefilling the same prompt in one call, in chunks of 5, or token by token
-    gives identical logits here (`cut_probe`); the stream batch of two identical prompts matches alone
-    (`batch_probe`); the divergence needs the matmul WMMA path on (`QMATVEC_NO_WMMA_MM=1` clears it; the flash attention
-    switch does not). It is a near-tie flipped by a rounding difference in the batched F16 path, not corrupted state, but
-    the batched logits themselves are not measured: `inference_forward_batch` is a stub in this build. Open: whether the
-    engine should make batched F16 rows bit-identical to a single row (a cost to the WMMA speed), or the test should accept
-    near-ties (the user's call). `generate_verify`'s `inference_set_lm_head_q8` check fails the same way on HEAD.
-    The sliding-window ring (Gemma-4) and the MTP draft path are not covered by the lazy-KV tests here (no such model
-    files on this host).
+14. **Failing checks that predate the memory change: resolved 2026-11-16 (the user's decisions).**
+    (a) `t/45-store-lru.t`: the store keeps what the chain needs and drops superseded prompt ends itself, so the test now
+    adds a stale block older than the rest and checks that LRU takes exactly that block (`c9a1e9f`); Qwen3-0.6B and
+    Qwen3.5-0.8B pass, eager and lazy snapshots.
+    (b) Qwen3.5-0.8B batched or chunked replies: WMMA stays on for speed; a first difference that is a near-tie
+    (the two best alone logits within 0.1, the batched token one of them) is accepted, with the logits from a replay
+    of the alone reply (`bb5de99`). `seq_verify` passes on both models; `generate_verify`'s head check was starting from
+    the default Q8 head: it now sets the float head first, and the restore is exact.
+    Not covered by the lazy-KV tests here: the sliding-window ring (Gemma-4) and the MTP draft path (no such model files
+    on this host).
 
 **Decided by the user (2026-11-16):** item 12: the speech pieces keep their own prosody (no conditioning on the previous
 piece: closed). Item 13: ffmpeg is added (package M). Package L: built as an option.
