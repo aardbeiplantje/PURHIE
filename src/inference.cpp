@@ -2390,13 +2390,23 @@ static int save_checkpoint(inference_model_t* m) {
 static int prefill_with_checkpoint(inference_model_t* m, const int32_t* tokens, int n, int tail) {
     if (n <= 0) return 0;
     tail = std::min(tail, n / 2);  // a short prompt still gets a checkpoint, half way
+    // PREFILL_PROGRESS counts over the whole call (n tokens), as a stream's chunks do: the checkpoint's split is not a new total
     if (tail > 0 && qwen_model_is_recurrent(m->qwen)) {
+        m->evt_base = 0, m->evt_total = n;
         int rc = inference_prefill(m, tokens, n - tail);
+        m->evt_base = m->evt_total = 0;
         if (rc == 0) rc = save_checkpoint(m);
-        if (rc == 0) rc = inference_prefill(m, tokens + n - tail, tail);
+        if (rc == 0) {
+            m->evt_base = n - tail, m->evt_total = n;
+            rc = inference_prefill(m, tokens + n - tail, tail);
+            m->evt_base = m->evt_total = 0;
+        }
         return rc;
     }
-    return inference_prefill(m, tokens, n);
+    m->evt_base = 0, m->evt_total = n;
+    const int rc = inference_prefill(m, tokens, n);
+    m->evt_base = m->evt_total = 0;
+    return rc;
 }
 
 // Make the sequence equal to prompt[0, n), reusing the longest common prefix with the current one: append when

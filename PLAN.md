@@ -70,8 +70,9 @@ whisper-tiny, `voices/`) and EmbeddingGemma.
 
 13. **New, from items 1 and 2 (2026-11-16, both builds):** (a) Gemma-4 26B: prefill against token-by-token decoding differs by
     16 logits (cosine 0.994), and the streamed greedy tokens differ from `inference_generate_ex`'s; its chat checks assume
-    Qwen's template. (b) `events_test`: five PREFILL_PROGRESS checks fail (a long prompt reports no progress; the progress
-    counts; a nonzero return does not cancel the prefill). Both are present before the lazy-KV change; not yet diagnosed.
+    Qwen's template. (b) `events_test`: fixed. The one-shot prefill split at its checkpoint reported each segment's length as
+    PREFILL_PROGRESS's total, so the progress covered the first segment only; it now reports the whole call. The test's
+    prompt also gets a 256-row prefill batch, so it splits. Passes on the tiny draft pair and on Qwen3-0.6B.
 
 **Done 2026-11-16 (the detail is in the items above and in git):** `edbbd32` the Q8_0 predictor talker is loaded after the
 BF16 one by its tensors (not its name), and `t/64-multipart.t` split out of `t/64-audio.t`; `bcefaa3` and `bb64c61` the nginx

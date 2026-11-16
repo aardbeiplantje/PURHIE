@@ -50,6 +50,9 @@ static inference_model_t* fresh(const char* path, int n_ctx, const char* draft) 
     inference_model_t* m = inference_load_model(path);
     if (!m) { fprintf(stderr, "load: %s\n", inference_get_last_error()); exit(1); }
     if (draft && inference_set_draft_model(m, draft) != 0) { fprintf(stderr, "draft: %s\n", inference_get_last_error()); exit(1); }
+    // a prefill micro-batch of 256 rows: the ~1100-token base prompt splits into steps, so PREFILL_PROGRESS fires (the
+    // engine's own batch is larger than the prompt here, and a prompt in one step reports no progress)
+    if (inference_set_prefill_batch(m, 256) != 0) { fprintf(stderr, "prefill batch: %s\n", inference_get_last_error()); exit(1); }
     if (inference_kv_cache_init(m, n_ctx) != 0) { fprintf(stderr, "kv: %s\n", inference_get_last_error()); exit(1); }
     return m;
 }
