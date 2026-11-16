@@ -21,7 +21,7 @@ plan skip_all => 'set ROCM_INFERENCE_TEST_TTS, ROCM_INFERENCE_TEST_TTS_CODEC and
     unless $talker && -f $talker && $codec && -f $codec && $voice_dir && -d $voice_dir;
 plan skip_all => 'Web::Route is not installed' unless eval { require Web::Route; 1 };
 require ROCm::Inference;
-plan skip_all => "Minijinja $ROCm::Inference::MINIJINJA_VERSION is not installed"
+plan skip_all => "the Minijinja module is not installed"
     unless ROCm::Inference::_require_minijinja();
 
 (my $vd = $voice_dir) =~ s{/+\z}{};
@@ -47,14 +47,14 @@ my %WANT = (  # the encoder, the bitrate and the container of each format (after
 my @args = @ARGV;
 my @common = qw(-hide_banner -loglevel error -f s16le -ar 24000 -ac 1 -i);
 my $fmt;
-if (@args >= 8 && join(' ', @args[0 .. 6]) eq join(' ', @common)) {
-    my $tail = join ' ', @args[8 .. $#args];
+if (@args >= 11 && join(' ', @args[0 .. 9]) eq join(' ', @common)) {
+    my $tail = join ' ', @args[11 .. $#args];
     for my $f (sort keys %WANT) {
         my ($enc, $rate, $box) = @{ $WANT{$f} };
         $fmt = $f if $tail eq join(' ', '-c:a', $enc, '-b:a', $rate, '-f', $box, 'pipe:1');
     }
 }
-if (!defined $fmt || $args[7] eq '') {
+if (!defined $fmt || $args[10] eq '') {
     print STDERR "stub: unexpected arguments: @args\n";
     exit 2;
 }
@@ -64,7 +64,7 @@ if ($mode eq 'fail') {
     exit 1;
 }
 exit 0 if $mode eq 'empty';
-open my $fh, '<:raw', $args[7] or do { print STDERR "stub: $args[7]: $!\n"; exit 2 };
+open my $fh, '<:raw', $args[10] or do { print STDERR "stub: $args[10]: $!\n"; exit 2 };
 my $data = do { local $/; <$fh> };
 binmode STDOUT;
 print "stub $fmt " . length($data) . ' ' . md5_hex($data) . "\n";
