@@ -4,36 +4,60 @@
 > Finished work, with its measurements, is in the git history (this file was pruned of it on 2026-11-05, 2026-11-06
 > and 2026-11-12).
 
-## ▶ Next (verified 2026-11-15: the work packages)
+## ▶ Next (verified 2026-11-15; progress and TODO, kept current: 2026-11-16)
 
-Verified on 2026-11-15 against the repository and this host. The 118 paths and the 11 make targets this file names exist,
-with three exceptions: `/hf/Qwen3.5-0.8B` and `/hf/Qwen3.5-4B` are gone (the vision checks run from `/data/vision-ref`:
-`q35-0.8b-mmproj.gguf`, `q35-0.8b-bf16.gguf`, `q35-0.8b/`); the BF16 talker is `/models/qwen3tts-talker.gguf` (with
-`qwen3tts-codec.gguf`, `whisper-tiny.gguf` and `voices/`; the references stay under `/data/audio-ref`); and
-`/data/minimax-ref/te/mm_te_ref.py` is gone. Free disk: `/data` and `/models` 17 GB, `/hf` 34 GB, `/comfyui` 88 GB, so
-the 38 GB of IQ downloads (item 2 of the list below) do not fit: local conversions instead.
+How the work runs (the user, 2026-11-15): this file is verified against the repository and the host, then each open item
+is a package: one Haiku agent's task in its own worktree, with exact files, commands, data paths and a check. The main
+session briefs it, reviews its commit, reruns the check on `main`, then commits, pushes and touches the image's build
+trigger (AGENTS.md). Timing packages run alone on the machine. An agent commits early: a worktree with no changes is
+removed when its agent stops, and a resumed agent then lands in the main checkout.
 
-The open work as packages. Each is one agent's task with its check; it is done when the check passes and it is committed.
-The lists below keep each item's background. Done on 2026-11-15, each recorded in its item: A (item 11, Whisper's
-temperature fallback), B (item 2 of the 2026-11-14 list, the IQ types on the GPU), C (item 9, the codec's time per layer),
-E and E2 (item 10, Whisper's host path), F (item 15, the vision tower's host path), G (the tests' reply checks). Not
-started: D (item 7, the samplers' sort: a rank sort needs a second launch per codebook, about 18 us against 28 us, under
-1% of a frame).
+The host (2026-11-15): the 118 paths and the 11 make targets this file names exist, with three exceptions:
+`/hf/Qwen3.5-0.8B` and `/hf/Qwen3.5-4B` are gone (the vision checks run from `/data/vision-ref`: `q35-0.8b-mmproj.gguf`,
+`q35-0.8b-bf16.gguf`, `q35-0.8b/`); the BF16 talker is `/models/qwen3tts-talker.gguf` (with `qwen3tts-codec.gguf`,
+`whisper-tiny.gguf` and `voices/`; the references stay under `/data/audio-ref`); `/data/minimax-ref/te/mm_te_ref.py` is
+gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day before; not this work's files), `/hf`
+34 GB, `/comfyui` 88 GB: no downloads, one converted file at a time. No ffmpeg on this host (the image gets one).
 
-Next packages:
-- I the converter's model-card keys (`general.license`, base model, size label, and the rest of upstream's card keys), byte
-  for byte as `convert_hf_to_gguf.py` writes them (`tests/convert_verify.sh` compares them "aside" today).
-- J the vision tower's linears register-blocked on the host (77% of the 0.76 s pass).
-- K the codec's host stages overlapped with the device's work or moved to its kernels (36 ms of a 142 ms piece).
-- L (the user's decision first: quality) the code predictor's weights as Q8_0 on the device: half the bytes of the 2.5 GB
-  the predictor reads a frame, so the frame's 22.8 ms could reach about 15 ms. To measure before any default: the greedy
-  codes' agreement with the BF16 predictor and the speech.
+**Done** (each recorded in its item below):
+- 2026-11-15: item 8 (the samplers on the device: one sync a frame), item 7's first gains (a predictor stack 940 to
+  905 us), item 9 first version (the codec's convolutions on the device: 40 frames in 190 ms, 800 ms on the CPU) and its
+  time per layer (package C), package A (item 11, Whisper's temperature fallback), B (the IQ types on the GPU), E and E2
+  (item 10: a Whisper decoder token 18.3 to about 1.7 ms, the encoder 1.5 to 0.39 s, on the host), F (item 15: the vision
+  tower's pass 3.55 to 0.76 s on the host), G (the tests' reply checks).
+- 2026-11-16: package H (the split-invariance tests demand bit-exactness: Open leads, quality).
 
-The user's decisions: item 12 (prosody across speech pieces) and item 13 (mp3 / opus / aac). Not runnable on this host:
-the Flash measurements (its own MTP block, the PLE reads), `--parallel` and the store on the deployment,
-`events_test MODEL DRAFT`, nginx's X-Remote-User header (the docker repository). Larger and not packaged yet: the ComfyUI
-component API (milestone 1), speculative decoding under `--parallel` (three stages), FP8 as a weight type, raw
-completions' prompt arrays and logprobs.
+**In progress** (agents running, 2026-11-16):
+- I the converter's model-card keys (`general.license`, base model, size label and the rest of upstream's card keys) as
+  `convert_hf_to_gguf.py` writes them, for the four releases under `/data/conv`. Upstream's key lists are known (the
+  first attempt's dumps); the port into `Convert.pm` is being written. Then `tests/convert_verify.sh` compares them (it
+  sets them "aside" today): to run when the disk allows.
+- L1 (item 16) the code predictor's block matrices as Q8_0: the file (`/data/predq8/qwen3tts-talker-predq8.gguf`), the
+  loader and the host path, and the quality numbers (the predictor's logits, the greedy codes' agreement, the speech).
+- M (item 13) mp3, opus and aac from `/v1/audio/speech` through an external ffmpeg (`--ffmpeg`, `ROCM_FFMPEG`), tested
+  here with a stub program.
+
+**TODO** (in order):
+1. After M: `ffmpeg` in the image (the docker repository's Dockerfile), the submodule's commit taken here, and the three
+   formats checked against the real encoder in the container (`t/69-speech-formats.t` with `ROCM_INFERENCE_TEST_FFMPEG`).
+2. After L1, if its numbers hold: L2 the Q8_0 rows in the device kernels (`talker_gpu.hip`: a lane takes one 34-byte
+   block; the frame's 22.8 ms could reach about 16 ms), the device against the host on the Q8_0 file, the frame's time.
+   Then how a user gets the file (a converter recipe or option) and the server picking it up. BF16 stays the default.
+3. J the vision tower's linears register-blocked on the host (77% of the 0.76 s pass).
+4. K the codec's host stages overlapped with the device's work or moved to its kernels (36 ms of a 142 ms piece).
+5. After I: `tests/convert_verify.sh` in full (needs several GB free on `/data`).
+6. Item 7's leads (a few percent each): the q/k norm and rotary inside the attention, the norm once per layer; D the
+   samplers' sort (not started: about 18 us against 28 us a codebook, under 1% of a frame).
+7. Leftovers on the host paths: Whisper's encoder attention (a score vector allocated per query and head), its
+   decoder's cross-attention (six threads) and vocabulary product (memory-bound); the codec's kernel-7 inner loop.
+
+**Decided by the user (2026-11-16):** item 12: the speech pieces keep their own prosody (no conditioning on the previous
+piece: closed). Item 13: ffmpeg is added (package M). Package L: built as an option.
+
+Not runnable on this host: the Flash measurements (its own MTP block, the PLE reads), `--parallel` and the store on the
+deployment, `events_test MODEL DRAFT`, nginx's X-Remote-User header (the docker repository). Larger and not packaged yet:
+the ComfyUI component API (milestone 1), speculative decoding under `--parallel` (three stages), FP8 as a weight type, raw
+completions' prompt arrays and logprobs. To clear by hand: `/data/iqtest` (336 KB of logs of package B).
 
 ## ▶ Next (2026-11-14, kept current)
 
@@ -120,9 +144,14 @@ Quality and scope (decisions):
     unchanged, the sampled passes deterministic; 2 minutes), t/64 (17) and t/66 (4). Cost: each attempt is a decoder pass
     of the window (about 2 s for 93 tokens on the host: 21 ms a token), so such a window takes six passes (t/66's long clip
     23 s, was 7 s): the decoder's speed is item 10's.
-12. **Prosody across speech pieces.** Each sentence piece is a separate talker run (pieces joined with 0.2 s of silence),
-    so the prosody restarts at each piece. Decide: keep, or condition each piece on the previous one's frames.
-13. **mp3, opus and aac.** Refused with 400 (no encoder in the image). Decide: add an encoder to the image, or keep refusing.
+12. **Prosody across speech pieces: decided 2026-11-16, kept as it is.** Each sentence piece is a separate talker run (pieces
+    joined with 0.2 s of silence), so the prosody restarts at each piece; no conditioning on the previous piece's frames.
+13. **mp3, opus and aac: decided 2026-11-16, through ffmpeg (package M, in progress).** The server pipes the speech's PCM
+    through an external ffmpeg (`--ffmpeg`, `ROCM_FFMPEG`, or the one on PATH); the image installs it. Without one the
+    three formats stay a 400.
+16. **The code predictor's weights as Q8_0 (package L; the user: built as an option, 2026-11-16).** The predictor reads about
+    2.5 GB of BF16 a frame (16 stacks of 157 MB); Q8_0 rows are 34 bytes for 32 values against 64. L1 (in progress): the
+    file, the loader, the host path, the quality numbers. L2: the device kernels. BF16 stays the default.
 
 Not planned:
 14. **Torch-identical sampled frames.** The engine's sampler is its own generator (splitmix); a bit match would need torch's
