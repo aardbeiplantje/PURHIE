@@ -49,6 +49,32 @@ gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day b
    samplers' sort (not started: about 18 us against 28 us a codebook, under 1% of a frame).
 7. Leftovers on the host paths: Whisper's encoder attention (a score vector allocated per query and head), its
    decoder's cross-attention (six threads) and vocabulary product (memory-bound); the codec's kernel-7 inner loop.
+8. **The image (commit 39f1b8c, 2026-11-16):** the llama.cpp remnants are out (nginx's llama upstream and fixup hooks,
+   `lib/perl/llama.pm`, `lib/lua/fixup.lua`, the Vulkan and CMake packages, the GGML environment). The build is NOT verified:
+   it was not run here (no docker in this session), and the failing step is not known. Next: the failing step's output
+   (the tail of `build-watch.log` where the watcher runs) decides the next fix. `run.sh` (the host launcher) still names
+   llama (`LLAMA_DOCKER_IMAGE`, the `llama` container and volume): to change with the user's launch scripts.
+9. **NVIDIA Alpamayo 2 Edge (analysed 2026-11-16; released 2026-11-10; HF `nvidia/Alpamayo2-Edge`).** A driving
+   vision-language-action model: weights OpenMDW-1.1, code Apache-2.0 (the license to confirm with the user, as for MiniMax).
+   Config: the language model `cosmos3_edge_text` is dense (28 layers, hidden 2048, 16 query / 8 KV heads, MLP 9216, vocab
+   135168, rope theta 1e8: the engine's dense path, if its norms and activation match); the vision tower
+   `cosmos3_edge_vision` (27 layers, hidden 1152, patch 16: not Qwen3.5's, a new tower); an action expert (28 layers,
+   hidden 512, flow matching with 10 Euler steps, attending to the VLM's keys and values: a new attention mode); the
+   trajectory is in the language model's vocabulary (history ids 1000, future ids 3000, 128 tokens per future trajectory)
+   and integrated by a unicycle model over 64 waypoints at 0.1 s. Six cameras, 22 frames, about 3.2k prompt tokens; the
+   card's peak is 12 GB on an H100, so it fits this host's memory. Needs: transformers 5.17 with the custom code
+   (`NVlabs/alpamayo2-edge`: not checked out here; the reference venv has transformers 5.5.1, so an isolated environment
+   like `/data/tts-site`), then the converter (`safetensors_mmap` reads the shards), the vision tower, the expert, and the
+   trajectory decode, each checked against the reference. Not started: the modeling code is the first thing to read.
+10. **Qwen4 (checked 2026-11-16).** No `Qwen4` repository in the Qwen organisation on Hugging Face yet: the newest series
+    there is Qwen3.8 (`Qwen3.8-Flash-Next`, the engine's qwen4exp, is its preview). Watch `huggingface.co/Qwen`; when a
+    Qwen4 repository appears, read its `config.json` first: if its `architectures` is one the engine runs (qwen35moe,
+    qwen4exp), it is a registry entry; if not, it is a new architecture to analyse.
+11. **Qwen3.8-2.4T-A95B (in the Qwen organisation, about 9 days old at 2026-11-16).** Architecture `Qwen3_5MoeForCausalLM`
+    (the engine's qwen35moe): 92 layers, hidden 8192, 512 experts with 10 active, linear attention in three of four
+    layers. The engine can run the architecture; the size cannot: 2.4 trillion parameters is about 1.2 TB at 4 bits
+    against 128 GB of memory and 17 GB free on `/models`. It needs the expert pager (as GLM-5.3) and a disk of its own.
+    Not on this host: decide only if the user has such storage.
 
 **Decided by the user (2026-11-16):** item 12: the speech pieces keep their own prosody (no conditioning on the previous
 piece: closed). Item 13: ffmpeg is added (package M). Package L: built as an option.
