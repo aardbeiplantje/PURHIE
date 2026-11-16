@@ -20,6 +20,9 @@ gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day b
 34 GB, `/comfyui` 88 GB: no downloads, one converted file at a time. No ffmpeg on this host (the image gets one).
 
 **Done** (each recorded in its item below):
+- 2026-11-16 (later): mp3, opus and aac on `/v1/audio/speech` through ffmpeg (item 13; `--ffmpeg`, `ROCM_FFMPEG`; 36 of 36
+  format tests with a stub, t/65 13 of 13, t/64 17 of 17); the first real image build log and the build-context fix
+  (`8251416`).
 - 2026-11-15: item 8 (the samplers on the device: one sync a frame), item 7's first gains (a predictor stack 940 to
   905 us), item 9 first version (the codec's convolutions on the device: 40 frames in 190 ms, 800 ms on the CPU) and its
   time per layer (package C), package A (item 11, Whisper's temperature fallback), B (the IQ types on the GPU), E and E2
@@ -35,13 +38,12 @@ gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day b
 merged here):
 - L2 (item 16) the Q8_0 rows in the device kernels (`talker_gpu.hip`: a lane takes one 34-byte block), the device against
   the host on the Q8_0 file, the frame's time.
-- M (item 13) mp3, opus and aac from `/v1/audio/speech` through an external ffmpeg (`--ffmpeg`, `ROCM_FFMPEG`), tested
-  here with a stub program.
 - The `convert_verify.sh` run for all releases (the card keys are compared now): deferred until the disk allows, several GB.
 
 **TODO** (in order):
-1. After M: `ffmpeg` in the image's Dockerfile (this repository's, not the docker submodule, which is gone), and the three
-   formats checked against the real encoder in the container (`t/69-speech-formats.t` with `ROCM_INFERENCE_TEST_FFMPEG`).
+1. The three formats against a real ffmpeg: M is merged (`c17f950`, merged in `cd058e5`; `ffmpeg` in the image's runtime
+   packages in `ce89090`). Here the test passes 36 of 36 with a stub; its real-encoder checks (tests 31 to 36: the MP3 and
+   Ogg and ADTS signatures) are skipped without `ROCM_INFERENCE_TEST_FFMPEG`. Next: run them in the container.
 2. After L2: how a user gets the Q8_0-predictor file (a converter recipe or option) and the server picking it up
    (`--models-dir` prefers the BF16 talker today). BF16 stays the default.
 3. J the vision tower's linears register-blocked on the host (77% of the 0.76 s pass).
