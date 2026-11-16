@@ -98,6 +98,9 @@ RUN echo "apt: $APT_CACHEBUST" && apt-get update && apt-get install -y --no-inst
     perl \
     curl \
     nginx \
+    libnginx-mod-http-ndk \
+    libnginx-mod-http-lua \
+    libnginx-mod-http-perl \
     libjson-xs-perl \
     libsys-mmap-perl \
     ca-certificates \
