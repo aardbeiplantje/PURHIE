@@ -1,1294 +1,288 @@
 # Project Plan: rocm-hip (Strix Halo, gfx1151)
 
-> What is open: next steps, planned work, leads. How the engine is built and what it runs: [ARCHITECTURE.md](ARCHITECTURE.md).
-> Finished work, with its measurements, is in the git history (this file was pruned of it on 2026-11-05, 2026-11-06
-> and 2026-11-12).
+State as of 2026-11-16. This file holds open work, the current status of each feature, and the decisions and measured
+dead ends that still matter. Finished work is in the git history (the commit messages say what changed and where its
+checks are). Design: ARCHITECTURE.md.
 
-## ▶ Next (2026-11-16: the open items)
-
-How the work runs (the user, 2026-11-15): this file is verified against the repository and the host, then each open item
-is a package: one Haiku agent's task in its own worktree, with exact files, commands, data paths and a check. The main
-session briefs it, reviews its commit, reruns the check on `main`, then commits, pushes and touches the image's build
-trigger (AGENTS.md). Timing packages run alone on the machine. (This session worked inline: the agent rule was not asked
-for; the user can say which items to hand to agents.)
-
-The host (2026-11-16): `ffmpeg` 6.1.1 is installed here (apt, the user's go-ahead). `nginx` is not installed here: its
-configuration was tested with unpacked trixie-era packages (`nginx -t`, the Lua and Perl modules, the fixup on a stub
-backend) and the image build runs `nginx -t` itself (passed, 2026-11-16 19:42 by the watcher's clock). Free disk:
-`/data` and `/models` (one filesystem) 5.5 GB of 1007 GB; `/hf` 34 GB; `/comfyui` 88 GB. Models here: `/models` has
-Gemma-4 26B (`gemma-4-26B-A4B-it-Q4_0_ROCMFP4.gguf`: sliding-window ring), Qwen3.5-4B, Qwen3.6-35B and Qwen3.8-27B (each
-with MTP tensors), Qwen3.8-Flash-Next (123 GB), GLM-5.3-Flash (171 GB), Nemotron-3 (Nano, Super), Qwen3-0.6B, Qwen3.5-0.8B,
-the speech files (`qwen3tts-talker.gguf`, `qwen3tts-talker-f32.gguf`, `/data/predq8/...` the Q8_0 predictor, codec,
-whisper-tiny, `voices/`) and EmbeddingGemma.
-
-**Open items, in order** (the user picks what to start; each has its check):
-1. **Done 2026-11-16: lazy KV on the sliding-window ring (Gemma-4 26B).** The ring is active at a prefill batch of 64 (ring
-   2048 positions). A 2600-token prompt and 40 greedy tokens wrap it: the ring and the no-ring run give identical logits
-   (max difference 0) and 40 of 40 tokens. `seq_verify` passes; `store_verify` passes (on `/dev/shm`). `generate_verify`'s
-   output is identical to the baseline (commit `2bc24ea`, before the change), with five checks failing in both builds:
-   prefill against token-by-token decoding differs by 16 logits (cosine 0.994); the streamed greedy tokens differ from
-   `inference_generate_ex`'s; the chat checks assume Qwen's end token and template. New open item (below).
-2. **Done 2026-11-16: lazy KV on the MTP draft path.** `mtp_verify` refuses qwen35 models (draft heads are for qwen4exp
-   only). `tests/mtp_own_verify.sh` with the tiny qwen4exp pair generated from the Flash header: the own block drafts what the
-   sidecar drafts (240 drafts), at temperature 0 and 0.8 with 1 draft, 3 drafts and adaptive drafts, mapped and staged: all
-   pass, and the check results equal the baseline's line for line. `events_test` with the draft: the draft events fire and
-   the speculative output equals the plain one; five prefill-progress checks fail in both builds (a pre-existing gap, below).
-3. **The deployed service on the new image.** The watcher restarts the container from the 19:42 image. Check: `GET
-   /rocm/v1/models`, one short chat through `/rocm/` (the fixup: `conv_id` and `id_slot` added), one short speech request.
-   The user runs these, or the agent runs the GETs if the user allows it.
-4. **GLM-5.3 on the CPU in the deployment.** The CPU path is the one in use now (`INFERENCE_CPU_ONLY`: about 2.9 tok/s in the
-   earlier measurement, with the expert pages in the page cache). Measure tokens per second and `VmLck`, `RssAnon`,
-   `RssFile`, `RssShmem` during a real conversation; then decide whether CPU speed work is worth it.
-5. **Request logs.** `app.pm` writes every request body to `/tmp/request-logs` in the container, with no size limit or
-   rotation. The user said it is intended; a cap or rotation is a decision for the user.
-6. **`tests/convert_verify.sh` in full.** Blocked on disk: 5.5 GB free on the filesystem that `/models` shares. The run
-   needs several GB more. The user frees space, or names a directory for the outputs.
-7. **Done 2026-11-16: the quick regression (`make regress`): 47 of 47 pass.** Three rows failed only because the Perl XS
-   module could not find `libinference.so.1`; `tests/regress.sh` now puts `build/` on `LD_LIBRARY_PATH`. The full tier
-   (`make regress-full`) is not run yet.
-8. **Codec host stages** (36 ms of a 142 ms piece; the talker dominates a request). Overlap or move to the kernels: low
-   value, not started.
-   Leads (not started): the q/k norm and rotary inside the attention, the norm once per layer, and the sampler's sort (a
-   rank sort over several blocks, about 10 us against 28 us a codebook: under 1% of a frame). The Q8_0 predictor reads its
-   activations as `float4` from shared memory, which assumes a 16-byte alignment: a toolchain change shows first in the
-   predictor's device timing and its codes.
-9. **Whisper's encoder** (520 ms per window; the cost is spread over the linears, the attention's weighted sum, the GELU and
-   the stem convolutions; the two attempts gave no gain). Low value, not started.
-10. **Alpamayo 2 Edge.** The licence is confirmed (OpenMDW-1.1 weights, Apache-2.0 code). The modeling code is on GitHub
-    `NVlabs/alpamayo2-edge`, outside this session's GitHub scope: blocked until the user attaches the repo. The weights
-    (`nvidia/Alpamayo2-Edge` on Hugging Face, about 5.4 GB in BF16, 907 tensors in two shards; read from the headers with range
-    requests, nothing downloaded): the language model is 28 layers, hidden 2048, 16 query / 8 KV heads of 128, an ungated
-    `relu2` MLP (fc1 9216, fc2 back; no gate projection), no q/k norm, M-RoPE `[24, 20, 20]` (theta 1e8), vocab 135168, an
-    untied head. The vision tower is not Qwen3.5's: 27 layers, hidden 1152, 16 heads, MLP 4304 (gelu tanh), biases on every
-    linear, LayerNorm eps 1e-6, learned absolute positions (256, a 16x16 grid), patch 16 (768 inputs). The projector: LayerNorm
-    1152, the 2x2 merge (4608), fc1 11520, fc2 2048. The action expert: 28 layers, hidden 512, 16 / 8 heads of 128, MLP 3840
-    `relu2`, non-causal attention reading the VLM's keys and values; `action_in_proj` (a per-waypoint encoder over 60 inputs,
-    Fourier features), `action_out_proj` 512 to 2. The modeling code (flow matching and its guidance, the attention mode, the
-    action space, the trajectory tokenizer) is what the reads need.
-11. **Watch or table:** Qwen4 (not on Hugging Face yet: noted); Qwen3.8-2.4T-A95B (tabled); the memory measurement of the
-    deployment's GPU pins (tabled: GLM runs on the CPU).
-12. **Clear by hand:** `/data/iqtest` (336 KB of logs), and `nginx.conf~` in the repository root (the user's editor backup,
-    excluded from the image; git lists it as untracked).
-
-13. **New, from items 1 and 2 (2026-11-16, both builds):** (a) **Done 2026-11-16: Gemma-4's prefill keeps fp32 (the user's
-    decision).** Its prefill differed from token-by-token decoding by 8.4 logits, with a changed top token. The cause is two
-    16-bit paths: the WMMA matmul (fp16 activations) and flash attention. Either one alone leaves the gap (6.8 and 8.3), and
-    both off give 0. For a Gemma model, prefill now turns both off (`qmatvec_set_prefill_fp32`, `attention_set_prefill_fp32`,
-    set in qwen_model's prefill mode). `generate_verify`'s prefill checks pass (562 tokens, and micro-batches). The cost: Gemma
-    prefill runs at about 620 tok/s instead of 1840 on 562 tokens (3x slower). Qwen is unchanged (same logits, same speed).
-    Tabled as nice to have: the streamed greedy tokens differ from `inference_generate_ex`'s (the stream check), and the two
-    chat checks assume Qwen's end token and template (`generate_verify` now fails 3 checks, down from 5). (b) `events_test`:
-    fixed. The one-shot prefill split at its checkpoint reported each segment's length as
-    PREFILL_PROGRESS's total, so the progress covered the first segment only; it now reports the whole call. The test's
-    prompt also gets a 256-row prefill batch, so it splits. Passes on the tiny draft pair and on Qwen3-0.6B.
-
-**Done 2026-11-16 (the detail is in the items above and in git):** `edbbd32` the Q8_0 predictor talker is loaded after the
-BF16 one by its tensors (not its name), and `t/64-multipart.t` split out of `t/64-audio.t`; `bcefaa3` and `bb64c61` the nginx
-configuration, the fixup files, and the three nginx modules the Dockerfile was missing; `c9a1e9f` the LRU test over the limit
-(a stale block the store can evict); `bb5de99` the near-tie check in `seq_verify` (WMMA stays on) and `generate_verify`'s
-float-head baseline; `f620560` one `HIP_CHECK` (`src/hip_check.h`) and the silenced `sd.cpp` remarks; `3e6bb1f` `lib/perl`
-tracked; `0827a97` TODO 5 (the vision linears, 2x on that stage) and `abcd8a1` `t/95` (Q6_K encodes); `74fda6e` the GLM state
-and the KV slots registered as used, CPU-only allocates no GPU state, `INFERENCE_EXPERT_PIN_MB` capped in `run.sh` at 64 GB.
-Earlier in the session: the chat templates (`_tojson_args`, `t/15`), ffmpeg in the image and `t/69` 37 of 37 with the real
-encoders, the image's `/version` and the watcher, the serve and the watch, and the packages H, L1 and L1b (see git).
-
-**Items 1 to 14 of the previous list** (2026-11-16) are done, moved, or tabled, as recorded above: 1 to 4 and 12 to 14
-done; 5 and 8 done; 6, 7 and 9 to 11 are in the open list; 13 tabled.
-
-**Decided by the user (2026-11-16):** the speech pieces keep their own prosody (closed); ffmpeg is in the image (package M);
-package L (the Q8_0 predictor) is an option: BF16 by default, Q8_0 allowed.
-
-Not runnable on this host: the Flash measurements (its own MTP block, the PLE reads), `--parallel` and the store on the
-deployment, `events_test MODEL DRAFT`, nginx's X-Remote-User header (the docker repository). Larger and not packaged yet:
-the ComfyUI component API (milestone 1), speculative decoding under `--parallel` (three stages), FP8 as a weight type, raw
-completions' prompt arrays and logprobs. To clear by hand: `/data/iqtest` (336 KB of logs of package B).
-
-## ▶ Next (2026-11-14, kept current)
-
-Open work, in the order to take it. Each item names its state and the next concrete step.
-
-0. **Fast quantized DiT matmul** (DONE for Q8_0, 2026-11-14; user's priority). Device decode `mm_dequant_q8_0_bf16`
-   (`src/minimax_vae.hip`) into the BF16 scratch, then the BF16 kernels. Checks: bit-exact against the CPU decoder on the
-   mixed Q8_0 DiT (`MMDIT_CHECK_DEQUANT=1`, no mismatch); the 2048 canvas 0.991640 (= the CPU-decode run); wall time
-   129.5 s against 134.7 s for BF16 on the same run (the file is smaller). ROCmFP4 and its FAST variant are on the device too
-   (`mm_dequant_fp4_bf16`; 2026-11-14): bit-exact against the CPU decoder (`MMDIT_CHECK_DEQUANT=1`, full ROCmFP4 DiT, 18.6 GB),
-   the canvas 0.783152 (= the CPU-decode run), wall 128.9 s. Still open: the int8 WMMA route (quantizes activations: a different numerical path, not measured). The
-   batched quantized kernel (`qmatvec_launch_batch`) runs at ~1.4 TFLOP/s against 15-25 for the BF16 kernels: not used here.
-1. **DiT mixed Q8_0 recipe** (measured, 0.991640 at 38.4 GB against BF16 0.992087; decided 2026-11-14: BF16 stays the
-   default, the mixed Q8_0 stays supported as an option). Rebuild it from the BF16 GGUF with
-   `perl -Iblib/lib -Iblib/arch bin/rocm-convert -r plain -t '^blocks\.(0|1|48|49)\.=keep' -t '^(token_refiner|condition_proj|video_patch_proj|time_embedder|final_layer)=keep' dit-bf16.gguf dit-q8mix.gguf q8_0`
-   (run in perl/ROCm-Inference). `mm_open` takes any DiT GGUF path, and the device decode makes it run at BF16 speed.
-2. **IQ types on the GPU: checked 2026-11-15.** `matvec_verify` passes for IQ4_NL, IQ2_S, IQ2_XS, IQ1_S and IQ1_M (and
-   again for IQ2_XXS, IQ4_XS, IQ3_XXS, IQ3_S) on local conversions of `/data/vision-ref/q35-0.8b-bf16.gguf`
-   (`rocm-convert -r plain`, uniform weights; 164 to 447 MB, 19 to 101 s each): the float path within 1.3e-7 of the CPU
-   decode, the int8 path within 2.6e-8, the batched path (11 tokens) exact. The check takes the first matrix of each type
-   (here the token embedding, 248320 x 1024). Not run: files from Hugging Face (about 38 GB of downloads; 19 GB free).
-3. **MiniMax quantization, remaining**: FP8 not measured (the engine has no FP8 weight type to write: needs an encoder
-   and its operand path). DiT drift from block 30 (engine error grows against the fp32 chain; the mixed-recipe results
-   point at the non-block tensors' sensitivity; not chased).
-4. **ComfyUI backend** (milestone 1 next: the component API, verified on sd-turbo). `/comfyui` is mounted again
-   (28 files, about 167 GB, 7.9 GB free: converting to GGUF needs space on `/data`).
-5. **Audio: closed 2026-11-15** (functionally complete; the audio section above has the details). Speech: voices from
-   audio, long texts in pieces, pulled per piece, wav / pcm / flac and stream for wav and pcm, the codec's reference
-   state and the talker's voice prefix cached per voice. Transcription: long-form by the Whisper seek rule (W4). Open
-   items moved to the new list below.
-
-## ▶ Next (audio closed; the new list, 2026-11-15)
-
-Performance:
-6. **Prompt prefill on the GPU: done 2026-11-15 (U8).** The voice's prefix is cached (U7), but each request still runs its own rows on the
-   host (about 0.5 s for a 204-frame voice). Start: the rows through qmatvec's batched BF16 GEMM, then the causal
-   attention for several rows on the device.
-7. **Matvec kernels to ~230 GB/s.** State 2026-11-15: a predictor stack (5 layers, 30 launches, 157 MB of BF16) takes
-   905 us, was 940: rows of 2048 and more (the output projection, the down) issue two steps' loads together, and the gate's
-   and the up's rows are read together (eight loads in flight; the sums' order kept: the speech is byte-identical). The
-   frame: 23.4 -> 22.8 ms (predictor 16.3, talker 6.5). Where the 905 us go (`bench_stack`, not committed): with the weight
-   loads removed the stack takes 142 us (the launches' fixed cost: attention 37, QKV 33, gate/up 28, down 16, output 14,
-   q/k 14), so the weights stream in about 760 us: 206 GB/s, where the memory's peak is 256 (reached only by a pure stream;
-   the one-row pattern alone reaches 206). Not kept: each row's weight loads issued before the norm (1170 us: the in-order
-   vmcnt makes the norm's reads wait for the weights; an LDS-only barrier did not help). Leads, each a few percent: fewer
-   launches (the q/k norm and rotary inside the attention; the norm once per layer), and the samplers (28 us per codebook,
-   55 us for c0: 0.47 ms a frame; the bitonic sort's 66 barrier rounds in one block: a rank sort over several blocks and a
-   second launch for the draw would be about 10 us).
-8. **Sampler on the device: done 2026-11-15 (U9).** A frame is one sync (after the predictor): c0 and the predictor's
-   codebooks are drawn on the device. The frame's time is its GPU work (predictor about 16.5 ms, talker 6.7 ms), so the
-   speed-up left is item 7's.
-9. **Codec decoder on the GPU: first version done 2026-11-15 (U10).** The decoder's convolutions (the input convolution,
-   the four blocks, the output) run on the device; 40 frames decode in 190 ms (800 ms on the CPU). Per layer
-   (`QWEN3TTS_CODEC_PROFILE=2`; a piece of 32 frames, 106 ms on the device): the residual units' kernel-7 convolutions 67 ms
-   (63%, about 1.6 TFLOPS in every block), their kernel-1 convolutions 16 ms, the transposed convolutions 15 ms, the input
-   and output convolutions 5 ms (the output's 32-row tile for one channel costs 1.5 ms: not worth a variant), the pads 2 ms.
-   Tried and not kept (64 frames, best of 5, 282 ms): 32 input channels a chunk for kernel 7 (302 ms: 52 KB of shared
-   memory a block), 32 and 96 for kernel 1 (279 and 284 ms). Open: the host stages before the device (36 ms a piece, a
-   quarter of the decode: run the next piece's while the device works, or move the pre-convolution and the upsamplers to
-   the kernels); the kernel-7 inner loop. A 40-frame request spends about 0.9 s in the talker: the codec is no longer the
-   larger part.
-10. **Whisper on the GPU: measured 2026-11-15; the host path made fast instead.** Stage times (`WHISPER_PROFILE=1`,
-    whisper-tiny, one 30 s window, 16 threads) before: the encoder 1.5 s, the cross-attention keys and values 0.17 s, a
-    decoder token 18.3 ms. Two causes, both on the host: the decoder's linears and attention were shared out over the time
-    steps (one in decoding), so each ran on one thread (now over the output elements and the query-head pairs, above 50000
-    multiply-adds: bit-identical, 3.5 ms a token); and the dot products were scalar sums in order (now SIMD reductions in
-    `linear`, the attention's scores, the vocabulary product and the convolution stem: the last bits change, the encoder's
-    difference to the reference went from 6.3e-5 to 2.6e-5 of the peak, the 21 greedy tokens equal). Now: the encoder
-    0.39 s, the keys and values 0.007 s, a decoder token 1.5 to 1.9 ms; `whisper_fallback_verify` 14.5 s (115 s at the
-    start), t/66's long clip 3.8 s (23 s with the fallback's six passes before). Checks: `whisper_verify`,
-    `whisper_fallback_verify`, t/64 (17), t/66 (4: the French transcription and translation still equal transformers').
-    Left on the host: the encoder at about 45 GMAC/s (its attention allocates a score vector per query and head: about
-    9000 allocations a call), the decoder's cross-attention (six query-head pairs: six threads) and the vocabulary product
-    (80 MB of F32 a token: memory-bound). A device path only for a larger Whisper (only whisper-tiny is on this host).
-
-Quality and scope (decisions):
-11. **Whisper temperature fallback: done 2026-11-15.** A long-form window whose text compresses above 2.4 (zlib) or whose
-    average log-probability is below -1.0 is decoded again at the temperatures 0.2 to 1.0 (sampled, a splitmix seed from
-    the window's position and the attempt); the first attempt that passes is taken. When every attempt fails the engine
-    keeps the one with the highest average log-probability (the reference keeps the last: an option,
-    `whisper_set_fallback(..., keep_last)`): a window that is repetitive by its content (the test clip: one sentence five
-    times, ratio 4.1) keeps its greedy text, where the reference's rule gave the temperature-1.0 sample. Clips of 30 s or
-    less are unchanged. Checks: `whisper_verify` (identical output), `whisper_fallback_verify` (the ratios, the long clip
-    unchanged, the sampled passes deterministic; 2 minutes), t/64 (17) and t/66 (4). Cost: each attempt is a decoder pass
-    of the window (about 2 s for 93 tokens on the host: 21 ms a token), so such a window takes six passes (t/66's long clip
-    23 s, was 7 s): the decoder's speed is item 10's.
-12. **Prosody across speech pieces: decided 2026-11-16, kept as it is.** Each sentence piece is a separate talker run (pieces
-    joined with 0.2 s of silence), so the prosody restarts at each piece; no conditioning on the previous piece's frames.
-13. **mp3, opus and aac: decided 2026-11-16, through ffmpeg (package M, in progress).** The server pipes the speech's PCM
-    through an external ffmpeg (`--ffmpeg`, `ROCM_FFMPEG`, or the one on PATH); the image installs it. Without one the
-    three formats stay a 400.
-16. **The code predictor's weights as Q8_0 (package L; the user: built as an option, 2026-11-16).** The predictor reads about
-    2.5 GB of BF16 a frame (16 stacks of 157 MB); Q8_0 rows are 34 bytes for 32 values against 64. BF16 stays the default.
-    L1 done 2026-11-16: the file is `rocm-convert -r plain -t 'pred\.blk\..*\.weight$=q8_0' -t '.*=keep' talker.gguf
-    out.gguf q8_0` (the 35 matrices of `pred.blk.*`; everything else keeps its bytes; 1.85 to 1.78 GB; on this host
-    `/data/predq8/qwen3tts-talker-predq8.gguf`); the loader takes Q8_0 for the predictor's blocks only, and the host path
-    runs it (`dot_q8`); on the device since L2 (`93281dc`). Measured on the host against the BF16 file (the talker's
-    stages identical): the predictor's teacher-forced logits at worst row cosine 0.9999327, largest difference 0.71 (2.4%
-    of the largest logit); greedy codes differ from frame 3 (a near-tie flips a codebook and the frame's later codebooks
-    follow it), the first codebook from frame 52; the speech verifier passes and Whisper reads the speech back as the
-    test sentence. Greedy agreement is not the measure for sampled speech. L1b done 2026-11-16: the two sampling
-    distributions (temperature 0.9, the top 50) on the 750 teacher-forced rows: total variation mean 2.3%, median 2.2%,
-    95th percentile 4.3%, largest 6.8%; it grows with the codebook (0.8% for codebook 1, 3.6% for codebook 15); the top
-    token equal in 93.9% of the rows, 48.95 of the 50 candidates shared. The control (the BF16 engine against qwen-tts's
-    logits): 0.0005%, the top token always equal. So a codebook's draw differs in about 1 case of 43: a small shift of the
-    distribution, to be judged by ear before it is anyone's default. L2 done 2026-11-16 (`93281dc`): the four Q8_0
-    kernels on the device; the predictor takes 12.4 ms a frame on that file (BF16: 16.3 ms; the talker 6.6 ms either way).
-    The device and the host print the same stage lines, and the speech check passes. Open: the Q8_0 activations are read as
-    float4 from dynamic shared memory, which assumes the block's 16-byte alignment (true here, not guaranteed by the
-    language): a toolchain change would show in the device's predictor timing and codes first.
-
-Not planned:
-14. **Torch-identical sampled frames.** The engine's sampler is its own generator (splitmix); a bit match would need torch's
-    CPU random path. The product does not need it: greedy frames match qwen-tts exactly.
-
-Vision (multimodal, not audio):
-15. **Vision tower on the GPU: measured 2026-11-15; the host path made fast instead.** Stage times (`VISION_PROFILE=1`, the
-    reference image: 560 patches, 12 blocks, 16 threads) before: 3.55 s a forward pass (the linears 2.71 s, the MLP's GELU
-    0.48 s in one thread, the merger 0.12 s, the attention 0.14 s). Now 0.76 s: the dot products as SIMD reductions, the
-    GELU, the rotary and the residual adds shared out over the threads, the linears over (row, output) pairs, one score
-    buffer per thread in the attention. Checks: `vision_verify` (cosine 1.000000 in every stage; the largest differences
-    went from 1.1e-5, 2.0e-5 and 9.9e-5 to 6.0e-6, 9.7e-6 and 6.2e-5), `image_verify`, `mm_verify` (the image chat: last
-    logits cosine 0.999987, the 14 reply tokens equal). Left: the linears are 77% of the pass at about 80 GMAC/s (a
-    register-blocked host kernel first). A device path only for much larger images or batches: its gain here is at most
-    0.5 s an image.
-
-Earlier list (2026-11-13), kept for reference:
-
--1. **Image models from the original checkpoints** (2026-11-14, user: use the originals, no GGUF conversion; the engine smart
-   enough to read safetensors with LFS pointers). DONE: `src/safetensors_mmap` (the engine's reader: a directory or a file,
-   the index, LFS pointers resolved to `<git>/lfs/objects`, the tensors addressed by name in place). Feasibility shown: the
-   original MiniMax DiT (`/hf/MiniMax-H3-Image/transformer`, 12 LFS shards): 531 tensors, 66.28 GB, bytes identical to the
-   converted GGUF for every tensor. NEXT: the DiT, the PDD heads and the VAE read through a tensor source (a GGUF or a
-   checkpoint directory; about 35 GGUF call sites in `minimax_dit.cpp` and `minimax_vae.cpp`), then `mm_open` takes the
-   checkpoint directories. DONE (2026-11-14): the VAE too (`mmvae_open` takes `vae/diffusion_pytorch_model.safetensors`; the
-   latents' statistics and the rope theta from its config.json; `mm_vae_verify` identical on both paths). The end-to-end 256
-   request on the originals (DiT dir, PDD file, VAE file; text encoder still its GGUF, the VL one per the user's choice) gives
-   a PNG byte-identical to the GGUF-path one. Its timing that run: text load 48 s (15 s before), DiT open 25 s, sampler 116 s,
-   VAE 23 s; the slower loads are likely page-cache contention (both the original and the GGUF files read), not checked.
-   LLM safetensors loading is left as is (user, 2026-11-14). DONE for the DiT and the PDD heads: `mmdit_open` takes a GGUF or the original checkpoint (the
-   transformer directory; `pdd_fused_heads.safetensors` with `pdd_config.json` for the sigmas). Checked: the GGUF path and the
-   checkpoint path give the same numbers. The DiT verifier's numbers moved with the flash-attention change (committed
-   before this): velocity step 0 0.9984961-0.9985183, sampler 0.9840961 (was 0.9852158 before the flash kernel, `mm_dit_verify`
-   on HEAD gives 0.9840961). Same direction as the canvas check (0.9938 -> 0.9921). The text encoder (the Qwen3 LLM through the qwen loader) needs the same source in the qwen
-   loader: a larger change, after the image path.
-
-0. **Quantized text encoder and converter types** (2026-11-14, user: convert to every type the engine reads, no llama.cpp
-   dependency; keep every type supported even when its quality is lower). Native encoders so far: F32, F16, BF16, Q8_0,
-   Q4_0, Q4_1, Q5_0, Q5_1 (byte-identical to the reference in `tests/quantize_verify`), ROCmFP4 and its FAST variant.
-   Text encoder vs the BF16 reference (`tests/mm_te_verify`, worst row cosine, 3 prompts): BF16 0.99993; Q8_0 0.9998-0.9999
-   (34.8 GB); ROCmFP4 plain 0.9916-0.9956 (18.4 GB); ROCmFP4 with the strix recipe 0.9903-0.9956 (19.2 GB): both kept
-   supported, not the default. Q5_0 0.9978-0.9983 (22.5 GB); Q4_0 0.9892-0.9954 (18.4 GB). All below the 0.999 bar of
-   `mm_te_verify`; Q8_0 is the only one under it. Q4_1 0.9930-0.9947 (20.5 GB); Q5_1 0.9982-0.9987 (24.6 GB); Q4_K 0.9917-0.9959 (18.4 GB, read by the engine as is).
-   NATIVE ENCODERS (2026-11-14, each byte-identical to ggml's reference in `tests/quantize_verify`, 147 cases): Q4_0, Q4_1,
-   Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K (all five K-quants), MXFP4, NVFP4, TQ1_0, TQ2_0, IQ4_NL, IQ4_XS (no importance
-   matrix: the chunk API's search). `rocm-convert` accepts all of them as targets (the dry runs on the text encoder give the
-   sizes: Q2_K 10.8 GB, Q4_K 18.4, Q6_K 26.9, MXFP4 17.4, TQ2_0 8.5). DONE (2026-11-14): the IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
-   IQ3_S, IQ1_S and IQ1_M encoders (`src/quantize_iq.cpp`: the codebooks `src/iq_grids.h` (generated by
-   `tools/gen_iq_grids.py`) and `src/iq_kgrids.h` (`tools/gen_iq_kgrids.py`), ggml's neighbour tables built on first use).
-   ggml's reference needs an importance matrix for IQ2_XXS, IQ2_XS and IQ1_S (it asserts without one): the converter and
-   the verifier use UNIFORM weights (all ones) when none is given (`qz_quantize_im`); `rocm-convert --imatrix FILE` gives
-   them a llama-imatrix GGUF's weights (2026-11-14, commit e9d3895; a warning names every IQ tensor left uniform). With that: every type the engine decodes has a native encoder, 189 verifier cases byte-identical to ggml.
-   MEASURED (2026-11-14): the IQ2_XXS text encoder (`rocm-convert -r plain`, 8.45 GB, 2.06 bits a value, uniform weights,
-   1141 s to convert) FAILS the bar: worst row cosine 0.8155, 0.8092, 0.7641 (3 prompts). `matvec_verify` on the same file
-   matches the GPU matvec to the CPU decode (worst relative error 3e-8), so the loss is the quantization without an
-   importance matrix, not the decode path. IQ2_XXS (and IQ2_XS, IQ1_S) is not usable as a text encoder with uniform weights.
-   WITH the imatrix (`Qwen_Qwen3-VL-32B-Instruct-imatrix.gguf` from bartowski/Qwen_Qwen3-VL-32B-Instruct-GGUF: a calibration
-   of the base model, so the MiniMax encoder may differ from it) the worst row cosine is 0.9448, 0.9442, 0.8927 (was 0.8155,
-   0.8092, 0.7641): better, still far below the 0.999 bar. The IQ3 types with the same imatrix: IQ3_XXS (12.55 GB, 3.06 bits
-   a value) worst row cosine 0.9792, 0.9868, 0.9777; IQ3_S (14.09 GB, 3.44 bits) 0.9523, 0.9871, 0.9883. Both sit below the
-   Q4_K encoder (0.9917-0.9959 at 18.4 GB, no imatrix) and far below the bar, so no IQ type is a text-encoder default; the
-   quantized encoders that clear the bar are Q5_1 (0.9982-0.9987), Q5_0 (0.9978-0.9983) and Q8_0 (0.9998-0.9999).
-   GPU matvec on a real Hugging Face file (`matvec_verify` on redponike's Qwen3-VL-32B-Instruct-IQ4_XS.gguf, 17.7 GB): IQ4_XS
-   passes (worst relative error 3e-8; int8 path 1e-8; batched exact), and the same file's q5_K and q6_K pass. Not yet run on
-   the GPU then: IQ4_NL, IQ2_S, IQ2_XS, IQ1_S, IQ1_M (run on 2026-11-15: item 2 of the 2026-11-14 list). Legacy
-   and K-quant full-matrix reference behaviour: ggml weighs Q4_0 etc. by an imatrix when given; the verifier passes none
-   to those types. rocm-convert accepts all of them as targets (file types as ggml's; S variants where a type has none). The residency goal (the pipeline keeps the text encoder and the DiT both mapped)
-   is what a small text encoder buys: Q8_0 (35 GB) plus the DiT (66 GB) fit in the 124 GB of RAM at once.
-
-1. **MiniMax-H3-Image speed** (2026-11-13). End to end (2026-11-14, `mm_pipe_verify` 256 x 256 on the 2048 canvas, alone on the
-   device): 165.8 s (was 222 s): text 17.9 s, DiT open 15.6 s, sampler 109.0 s (was 169 s), VAE 22.8 s; the image is clean.
-   The text encoder's 16.5 s is the load of its 65 GB weights (15.3 s; ~4 GB/s, the same as the DiT's open 16 s); its prefill is
-   0.75 s. Both loads are I/O, not compute. DONE: the pipeline caches the last 32 prompts' embeddings (a repeat skips the
-   encoder: 0.00 s; two calls in one process, the second 132 s against 165 s, images byte-identical). Keeping the weights
-   resident is a general memory problem (not with both models: 131 GB against 128 GB UMA), tracked with the mmap work. The linears: `sd_gemm_wmma256b` (BF16 activations, converted once per call; a
-   32-wide k-tile double-buffered in LDS; the output staged through LDS for 8-row stores) runs 4096 x 4105 x 4096 in 8.8 ms
-   (15.6 TFLOPS) against 16.1 ms for the F32-activation tile; the 1024 canvas velocity 4.00 s (4.76 s before). Found by
-   ablation: the F32 activations, re-read per 256 output rows, were the bottleneck (compute was not). Not done: a 256 x 256
-   tile did no better (16 waves, single stage); swapping the block order is slower. `tests/mm_dit_verify` fails on its
-   reference files (velocity cosine 0.99852 at step 0, sampler 0.985). Not stale: regenerating them from the released weights
-   gives identical files, and `2f9604c` gives the same numbers. Per-block comparison (`tests/mm_dit_dump.py`, the engine's
-   `MMDIT_DEBUG` + `MMDIT_DEBUG_ALL`): block 0 cosine 0.99999, blocks 0-25 at about 0.8% relative error (bf16 noise), then the
-   drift grows from block 30 (cosine 0.99980) to block 49 (0.9927). Rounding the residual to bf16 in the engine does not change
-   the drift (the sampler 0.9852 -> 0.9892). Per-op inside block 30 (`MMDIT_DEBUG_LAYER=30`, `LAYER=30 tests/mm_dit_dump.py`): the input to the block (block 29's
-output) differs by 1.8%; after the AdaLN (attention input) 4.9%, the attention output 7.8%, the FFN output 7.6%. The error is
-spread over all tokens (median 3.9% per token) and channels (worst 0.14), with no localized operation: consistent with
-accumulated rounding, not a single wrong op. RESULT (2026-11-14, `FIRST=30 tests/mm_dit_fp32chain.py`: blocks 30-49 in fp32 from the reference's block-29 values, weights
-exact from the bf16 release, only those 20 blocks on the GPU): the fp32 chain's block-49 output vs the reference: cosine
-0.99965 (relative 2.7%); vs the engine: 0.99303 (relative 11.9%); the engine vs the reference: 0.99268. The reference is
-close to fp32, so the drift from block 30 is an ENGINE error, not the reference's rounding. (Corrected below.)
-UPDATE (same day): the chain's timestep embedding was bf16 (the loader cast the release's F32 time embedder); with it in fp32
-the fp32 chain vs the reference is cosine 0.99914 (relative 4.3%), vs the engine 0.99386 (11.1%). Block 30, same input (the
-reference's block 29 fed to the engine via `MMDIT_REPLACE_IN`), per op vs the fp32 chain: post-AdaLN input 6e-5, attention
-output 0.4%, projected 0.4%, FFN input 0.2%, FFN output 0.4%: bf16-rounding size (the engine's GEMM and attention inputs
-are bf16, as the reference's are), not one wrong op. Open: why the engine's bf16 rounding accumulates to 11% by block 49
-where the bf16 reference's reaches 4% (the engine keeps the residual in fp32; the reference rounds it). `tests/mm_canvas_verify` (released latents) was 0.99381 before the attention work.
-   Attention (2026-11-14): the wrapper (`sddev::attention`, 4105 tokens, 56 heads) went 96.6 -> 31 ms per call. Two causes:
-   the V transpose read with a stride per thread (101 ms; now a 32 x 32 LDS tile, 1.2 ms), and the scratch buffers zeroed on
-   the CPU (now not). The kernel (`sd_flash_attn`): 8 waves per block, 128 query rows, Q in registers, DPP row reductions,
-   exp2: 33 -> 25 ms per layer. Its accuracy equals the old kernel's against a float64 reference (5.9e-4 vs 5.9e-4 max
-   error at 4105 keys). BUT the released-pipeline cosine moved 0.99381 -> 0.99209. The sensitivity is rounding: the old
-   kernel's P rounding to nearest with expf and the new kernel's with exp2 give 0.99209; expf with the new structure
-   0.99292; truncating P 0.99210. So ulp-level changes in P move the cosine by about 1e-3, and the old 0.99381 is one point
-   in that band, not a more accurate kernel. Open: whether the released-cosine metric should be tracked this closely at
-   all; a bf16 attention reference would be the fairer comparison.
-2. **MiniMax server behaviour** (done 2026-11-13, see the record below): images queue, one at a time (no 503).
-3. **MiniMax quantization** (later, the user): FP8 or ROCmFP4 for the DiT (66 GB BF16 now). Measure the quality cost first;
-   BF16 stays the default until that is known. MEASURED (2026-11-14): the DiT reads quantized GGUF linears (`lin_of`; each
-   decoded to BF16 once per call, `dequant_bf16`, then the BF16 kernels; `MMDIT_UBATCH` rows per launch, default 256).
-   Sampler cosine, 16 x 16 check (`mm_dit_verify`, BF16 0.9841) and the 2048 canvas (`mm_canvas_verify` on the released
-   inputs, BF16 0.992087): Q8_0 (35.2 GB) 0.9849 and 0.9068; ROCmFP4 (`rocmfp4`, 18.6 GB, 4.5 bits) 0.9761 and 0.7832.
-   Controls: the decoded Q8_0 linear matches the BF16 original (cosine 0.999983); BF16 weights through the same scratch give
-   0.992087 (`MMDIT_SCRATCH_BF16=1`); 128-row batches give the same canvas number as 256. So the canvas drop is the
-   quantized values, not the path. The batched quantized matmul (`qmatvec_launch_batch`) runs at ~1.4 TFLOP/s against
-   15-25 for the BF16 kernels (the quantized route is not used for the DiT). Not measured: FP8 (the engine has no FP8 weight
-   type to write). BF16 stays the default.
-   MIXED RECIPES (2026-11-14, `rocm-convert -r plain -t REGEX=keep`; the 2048 canvas, BF16 0.992087): "keep" = the tensor
-   stays BF16. Q8_0 with the first and last two blocks (0, 1, 48, 49) and the token refiner, condition_proj,
-   video_patch_proj, time_embedder and final_layer kept: 0.991640 at 38.4 GB (9.29 bits a value). ROCmFP4 ablation: all
-   layers 0.783152; only the blocks kept 0.766359; only the non-block tensors kept 0.965980; both kept 0.932446 (lower
-   than the non-block kept alone: unexplained, not chased). So the non-block tensors carry the sensitivity; adaLN
-   (`adaln_proj`, in every block) was not kept (kept at BF16 it would be about 26 GB). The mixed Q8_0 is the candidate for
-   an optional DiT; not a default (BF16 stays the default).
-4. **ComfyUI backend** (backlog, planned 2026-11-13, see Later): the component API first, then the node package.
-- (done) **MiniMax server and resize (item 2, 2026-11-13).** The released pipeline resizes the 2048 canvas to the request
-   with diffusers' `VaeImageProcessor.resize`, which is PIL's LANCZOS (the processor's default `resample`). Our area
-   averaging differed from it (mean 1.15 levels, max 26 on the 256 fox); the engine now uses a Lanczos resize with PIL's
-   two-pass structure (`resize_lanczos`): max 1 level, 99.96% of values exact. Requests queue: the server loop is single
-   threaded and an image runs inside its route, so other requests wait in the socket queue (a 503 would need a
-   non-blocking loop; not done). Each image's log line gives its size, the canvas and the seconds it took. The canvas
-   helper `ROCm::Inference::MiniMaxImage::canvas` matches the engine's `canvas_size` (round half to even).
-- (done) **MiniMax-H3-Image: DONE 2026-11-13 (was: check the image structure against the released pipeline).** Three causes:
-   (a) two layout errors in the native checkpoint, shared by the engine and my reference (so their agreement hid them): the
-   fused QKV rows are grouped per head (q, k, v of D rows each per head: rows `(h * 3 + part) * D`), not `[all q | all k | all
-   v]`; the FFN's projection holds the GATE first and the VALUE second (the released diffusers-format weights have the halves
-   swapped: `ff.net.0.proj` is the native `fc1` with its halves exchanged). The VAE has both (qkv per head of 64; `ff.w1`
-   halves). Checked against `transformer_diffusers` / `vae_diffusers` (the released format, the diffusers class's own names).
-   (b) the released pipeline generates on a canvas of at least 2048 x 2048 pixels (`min_generation_area` default, the canvas
-   rule `get_image_canvas_size`), then resizes to the request: a 256 request runs as 128 x 128 latents. The engine now does the
-   same (`canvas_size`, `resize_area`; the released resize is diffusers' image processor, ours is area averaging: a small
-   difference, not checked). (c) the reference scripts now use the released weights and the released text stage.
-   Results: the released text stage's embeddings equal ours (max difference 0.0); the engine's sampler on the released
-   pipeline's own inputs (text, torch seed-0 noise at 128 x 128, the released final latent): cosine 0.993865; the VAE vs the
-   released VAE: cosine 1.0000000; the released pipeline's fox at 256 (`/data/minimax-ref/released/released_fox_256.png`).
-   Runs: `tests/mm_canvas_verify` (the sampler on the released inputs), `tests/mm_dit_ref.py` (now released weights),
-   `tests/mm_vae_ref.py` (released VAE). Note the default request in the released pipeline is 2048 x 2048: a 2048 image is
-   four times the DiT's tokens and the attention is quadratic in them (speed: item 1).
-5. **Qwen3.8-Flash-Next in the deployment** (section below): the model's own MTP block as draft head and the parallel
-   PLE reads are in; both are to be measured there (the user).
-6. **Concurrent runs** (section below): the deployment runs `--parallel` now; watch the store's resume (the `kv`
-   line's mapped blocks) and the queue there.
-7. **Server logging** (section below): in and soaked on Flash (2026-11-12); nothing open on it except the `kv`
-   line's counters with several jobs.
-8. **GLM-5.3-Flash (`glm5_next`)**: runs whole (4.3-7.6 tok/s); its speed work is tabled (user, 2026-11-12). The open
-   leads are in its section below.
-9. **Independent of llama.cpp** (user, 2026-11-09): `bin/rocm-convert` converts (byte for byte convert_hf_to_gguf.py's,
-   `tests/convert_verify.sh`) and quantizes (`inference_quantize`; `-r plain` byte for byte llama-quantize's,
-   `tests/quantize_verify.sh`; default recipe `strix`; the quality measure for a recipe is `perplexity --kl`, the
-   KL divergence from the reference model, ARCHITECTURE.md s4). Open: the recipe choices measured by KL on a real
-   model (Qwen3-30B-A3B's K / V, the Q8_0 LM head; only Qwen3-0.6B was run: strix 0.188 against plain 0.221); the
-   `strix` recipe on Flash in the deployment (its Q8_0 LM head and hc mixers are untested on the real model); the
-   model-card `general.*` keys (license, base model, size label). Not converted:
-   a SentencePiece Llama 2, Gemma 4's dense / per-layer input variants (31B, E2B), NVFP4 / modelopt checkpoints
-   (/data/hf/Qwen3.6-35B-A3B-NVFP4-Fast), DeepSeek-V4.1-Flash (`DeepseekV41ForCausalLM`, on /hf, 510 GB: Engram
-   n-gram tables of 197 GB FP8, 289 GB of FP4 experts; a new package after upstream `conversion/deepseek41.py` and
-   ~450 GB free disk - /data has 180 GB; its experts alone exceed 128 GB). DeepSeek-V4-Flash converts (152 GB FAST,
-   MXFP4 experts kept; its MTP layer left out as upstream does: a separate draft file, with the MTP work) but the
-   engine has no `deepseek4` (KV compressors, hash routing, grouped output projection; like GLM-5.3 it does not fit
-   128 GB resident, so it would use the expert pager).
+How the work runs: each open item is a package with its check. The main session briefs it, reviews the commit, reruns the
+check on `main`, commits, pushes, and (AGENTS.md) touches `.build-trigger` when the image needs a build. Timing packages
+run alone on the machine.
 
 ## Status in brief
 
-The engine runs qwen2, qwen3, qwen3moe, qwen35 / qwen35moe, qwen4exp (Qwen3.8-Flash-Next), gemma4, gemma-embedding,
-nemotron_h_moe, llama and glm5-next (GLM-5.3-Flash, its experts paged from disk) from zero-copy GGUF mappings on the
-UMA. Surfaces: the C API (`libinference.so`), the Perl XS module ROCm::Inference (Minijinja templates),
-rocm-inference-server (OpenAI-compatible: chat, raw completions, embeddings, `--models-dir`, `--parallel`), and
-`bin/rocm-convert`. Regression suite: `make regress` / `make regress-full`. Deployed by the user's
-llama.cpp-rocm-gfx1151-docker (its build files are in this repository's Dockerfile since 2026-11-16: the llama.cpp submodule was removed), which builds rocm-hip from GitHub `main`: its watcher
-takes a fresh `CACHEBUST` per build, and a build is started by touching its `.build-trigger` (AGENTS.md). Design:
-ARCHITECTURE.md; measurements: git history.
+- **Engine:** runs qwen2, qwen3, qwen3moe, qwen35 / qwen35moe, qwen4exp (Qwen3.8-Flash-Next), gemma4, gemma-embedding,
+  nemotron_h_moe, llama and glm5-next (GLM-5.3-Flash, experts paged from disk) from zero-copy GGUF mappings on the UMA.
+- **Surfaces:** the C API (`libinference.so`), the Perl XS module ROCm::Inference (Minijinja templates),
+  `rocm-inference-server` (OpenAI-compatible: chat, raw completions, embeddings, audio, images, `--models-dir`,
+  `--parallel`), and `bin/rocm-convert`.
+- **Deployment:** the user's llama.cpp-rocm-gfx1151-docker builds rocm-hip from GitHub `main` (its Dockerfile is this
+  repository's). The image's watcher restarts the container from each new image; a build starts when `.build-trigger`
+  is touched.
+- **Tests:** `make regress` (quick tier) passes 47 of 47 on this host (2026-11-16). `make regress-full` has not been run.
+- **Image:** `/version` carries the rocm-hip commit. Last image build with nginx's `-t` check: 2026-11-16 19:42.
 
-10. **Multimodal and audio (section below, 2026-11-13)**: audio done through the voice clone from new audio, long-form
-   and translate; the talker's fused device block is the default (U2: 44 ms per frame against 51 to 55 on the host); the
-   image path is on the GPU (I6: 3.3 s per 512 x 512 image against 28 s on the host; the reference image was noise before,
-   corrected). The speech frame is one sync and its codec decodes on the device (U9, U10); MiniMax-H3-Image runs (its
-   section below). Open: the sd VAE's convolutions (the GEMM) and the vision tower's device path. The ComfyUI safetensors
-   question: converted by rocm-convert as F16/BF16 GGUF (the engine reads them in place; sd-turbo is done that way).
+## Open items, in order
 
-## Qwen3.8-Flash-Next
+1. **Deployed service check (on the user's host).** `GET /rocm/v1/models`, one short chat through `/rocm/` (the fixup:
+   `conv_id` and `id_slot` added), one short speech request. This session cannot reach the service (nothing listens on
+   port 8000 here). The user runs the checks, or gives a reachable address.
 
-Quantized: /models/Qwen3.8-Flash-Next-Q4_0_ROCMFP4_FAST-PLE_Q8_0.gguf (PLE table Q8_0 on disk). Open:
-- **The own MTP block as draft head: to be measured on Flash.** `set_draft_model` with the model's own file takes
-  blk.48 from the model's mapping; the server drafts with it by default (`--parallel 1`, no `--draft`; `--draft none`
-  turns it off). On tiny models it drafts exactly what the same block as a sidecar drafts. Open: acceptance and tok/s
-  on Flash (`build/mtp_verify F F 128` with F the model; the sidecar measured ~38 -> ~50 tok/s). If the own block's
-  acceptance is worse than the sidecar's, the first suspect: the base file's nextn.hc_head_norm is the sidecar's
-  output_hc_norm + 1.0 (every other norm in both files has the converter's +1, so the base file is likely right and
-  the sidecar off).
-- **PLE rows in parallel: to be measured in the deployment.** Cold rows of the 50.7 GiB table were read one at a time
-  (400-480 tok/s on 30k-token opencode prompts, 2026-11-09); now MADV_RANDOM on the CPU-only tensors and a batch's
-  rows decoded on 32 threads (PLE_THREADS): a 512-token chunk's 8192 rows ~0.05 s instead of ~1.9 s cold.
-- **Memory on 124 GB**: ~65 GB resident; the PLE table and token embeddings are read by the CPU through the page
-  cache, and prefill crawls when that cache is squeezed (a block store in /dev/shm, two 262k-token KV caches,
-  downloads with dirty pages). The server warns at a load (`memory_check`); a store on a disk works.
-  `QMATVEC_PREFILL_SPLIT_VARIANT=1` in the docker repo's run.sh (2026-11-09) was not the cause and can go.
-- The fork's qwen4exp is behind upstream's (recurrent_layers as indices vs upstream's bool flags; llama-server
-  rejects these files): worth porting in the fork (the user's).
+2. **KV snapshots during prompt processing, for the large CPU-only models (GLM first, then DeepSeek).** Wanted: snapshots
+   written during prefill, about every 500 tokens, so that a restart does not lose a 10k-token prompt (5 minutes or more on
+   GLM CPU-only). Opt-in per model, default off.
+   - **The gap:** the block store holds only a one-layer stand-in KV cache for GLM. The real per-position state (MLA
+     latents, indexer keys, gates, pooled rows, in `GlmState`'s `LazyRows`) and the KDA recurrent state are never written.
+     A GLM resume from the store cannot work at any snapshot frequency until they are saved.
+   - **Possible wrong output (not confirmed):** `store_lookup` treats a stored block as valid whenever the model has no
+     recurrent state in `rs.mem`, which holds for GLM. A GLM resume could then reuse stored blocks without their state.
+     Needs a test that goes through the sequence path (my repro through `inference_generate` never reached the lookup,
+     even on Qwen3-0.6B, so it proves nothing either way).
+   - **Proposed design:** `--store-state-every 500` for the opted-in models. During prefill the prompt is cut at each
+     500-token boundary (as the recurrent snapshots already are). At each boundary, write the new rows of the span (latent,
+     ik, ig, and the pooled rows) and the KDA state. Resume restores both. Per-token size: fp32 rows of `kv_lora` plus
+     two `ix_dim` values per MLA layer; the exact figure will be read from the GGUF before the format is fixed. Also
+     possible: F16 rows (half the bytes, a quality check needed).
+   - **Decision needed:** go ahead with the design, and the F32 or F16 row format.
 
-## GLM-5.3-Flash (`glm5_next`)
+3. **GLM-5.3 on the CPU in the deployment (user).** Measure tokens per second and `VmLck`, `RssAnon`, `RssFile`, `RssShmem`
+   during a real conversation. Last measured: 2.9 tok/s CPU-only (expert pages in the page cache). Wait for item 2 first:
+   a container restart currently resets the prefill.
 
-**Where it stands (2026-11-12).** `/models/GLM-5.3-Flash-FAST.gguf` (171 GB FAST; its `indexer_compressor_ape` /
-`_gate` came out 4-bit - tiny tensors, not worth the 19 h to redo). Loader, CPU reference (`src/glm5_ref.cpp`, equal
-to upstream's glm5-next on the tiny model, cos 1.000000 every layer) and GPU forward pass (`forward_glm5`,
-`src/glm5_gpu.hip`) are in; the tokenizer (`glm4`) equals upstream's on 28 prompts. Tests: `tests/glm5next_verify.sh`
-(the tiny model of `tools/gen_glm5next_ckpt.py` as FAST against its F32 decode in the oracle: upstream llama.cpp's
-CPU build at /data/conv/upstream-build, `make ref_dump_stock REF_STOCK=/data/conv/upstream
-REF_STOCK_B=/data/conv/upstream-build`), `tests/glm5next_head_verify.sh` (the release's first 8 blocks as a model,
-/data/conv/glm53-head8.gguf, 21.5 GB; full tier row glm5next_head8), `glm5next_verify --bench` on `GLM_BENCH=4,16`.
-Rules (user, 2026-11-10): the reference is for numbers only; the engine keeps its UMA way (the GGUF mapped and pinned
-in place, GPU-first with the CPU alongside) and FP4-sized weights.
+4. **Request logs (done 2026-11-16, `f75975c`).** One file per hour: `requests_YYYYMMDD_HH.log`. The user deletes old files
+   by hand; nothing rotates or deletes automatically.
 
-Memory: 95% of the 320B params are expert weights, and no 4-bit quantization fits 128 GB, so the experts are paged
-(`src/expert_pager.h`): `hipHostRegister` makes a range a KFD SVM range the driver keeps resident (so what is
-registered must fit, and is mlocked against reclaim); `hipHostUnregister` does not let go, a MAP_FIXED remap does. The
-default: the pager registers experts until the budget is full (`INFERENCE_EXPERT_PIN_MB`; 0: never), promotes the hot
-ones (`INFERENCE_EXPERT_PROMOTE=0`: first come only), and an expert not on the GPU is computed on the CPU from the plain
-mapping (`src/expert_cpu.h`, AVX-512 VNNI, a batch's work grouped by expert). `INFERENCE_EXPERT_EVICT=1` is the LRU
-mode (releases; 1.8 tok/s); `INFERENCE_CPU_ONLY=1` runs the whole forward pass on the CPU pool (2.9 tok/s, no
-registration at all; no batched prefill, checkpoints, sequences or MTP draft there). `tools/glm_chat.pl` chats through
-the model's template (needs Minijinja's `loop_controls`; scripts/setup-minijinja.sh passes it). Whole file: 4.3-7.6
-tok/s (a conversation that stays on its subject promotes its experts: the higher figure; a new subject is a new set
-and the disk decides), first text 0.2-0.7 s warm, 6 s cold; prompts 31-43 tok/s on random tokens. **Tabled (user,
-2026-11-12: this speed is fine).**
+5. **`tests/convert_verify.sh` in full.** Blocked on disk: 5.5 GB free on `/data` and `/models` (one filesystem). The run
+   needs several GB more.
 
-Open leads, when it is picked up again:
-- Chat template key order (found 2026-11-16 with the tojson fix): the messages and tools reach the template as Perl
-  hashes, so `tool.items()` (GLM's tool definitions) follows Perl's hash order, and `|tojson` sorts the keys
-  (`_py_tojson`, canonical). Python's templates see the request's order in both. Perl's order differs from one process
-  to the next, and in the test render `description` came before `name` (Python: `name` first). Whether GLM's tool calls
-  suffer is not measured. Fix: keep each object's key order in the Perl data (ordered pairs from the JSON parser) and
-  render `tojson` in that order.
-- Memory (the user: "uses all memory"; found and fixed 2026-11-16, not yet measured on the real model). The deployed GLM
-  runs the GPU path with the expert pager on (the file is over 3/4 of memory; `run.sh` had no `INFERENCE_*` variable).
-  Before the fix, what it pinned at load: (1) the experts, mlocked and registered up to the budget (what is available
-  at load less the rest of the model and 16 GB: by design, and the default); (2) `GlmState`, every row of the context
-  at once: about 38 KB a position at 12 MLA layers, so 40 GB at the trained 1,048,576 positions the server gives GLM
-  (`/dev/shm/glm5_state.bin`, `mem.alloc` registers the whole file); (3) the same state again in CPU-only mode, which
-  does not use it. The KV cache of GLM is a one-layer stand-in (128 bytes a position), not the cause. Fixed (same day):
-  the per-position rows are `LazyRows`, registered in 2 MB steps as `reserve(pos0 + T)` reaches them (tiny GLM: output
-  byte-identical); CPU-only allocates none of the GPU state; `run.sh` passes `INFERENCE_EXPERT_PIN_MB` (default 65536,
-  64 GB: the expert pins are capped; the speed cost of fewer GPU experts is not measured). The KV slots of the other
-  models are registered as the attention reaches them (`kv_cache_reserve`, `register_on_use`): a Qwen3-0.6B cache of
-  32768 positions pinned 3.8 GB at creation, now 0.18 GB. Checks: `kv_verify` (eager and lazy), `generate_verify`,
-  `seq_verify`, `store_verify`, the Perl model tests (11 files, 1532 tests), `glm5next_verify` (GPU and CPU-only).
-  Measured with `mem_probe` (a probe of `VmLck`, `RssAnon`, `RssFile`, `RssShmem` and the system figures at each stage).
-  Still to measure: the deployed GLM at a long conversation (the pinned rows and the page cache for the CPU experts).
-- The MTP block (blk.45) as draft head: not bound yet; `index_share_for_mtp_iteration` means the draft shares the
-  main index, so the verify path's rollback has to roll the index back too. Its experts are registered with the
-  rest (3.6 GB).
-- Reads of cold experts on several threads (readahead into the page cache, the mapping kept); layer L+1's router
-  on the stream before layer L to read ahead; use counts kept in a file beside the model for a warm start; the GPU
-  budget on varied prompts (the sweep was on one prompt); cheaper promotion swaps (the release on a thread behind
-  the forward pass, fewer swaps under memory pressure).
-- Profile the GPU's own ~100 ms/token on the whole file (3x the all-resident projection: the drains, first reads of
-  new pages?); a real prompt's prefill rate in the deployment.
-- Prefill: sparse MLA on WMMA (~40% of a long prefill: scalar FP32 over ~2k positions x 64 heads x 512 a token); a
-  chunked KDA; an F16 latent cache (half the bytes).
-- Batched sequences; the stand-in one-layer KV cache's sequence features (store, checkpoints) for GLM's state; a
-  second context on the same model forwarding at the same time would have its experts swapped under it (one
-  forward at a time is assumed; the pager would need use counts).
-- The routing trace of real text (the pager's counters, `INFERENCE_VERBOSE`); the indexer's ties are picked by the
-  lower pool index on both paths (llama.cpp's top_k is unordered: no rule to match).
-- The NPU (amdxdna, no /dev/accel in the container) behind `cpu_expert_ffn`'s interface: judged far-fetched.
-- Vision (`glm5_next_vision`) is an independent track: an encoder path, a patch + merger projection, the image
-  token interleave, and a reply-kind channel in the C API for `reasoning_effort` / `clear_thinking`.
+6. **The full regression tier (`make regress-full`)** on the models here. The quick tier passes; the full one has perplexity
+   rows for models not run here (Flash, the 122B and 120B files) that need `tests/regress.sh --update` on those rows.
 
-## Concurrent runs
+7. **ComfyUI backend, milestone 1: the component API** (verified on sd-turbo), then the node package
+   (`comfyui-rocm-inference`: `EngineLoad`, `EngineTextEncode`, `EngineSample`, `EngineVAEDecode`, `EngineSaveImage`,
+   calling the server; installed by the user into `/comfyui/custom_nodes`, which does not exist yet). See "ComfyUI" below.
 
-Decision (user, 2026-11-07): KV persists, one conversation's cache is not cleared by another's; per-slot sequences
-are dropped. In: the block store (`--store DIR`, `--store-max` GB, lazy prompt-end snapshots written on SIGTERM), a
-switch between conversations reads the prefix back (a 27B switch: 0.79 s instead of 36.8), `preserve_thinking` (a
-new user message no longer re-prefills the previous turn), `--parallel N` (N conversations of one model in one forward
-pass, prompts prefilled in chunks between the others' tokens; not with a draft head). Open:
-- Watch the resume on the deployment (the `kv` line's mapped blocks) and `--parallel` on the 27B / 35B there (the
-  tests ran on Qwen3.5-4B). `--store-max` 32+ on the deployment (one 130k-token 27B conversation ~14 GB).
-- The 10 identical resends in opencode's log (5 each before two compactions, at ~210k tokens) look like failed
-  requests, whose replies the log does not have.
-- Not done: a disk tier for the store; the store on by default in run.sh (the deployment sets ROCM_STORE_DIR).
-- **Speculative decoding under `--parallel` (scoped 2026-11-12; not started).** Blocked in the engine, not the
-  server: `forward_seqs` refuses a model with a draft head ("batched decoding: not for this architecture yet"); the
-  head's state (`mtp_carry`, `mtp_pos`, its KV cache) is one per model, not per sequence; a batched pass takes one
-  token per sequence (a second row of a sequence is refused); a verify needs k + 1 rows of one sequence, with its
-  recurrent layers run row by row and a rollback to the snapshot after row keep - per sequence (`rs_mid` is one).
-  Stages: (1) per-sequence head state (carry, pos, KV) and forward_seqs with the head run on single-token rows (drafts
-  for every sequence, no verify: a correctness check against the sequential path, bit for bit); (2) verify rows
-  (k + 1 per sequence in one pass, attention over the sequence's own KV, recurrent layers per row), tested against
-  forward_verify; (3) per-sequence rollback, the server's loop with drafts per job, the `--parallel` flag without
-  `--draft` refused lifted. Expected gain unmeasured: the sequential sidecar gave ~38 -> ~50 tok/s, the batch already
-  amortizes the weight reads across sequences, so the k + 1 rows' cost is the thing to measure first (step_chats at
-  2 sequences vs 1 on Qwen3.5-4B, then the verify rows' pass time).
-- To look at: `--parallel` by default; several models generating at once (one forward pass each per round; GPU sharing); loads off the request path
-  (between rounds, or in a second process: a request that arrives during a load waits, 2 s from the page cache,
-  minutes from a cold disk); fairness and queue limits per user (the logging's user and conversation id);
-  llama-server on the same GPU.
+8. **MiniMax-H3-Image:**
+   - Check the images against the released pipeline (the timestep convention, t = 1 - sigma; the PDD heads' role). The
+     engine's arithmetic is checked (the reference chain matches), but whether the released model is reproduced is not.
+   - FP8 as a weight type: not measured (the engine has no FP8 weight type to write; needs an encoder and its operand path).
+   - DiT drift from block 30 (the engine's error grows against the fp32 chain). Not chased.
+   - The text encoder from the original checkpoint (the Qwen3 LLM through the qwen loader needs the same tensor source
+     as the DiT; a larger change, after the image path). The user chose the VL encoder.
+   - License: the user's confirmation covers the project; the community license terms are the upstream's.
 
-## Server logging
+9. **Alpamayo 2 Edge.** Licence confirmed (OpenMDW-1.1 weights, Apache-2.0 code). The modeling code is at
+   `NVlabs/alpamayo2-edge`, outside this session's GitHub scope: blocked until the user attaches the repository. The weight
+   headers are read (the language model: 28 layers, hidden 2048, 16 query / 8 KV heads of 128, `relu2` MLP, M-RoPE
+   `[24, 20, 20]`, vocab 135168; the vision tower: 27 layers, hidden 1152, 16 heads, learned absolute positions; the action
+   expert: 28 layers, hidden 512, non-causal attention over the VLM's keys and values).
 
-In: the engine's event hook, `set_event_handler`, `ROCm::Inference::Log`, the server's lines (start, done, prefill
-progress, generating every 5 s, loads, access, cancels), `--log-level` / `--log-format` / `--log-color` /
-`--debug-stream`, for sequential and `--parallel` requests alike; `t/05-log.t`, `t/15-events.t`, `tests/events_test`,
-`t/62-server-log.t`. Soaked on the Flash model in the deployment (2026-11-12, 30k-token requests at `--parallel 4`):
-prefill ticks every ~2.5 s through the 52 s prefill, `generating` lines every 5 s, no per-token lines. Open:
-- With `--parallel`, the done line's store counters (`kv` line) are the model's over the request, so another job's
-  blocks can show in them.
-- Identity: the user (nginx X-Remote-User; a Keycloak JWT later), the client address (X-Real-IP), the conversation
-  id (X-LLamaCPP-Id-slot). The docker repo's nginx needs `proxy_set_header X-Remote-User` on /rocm/ (not done).
+10. **Concurrency (`--parallel`).**
+    - Speculative decoding under `--parallel` (not started; three stages): per-sequence draft-head state and batched
+      forward with single-token rows (a bit-for-bit check against the sequential path); verify rows (k+1 per sequence,
+      tested against `forward_verify`); per-sequence rollback, and the server's loop with drafts per job. Blocked in the
+      engine: `forward_seqs` refuses a model with a draft head, and the head's state is one per model. Measure first: the
+      k+1 rows' cost (`step_chats` at 2 sequences vs 1 on Qwen3.5-4B, then the verify rows' pass time). The sequential
+      sidecar gave about 38 -> 50 tok/s.
+    - Watch on the deployment: the store's resume (the `kv` line's mapped blocks), and `--parallel` on the 27B and 35B
+      (the tests ran on Qwen3.5-4B). `--store-max` 32 or more (one 130k-token 27B conversation is about 14 GB).
+    - The 10 identical resends in opencode's log (5 each before two compactions, at about 210k tokens) look like failed
+      requests whose replies the log lacks.
+    - Not done: a disk tier for the store; the store on by default in `run.sh` (the deployment sets `ROCM_STORE_DIR`).
+    - Later: `--parallel` by default; several models generating at once; loads off the request path (a request during a
+      cold load waits minutes); fairness and queue limits per user; llama-server on the same GPU.
 
-## Multimodal and audio (engines in build, phased; started 2026-11-12)
+11. **Server identity and logging.** With `--parallel`, the done line's store counters (the `kv` line) are the model's over
+    the request, so another job's blocks can show in them. Identity: the user (nginx `X-Remote-User`; a Keycloak JWT later),
+    the client address (`X-Real-IP`), the conversation id (`X-LLamaCPP-Id-slot`). The docker repository's nginx needs
+    `proxy_set_header X-Remote-User` on `/rocm/`.
 
-Phases, in order. Each ends with a check against the reference (transformers in `/data/hf/venv`: torch 2.6 CPU,
-transformers 5.5.1, Pillow; no torchvision in that venv). A phase is done when its check passes and is committed.
+12. **Flash (Qwen3.8-Flash-Next) measurements, in a deployment window** (the model file is 122.8 GB and shares the host's
+    124 GB with the deployment):
+    - The model's own MTP block as draft head: acceptance and tok/s (`build/mtp_verify F F 128`; the sidecar measured
+      about 38 -> 50 tok/s). If the own block's acceptance is worse, check the base file's `nextn.hc_head_norm` (the
+      sidecar's `output_hc_norm` + 1.0; the base file is likely right and the sidecar off).
+    - PLE rows in parallel, in the deployment (`PLE_THREADS`, `MADV_RANDOM`): 30k-token prompts were 400-480 tok/s with
+      cold rows read one at a time.
+    - `events_test MODEL DRAFT` with the Flash draft (not run; a tiny model with a draft head is the substitute, and
+      `tools/gen_qwen4exp_tiny.py` writes none).
+    - YaRN beyond 262,144 positions (the card reaches 1M by a `factor` 4.0 override): not started (frequencies, attention
+      scale, a `--rope-factor` option, a quality check). The 16 GB KV budget caps it at about 600k positions at F16.
+    - The fork's qwen4exp is behind upstream's (`recurrent_layers` as indices, not bool flags): the user's to port.
 
-**Vision (Qwen3.5-0.8B first; its 4B and the 122B are the same architecture):**
-- V1 reference (done 2026-11-12): `/data/vision-ref/dump.py` writes `/data/vision-ref/q35-0.8b/`: the test image, the
-  processor's pixel_values (560 x 1536: 20 x 28 patches of 3 x 2 x 16 x 16), the grid (1, 20, 28), the token ids (169,
-  140 image pads), the patch embedding, block 0's output, the merged image features (140 x 1024) and the greedy reply
-  "Two shapes: a red square and a blue circle." Scripts and data stay outside the repo.
-- V2 converter (done 2026-11-12): `rocm-convert --mmproj` writes the tower as F32 GGUF (`v.*` tensors, `qwen3_5_vision.*`
-  keys; the patch embedding flattened to 1536 per output); `tests/mmproj_verify.py` reads all 153 tensors back and they
-  equal the BF16 widened to F32 bit for bit. The 0.8B's file is `/data/vision-ref/q35-0.8b-mmproj.gguf` (402 MB).
-- V3 ViT forward, host float32 (done 2026-11-12: `src/vision.{h,cpp}`, the order of operations of transformers'
-  Qwen3_5VisionModel; `tests/vision_verify.cpp` / `make build/vision_verify`): the patch embedding, the interpolated
-  position embedding, the 2-D rotary, the 12 blocks with full attention per image, the merger. Against the V1
-  reference: patch embedding, block 0 and the merged features each have a worst row cosine of 1.000000, the
-  largest absolute difference 1e-4 on the 1024-wide features. The GPU path is still to come (the same checks).
-- V4 M-RoPE in the LM forward (done 2026-11-12): `src/mrope.cpp` (the positions, all 169 tokens of the V1 prompt and the
-  decode offset equal transformers' get_rope_index); the rotary kernel (`attention.hip` norm_rope) takes each token's
-  three positions with the interleaved section split, and the offset after the prompt; the engine takes the image
-  rows and positions through `inference_set_mm` before `inference_prefill`. `tests/mm_verify.cpp` (`make
-  build/mm_verify`, run from build/co) on the BF16 Qwen3.5-0.8B: the image chat's last logits at cosine 0.999986 to
-  transformers', the same argmax, and the 14 greedy reply tokens equal. Plain attention checks still pass
-  (attn_verify, attn_decode_verify, attn_split_verify); plain Qwen3.5 text was not re-run beyond that.
-- V5 image input (done 2026-11-13): the processor (`src/image.{h,cpp}`, stb_image in `src/third_party/`, PIL-style
-  bicubic, smart_resize, merge-order pixel rows; `tests/image_verify.cpp`: the V1 PNG's pixel rows equal transformers'
-  exactly, features at cosine 1.000000; a 757 x 541 PNG (a real downscale): max |diff| 0.0078, one 8-bit step). The
-  Perl binding (`ROCm::Inference::vision_load`, `chat(..., images => [...], vision => $v)`, `image_prompt`, `set_mm`,
-  `hidden_size`): the V1 image through Perl gives "Two shapes: a red square and a blue circle.". The server: `--mmproj`
-  and `image_url` parts with data: URLs (a URL is refused, an image without `--mmproj` is a 400). A sequence with image
-  rows neither reads nor writes the KV block store, and its RoPE offset ends when it is truncated below its images
-  (the store's skip is not covered by a test yet). Checks: `perl/ROCm-Inference/t/63-server-image.t` (env-gated, passes
-  on the 0.8B), the store and server suites (30, 40, 45, 60) pass. Open: `--parallel` above 1 refuses images; the
-  vision tower runs on the host (float32), a GPU path is not started.
+13. **Gemma-4 26B, chat and streaming checks** (nice to have). `generate_verify` fails 3 checks: the streamed greedy tokens
+    differ from `inference_generate_ex`'s; the chat checks assume Qwen's end token and template. The prefill is exact now
+    (see "Done in this round").
 
-**Audio transcription (whisper-tiny, `/data/hf-small/whisper-tiny`):**
-- A1 reference (done 2026-11-13): `/data/audio-ref/dump.py` writes `/data/audio-ref/whisper-tiny/`: the clip (5.9 s of
-  LibriSpeech dev-clean from hf-internal-testing/librispeech_asr_dummy, `clip.wav` and `samples.npy`), the features
-  (`input_features.npy`, 1 x 80 x 3000, the extractor's torch path, float32), the encoder output (1 x 1500 x 384), the
-  greedy tokens (`tokens.npy`, 21, after the prompt `50258 50259 50359 50363`, ending before EOT 50257), the filters
-  (`mel_filters.npy`, 201 x 80) and `input_features_f64.npy` (the same steps in numpy double). The text: "Mr. Quilter
-  is the apostle of the middle classes and we are glad to welcome his gospel."
-- A2 mel in C (done 2026-11-13): `src/mel.{h,cpp}` (`whisper_log_mel`, `mel_filter_bank`), `tests/mel_verify.cpp`
-  (`make build/mel_verify`): the filter bank equals the extractor's exactly; the features equal the double replica to
-  1.2e-7; against the float32 torch reference the largest difference is 1.15e-5 (the reference's float32 rounding,
-  which transformers itself puts at about 1e-5). Direct DFT over the 400-point frames, OpenMP over frames.
-- A3 whisper in the engine (done 2026-11-13, host float32): the converter (`ROCm::Inference::Convert::Whisper`, F32:
-  `rocm-convert <dir> <out.gguf> bf16-ref`; whisper.* keys with the suppression lists; llama.cpp's whisper tensor names
-  where they exist) writes `/data/audio-ref/whisper-tiny.gguf` (151 MB). `src/whisper.{h,cpp}`: the conv stem, the
-  non-causal encoder, the decoder with the self-attention cache and cross-attention over the encoder's keys and values
-  (computed once), the tied head, greedy with the generation config's suppressions. `tests/whisper_verify.cpp` (`make
-  build/whisper_verify`): the encoder from the mel (A2) at worst row cosine 1.0000000, max difference 7e-5 of the largest
-  value; the 21 greedy tokens equal the reference's, EOT 50257; 1.9 s on 16 threads. One clip only so far.
-- A4 `/v1/audio/transcriptions` (done 2026-11-13): the converter writes the vocabulary (tokenizer.ggml.*, `pre`
-  `qwen2`: only special tokens are encoded, by exact text); the engine decodes a WAV (PCM 8-32 / float, mono mix, linear
-  resampling to 16 kHz) and transcribes up to 30 s (`whisper_transcribe`: the language, transcribe and no-timestamps
-  prompt, greedy, the text). The Perl binding (`ROCm::Inference::whisper_load`) and the server (`--whisper FILE`, which
-  needs no chat model; `POST /v1/audio/transcriptions`, multipart: `file`, `language`, `response_format` json|text)
-  with ROCm::Inference::Multipart. Checks: `make build/whisper_verify` (the WAV equals the reference waveform exactly,
-  the special-token ids, the text equal to transformers' transcription) and `perl/ROCm-Inference/t/64-audio.t` (the
-  multipart parser always; the server test env-gated: ROCM_INFERENCE_TEST_WHISPER, ROCM_INFERENCE_TEST_WAV) passes.
-  Open: long-form audio (over 30 s: chunking with timestamps), other languages than English are only checked by the
-  token table (the test is English), translate, the GPU path, and resampling is linear (not band-limited).
+14. **Clear by hand (the user):** `/data/iqtest` (336 KB of logs), and `nginx.conf~` in the repository root (the editor's
+    backup, excluded from the image).
 
-**Speech generation (Qwen3-TTS 0.6B, `/data/hf-small/Qwen3-TTS-12Hz-0.6B-Base` and its tokenizer):**
-- T1 reference (done 2026-11-13): transformers 5.5.1 has no Qwen3-TTS, so the official `qwen-tts` 0.1.1 runs from
-  `/data/tts-site` (its pinned transformers 4.57.3, librosa, sox, a torchaudio stub: the CUDA torchaudio does not load on
-  the CPU torch; the stub is only the speaker encoder's kaldi fbank). The venv is untouched. `/data/audio-ref/tts_dump.py`
-  writes `/data/audio-ref/tts/`: the in-context voice clone (the LibriSpeech clip with its transcript), the text ids
-  (20), the reference text ids (34), the reference codec frames (74 x 16), the talker's codes (50 x 16) and the 24 kHz
-  wave (4 s). Greedy decoding loops into near silence (RMS 3e-5), so the reference samples with `torch.manual_seed(0)`;
-  the reference Whisper transcribes the wave as "Hello, this is a short test of the speech synthesis.". The codec
-  decodes the reference clip's own codes to speech (RMS 0.058). T2 checks teacher-forced logits and codes (torch's
-  sampling cannot be reproduced token for token).
-- T2 talker as an engine architecture (done 2026-11-13, host float32): the converter (`ROCm::Inference::Convert::Qwen3TTS`,
-  F32 of the BF16 checkpoint, `talker.*` / `pred.*` tensors and `qwen3tts.*` keys; the speaker encoder and the codec are
-  skipped on purpose) writes `/data/audio-ref/tts/qwen3tts-talker.gguf` (3.6 GB). `src/qwen3tts.{h,cpp}`: the in-context
-  voice clone's prefill (the codec prefix with the speaker embedding, the reference text and frames, the trailing text),
-  the 28-layer talker (Qwen3 blocks, per-head q/k norms, GQA; the M-RoPE with its three axes equal is plain RoPE here),
-  the 15-codebook code predictor, a KV-cached greedy generation (repetition penalty once per distinct token, the codec
-  range suppressed except EOS, EOS not before frame 2). `tests/qwen3tts_verify.cpp` (`make build/qwen3tts_verify`, 44 s):
-  the prefill, the talker's hidden states and logits over 133 positions and the predictor's logits match qwen-tts's
-  teacher-forced values at cosine 1.0000000 (within 1e-5 of the scale); the greedy generation reproduces qwen-tts's greedy
-  codes frame for frame (199 frames; the engine returns 200 because the reference's max count drops one). Not yet: the
-  sampling loop (top-k, temperature 0.9, the sub-talker's sampling: torch's RNG is not reproduced), the speaker encoder
-  (the x-vector for the speaker embedding, an input here), the BF16 weights, and a Perl binding.
-- T3 codec decoder (done 2026-11-13, host float32): `ROCm::Inference::Convert::Qwen3TTSTokenizer12` (the decoder's F32
-  tensors as `codec.*`; the encoder skipped on purpose) writes `/data/audio-ref/tts/qwen3tts-codec.gguf` (456 MB).
-  `src/qwen3tts_codec.{h,cpp}`: the residual quantizer (first codebook plus the 15 others, each with its projection), the
-  causal pre-conv, the 8-layer sliding-window transformer (16 heads of 64 inside a 512-wide state), the two ConvNeXt
-  upsamplers, the four decoder blocks (Snake, transposed convolution, dilated residual units), the output convolution and
-  the clamp; chunks of 300 frames with 25 of left context as `chunked_decode`. `tests/qwen3tts_codec_verify.cpp` (`make
-  build/qwen3tts_codec_verify`, about 55 s): the reference clip's own 74 frames decode to qwen-tts's wave (cosine 1.0000000,
-  1.4e-5 of the scale), and the talker's 50 frames decode, after qwen-tts's cut of the reference's share, to the T1 wave
-  (cosine 1.0000000, 1e-5 of the scale).
-- T4 `/v1/audio/speech` returning WAV (done 2026-11-13, first version): the text's chat ids (the GGUF's tokenizer, now in
-  the talker GGUF as tokenizer.ggml.*), the sampling (`qwen3tts_generate`: top_k 50, temperature 0.9, repetition penalty
-  1.05 for the talker, top_k 50 and temperature 0.9 for the code predictor; splitmix64 from the seed), the codec, the cut
-  of the reference's share (`src/qwen3tts_speech.{h,cpp}`, `qwen3tts_speak`). A voice is a directory (voice.json,
-  codes.i32, spk.f32) written by `tools/qwen3tts_voice.py` (qwen-tts's speaker embedding and speech-tokenizer encoder,
-  outside the engine). Checks: the tokenizer's ids equal qwen-tts's, top_k 1 gives the greedy frames, `qwen3tts_speech_verify`
-  (same seed the same wave, another seed other frames, the level), Whisper reads the seed-0 speech back as "Hello, this is
-  a short test of the speech synthesis.", the endpoint returns the WAV (t/65-speech.t). Not yet: the speaker encoder and
-  the codec encoder in the engine (the voice comes from the Python tool), a voice-clone from new audio on the server,
-  the sampled frames are not torch's (its generator), streaming, response formats other than wav, long texts are not
-  chunked, one request at a time.
+15. **Watch or table:** Qwen4 (not on Hugging Face yet); Qwen3.8-2.4T-A95B (tabled); the memory measurement of the
+    deployment's GPU pins (tabled: GLM runs on the CPU).
 
-**Audio, continued (2026-11-13, requested "continue with audio ... until it's done"; the UMA rules apply):** the open
-items of A1-A4 and T1-T4, in order, each a commit with its check here as history (done items are kept, not pruned):
-- A5 resampling: a band-limited (windowed-sinc) resampler in `src/audio.{h,cpp}` replaces the linear one in the WAV
-  decode (whisper and the TTS voice input at 24 kHz); checked against librosa's soxr_hq output.
-  **Done 2026-11-13:** `src/audio.{h,cpp}` (`audio_decode_wav` for any rate, `audio_resample`): the Kaiser-windowed sinc
-  with soxr-like constants (cutoff 0.9565 of the lower Nyquist, 90 zero crossings, beta 12.4, a table for the window,
-  OpenMP over the outputs). `tests/audio_verify.cpp` (`make build/audio_verify`) against librosa 0.11's soxr_hq on
-  /data/audio-ref/resample (dump.py there): 16 -> 24 kHz, 24 -> 16 kHz and a 44.1 kHz 16-bit WAV decoded to 16 kHz, each
-  at cosine 0.9999998 and a largest difference of 1.5e-3 of the peak. A 16 kHz WAV stays bit-identical through whisper
-  (`whisper_verify` passes, the WAV max difference 0). Not band-limited to soxr's exact polyphase: the rest is soxr's
-  design. Speed: 0.15 s for all three on 16 threads.
-- T5 speaker encoder in the engine (the ECAPA-TDNN of qwen-tts's `Qwen3TTSSpeakerEncoder`, the 24 kHz log-mel of its
-  `mel_spectrogram`): converter writes `speaker_encoder.*` into the talker GGUF; checked against qwen-tts's
-  `extract_speaker_embedding` on the reference clip.
-  **Done 2026-11-13:** `ROCm::Inference::Convert::Qwen3TTS` writes the 76 `speaker_encoder.*` tensors as `spk.*` (F32 of the
-  checkpoint's BF16) and the architecture as `qwen3tts.spk.*` keys; `speaker_log_mel` (`src/mel.cpp`: the radix-2 FFT, the
-  Slaney filters as `mel_filter_bank`, reflect-padded uncentred frames) and `qwen3tts_speaker_embedding` (`src/qwen3tts.cpp`:
-  the ECAPA-TDNN with reflect-padded 'same' convolutions, SE-Res2Net blocks, the multi-layer aggregation, attentive statistics
-  pooling). `tests/speaker_verify.cpp` (`make build/speaker_verify`) against qwen-tts's `mel_spectrogram` and
-  `extract_speaker_embedding` on the clip at 24 kHz (/data/audio-ref/speaker, dump.py): the filter bank equal to 1e-7 of its
-  peak, the log-mel at cosine 1.0000000 (1.1e-5 of the peak), the 1024-dim embedding at cosine 1.0000000 (5.7e-7 of the peak).
-- T6 codec encoder in the engine (the speech tokenizer's SEANet encoder, its 8-layer transformer, the downsample and
-  the residual VQ encode): converter writes `encoder.*` and the quantizer's encode tensors into the codec GGUF; checked
-  against qwen-tts's `encode` (the reference clip's codes, exact integers).
-  **Done 2026-11-13:** `ROCm::Inference::Convert::Qwen3TTSTokenizer12` writes the encoder (the 496 tensors of the checkpoint
-  less the unused output projections; `enc_gname`: the short names `enc.sea0`, `enc.resS.c1/c2`, `enc.downS`, `enc.sealast`,
-  `enc.tfL.*`, `enc.ds`, `enc.qs/qa.proj`, `enc.qs/qa.N.sum/usage`, because a GGUF tensor name holds 63 bytes: the long
-  checkpoint names were cut to 63 and the engine could not find them) and the `qwen3tts_codec.enc.*` keys. The engine
-  (`src/qwen3tts_codec.cpp`): the SEANet with Mimi's causal padding arithmetic (zero padding; the downsample replicate), the
-  8-layer causal transformer with the sliding window (250), half-rotation RoPE, GELU MLPs and layer scales, the downsample,
-  the split residual VQ encode (nearest entry by L2 over `embed_sum / max(usage, 1e-5)`, the semantic codebook, then 15
-  acoustic), `qwen3tts_codec_encode` (T = ceil(n / 1920) frames). `tests/codec_encode_verify.cpp` (`make
-  build/codec_encode_verify`, 1.4 s): the 74 x 16 codes of the reference clip equal qwen-tts's `encode` on every integer
-  (`enc_codes_ref.i32`, codec_dump.py; the same codes as the T1 reference `ref_codes.npy`).
-- T7 voices from audio: the engine makes a voice from a WAV and its transcript (`qwen3tts_make_voice`); the server
-  takes `POST /v1/audio/voices` (multipart: name, file, ref_text), so `tools/qwen3tts_voice.py` is only the reference.
+## Audio, vision and image: status
 
-  **Done 2026-11-13:** `qwen3tts_make_voice` (`src/qwen3tts_speech.cpp`: the codec encoder's codes and the speaker
-  embedding of the same samples); the Perl binding (`ROCm::Inference::Speech::make_voice`, `speech_voice_write`,
-  `speech_wav_samples`); the server's `POST /v1/audio/voices` (multipart: `file` a WAV of 0.5 to 60 s, `ref_text`,
-  `name`; 409 when the name exists) and `GET /v1/audio/voices` (names, frames, transcripts). Checks: the Perl test
-  `t/65-speech.t` with ROCM_INFERENCE_TEST_WAV (13 tests pass: the clip's voice has 74 frames, the directory reads
-  back, speech with it). Through the server: the clip-made voice (2.5 s to make, 5.9 s clip) gives speech that Whisper
-  transcribes as "Hello, this is a short test of the speech synthesis." `tools/qwen3tts_voice.py` is the qwen-tts
-  reference of the same voices.
-- T8 prefix KV cache: a voice's prefill (its reference text, codes and speaker embedding) is the same for every request
-  in that voice, so its per-layer K/V is computed once and kept with the voice; a request continues from it (the KV
-  cache's prefix reuse, as the engine's sequences do for chat).
-  **Decided 2026-11-13 (not built): the prefill is a small share.** Measured on the BF16 talker (16 threads): a 40 frame
-  utterance takes ~2.3 to 4 s, of which the prefill (84 positions, batched) is a fraction of one frame's 50 to 70 ms per
-  frame times the frames; a voice's cached prefix would save a few percent per request. The next speed item is the frame
-  itself (below), not the prefix.
-- T9 BF16 weights: the talker and the speaker encoder keep the checkpoint's BF16 in the GGUF (mmap, read in place, widened
-  inside the dot products): half the bytes of the F32 files, no copy at load.
-  **T9 and U1 done 2026-11-13 (the talker part of U1):** the talker GGUF writes its matrices and tables as BF16 (the
-  checkpoint's own bytes, `raw`; norms, biases and the speaker encoder F32) and the engine reads them in place (`Mat`:
-  F32 or BF16, widened in the dot products; the same numbers). The linear runs parallel over output rows with each row
-  read once for the batch; the reductions vectorize with `#pragma omp simd` and the host engines compile with
-  AVX-512 (`HOST_SIMD` in the Makefile: qwen3tts, codec, speech, mel, audio, whisper). The codec's convolutions run with
-  the time loop innermost (vectorized) and parallel over output channels. Measured on this machine (16 threads):
-  talker forward 31 -> 17.8 ms per token, code predictor 107 -> 8.4 ms per frame, 40 frames of speech 10.0 -> 2.3 s
-  (57 ms per frame incl. the prefill: faster than the 80 ms of audio a frame makes), codec decode of 40 frames 18.1 ->
-  1.2 s. All TTS verifiers pass on the BF16 talker (qwen3tts_verify, speaker_verify, speech verify, the codec's
-  encode and decode). The F32 talker stays at /data/audio-ref/tts/qwen3tts-talker-f32.gguf (3.6 GB). Open: the whisper
-  and vision host kernels still use the old loops (U1), the GPU path (U2).
-- W4 whisper long-form by the seek rule (2026-11-15, the open item of W1/W3): a clip over 30 s is decoded as Whisper's
-  sequential decoding: each window (at most 30 s from seek) with timestamps, conditioned on the previous text (<|startofprev|>
-  and its last 224 tokens); seek moves to the end of the last complete segment (consecutive timestamps close one; a window
-  ending in an open segment moves seek to its last timestamp; no timestamps: the whole window); control markers are not
-  text. A clip of 30 s or less keeps the no-timestamps decoding (its verified text is unchanged: whisper_verify PASS). Checks:
-  t/66 with a 37.6 s clip (the sentence six times, 0.5 s apart): the sentence six times, 127 text tokens. The temperature
-  fallback is item 11 (done 2026-11-15). Open: the timestamp rules are not forced (the decoder's own choices).
-- W1 whisper long-form: audio over 30 s is cut at the quietest point before each 30 s window and the texts joined. (Replaced
-  by W4 below.)
-- W2 translate: `task` translate (the `<|translate|>` token in the prompt) through the endpoint.
-- W3 other languages: a French and a Chinese clip (qwen-tts speech, the Whisper reference from transformers) with the
-  engine's tokens equal to transformers' greedy tokens under the same language token.
-  **Done 2026-11-13:** `whisper_transcribe_task` (`src/whisper.cpp`): clips of any length in windows of at most 30 s, each
-  window's end at the quietest 0.1 s frame of its last 10 s (or the window's end), the texts joined; the task transcribe or
-  translate (the `<|translate|>` token). The Perl binding (`transcribe($wav, language, task)`) and the endpoint's `task`
-  field; the docs say any length. Checks: `t/66-whisper-long.t` (env-gated): a 38 s clip (the reference sentence six times,
-  0.5 s apart) gives the sentence six times (126 tokens, 6.8 s on 16 threads); a French clip (qwen-tts speech in the
-  clip's voice, /data/audio-ref/lang/dump.py) transcribes and translates exactly as transformers' whisper-tiny does (20 and
-  10 tokens, equal texts). Open: the cut is a pause, not a timestamp (a word at a window's end with no pause is not
-  protected), no previous-text conditioning across windows.
-- S1 audio from MODELS_DIR (done 2026-11-14): `rocm-inference-server --models-dir DIR` serves the audio models in DIR
-  without flags: a Whisper GGUF (arch whisper) becomes `--whisper`; a talker (arch qwen3tts) with its codec (arch
-  qwen3tts_codec) becomes `--tts` and `--tts-codec`, with voices in DIR/voices (created). Flags still win. Checked: the
-  server's log names the picked files, the audio GGUFs are not listed as chat models. Checked in the container
-  (2026-11-14, the server at /rocm/v1): `/v1/audio/transcriptions` on a copied WAV, `POST /v1/audio/voices` (a 16 s clip,
-  frames 204), and `/v1/audio/speech` with that voice returns a WAV that Whisper transcribes as "Hello there. This is a
-  test.". Found and fixed on the way: the device path needs BF16 talker matrices; the F32 talker (talker-f32) failed with
-  "a matrix is not BF16". It now runs on the host (`bf16_matrices`), and the auto-pick prefers the BF16 talker.
-  `qwen3tts_speech_verify` passes with both files.
-- S2 speech for real use (2026-11-14): (a) long texts: cut at the sentence ends into pieces of at most 220 characters
-  (`speech_pieces`), one talker run each, piece i with seed + i, 0.2 s of silence between pieces; input up to 20000
-  characters. (b) the server pulls the speech one piece per round (Web::Route's `pull`): other requests are served
-  between the pieces. Web::Route: a reference to a string as the last piece ends the body in its round
-  (t/31-pull-last.t). (c) response_format wav, pcm and flac (`audio_flac16` in src/audio.cpp: FLAC with fixed predictors
-  of order 0 to 3 and Rice residuals, lossless; decoded with libsndfile, exact on the test signals and on the speech:
-  the FLAC decodes to the WAV's samples). mp3, opus and aac are refused (400): no encoder in the image. (d) stream: true
-  with wav (header of unknown length) or pcm sends each piece as it is made. Measured locally on the BF16 talker: a
-  52.9 s text in 6 pieces took 68 s (about 100 ms per frame, the device path); a 1.4 s request beside it finished after
-  about 22 s (it waits for one of the other's pieces). Open: the pieces do not share prosody (each is its own run),
-  and a streamed WAV's header is not a finished file.
-- S3 the audio models rescanned (2026-11-14): with `--models-dir`, the directory's GGUF files are checked before each
-  speech, transcription or voice request (stat only; the classification by header runs when a file changed). A model
-  whose file changed is loaded again, or dropped when it is gone; a load that fails is logged and the last good model is
-  kept. A speech job holds the model it started with (tested: a talker swapped in during a 80 s request; both finished on
-  their own models). Voices are read per request as before. The flags' models are loaded once. Tested locally with links to
-  the F32 talker under other names (the BF16 file is no longer at /data/audio-ref/tts: it was moved). Speech answers 503
-  with no talker in the directory, and recovers when one comes back.
-- U3 device frame profile (2026-11-14, `QWEN3TTS_PROFILE=1`: the stages; `=2`: each kernel timed, direct launches).
-  Before: a frame (45 frames of made-from-clip, device) took predictor 27.8 ms + talker 9.5 ms. The predictor's 16 stacks
-  (5 layers each) and the talker's 28 blocks read about 2.6 GB and 0.9 GB of BF16 weights per frame. Changes: each block is
-  six launches (`src/talker_gpu.hip`: the rms norm inside the QKV and gate/up matvecs, the q/k norms with the rotary and the
-  cache store, the residual adds in the output and down matvecs, the heads' norm), 4 loads in flight per lane; the
-  position is read on the device, so the talker frame and the predictor stack are HIP graphs replayed per step (the
-  stream is non-blocking; the profile level 2 keeps direct launches). After: predictor 20.3 ms + talker 7.2 ms = 27.5 ms
-  (26% less). Checks: the greedy generation equals qwen-tts's on all 200 frames (device and host), the top-k 1 frames
-  equal the greedy, the speech verifier and t/65 pass; the sampled frames changed from the old kernels' (the sampler's
-  draws are sensitive to the last bits of the logits), and the new version is stable over repeated runs and with
-  HIP_LAUNCH_BLOCKING=1. Measured in isolation (standalone benchmarks, the same kernels): a matvec of 12.6 MB reads at
-  320 GB/s whether its weights are a registered file mapping, a device copy or anonymous memory; the activation arena
-  costs nothing; graphs replace the launch overhead (30 launches: the same time either way once pipelined). Ruled out:
-  the registration size, /dev/shm huge pages (no change), the GPU clock (it drops only after pauses of 3 ms or more).
-  Open: a predictor stack costs about 1.1 ms on the device where the bandwidth floor is about 0.5 ms (the stage timers
-  count it through the heads' syncs); the per-kernel event timings are inflated by the events, and rocprofv3 wrote no
-  trace here (under it the speech output also changed, unexplained). Next options: find the 2x in the stack (a trace
-  without events), and the predictor's weights as Q8_0 (half the bytes; a quality decision, not the default).
-- U4 the predictor stack, round two (2026-11-14). A stack (5 layers, six launches each) in a standalone benchmark
-  (`bench_stack`: the same kernels and arguments, a graph; device memory) takes 1156 us; with a sync after each it is the
-  same (the sync costs nothing). Per layer, with one kernel type left out at a time: QKV 48 us (8.4 MB: 175 GB/s), the
-  output projection 36 us (4.2 MB: 117 GB/s), gate/up 61 us (12.6 MB: 206 GB/s), down 31 us (6.3 MB: 203 GB/s), the
-  attention and the rotary about 3 us each. Findings: the earlier 323 GB/s of a single matvec was a cache artifact (the
-  same 12.6 MB read again and again); the stack reads 157 MB, which is cold. Achievable: a streaming read reaches 256 GB/s
-  with no flush (a memset before a run leaves dirty lines to write back during the read: 147 GB/s, a bad measurement).
-  Kept: the dot product's four loads per step unconditional (a load inside a branch serialized them: 1156 -> 1034 us with
-  the fix), the RMS prologue with wave shuffles. Not kept: two rows per warp (eight loads in flight): 1035 us, 100 to
-  108 VGPRs per thread (the activations' reads), and capping the registers at 64 spilled (1850 us). Engine (45 frames of
-  made-from-clip): predictor 17.0 ms, talker 6.2 ms: 23.2 ms per frame, down from 37.3 at the start of U3. The
-  predictor's floor at 256 GB/s is about 10 ms, the talker's about 3.5 ms. Open: the matvec kernels at 175 to 206 GB/s.
-- U5 the codec on the CPU (2026-11-15): a speech request decodes the voice's reference frames with the generated ones (74 to
-  204 frames), so a request with a 204-frame voice decodes 298 frames: most of its time (the container: 14 s for 94 frames,
-  of which the talker's stages about 3 s). Now: the codec's convolutions (blocks of 8 output rows and 256 samples) and its
-  transposed convolutions (phase-wise causal filters: the strided scatter was not vectorized). Bit-identical output (codec
-  verify PASS, speech output max difference 0). One codec call on 40 frames: 1108 -> 558 ms at 16 threads (the convolution
-  with a 4 x 64 block in registers); 14.1 -> ~7 s at 1 thread. The server's request for the 204-frame voice: 14 -> 8.7 s, and
-  its output is byte-identical to the earlier output (the codec change is exact end to end). Tried and not used: decoding only the last 25 reference frames as context (the codec's attention window is
-  250 frames: the waveform changes, cosine 0.973; its words are the same; not used: superseded by U6, which is exact).
-  Open: a streamed decoder with the reference's state cached per voice would make the reference free and stay exact.
-- U6 the codec's reference state cached per voice (2026-11-15). The decoder is a stream: each layer is causal, so the
-  frames decode in pieces with a state (the causal layers' input histories; the transformer's keys and values of the last
-  sw - 1 frames; the next frame's index), bit for bit as at once (`decode_stream`, `DecState`). A voice's reference is
-  decoded once (`qwen3tts_codec_decode_after`, keyed by the codes' hash, the last 8 kept), and each request decodes only
-  its own frames. Checks: the stream decodes 40 and 300 frames bit-identically to the previous decoder (saved outputs);
-  `tests/codec_after_verify.cpp` (`make build/codec_after_verify`): references of 1, 20, 74, 249, 250, 260 frames, a cache
-  hit and a second reference, each bit-identical to the whole sequence's decode: PASS. The codec verifier and the speech
-  verifier PASS. Timing (local, BF16 talker, 40 frames of made-from-clip): speak 3.3 s -> 2.1 s on a cache hit (the first
-  call 4.6 s, with the reference decoded). The server (rocm-hip 4a1f52f, the 204-frame voice): the first request 11.2 s (the
-  reference decoded), the next 5.6 s (was 8.7 s), both byte-identical to the earlier output. Open: the talker's prefill (0.74 s
-  in the container) was per request; now U7: the voice's prefix rows cached (below).
-- U7 the talker's prefill per voice (2026-11-15). The rows that depend on the voice only (the role, the codec prefix, the
-  reference's text and frames: 9 + min(reference text, R) rows) keep their keys and values per layer in a per-model cache (the
-  last 8 voices, keyed by the role, the language, the reference ids and codes, the speaker embedding); a request copies them
-  in and runs its own rows (block_step at the offset). Checks: greedy and sampled generation equal to qwen-tts (the talker
-  verifier), the speech verifier and t/65 PASS; a miss and a hit give identical audio (speak called 3 times: 7.1 s, then
-  4.3 s, the F32 talker on the host).
-- U8 the talker's prefill on the GPU (2026-11-15). The prompt's rows (the request's, and a voice's prefix on a miss) go
-  through the layers on the device (`dev::prefill_block`, `talker_gpu.hip`): the batched rms norm, the tiled matmul
-  `tk_gemm` (fp32 activations over BF16 weights; a tile of 16 rows by 32 tokens, the chunks of 64 in shared memory), the
-  q/k norms with the rotary and the cache store per row, the causal attention per row (the decode step's attention), the
-  residual adds and the SiLU gate. The last row's head is the decode's. The voice prefix stays cached (U7). Checks: the
-  greedy and the sampled generation equal qwen-tts's (200 frames, BF16 talker on the device), the speech verifier PASS; the
-  host path (QWEN3TTS_DEVICE=cpu) unchanged. Timing (222-frame voice, 188 request rows): 637 ms on the host, 181 ms on the
-  device. The server (rocm-hip 90d89ad, the 204-frame voice): the first request 7.4 s (was 11.1), the next 1.9 s (was 5.5),
-  the transcription correct; the output is no longer byte-identical to the earlier one (the prefill sums in another order).
-  The first version (qmatvec's batched product) was not faster: it re-reads each token's activations per output
-  row (266 GB of cache traffic for the prompt). The profile line shows the request rows' time (`request rows`).
-- U9 the predictor's sampler on the device (2026-11-15, item 8). Per frame the predictor's stacks, heads, draws and the next
-  rows' embeddings are launches on the stream (`tk_sample_next`: the top_k by (logit desc, index asc) in a bitonic sort in
-  LDS, the draw from the float softmax with the splitmix state on the device; `tk_gather_row`: the codec embedding of c0,
-  the position advances on the device); the host syncs once for the frame's codes and RNG state. The host path and c0's
-  draw are unchanged. Checks: `tests/talker_sample_verify` (3000 rows: ties, -inf, greedy, top_k 0/1/50/2, the state and the
-  position): 0 mismatches; `qwen3tts_verify` (BF16 talker on the device): greedy 200 frames equal to qwen-tts, top_k 1 equal
-  to greedy, PASS; `qwen3tts_speech_verify` PASS; Perl `t/65-speech.t` 13 pass. Sampled frames for a seed changed (the
-  draw maps the same u to the sorted order); the rule is the same. Timing, predictor per frame (200 frames): idle 16.80 ms
-  before, 16.70 after (the syncs cost nothing when the GPU is the bound); with every core busy (32 busy-loop processes)
-  31.7 and 34.7 ms before, 18.3 and 17.6 ms after: the old per-codebook syncs were exposed to host scheduling.
-  c0 on the device too (same day): `tk_sample_c0` draws the first codebook from the talker's logits with qwen-tts's
-  processing on the device (the repetition penalty by seen flags, the suppressed range except eos, eos from frame 2 on) and
-  resets the predictor's own position (`ppos_dev`); the talker's head writes its normed output into the predictor's first
-  row; the talker's graph of a step is not waited for. One sync per frame (QWEN3TTS_PROFILE adds one after the talker's
-  graph, for its stage times). Checks: `talker_sample_verify` with 600 rows of c0 (0 mismatches); `qwen3tts_verify` on the
-  one-sync path: greedy 200 frames equal to qwen-tts, top_k 1 equal to greedy; `qwen3tts_speech_verify` PASS, two runs the
-  same WAV, Whisper reads the seed-0 speech back as the test sentence; `t/65-speech.t` 13 pass with a clip voice. Sampled
-  frames for a seed changed once more (c0's draw is the device's). The stage times are unchanged (GPU-bound).
-- U10 the codec decoder's convolutions on the device (2026-11-15, item 9; `src/codec_gpu.hip`, the device path in
-  `src/qwen3tts_codec.cpp`; `QWEN3TTS_CODEC_DEVICE=cpu` keeps the host's decoder). From the decoder's input convolution on
-  (about 95% of the multiply-adds): `cd_pad_act` (a layer's padded input: its history, SnakeBeta of the new columns, the
-  next history), `cd_conv` (the causal convolution as a tiled product, 32 rows by 128 columns a block, 2 by 8 outputs a
-  thread, the weights' and inputs' tiles in shared memory per chunk of input channels; the residual add or the next
-  SnakeBeta in its store) and `cd_tconv` (the transposed convolution, rows (channel, phase)). F32 weights read in place
-  (the GGUF mapping registered), the activations in an arena of registered pages (about 110 MB, sized for 32 frames), one
-  sync per piece of 32 frames; the frame-rate stages stay on the host. Every output sums in one order whatever its tile,
-  so pieces give the same bits as one piece on the device too. Checks, on the device and on the host path:
-  `qwen3tts_codec_verify` (cosine 1.0000000, 6e-6 and 8e-6 of the peak against qwen-tts; the host's 7e-6 and 8e-6),
-  `codec_after_verify` (bit-identical after references of 1, 20, 74, 249, 250, 260 frames, the cache hit, a second
-  reference), `codec_encode_verify`, `qwen3tts_speech_verify`, `t/65-speech.t` (13), Whisper reads the speech back. Timing
-  (best of 5): 40 frames 186 ms (CPU 800 ms), 200 frames 0.89 s (CPU 5.2 s). `QWEN3TTS_CODEC_PROFILE=1` prints a piece's
-  host and device times. The three standalone codec tests link the kernel loader and HIP now.
-- U1 threads: the host matmuls and convolutions run on the 16 cores (OpenMP over output rows); real-time factors
-  measured for the speech (talker frames per second) and the transcription (seconds of audio per second).
-- U2 GPU path (UMA: the GGUF map is pinned, so the GPU reads the same pages): decided after U1 by the measured split;
-  the talker's and the whisper's matmuls are the candidates (the engine's existing F32/BF16 GEMM kernels).
-  **Per-linear path, measured 2026-11-13 (`QWEN3TTS_DEVICE=linear`, kept for comparison):** the GGUF mapping registered
-  read-only (`hipHostRegister`, coarse-grained: the UMA pattern of qwen_model's /dev/shm regions), the BF16 linears through
-  `matvec_bf16f` / `matmul_f_bf16f` (fp32 activations: the existing BF16 kernels round the activations to bf16, 1.8e-3 of
-  the peak, too coarse for the talker's checks) via `qmatvec_launch_bf16f`. A warm matvec of 4 MB of BF16 takes 17 to 37 us.
-  But one synchronized launch per linear (~430 per frame) made a frame 77 ms against 52 ms on the host.
-  **Fused talker, done 2026-11-13 (the default; `QWEN3TTS_DEVICE` unset or `gpu`; `QWEN3TTS_DEVICE=cpu` forces the host):**
-  one token's block on the device (`src/talker_gpu.hip`: RMS norm, rotary, the KV cache store and attention, the SiLU MLP,
-  the residual adds, the BF16 matvecs of the per-linear kernels) for the talker's 28 layers and the code predictor's 5
-  layers and 15 heads. The activations are UMA arenas (registered pages); the weights are read in place. One frame syncs
-  about 17 times: after the predictor's first stack, after each of its 15 heads (the sampler reads the logits on the host)
-  and after the talker's head. Checks: the greedy frames equal qwen-tts's (199 frames); the sampled top-k 1 frames equal the
-  greedy; the talker, speaker, codec and speech verifiers pass in the default mode, in `linear` and in `cpu`; the Perl
-  speech test passes (13); three device runs identical. 41 frames: 43.7 ms per frame (1.79 s) against 51 to 55 ms on the
-  host (2.08 to 2.27 s), about 15 to 20% faster. A frame reads about 3 GB of weights (the predictor's five layers 16
-  times); at the 110 to 240 GB/s measured for a matvec that is 13 to 27 ms of the 44 ms. A race found and fixed on the
-  way: the host wrote the codec embedding into the pinned row the predictor's first stack still read; it showed only
-  when the debug syncs were in (a wrong frame 0 without them). A run holds `gpu::run_mu`: one fused talker at a time.
-  Next for the device: fewer launches and syncs per frame (the norm, rotary and the KV store fused into the attention; one
-  kernel per predictor step; the sampler on the device), then the measurement again.
+Verified against the references in the sections that follow. Each row says what works, what is open, and where it runs.
 
-**Image generation (sd-turbo, `/data/hf-small/sd-turbo`):**
-- I1 reference: diffusers is not in the venv (pip install if the registry allows it); the one-step output for a fixed
-  seed and prompt, and the intermediate latents.
-- I2 CLIP text encoder (1024-wide) in the engine; check the embeddings.
-- I3 VAE decoder (2-D convs, group norm, mid attention); check the image from a fixed latent.
-- I4 UNet (2-D convs, resnet blocks, self- and cross-attention transformers, up/down sampling); check one denoising
-  step's output.
-- I5 scheduler, the one-step sampler, PNG encoding (zlib), and `/v1/images/generations`.
+| Feature | Works now | Open |
+|---|---|---|
+| **Speech output** (`/v1/audio/speech`, Qwen3-TTS 0.6B) | `wav`, `pcm`, `flac` native; `stream` for `wav` and `pcm`; `mp3`, `opus`, `aac` through ffmpeg in the image (`t/69`: 37 of 37); voices from audio (`POST /v1/audio/voices`, a voice clone from new audio); long texts in pieces with the seed per piece; the BF16 talker is the default, the Q8_0 predictor an option | Pieces do not share prosody (decided: kept); a streamed WAV's header is not a finished file; the sampled frames are not torch's (its generator); one request at a time per talker |
+| **Speech input** (`/v1/audio/transcriptions`, Whisper tiny) | `json` and `text`; any length, in 30 s windows with the timestamp seek rule and the temperature fallback; `task` transcribe or translate; WAV decode for any rate (band-limited resampler, soxr-like) | The cut between windows is a pause, not a timestamp; the timestamp rules are the decoder's own choices; languages other than English are checked only on the token table (plus one French clip); the GPU path (the host runs it: about 0.4 s for the encoder per window) |
+| **Vision** (`image_url` in chat, Qwen3.5-0.8B checked) | `--mmproj` with `data:` URLs (a URL is refused; an image without `--mmproj` is a 400); the image's chat matches transformers (cosine 0.999987, the reply tokens equal) | `--parallel` above 1 refuses images; the tower runs on the host in float32 (a GPU path would save at most 0.5 s an image: not started); the 4B and the 122B share the architecture but are not checked; the store does not share image sequences |
+| **Image generation, sd-turbo** (`/v1/images/generations`) | PNG (`b64_json` or `png`), sizes 64 to 1024 in multiples of 8, the GPU path by default (512 x 512 in 3.3 s) | One image at a time; the seeded noise is not torch's (the reference is the proof of the arithmetic); only sd-turbo's one-step sampler; the VAE's convolutions (the GEMM) are next for speed |
+| **Image generation, MiniMax-H3-Image** (`--minimax DIR`) | the pipeline end to end on the original checkpoints (the DiT, PDD heads and VAE read in place; the text encoder from its GGUF); 256 x 256 in about 166 s; the Q8_0 and ROCmFP4 DiT on the device; the last 32 prompts' embeddings cached; images queue, one at a time | Item 8 above (the released-pipeline check, FP8, the text encoder's source, block-30 drift) |
+| **Qwen3.5 text** | qwen35 and qwen35moe run; the plain-text attention checks pass; plain Qwen3.5 text was not re-run after the M-RoPE change | None listed |
 
-  **Status 2026-11-13:** I1 done: `/data/image-ref/sd-turbo/dump.py` (diffusers 0.35.2 isolated in `/data/diff-site`, the
-  pip install with its small dependencies only: no numpy or torch there) writes the one-step reference (seed 0, "a photo of
-  a red fox in the snow", float32): `prompt_embeds.npy` (1 x 77 x 1024), `noise.npy` (1 x 4 x 64 x 64), `unet_out.npy` (the
-  UNet at t = 999), `latents_after_step.npy`, `image_u8.npy` and `image.png` (512 x 512). The components: UNet2DConditionModel
-  (SD 2.x: channels 320/640/1280/1280, layers 2, heads 5/10/20/20, cross-attention 1024, linear projections, GroupNorm 32),
-  CLIPTextModel (1024 wide, 23 layers, 16 heads, FFN 4096, GELU, 77 tokens), AutoencoderKL (latents 4, scale 0.18215,
-  128/256/512/512), EulerDiscreteScheduler (trailing spacing, epsilon). The fp16 weights (`*.fp16.safetensors`) are
-  the files read: the converter writes them as F16 copies (the checkpoint's values), the engine reads them in place.
-  **I2 done 2026-11-13:** the converter (`rocm-convert` of a diffusers folder: `Convert::Diffusers`, one GGUF of 1306
-  F16 tensors named `te/un/va` + index, the checkpoint's names as KV arrays `sd.names.*`, the component configs as
-  `sd.te/unet/vae/sched.*`, the CLIP vocabulary and merges as `sd.tok.*`, the pad and bounds as `sd.te.pad/bos/eos`; 2.58
-  GB, `/data/image-ref/sd-turbo/sd-turbo-f16.gguf`). `src/sd.{h,cpp}`: the CLIP tokenizer (byte-level BPE, the word-end
-  marker; the reference's fast tokenizer splits each "!" as a word of its own without the marker: reproduced) and the
-  23-layer causal text encoder (F16 read in place, F16C conversion, exact GELU, the final layer norm).
-  `tests/sd_text_verify.cpp` (`make build/sd_text_verify`): the reference prompt's 77 ids equal transformers' CLIPTokenizer,
-  three more prompts with capitals, contractions and punctuation equal too; the embeddings equal diffusers' encode_prompt
-  at worst row cosine 1.0000000 (1.3e-6 of the peak 13.0).
-  **I3 done 2026-11-13:** the VAE decoder (`sd_vae_decode`: the post-quant 1x1 conv, conv_in, the mid block's two resnets
-  with one attention head over the positions, four up blocks of three resnets with nearest upsampling and a 3x3 conv,
-  GroupNorm 32 (eps 1e-6), SiLU, conv_out; direct convolution along the rows, OpenMP over the channels). `tests/sd_vae_verify`
-  (`make build/sd_vae_verify`): the float decode of the reference latents at cosine 1.0000000 and 1.7e-6 of the peak 9.85
-  against diffusers' decode (16.7 s on 16 threads: unoptimized; the GPU's job).
-  **I4 done 2026-11-13:** the UNet (`sd_unet`: the sinusoidal time embedding, ResnetBlock2D with the time projection,
-  Transformer2DModel with linear projections, self- and cross-attention (heads of 64), GEGLU; the down, mid and up blocks
-  with the skip connections; the stride-2 downsamplers, the nearest upsamplers). `tests/sd_unet_verify.cpp` (`make
-  build/sd_unet_verify`): one prediction at t = 999 against the pipeline's captured call (its input, the prompt's states,
-  its output): cosine 1.0000000, 1.7e-6 of the peak 6.85; 8.1 s on 16 threads. The pipeline's latents: `prepare_latents`
-  scales the latents it is given by sigma once more (the reference's initial latents are noise * sigma^2; the UNet input
-  is noise * sigma, as captured: the Euler step is latents - sigma * eps, checked).
-  **I5 done 2026-11-13:** the sampler (`sd_generate`: the one Euler step to sigma 0 from sigma = 14.6147 (the scaled-linear
-  schedule at t = 999), the VAE, diffusers' postprocess to 8 bits), the PNG (`sd_encode_png`: zlib, IHDR/IDAT/IEND, CRCs),
-  the seeded latents (`sd_random_latents`: a Mersenne Twister and Box-Muller, not torch's sequence). `tests/sd_image_verify.cpp`
-  (`make build/sd_image_verify`): the reference image (512 x 512, seed 0 of the pipeline) reproduced: 99.9961% of the bytes
-  equal (the reference was noise, its latents scaled twice; corrected in I6), the largest step 1, the PNG written by the engine decodes (PIL) to the same pixels. The Perl binding
-  (`ROCm::Inference::sd_load($gguf)->generate($prompt, size => '512x512', seed => N)` returns the PNG bytes; `t/67-image.t`,
-  env-gated: 7 checks pass) and the server (`--sd FILE.gguf`, `POST /v1/images/generations`: prompt, size (multiples of 8,
-  64 to 1024), n (1), seed, response_format b64_json (default; the PNG in data[0].b64_json) or png (image/png); checked:
-  a 128 x 128 image in 3.3 s, the 400s). Measured on the host (16 threads): a 512 x 512 image takes about half a minute
-  (text 0.5 s, UNet 8 s, VAE 17 s): the VAE and the UNet's convolutions are the next speed items (the GPU's job: the
-  same fp16 weights in place). Not yet: the torch-identical seeded noise (the reference image is the proof of the
-  arithmetic, not of the seed), the multi-step samplers (sd-turbo is one step), the server's one image at a time.
-  **I6 done 2026-11-13 (the image path on the GPU, the default; `SD_DEVICE=cpu` is the host):** `src/sd_gpu.hip` (the
-  kernels: one strided GEMM with F16 or float A operands in 64 x 64 tiles, the im2col of the convolutions, the GroupNorm in
-  three passes, the softmax rows, LayerNorm, SiLU, the residual add, GEGLU, the nearest upsampling) and `src/sd_device.{h,cpp}`
-  (the launches, a pool of pinned device-visible memory `sddev::Floats`, the GGUF mapping registered read-only so the F16
-  weights are read in place). The UNet's and the VAE's activations are `Floats`; the primitives dispatch to the device and
-  the channel planes are read by the GEMM's strides (no transposes). The CLIP text encoder stays on the host (`HostOnly`).
-  A device run is serialized (`sddev::run_mutex`). Measured for 512 x 512, one step: UNet 1.3 s (host 10.9 s), VAE 1.9 s
-  (host 17 s), the image 3.3 s (host 28 s). Checks on both paths: `sd_text_verify`, `sd_unet_verify`, `sd_vae_verify`,
-  `sd_image_verify` (99.92% of the bytes equal, the largest step 1), `t/67-image.t` (7 of 7).
-  **The reference was noise, now corrected:** `/data/image-ref/sd-turbo/dump.py` passed the pipeline `noise * init_noise_sigma`,
-  and diffusers' `prepare_latents` scales the given latents by `init_noise_sigma` again (diffusers 0.35.2,
-  pipeline_stable_diffusion.py), so the reference and the engine's check both used noise * sigma^2: their images were noise
-  (the 99.99% match was of two noise images). The dump now passes the noise as it is (one scaling) and writes the raw
-  files the verifiers read; the check starts from noise * sigma. The endpoint (`Inference.xs`, `lat *= sigma` once) was
-  already right: `generate("a photo of a red fox in the snow", seed => 0)` gives a fox. Open: the GEMM is a plain fp32 tile
-  (the VAE's 3 x 3 convolutions are most of its 1.9 s: a WMMA or a larger tile is the next step), the resnets' per-channel
-  time add is a host loop, and the server's one image at a time (see above) still holds.
+Not on this host, or not checked: the 4B and 122B vision towers; the Whisper GPU path (only whisper-tiny is here); other
+languages' transcription beyond the French clip; ffmpeg's encoders on any host other than the image (t/69 uses the one
+installed here).
 
-**MiniMax-H3-Image (requested 2026-11-12: "should be supported too"; `MiniMaxAI/MiniMax-H3-Image` on Hugging Face,
-code at github.com/MiniMax-AI/MiniMax-H3-Image; the user confirmed the license is fine for this project, 2026-11-12).**
-Text-to-image and image editing. Checkout: `/hf/MiniMax-H3-Image` (its git LFS objects are complete: 55 of 55 match
-their pointers' sizes, 204 GB; the working tree holds pointer files, so rocm-convert reads the objects through
-`lfs_path`, no checkout needed; checked 2026-11-13). Config: the transformer is a `MiniMaxH3DiTModel` (50 layers, hidden
-5376, 56 heads of 128, FFN 14336, 2 token-refiner layers, text width 5120, 24 latent channels, patch 1 x 2 x 2, adaLN,
-time embed 2688); the text encoder is `Qwen3VLForConditionalGeneration` (64 layers, hidden 5120, 64 heads / 8 KV of 128,
-FFN 25600, rope theta 5e6, M-RoPE interleaved sections 24/20/20: text-only positions reduce to plain RoPE; its
-`model.visual.*` tower is not needed for t2i); the VAE `MiniMaxH3ImageVAE` has 24 latent channels with per-channel mean
-and std; the sampler is `MiniMaxH3Scheduler` (euler, velocity form) with 6 sigmas (`model_index.json` task list t2i, edit);
-`pdd_fused_heads.safetensors` (12 MB) and `pdd_config.json` (the 6-step sigma schedule) come with it. Reference code (the
-modeling and pipeline of diffusers 0.43): `/data/minimax-ref/diffusers` (outside the repo; the `python/` package of the
-clone is still absent). Sizes: transformer 65 GB and text encoder 67 GB in BF16, the VAE 2.3 GB; /data had 147 GB free
-on 2026-11-13.
+## Per-model gaps
 
-Memory: the two large parts together (134 GB of BF16) do not fit the 128 GB UMA resident at once, and a registered
-mapping stays pinned. So the text encoder runs first (the prompt's embeddings, a few MB), is released (unregistered and
-unmapped), and only then the DiT is registered. Text encoding is one call per prompt, so the cost is the load (the page
-cache is cold again for each).
+From PLAN.md's notes, not re-tested for this summary. A blank means no open item is recorded.
 
-Milestones (each verified against the reference before the next; the image quality is the constraint, so BF16 for the
-DiT and the text encoder, no ROCmFP4 unless the user asks for it):
-- M1 text encoder: the Qwen3-VL text part converted to GGUF (a `Qwen3VLForConditionalGeneration` converter as a
-  subclass of the Qwen3 one, prefix `model.language_model`, the visual tower skipped); the engine's prompt hidden states
-  equal transformers' for the reference prompts (cosine ~1 per layer used). **Done 2026-11-13:** `rocm-convert` reads the
-  text encoder from the LFS objects (`ROCm::Inference::Convert::Qwen3VL`, 707 tensors, 65.5 GB BF16 GGUF in 103 s, at
-  `/data/minimax-h3/text-encoder-bf16.gguf`); `tests/mm_te_verify` (`make build/mm_te_verify`) runs the engine's prefill
-  on three reference prompts and compares the residual after layer 50 with transformers' `hidden_states[50]` (reference
-  from `/data/minimax-ref/te/mm_te_ref.py`, CPU bf16): worst row cosine 0.99993 to 0.99994, the largest element 1.1% of the
-  peak (about 170 to 220 of 15000 to 16000): the reference's bf16 residual stream against the engine's fp32, accumulated
-  over 50 layers (not isolated; the cosine is the criterion here). The engine's dense-layer path is qwen3's, so the
-  conditioning is the same code the Qwen3 models run.
-- M2 VAE: `MiniMaxH3ImageVAE` decoder, checked against diffusers on a fixed latent (cf. sd_vae_verify). Corrected
-  2026-11-13 from reading `/hf/MiniMax-H3-Image/vae` (the 2.3 GB file's tensors): it is not a conv decoder. The decoder is a
-  ViT: `x_embedder` (24 latent channels to 1024 per token), 4 register tokens and a mask token, 24 transformer blocks at
-  width 1024 (16 heads of 64, QKV fused, RMS-normed q and k without affine, gated SiLU FFN 4096, layer scales `scale1`
-  and `scale2`, 2-D RoPE with theta 100 and half of the head dim), `norm_out`, and `proj_out` to 768 values per token
-  (3 x 16 x 16: one output token is a 16 x 16 pixel patch; how the latent positions map to tokens is in the reference). The encoder
-  (3-D causal convs, `vae_clip_length` 17) is for edit only. Per-channel latent mean and std from the config. Tiled decode
-  (`vae_tile_size` 256, overlap 64) in the reference. Reference: `/data/minimax-ref/diffusers/models/autoencoders/
-  autoencoder_kl_minimax_h3_image.py` (838 lines).
-  **Done 2026-11-13:** `rocm-convert /hf/MiniMax-H3-Image/vae` writes the decoder as F32 (no conversion: the file's own
-  values; `Convert::MiniMaxVAE`, 300 tensors, 1.62 GB, names as the checkpoint's, the latents' mean and std as tensors) at
-  `/data/minimax-h3/vae-decoder-f32.gguf`. The engine: `src/minimax_vae.{h,cpp}` and `src/minimax_vae.hip` (the ViT on the
-  device: `sddev::linear_f32` (the GEMM now takes a float bias too), `mv_rmsnorm`, `mv_layernorm`, the 2-D rotary, the
-  scale-and-add, SwiGLU, the unpatchify); the reference's tiles (`_split_tiles`, `_stitch_tiles`, `_blend`) in the host code.
-  `tests/mm_vae_verify` against diffusers 0.43.0 (`mm_vae_ref.py`; the checkpoint's keys mapped to diffusers' names: the fused
-  `to_qkv` split in thirds, `ff.w1` / `ff.w2` as `ff.net.0.proj` / `ff.net.2`, `x_embedder` as `proj_in`): a 16 x 16 latent
-  (one tile) cosine 1.0000000, max difference 2e-5 of the peak; a 40 x 40 latent (9 tiles, blended) cosine 1.0000000, 5e-5 of
-  the peak. Two seconds for both with the load. The device is required (no host path yet). diffusers 0.43.0 is in
-  `/data/diff43b` (installed without its dependencies; import with `PYTHONPATH=/data/diff43b:/data/diff-site`).
-- M3 DiT: `MiniMaxH3DiTModel`, the t2i path (one packed sequence: text rows, then the generated image rows; no
-  reference images). **Converted 2026-11-13:** `rocm-convert` now knows it (`Convert::MiniMaxDiT`: the checkpoint's
-  531 tensors in BF16 copied raw, the names as they are, the configuration as keys `minimax_h3_dit.*`): 66.28 GB at
-  `/data/minimax-h3/dit-bf16.gguf`, 64 s. Before this the answer to "does rocm-convert convert it" was no: the
-  architecture was not in its list, so it is a converter module like the VAE's (BF16 is copied, not re-encoded).
-  Spec read from `/data/minimax-ref/diffusers` (2026-11-13):
-  - Token layout: `text_token_tags` 1 for the prompt rows (the text encoder's hidden state 50, through `condition_proj`
-    (5120 -> 5376) and the 2-block `token_refiner` (plain pre-norm, no AdaLN, no RoPE, full attention over the text, the
-    `final_norm`)), then the image rows with tag 0. Latent (24, H/16, W/16) patchified to tokens of 24 x 1 x 2 x 2 = 96
-    values, layout (c, ph, pw) per token, tokens row-major over (h', w'), `video_patch_proj` (96 -> 5376). Image tokens for
-    1024 x 1024: 32 x 32 = 1024. The unpatchify is the exact inverse (the decoder's input order, M2).
-  - Rotary: 3 axes (t, h, w) of 16 frequencies each, `inv_freq[k] = 10000^(-k/16)` (rope_theta 10000, the default; the
-    config does not set it), concatenated and doubled: 96 rotated channels of the 128-wide head, rotate-half. Text rows:
-    t = 0..T-1, h = w = 0. Image rows: t = T, and (h, w) on the grid `2 * sqrt(area)`-normalized of
-    `np.linspace(left, left + ratio, n, endpoint=False) * 32` with ratio = n / sqrt(area), left = (1 - ratio) / 2
-    (`_spatial_position_grid`, float64): for a square canvas, the centres of 32 cells over [0, 32).
-  - Timestep: one value per step, t = 1 - sigma (the sigmas of `pdd_config.json` 1, 0.9675, 0.8875, 0.75, 0.5328, 0.2320 give t = 0, 0.0325, 0.1125, 0.25,
-    0.4672, 0.768 for the six steps), unscaled.
-    `time_proj`: sinusoid of 256 with `flip_sin_to_cos` (cos first), downscale shift 0; then `time_embedder`
-    (linear 256 -> 5376, SiLU, linear 5376 -> 2688; the checkpoint's `proj_in` / `proj_out`).
-  - AdaLN, per block: `adaln_proj.linear` (2688 -> 6 x 5376 x 3, bias) on SiLU(temb); the 6 chunks are shift, scale, gate
-    for the attention and for the MLP, each a table of rows `t * 3 + tag` (tags: 0 image, 1 text). Each row of the
-    sequence picks its row by that index. Attention and MLP: x = x + gate * f(RMSNorm(x) * (1 + scale) + shift).
-  - Attention: fused `attn.qkv_proj` (5376 -> 3 x 5376, no bias) split into q, k, v (56 heads of 128); RMS-normed q and
-    k per head (eps 1e-5, no affine); rotary; non-causal full attention over the whole sequence (text and image rows
-    together); `attn.out_proj` (no bias).
-  - MLP: `mlp.fc1` (5376 -> 2 x 14336, no bias): the first half is the value, the second the gate: value * SiLU(gate);
-    `mlp.fc2` (14336 -> 5376, no bias).
-  - Output: `final_layer.norm` (RMSNorm with weight, eps 1e-5) then `final_layer.adaln_proj.linear` (2688 -> 2 x 5376,
-    bias): shift, scale per timestep row (`timestep_indices`, all 0 for t2i): x * (1 + scale) + shift; then the PDD head
-    of this step: `pdd_fused_heads.safetensors` (`video_out.weight` [6, 96, 5376], `video_out.bias` [6, 96], F32: one
-    head per sampling step; the checkpoint's own `final_layer.video_out` is not used by the pipeline's `pdd_proj_out`).
-    Velocity of the image rows only.
-  - Sampler (`MiniMaxH3Scheduler`, euler velocity form, no guidance: it is baked in, so one forward per step, six
-    forwards per image): x_{i+1} = x_i + (sigma_i - sigma_{i+1}) * v_i. Initial x: noise (N(0, 1), 24 x H/16 x W/16).
-  - Cost (corrected with the inner width 7168): about 0.39 GMAC per token per block (qkv 115M, out 38M, fc1 154M, fc2 77M),
-    50 blocks: 19 GMAC per token, 1100 tokens: 21 TMAC per forward (42 TFLOP), six forwards per image: about 250 TFLOP at
-    1024 x 1024. The adaLN projections are per timestep
-    (13 GB of the 66 GB, applied once per block per step). At the fp32 tile's 3 TFLOPS that is a minute and a half per
-    image: BF16 operands in a tensor-core GEMM are needed for a usable speed (M3's second half).
-  - **Engine done 2026-11-13 (`src/minimax_dit.{h,cpp}`, the BF16 GEMM mode in `sd_gpu.hip`, the AdaLN kernels in
-    `minimax_vae.hip`), verified:** `tests/mm_dit_verify` against `tests/mm_dit_ref.py` (diffusers 0.43.0 in bf16 on the
-    GPU, the checkpoint's values, a 16 x 16 latent with the 9-token prompt): the velocity cosine 0.99995 at step 0 and
-    0.99995 at step 5 (max difference 2e-2 of the peak 1.8). Three things were wrong on the way and are fixed: the
-    RMS-norm launch (one block per row, not one per 256 elements), the prompt's host copy passed to the device, and the
-    checkpoint's F32 linears (`video_patch_proj`, the time embedder: read as F32 in place). The attention is 56 heads of 128
-    (inner width 7168, not 5376: the QKV rows are 21504, `out_proj` is 5376 x 7168). The cost at 1024 x 1024 (1024 image
-    tokens): **11.4 s per forward** (was 40 s) since the linears run on the tensor cores (`sd_gemm_wmma`: BF16 weights, the
-    activations rounded to BF16 on load, F32 accumulate; a 64 x 64 tile, a 64-wide k-tile, 4 waves of 2 x 2 WMMA 16 x 16 x 16
-    tiles; the same cosines, 0.99995): the linears 6.2 s (about 7 TFLOPS). The attention on the tensor cores too (head width
-    128: BF16 scores and values as batches over the heads, the softmax in F32 written as BF16 with zero pads): 2.7 s (was 4.4
-    s), the whole forward **9.7 s** at 1024 px. Tuning (2026-11-13): a 128 x 128 tile, eight waves of 32 x 64 (2 x 4 WMMA
-    tiles): the linears 6.1 s to 3.7 s (about 11 TFLOPS), the forward **7.2 s**. Tried and not kept: the activations converted
-    to BF16 once and read as 16-byte vectors (`sd_gemm_wmma128bb`, kept in the source): 5.9 s for the linears, slower (the
-    per-call temporaries and their syncs); a wave per softmax row (`sd_softmax_bf16_w`): 3% of the attention. Attention 2.6 s
-    is the two K = 128 batched GEMMs and the F32 score buffer (240 MB per layer): a fused flash-style kernel is the next
-    step for it. The six-step sampler (`mmdit_sample`) against the reference's six steps from the
-    same noise: cosine 0.999993 (`tests/mm_dit_verify`, `tests/mm_dit_ref.py`). Still open: a larger BF16 tile, the
-    attention's softmax passes, and the server's wiring for the DiT.
-  **Speed and server (2026-11-13, items 1 and 2):** a 256 request (generated on the 2048 canvas, 4105 tokens) takes **222 s**
-  end to end, down from 352 s: the flash attention (`sd_flash_attn`) and the 256 x 128 GEMM tile for the large token counts
-  (the linears 27 s to 17.7 s per forward; the released-canvas sampler cosine unchanged, 0.993806). Phases (`MM_PIPE_DEBUG=1`):
-  text 12 s, DiT load 17 s, sampler 169 s, VAE 23 s. Still open: the linears (about 9 TFLOPS: a larger LDS stage or a
-  256 x 256 tile), the flash kernel (about 2.5 TFLOPS), and the DiT weights read from the mapping on every forward. The server
-  route is in: `--minimax DIR` (`ROCm::Inference::MiniMaxImage`), `/v1/images/generations` with `"model": "minimax-h3-image"`
-  (default 1024 x 1024, sizes multiples of 32 from 256 to 2048); `t/68-minimax-image.t` passes its four checks.
-    (The earlier line: the sampler (`mmdit_sample`) is written but not yet
-    compared end to end.
-  - Plan (as written before the engine): (a) the engine's BF16 A operand in the GEMM (the bf16 weight's high half in a float, as the F16 path does);
-    (b) `src/minimax_dit.{h,cpp}` with the token refiner, the blocks, the output, the sampler; (c) the verifiers:
-    per-block against diffusers (block 0 with the real weights, fp32 reference from the same BF16 values; the modules
-    built from the reference classes, the checkpoint's keys mapped: `attn.qkv_proj` to `attn.to_qkv` fused, `blocks.N` to
-    `transformer_blocks.N`), then the whole forward on a small canvas (256 x 256) against a torch BF16 run on the GPU
-    (the full model fits the UMA as a device model; the CPU reference cannot hold 132 GB as fp32).
-- M4/M5 pipeline (2026-11-13): `src/minimax_pipe.{h,cpp}` runs prompt -> text encoder (layer 50, the M1 path; the prompt's ids
-  match the reference's: 9 tokens for the fox prompt) -> the encoder released -> the DiT sampler (6 steps, seeded noise) -> the
-  VAE decoder -> pixels (decoded * ImageNet std + mean, clamped, truncated to 8 bits). `tests/mm_pipe_verify` writes a PNG:
-  256 x 256 in 56 s, 1024 x 1024 in 85 s. **Open, and the reason the server is not wired yet:** the images have no global
-  structure: a grid of independent 16 px blocks with texture but no composition (a fox is not visible at either size). Every
-  stage matches the diffusers model code (the DiT velocity 0.99995, the sampler 0.999993, the VAE 1.0000000, the text ids), so
-  the gap is in what the reference pipeline does around those modules, or in what the reference would produce for these
-  latents. Candidates to check against the released pipeline, not yet verified: the timestep convention (t = 1 - sigma), the
-  rotary's spatial scale (32) and the frame clock, the velocity update's sign convention, the adaLN row selection for the
-  text rows, and whether the released checkpoint expects guidance or a prompt template that the modular pipeline adds. The
-  server's `/v1/images/generations` (`--sd`) is unchanged: the MiniMax route waits for the quality check.
-  **Checked 2026-11-13:** the timestep (the scheduler's `timesteps` are `1 - sigmas[:-1]`), the initial noise (`randn` of
-  `(1, 24, 1, h, w)`, the same shape as the engine's), the velocity update, and the absence of guidance and of a prompt template
-  all match the reference code. The reference chain alone (diffusers' DiT with the prompt's states, six steps, diffusers' VAE,
-  `/data/minimax-ref/dit/reference_sample_256.png`) shows the same patch grid, so the engine reproduces the reference's output;
-  the open question is whether the reference chain reproduces the released model, which needs the released pipeline (not
-  runnable here: its components together exceed the 124 GB of memory).
-- M4 sampler and PDD: the six-sigma euler velocity loop, the fused heads from `pdd_fused_heads.safetensors` (check
-  what they replace), t2i end to end against the diffusers pipeline (same seed, the same initial noise).
-- M5 server: the image endpoint's model choice (the request's `model` field; today there is one `--sd` file), the
-  size limits (up to 16 MP per the card), the edit task (`/v1/images/edits`) after t2i.
+- **GLM-5.3-Flash (glm5-next):** no store resume for GLM's state (item 2). CPU-only speed 2.9 tok/s (earlier); the
+  deployment is unmeasured (item 3). Memory on the real model is unmeasured at a long conversation (the pinned rows and
+  the page cache for the CPU experts). The MTP block (blk.45) is not bound as a draft head: the index is shared, so a
+  verify's rollback must roll it back too. Sparse MLA prefill is about 40% of a long prefill and is not on WMMA. Batched
+  sequences are not supported. Its vision track (`glm5_next_vision`) is not started. Speed work tabled (user: 4.3-7.6
+  tok/s is fine).
+- **Qwen3.8-Flash-Next (qwen4exp):** item 12 (MTP acceptance and tok/s, PLE parallel reads, draft events, YaRN, memory on
+  124 GB). Its `--parallel` and store checks are on the deployment (item 10).
+- **Qwen3.5 (0.8B, 4B, 122B):** vision on the host only; `--parallel` refuses images; the 4B and 122B vision not checked.
+- **Qwen3.6-35B:** the full regression's perplexity baselines are not recorded (item 6). The MoE decode streams its experts at
+  about 125 GB/s against about 200 for dense layers (latency-bound launches). Its Q4_0 forward_verify drifts to cos 0.989 at
+  layer 21 (smooth; the next token equals llama.cpp's); the suite's row uses min cos 0.985.
+- **Qwen3.8-27B (dense, ROCmFP4_FAST):** compute-bound on `matmul_wmma_q4_0_rocmfp4_fast` (about 26 of 59 TOPS, 70% of a 32k
+  prefill). The epilogue fix (FP16 WMMA on pre-scaled weights, twice the LDS) is tabled.
+- **Qwen3 (0.6B and the rest of the family):** prefill against token-by-token decoding is a bound, not exact (up to 0.4
+  logits on Qwen3-0.6B; the top token the same). Exact only with `QMATVEC_NO_WMMA=1`.
+- **Gemma-4 26B (gemma4):** prefill is fp32 for Gemma (about 3x slower than the WMMA prefill; see "Done in this round").
+  Its streamed and chat checks are open (item 13).
+- **Nemotron-3 (Nano, Super):** the reply format is not checked against its template.
+- **Llama 3.x:** no Llama 3.1 files here; its built-in tools (`<|python_tag|> brave_search.call(...)`) are not parsed.
+- **Mistral:** llama architecture with a SentencePiece tokenizer; untested (an older architecture, tabled).
+- **EmbeddingGemma (gemma-embedding):** none open.
+- **Qwen2.5-0.5B:** no quantized KV cache (2 x 64 cannot satisfy `n_kv * D % 256 == 0`).
+- **DeepSeek-V4 (deepseek4):** not implemented: the engine has no KV compressors, hash routing or grouped output projection.
+  Like GLM it does not fit 128 GB resident and would use the expert pager. Its MTP layer is a separate draft file (later).
 
-Open: the license check (the user's confirmation covers the project; the community license terms are the upstream's),
-the PDD heads' role (not read yet), and the throughput target (the card's 6 steps at 1024 x 1024 is the reference).
+## Done in this round (kept short; details in git)
 
-**ComfyUI backend (backlog, planned 2026-11-13; see "ComfyUI backend" under Later).**
+- Gemma-4 prefill keeps fp32: the WMMA matmul and flash attention are off for a Gemma prefill only. Prefill matches
+  token-by-token decoding exactly (commit `08d968b`). The cost: 620 tok/s instead of 1840 on a 562-token prompt.
+- Quick regression: 47 of 47 (`b4b5b97`: `tests/regress.sh` puts `build/` on `LD_LIBRARY_PATH`).
+- Request logs: one file per hour (`f75975c`).
+- Earlier: the lazy KV registration (the GLM state and every KV slot); the sliding-window ring with lazy KV (Gemma-4); the
+  MTP draft under lazy KV (qwen4exp tiny pair); the `events_test` progress fix; the nginx configuration and fixup; the
+  Dockerfile's nginx modules; the Q8_0 predictor's selection (BF16 default); the vision linears (2x); `HIP_CHECK`
+  consolidation; the LRU stale-block test; the Q6_K encodes and the Q8_K decode-only check.
 
-Dependencies: V5 and A4 / T4 / I5 need the server's API work (multipart, binary responses); the decoders for PNG, WAV
-and the codec are small C files. Order: V1-V5 first (the Qwen3.5 checkpoints are local and the test is the same
-architecture as the user's deployed models), then A1-A4 (the smallest engine change of the three audio/image paths),
-then T1-T4, then I1-I5 (the largest: UNet and VAE kernels are new).
-
-**Investigated 2026-11-12 (the background for the phases above):**
-
-Asked for: OpenAI-style `/v1/audio/transcriptions`, image input, image generation and audio generation. Local
-checkpoints: the Qwen3.5 family (0.8B, 4B, 122B-A10B, and the Qwen3.6 NVFP4 copy) carries a vision tower (the 4B's
-safetensors: 297 `model.visual.*` tensors, 24 blocks, hidden 1024, patch 16, spatial merge 2, out 2560;
-`image_token_id` 248056); GLM-5.3 and DeepSeek-V4.1 have vision configs too. No local model has an audio config, and
-there is no diffusion, TTS or Whisper checkpoint in /models. The engine has no encoder, no cross-attention, no mel / STFT,
-no image decoder and no multipart parsing (`qwen_ops.h`: M-RoPE is reduced to plain RoPE for text).
-
-Downloaded for the test (2026-11-12, `/data/hf-small`, 5.7 GB, from Hugging Face; the fetch script is `fetch.py`
-there): `whisper-tiny` (openai/whisper-tiny, 151 MB: encoder-decoder, 4 + 4 layers, d 384, 80 mel bins, 1500 source
-positions), `sd-turbo` (stabilityai/sd-turbo, fp16 UNet / VAE / text encoder: an SD 2.1-type UNet with
-cross-attention dim 1024, one-step sampling), `Qwen3-TTS-12Hz-0.6B-Base` (2.4 GB: a talker LM plus a speaker encoder)
-and `Qwen3-TTS-Tokenizer-12Hz` (651 MB: the codec whose `decoder_config` turns codes into audio). The vision test
-needs no download: `/hf/Qwen3.5-0.8B` and `/hf/Qwen3.5-4B` (safetensors) carry the vision tower. The user's own local
-models live outside this host's mounts (their deployment's `/mnt/data3/models` is not visible here): paths needed
-to test them here.
-
-Ranked by fit:
-1. **Image input (vision chat)**, best fit; the test model is Qwen3.5-4B (BF16 GGUF local, the vision tower in its
-   safetensors). Needs: (a) the converter writes the tower (it stops on vision tensors today, ARCHITECTURE s4); (b) the
-   ViT forward on the GPU: patch conv, 2-D positions, full non-causal attention per image (the flash kernel is
-   causal: a non-causal variant), GELU MLP, spatial merger; the matvec and norm kernels are reused; (c) M-RoPE: a
-   (t, h, w) position per token for image spans; (d) image decoding (PNG / JPEG: vendor stb_image, or pass decoded
-   pixels), resize to multiples of patch x merge, normalize; (e) splice the merged embeddings at the image pad tokens,
-   bidirectional inside each image; (f) the KV store's block keys include an image hash - two images with the same
-   pad tokens would otherwise reuse each other's KV (fix before enabling it); (g) `image_url` parts in chat messages
-   (data: URIs in the JSON, no multipart). Test: against transformers (torch 2.6 CPU and transformers 5.5.1 are in
-   /data/hf/venv) on a tiny random vision checkpoint (a generator like tools/gen_*_ckpt.py), then on the 4B. About
-   3-4 sessions.
-2. **Audio transcription**, no local model. Whisper is encoder-decoder with cross-attention, which the engine lacks.
-   A decoder-only audio LLM (an audio encoder feeding the LM, as Qwen's speech models do) reuses item 1's splice and
-   is the closer path; choose the model first. Also needed: the mel spectrogram (STFT in C), a conv stem, and
-   multipart/form-data uploads (Web::Route parses JSON; check). About 2-3 sessions after item 1 if decoder-only;
-   more for Whisper.
-3. **Audio generation (TTS)**, no local model. A speech LM emits codec tokens (decoder-only: the engine can run it),
-   then a codec decoder turns them into audio: 1-D transposed convolutions and snake activations, new kernels. Large;
-   wait for a chosen model.
-4. **Image generation**, no local model. A diffusion or flow model (UNet or DiT), a VAE decoder (2-D convs, group
-   norm), a text encoder, a scheduler, and a PNG encoder: none of it exists here. A separate engine, the largest item.
-
-Models chosen for the tests (downloaded above): item 2 whisper-tiny (encoder-decoder, so it shows what the engine
-must add); item 3 Qwen3-TTS 0.6B with its tokenizer; item 4 sd-turbo. Still open: whether the server decodes images
-(item 1) or takes decoded pixels; the paths of the user's own local models, if they should be tested on this host.
-
-## Later
-
-### ComfyUI backend (backlog, planned 2026-11-13)
-
-Asked for: use the engine as a backend for ComfyUI (`/comfyui` on this machine: the user's model library). Decided with the
-user: option 1 (a ComfyUI custom-node package that calls our HTTP server), models converted to GGUF by rocm-convert (one
-format, mapped in place), and the image models kept at BF16 (safetensors is BF16 or F32 for most of them; a GGUF quant
-down to 4 bits reduces image quality more than it saves, so ROCmFP4 only as an explicit choice, and FP8 sources stay
-FP8 in the engine's FP8 operand path, not re-quantized). The priority is the MiniMax-H3-Image work above.
-
-Inventory of `/comfyui` (178 GB of safetensors, 28 files, all valid with exact sizes on 2026-11-13; 17 GB free):
-- Z-Image-Turbo (`diffusion_models/z_image_turbo_bf16`, S3-DiT, 30 blocks, dim 3840, FFN 10240, text dim 2560 = Qwen3-4B,
-  which the engine runs as `qwen3`; VAE `vae/ae.safetensors`, 16 channels, flow matching).
-- SD1.5 family: `checkpoints/DreamShaper_8_pruned` (LDM key names, 768-wide CLIP-L, 8 heads, 1x1 conv proj_in),
-  `vae/vae-ft-mse-840000-ema-pruned`, `diffusion_models/lotus-depth-d-v1-1` (depth output), `loras/nlc_pink`.
-  The sd engine is SD2.x (linear proj_in, heads of 64, 1024 context): needs a config-driven UNet and an LDM key converter.
-- Qwen-Image (`diffusion_models/qwen_image_fp8_e4m3fn`, MMDiT, 60 blocks, dim 3072, plain E4M3 without scales; edit
-  variant `qwen_image_edit_2509_fp8`; text `text_encoders/qwen_2.5_vl_7b_fp8_scaled` (text part, hidden 3584); VAE
-  `vae/qwen_image_vae` (3D causal VAE, used on single images); LoRAs Lightning 4/8 steps, Edit Lightning.
-- Flux.2 dev (`diffusion_models/flux2_dev_fp8mixed`: BF16 and FP8 layers with `weight_scale`/`input_scale` and a
-  `_quantization_metadata` table; double and single blocks, dim 6144; text `text_encoders/mistral_3_small_flux2_bf16`
-  (Mistral-3-Small, hidden 5120, the text stack of three layers concatenated into 15360); VAE `vae/flux2-vae` (32
-  channels); LoRA `Flux_2-Turbo-LoRA`).
-- Utility models: BiRefNet (`background_removal/birefnet`, background removal), MoGe-2 (`geometry_estimation/moge_2_vitl_normal`,
-  normals and depth), DINOv3 (`clip_vision/dino_v3_L_naf_fp32`, the image encoder TRELLIS uses).
-- 3D: TRELLIS.2 (`diffusion_models/trellis_2_int8_convrot`, shape and texture VAEs) and Pixal3D (multiview): sparse
-  transformers and sparse-conv decoders with mesh extraction; not planned yet.
-
-Milestones (after MiniMax M1-M5; each verified against a reference: diffusers where it has the pipeline, otherwise
-ComfyUI on CPU):
-1. Component API and image pipeline abstraction: handles for the text encoder, the diffusion model and the VAE that stay
-   mapped in the server process; a scheduler interface (discrete SD and flow matching); a model registry with load and
-   unload (UMA budget: Flux.2 alone is about 70 GB). Verified on sd-turbo, which has a reference.
-2. The ComfyUI node package (`comfyui-rocm-inference`): `EngineLoad`, `EngineTextEncode`, `EngineSample`,
-   `EngineVAEDecode`, `EngineSaveImage`, calling the server; ComfyUI keeps the graph, LoRA and ControlNet nodes and its
-   upscalers. Installed by the user into `/comfyui/custom_nodes`.
-3. SD1.5 family (DreamShaper, vae-ft-mse, Lotus depth, the nlc LoRA): the config-driven UNet, the LDM converter, the
-   quick-GELU CLIP-L. The smallest model change for the most checkpoints.
-4. Z-Image-Turbo: the S3-DiT (3-axis RoPE, qk-norm, adaLN) with the `ae` VAE; its text encoder already works.
-5. Runtime LoRA (the Lightning and Turbo LoRAs; y += B(A x) on the device, weights untouched).
-6. Qwen-Image (the FP8 E4M3 operand in the GEMM, the 3D VAE's single-image path, Qwen2.5-VL text), then the edit variant.
-7. Flux.2 (FP8 layers with their scales, the Mistral-3 text stack with the three concatenated layers, the 32-channel VAE).
-8. Utility models (BiRefNet, MoGe-2, DINOv3) as the nodes need them. 3D (TRELLIS.2, Pixal3D): deferred.
-
-OpenAI API mapping: `/v1/images/generations` for every text-to-image model (with a `model` field), `/v1/images/edits` for
-Qwen-Image edit and Flux.2 references. Depth, background removal and 3D have no OpenAI equivalent: our own endpoints, or
-ComfyUI only.
-
-Open questions: the node package's server API (one endpoint per component handle, or a single `/v1/images/workflow` taking
-ComfyUI's node JSON); the UMA budget policy (load per request or keep the last model); diffusers 0.35.2 has no Z-Image or
-Flux.2 pipeline, so those references need a newer diffusers or ComfyUI on CPU.
-
-- **Converter follow-ups**: an importance matrix (the weighted ROCmFP4 search; collected on the GPU by the
-  engine), and a faster encoder (AVX-512 across 16 blocks keeps each block's summation order, so the bytes stay the
-  reference's).
-- **Qwen3.8-Flash-Next beyond 262,144 tokens (YaRN)** (HF card, 2026-11-06). The checkpoint is 262,144 natively;
-  the card reaches 1M by a YaRN override (`factor` 4.0, original 262144, with an attention scale). The GGUF has no
-  rope-scaling keys and the engine has no YaRN. To do: YaRN frequencies and the attention scale in the RoPE, a
-  `--rope-factor` option, and a quality check at long context. The 16 GB KV budget caps it at about 600k positions
-  at F16 even then. Not started.
-
-## Open leads
+## Open leads (speed and quality; not scheduled)
 
 Speed:
-- Long-context prefill attention runs at ~25% of the FP16 WMMA peak (already ahead of llama.cpp's: 5.5 vs 7.7 s on
-  Qwen3.6-35B at 32k): the largest lever for long prompts. `build/attn_bench` (the kernels alone, 1,024 tokens at
-  position 31,744, best of 20, +-2%): D 256 17 TFLOPS (32 ms), D 128 12 (22 ms), D 64 13 (21 ms). Ablations: the
-  WMMAs are ~58% of D 256 (~29 TFLOPS while they run, near the practical peak), the K / V staging ~18%, the per-block
-  glue (4 barriers, sP through LDS, the softmax's moves) the rest. 32-position blocks lost (Tried and rejected), so
-  the barriers are not what holds it back: the lever left is the registers (D 256 runs 4 waves per SIMD at 256
-  VGPRs). Share of a 32k prefill in attention: Qwen3-0.6B 84%, Gemma-4-26B 67%, Llama-3.2-1B 63%, Qwen3.6-35B 35%,
-  Qwen3.5-4B 28%, Nemotron-Nano 25%, Qwen3.8-27B 20%.
-- Qwen3.8-27B (dense ROCmFP4_FAST) is compute-bound: matmul_wmma_q4_0_rocmfp4_fast ~26 of ~59 TOPS (70% of a 32k
-  prefill); its epilogue (exact per-block scaling, ~19%) would need FP16 WMMA on pre-scaled weights (twice the
-  LDS). Tabled.
-- MTP verify passes: read experts shared by the verified tokens once (~3.8 of 10 shared by two tokens: ~19% of a
-  2-token pass's expert bytes); draft cost 2.7 ms, mostly the head's LM head (a vocabulary cut hurts other
-  scripts; a shortlist from the main model's top logits of the previous row, or an int8 copy).
-- MoE decode (Qwen3.6-35B): the experts' matvecs stream at ~125 GB/s against ~200 for dense layers (5.5 of 13 ms a
-  token), the DeltaNet matvecs of a 2,048-wide model at ~135: latency-bound launches.
-- Decode leftovers (Flash): moe_router 48 x 14 us, hc_norm 98 x 7.6 us, deltanet_rule 36 x 19 us, hc_mix 97 x
-  2.9 us, ~930 launches x ~1.7 us of gaps; each well under 5%.
-- Prefill: deltanet_conv (~100 GB/s); the quantizing producers (swiglu, add_rmsnorm_rows) compute both Q8_0 and
-  Q8_K though each consumer reads one; the CPU embedding row decode; attn_k / attn_v as two launches (~1%).
-- Small F16 matrices (Qwen3.5-0.8B, 1,024-2,048 rows) latency-bound at 55-76 GB/s; MoE experts in F16 / BF16 run
-  matmul_f_id (no model here has them); BF16 FFN down (K 17408) the slowest shape (23 TFLOPS).
+- Long-context prefill attention runs at about 25% of the FP16 WMMA peak. The attention kernel alone (`build/attn_bench`,
+  1024 tokens at position 31,744): D 256 at 17 TFLOPS, D 128 at 12, D 64 at 13. The lever left is registers (D 256 runs 4
+  waves per SIMD at 256 VGPRs). Share of a 32k prefill in attention: Qwen3-0.6B 84%, Gemma-4-26B 67%, Llama-3.2-1B 63%,
+  Qwen3.6-35B 35%, Qwen3.5-4B 28%, Nemotron-Nano 25%, Qwen3.8-27B 20%.
+- MTP verify: read the experts shared by the verified tokens once (about 19% of a 2-token pass's expert bytes). Draft
+  cost 2.7 ms, mostly the head's LM head (a vocabulary cut hurts other scripts; a shortlist from the main model's top
+  logits, or an int8 copy).
+- Decode leftovers on Flash (each under 5%): `moe_router`, `hc_norm`, `deltanet_rule`, `hc_mix`, about 930 launches of
+  about 1.7 us of gaps.
+- Prefill: `deltanet_conv` at about 100 GB/s; the quantizing producers compute both Q8_0 and Q8_K though each consumer reads
+  one; attn_k and attn_v as two launches (about 1%).
+- Small F16 matrices (1024 to 2048 rows) are latency-bound at 55 to 76 GB/s; BF16 FFN down (K 17408) is the slowest shape
+  (23 TFLOPS). MoE experts in F16 or BF16 run `matmul_f_id` (no model here has them).
 
-Quality / correctness:
-- Prefill is split-invariant (ARCHITECTURE.md section 5), and the tests demand it since 2026-11-16 (package H):
-  `seq_verify` (a chunked prompt's and a batch's tokens equal, on Qwen3-0.6B and Qwen3.5-4B), `store_verify` (whole
-  replies equal in phases 2 to 4), `generate_verify` (the chat turns' whole replies; a prompt in micro-batches of 1500
-  and a prompt in calls of 200 bit-identical to the one call's logits). Prefill against token-by-token decoding stays a
-  bound (exact only with `QMATVEC_NO_WMMA=1`: on Qwen3-0.6B the logits differ by up to 0.399, the top token the same).
-  Open: the full tier's perplexity baselines of the models not run here (the Flash model, the 122B and 120B files) need
-  `tests/regress.sh --update` on those rows.
-- Draft events are not verified: `events_test MODEL DRAFT` is written but not run. The Flash model (122.8 GB file)
-  shares the work host's 124 GB with the deployment: Flash work needs a window with the deployment stopped, or a
-  generator for a tiny model with a draft head (tools/gen_qwen4exp_tiny.py writes none).
-- K-quants dot Q8_K activations (one scale per 256), as ggml's CPU backend; ggml's GPU backend uses q8_1 (per 32):
-  ~1% better perplexity at Q2_K. An option for the K-quant kernels.
-- A quantized KV cache needs n_kv * D % 256 == 0 (Qwen2.5-0.5B, 2 x 64, cannot have one).
-- Qwen3.6-35B Q4_0 forward_verify drifts to cos 0.989 at layer 21 (smooth, next token = llama.cpp's): its suite
-  row uses min cos 0.985.
-- One forward_verify run on the 35B once hit a GPU memory fault in matvec_q8_id_q5_K, never reproduced; likely
-  the test's buffer overrun fixed on 2026-11-04 (5e6e9e6). Close after a few clean runs.
+Speech (the open speed items):
+- Matvec kernels at 175 to 206 GB/s (the predictor stack: about 905 us against a floor of about 760 at 256 GB/s; fewer
+  launches and the samplers' sort are the leads, a few percent each).
+- Codec host stages: 36 ms of a 142 ms piece run on the host before the device; overlap them with the device's work or move
+  the pre-convolution and the upsamplers to the kernels. The kernel-7 inner loop of the residual units is 63% of the codec.
+- Whisper's encoder: the attention allocates a score vector per query and head (about 9000 allocations a call); the
+  decoder's cross-attention runs on six threads. Low value: only whisper-tiny is here.
+- A streamed codec decoder with the reference's state cached per voice is done (`U6`); the talker's prefill is not a
+  share worth a cache (decided).
 
-Tests and API:
-- In `make regress`: kv_verify, generate_verify, events_test, seq_verify (0.6B, 4B), store_verify.sh, and the Perl
-  suites (Web::Route, Minijinja, ROCm::Inference with the server tests on Qwen3.5-4B). Still out: mtp_verify and
-  `events_test MODEL DRAFT` (the Flash model and its draft head: a window with the deployment stopped).
-- **Raw completions (`POST /v1/completions`, 2026-11-12: whole and streamed, sequential and `--parallel`) leave out
-  two parts of OpenAI's; likely not needed** (coding agents use chat; both are what evaluation harnesses use), so do
-  them when a client asks: `prompt` as an array (several prompts answered as choices[i], or token ids instead of
-  text; 400 now - on the `--parallel` server one job per prompt) and `logprobs` (per-token log-probabilities with the
-  top-N alternatives, with `echo` to score the prompt itself; always null now - needs the logits out per step:
-  `get_logits` exists, a read a token).
-- Untested: Mistral (llama architecture, SentencePiece tokenizer), Llama-3.1-8B (no files); Llama 3.1's built-in
-  tools (<|python_tag|> brave_search.call(...)) not parsed; Nemotron's reply format (check against its template).
-- The XS module lacks inference_prefill_logits, model_name and set_seed (add when a Perl user needs them); a C
-  API channel flag for reply kinds only if a non-Perl user needs it.
+Quality and correctness:
+- K-quants dot Q8_K activations (one scale per 256, as ggml's CPU backend); ggml's GPU backend uses Q8_1 (per 32): about
+  1% better perplexity at Q2_K. An option for the K-quant kernels.
+- The Q8_0 predictor's activations are read as `float4` from dynamic shared memory, which assumes 16-byte alignment (true
+  here, not guaranteed by the language). A toolchain change would show in the predictor's timing and codes first.
+- The predictor's Q8_0 draws differ from BF16's in about 1 case of 43 (total variation mean 2.3%). The BF16 default stays.
+- One forward_verify run on the 35B hit a GPU memory fault in `matvec_q8_id_q5_K`, never reproduced; likely the test buffer
+  overrun fixed on 2026-11-04. Close after a few clean runs.
+- The XS module lacks `inference_prefill_logits`, `model_name` and `set_seed` (add when a Perl user needs them).
+- Raw completions: `prompt` as an array and `logprobs` are not implemented (400, and always null). Likely not needed (coding
+  agents use chat); do them when a client asks. `logprobs` needs the logits out per step (`get_logits` exists).
+- GLM's chat template key order: Perl's hash order differs from Python's (`tool.items()` and `|tojson` sort keys), so GLM's
+  tool definitions may render differently. Not measured. Fix: keep each object's key order from the JSON parser.
+
+## ComfyUI
+
+`/comfyui` holds the user's model library: 28 model files, about 167 GB (safetensors; all valid). Nothing is wired yet.
+
+- **Z-Image-Turbo** (`diffusion_models/z_image_turbo_bf16`, S3-DiT, 30 blocks, dim 3840, text dim 2560 = Qwen3-4B, which the
+  engine runs as `qwen3`); VAE `vae/ae.safetensors` (16 channels, flow matching).
+- **SD1.5 family:** `checkpoints/DreamShaper_8_pruned` (LDM key names, 768-wide CLIP-L), `vae/vae-ft-mse-840000-ema-pruned`,
+  `diffusion_models/lotus-depth-d-v1-1` (depth output), `loras/nlc_pink`. The engine's sd is SD2.x: a config-driven UNet and
+  an LDM key converter are needed.
+- **Qwen-Image** (`diffusion_models/qwen_image_fp8_e4m3fn`, MMDiT, 60 blocks, dim 3072, plain E4M3 without scales; the edit
+  variant `qwen_image_edit_2509_fp8`); text `text_encoders/qwen_2.5_vl_7b_fp8_scaled`; VAE `vae/qwen_image_vae` (3D causal,
+  single images); LoRAs Lightning 4 and 8 steps, Edit Lightning.
+- **Flux.2 dev** (`diffusion_models/flux2_dev_fp8mixed`: BF16 and FP8 layers with scales and a quantization table; double and
+  single blocks, dim 6144); text `text_encoders/mistral_3_small_flux2_bf16`; VAE `vae/flux2-vae` (32 channels); LoRA
+  `Flux_2-Turbo-LoRA`.
+- **Utility models:** BiRefNet (`background_removal/birefnet`), MoGe-2 (`geometry_estimation/moge_2_vitl_normal`), DINOv3
+  (`clip_vision/dino_v3_L_naf_fp32`). Also TRELLIS.2 and Pixal3D in `diffusion_models` (3D: deferred).
+
+Plan: the component API first (handles for the text encoder, the diffusion model and the VAE that stay mapped; verified on
+sd-turbo), then the node package. The image models stay BF16 (safetensors is BF16 or F32 for most); GGUF quants only as an
+explicit choice; FP8 sources stay FP8 in the engine's FP8 operand path. Open: the UMA budget policy (load per request, or
+keep the last model); ComfyUI's node JSON; diffusers 0.35.2 has no Z-Image or Flux.2 pipeline, so those references need a
+newer diffusers or ComfyUI on CPU.
+
+## Decisions by the user
+
+- 2026-11-16: the speech pieces keep their own prosody. ffmpeg is in the image. The Q8_0 predictor is an option (BF16 default).
+- 2026-11-16: Gemma-4's prefill keeps fp32 (the 3x prefill cost accepted).
+- 2026-11-16: request logs roll over each hour; the user deletes old files.
+- 2026-11-16: requested: KV snapshots during prefill, every 500 tokens, opt-in for the large CPU-only models. The design
+  is open (item 2).
+- 2026-11-15: audio closed as functionally complete; the talker's and codec's device paths are the default.
+- 2026-11-14: the image models load from the original checkpoints, not GGUF conversions; LLM safetensors loading is left as is.
+- 2026-11-14: the DiT's BF16 stays the default; the mixed Q8_0 recipe stays supported as an option.
+- 2026-11-12: GLM-5.3's speed work is tabled (4.3-7.6 tok/s is fine).
+- 2026-11-07: a conversation's KV persists; one conversation's cache is not cleared by another's.
+- 2026-11-04: the older architectures (gpt-oss, deepseek2, glm4, phi3, gemma2 / gemma3, Mistral) are tabled.
 
 ## Tabled
 
-- GLM-5.3-Flash speed work (user, 2026-11-12: 4.3-7.6 tok/s is fine); its leads are in the GLM section.
-- Older architectures: gpt-oss, deepseek2, glm4, phi3, gemma2 / gemma3, Mistral (user, 2026-11-04).
-- The ROCmFP4_FAST WMMA kernel work (user, 2026-11-04: "move on, table this for now").
-- A CPAN release of ROCm::Inference, Minijinja and Web::Route (user, 2026-11-05: the Docker image builds them
-  from source).
+- GLM-5.3-Flash speed work (see above).
+- Older architectures: gpt-oss, deepseek2, glm4, phi3, gemma2 / gemma3, Mistral.
+- The ROCmFP4_FAST WMMA kernel work ("move on, table this for now", 2026-11-04).
+- A CPAN release of ROCm::Inference, Minijinja and Web::Route (the Docker image builds them from source).
+- A disk tier for the KV store.
 
 ## Tried and rejected (measured; do not repeat without a new idea)
 
-- Prefill attention with 32-position blocks (2026-11-12: each 16-column half its own S and P V product, one softmax
-  rescale per 32 positions, D 256's Q aliased with the K / V staging): slower on every shape - D 256 41.7 / 42.7 ms
-  against 31.7 / 32.6, D 128 28.3 against 22.8, D 64 22.7 against 21.0; the same code with 16-position blocks
-  already loses 8-19% on D 256 from the aliasing; the Q row padding (D + 8 halves instead of D + 4) is neutral.
-- GPU reads of an unregistered mapping (2026-11-11, after a boot with `amdgpu.noretry=0`, `tools/gpu_demand_paging.cpp`):
-  a kernel reading unregistered pages that are in memory hangs the GPU ("HW Exception ... GPU Hang", a full reset
-  after ~20 s, no page fault logged). Do not repeat on this kernel / firmware; registration is not optional.
-- HIP graphs for decode launch gaps: ~0.3% (1.96 vs 1.88 us per dependent kernel; per-token parameter updates).
-- Small-kernel merges (moe_combine into add_rmsnorm: slower, every workgroup recomputes the expert sum; others
-  assessed not worth it, 2026-10-21).
-- WMMA operand pipelining in the FAST kernel: 10% slower (173 VGPRs); bigger dense WMMA tiles, 2 tiles per wave,
-  32 weight rows per wave: no gain.
+- Prefill attention with 32-position blocks (2026-11-12): slower on every shape (D 256 41.7 / 42.7 ms against 31.7 / 32.6, D 128
+  28.3 against 22.8, D 64 22.7 against 21.0). The same code with 16-position blocks already loses 8 to 19% on D 256 from the
+  aliasing; the Q row padding is neutral.
+- GPU reads of an unregistered mapping (2026-11-11, with `amdgpu.noretry=0`): a kernel reading unregistered pages that are in
+  memory hangs the GPU (a full reset after about 20 s, no page fault logged). Registration is not optional.
+- HIP graphs for decode launch gaps: about 0.3% (1.96 vs 1.88 us per dependent kernel).
+- Small-kernel merges (moe_combine into add_rmsnorm: slower, each workgroup recomputes the expert sum).
+- WMMA operand pipelining in the FAST kernel: 10% slower (173 VGPRs); bigger dense WMMA tiles, 2 tiles per wave, 32 weight
+  rows per wave: no gain.
 - Decode attention on a Q8_0 cache: 16-byte K pieces, 4 V dims per thread, 128-position chunks: no gain.
 - Flash prefill prefetch of the next K/V block at D 256: spills (13 VGPRs), -5%; kept for D <= 128 only.
-- MTP vocabulary shortlist: +2-5% on English, -18% on Chinese (tokens spread over the vocabulary).
+- MTP vocabulary shortlist: +2 to 5% on English, -18% on Chinese (tokens spread over the vocabulary).
 - moe_router: per-wave argmax top-k instead of the bitonic sort (15.3 vs 14.3 us); 8 waves per router row.
 - Unrolling the FAST matvec quad loop by 2; fewer lanes per row for the Q8_0 matvec (32 is best).
 - IQ WMMA staging prefetch; a K rotation per workgroup in the expert kernels.
 - Loads inside branches or `c ? load : 0` in kernels: they serialize (keep loads unconditional, select after).
+- Speech: 32 input channels per chunk for the codec's kernel 7 (302 ms against 282: 52 KB of shared memory a block);
+  decoding only the last 25 reference frames as codec context (waveform changes, cosine 0.973).
+- Vision: a 4x4 register block (the OpenMP reduction over array elements gave wrong results); a 4x2 blocked linear and a
+  per-pair attention buffer on Whisper (no measurable gain; reverted).
