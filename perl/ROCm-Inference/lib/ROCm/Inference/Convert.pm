@@ -161,7 +161,7 @@ sub general {
             $self->kv("general.sampling.$k", $ty, $ty == STR ? $v : $ty == I32 ? int $v : 0 + $v);
         }
     }
-    $self->kv('general.name', STR, $self->{opt}{name} // _model_name(basename($self->{dir})));
+    $self->{card_at} = scalar @{$self->{kv}};  # the model card's keys (model_card()) go here, instead of general.name
 }
 
 # "qwen3-0.6b" -> "Qwen3 0.6b" (gguf-py's metadata heuristics give the same for plain names)
@@ -169,6 +169,387 @@ sub _model_name {
     my ($n) = @_;
     $n =~ s/[-_]+/ /g;
     return join ' ', map { /^[a-z]/ && !/^\d/ ? ucfirst : $_ } split / /, $n;
+}
+
+# ---------------------------------------------------------------- the model card (gguf-py's Metadata)
+
+# model_card($specs): the keys gguf-py's Metadata writes from the model card (README.md's YAML front matter),
+# config.json's _name_or_path and the directory's name, at the place general() left (after general.sampling.*), in
+# set_gguf_meta_model's order. $specs are the tensors (name, ne): their parameter count gives the size label, which
+# the directory's name may give instead (get_model_id_components checks it against the count).
+sub model_card {
+    my ($self, $specs) = @_;
+    my $at = $self->{card_at} // croak 'model_card: general() comes first';
+    my ($total, $shared, $expert, $ec) = _param_counts($specs);
+    my $m = $self->_card_fields($total);
+    $m->{size_label} //= _size_label($total, $shared, $expert, $ec) if $total > 0;
+    my @kv = _card_kv($m);
+    splice @{$self->{kv}}, $at, 0, @kv;
+    my %at;
+    $at{$self->{kv}[$_][0]} = $_ for 0 .. $#{$self->{kv}};
+    $self->{kv_at} = \%at;
+    return \@kv;
+}
+
+# Metadata.load: the card's values, each only while unset (the plain keys, then the model_ spellings, then the
+# Hugging Face convention), the base models, datasets, licence, tags and languages; then config.json's
+# _name_or_path and the directory's name (each only while unset); then --name, else the directory's name.
+sub _card_fields {
+    my ($self, $total) = @_;
+    my $card = _front_matter(File::Spec->catfile($self->{dir}, 'README.md'));
+    my %m;
+    my $take = sub {
+        my ($field, $key) = @_;
+        $m{$field} //= $card->{$key} if defined $card->{$key} && !ref $card->{$key};
+    };
+    for my $p (
+        [name => 'name'], [author => 'author'], [version => 'version'], [organization => 'organization'],
+        [description => 'description'], [finetune => 'finetune'], [basename => 'basename'],
+        [size_label => 'size_label'], [source_url => 'url'], [source_doi => 'doi'], [source_uuid => 'uuid'],
+        [source_repo_url => 'repo_url'],
+        [name => 'model_name'], [author => 'model_author'], [version => 'model_version'],
+        [organization => 'model_organization'], [description => 'model_description'],
+        [finetune => 'model_finetune'], [basename => 'model_basename'], [size_label => 'model_size_label'],
+        [source_url => 'model_url'], [source_doi => 'model_doi'], [source_uuid => 'model_uuid'],
+        [source_repo_url => 'model_repo_url'],
+        [name => 'model_name'], [author => 'model_creator'], [basename => 'model_type'],
+    ) {
+        $take->(@$p);
+    }
+    $m{base_models} = _card_refs($card, [qw(base_model base_models base_model_sources)], $total);
+    $m{datasets} = _card_refs($card, [qw(datasets dataset dataset_sources)], $total);
+    $take->(license => 'license');
+    $m{license} //= join(',', @{$card->{license}}) if ref $card->{license} eq 'ARRAY';  # (a list: comma-joined)
+    $take->(license_name => 'license_name');
+    $take->(license_link => 'license_link');
+    my $arr = sub {
+        my ($field, $key) = @_;
+        my $v = $card->{$key};
+        return unless defined $v;
+        my @add = ref $v eq 'ARRAY' ? @$v : ref $v ? () : ($v);
+        $m{$field} = [@{$m{$field} // []}, @add];
+    };
+    $arr->(tags => 'tags');
+    $arr->(tags => 'pipeline_tag');
+    $arr->(languages => 'languages');
+    $arr->(languages => 'language');
+    my $nop = $self->{config}{_name_or_path};
+    _fill_id(\%m, _id_components($nop, $total)) if defined $nop && !ref $nop && ($nop =~ tr{/}{}) <= 1;
+    _fill_id(\%m, _id_components(basename($self->{dir}), $total));
+    $m{name} = $self->{opt}{name} if defined $self->{opt}{name};
+    $m{name} //= basename($self->{dir});
+    return \%m;
+}
+
+# The model-card fields of a base model or a dataset ("Qwen/Qwen3-0.6B-Base", a URL, or a mapping), the first of the
+# keys present (base_model, base_models, base_model_sources) giving the list; undef when none is present
+sub _card_refs {
+    my ($card, $keys, $total) = @_;
+    my ($k) = grep { exists $card->{$_} } @$keys;
+    return undef unless defined $k;
+    my $v = $card->{$k};
+    my @ids = !defined $v ? () : ref $v eq 'ARRAY' ? @$v : ref $v ? () : ($v);
+    my @out;
+    for my $id (@ids) {
+        my %e;
+        if (ref $id eq 'HASH') {
+            %e = %$id;
+        } elsif (!defined $id || ref $id) {
+            # gguf-py logs an error and keeps an empty entry
+        } elsif ($id =~ m{\A(?:https?|ssh)://}) {
+            $e{repo_url} = $id;
+            if ($id =~ m{\Ahttps?://huggingface\.co/([^/]+/[^/]+)\z}) {
+                my ($full, $org, undef, undef, $ver) = _id_components($1, $total);
+                $e{name} = _id_to_title($full) if defined $full;
+                $e{organization} = _id_to_title($org) if defined $org;
+                $e{version} = $ver if defined $ver;
+            }
+        } else {
+            my ($full, $org, undef, undef, $ver) = _id_components($id, $total);
+            $e{name} = _id_to_title($full) if defined $full;
+            $e{organization} = _id_to_title($org) if defined $org;
+            $e{version} = $ver if defined $ver;
+            $e{repo_url} = "https://huggingface.co/$org/$full" if defined $org && defined $full;
+        }
+        push @out, \%e;
+    }
+    return \@out;
+}
+
+# Each field a model id gives while unset (its name is the title form)
+sub _fill_id {
+    my ($m, $full, $org, $bn, $ft, $ver, $sl) = @_;
+    $m->{name} //= _id_to_title($full) if defined $full;
+    $m->{organization} //= _id_to_title($org) if defined $org;
+    $m->{basename} //= $bn if defined $bn;
+    $m->{finetune} //= $ft if defined $ft;
+    $m->{version} //= $ver if defined $ver;
+    $m->{size_label} //= $sl if defined $sl;
+}
+
+# The keys in set_gguf_meta_model's order (the fields it does not get from the card are not written)
+sub _card_kv {
+    my ($m) = @_;
+    my @kv;
+    my $put = sub {
+        my ($key, $field) = @_;
+        push @kv, ["general.$key", STR, $m->{$field}] if defined $m->{$field};
+    };
+    for my $p (['name', 'name'], ['author', 'author'], ['version', 'version'], ['organization', 'organization'],
+               ['finetune', 'finetune'], ['basename', 'basename'], ['description', 'description'],
+               ['size_label', 'size_label'], ['license', 'license'], ['license.name', 'license_name'],
+               ['license.link', 'license_link'], ['source.url', 'source_url'], ['source.doi', 'source_doi'],
+               ['source.uuid', 'source_uuid'], ['source.repo_url', 'source_repo_url']) {
+        $put->(@$p);
+    }
+    for my $kind (['base_model', $m->{base_models}], ['dataset', $m->{datasets}]) {
+        my ($prefix, $list) = @$kind;
+        next unless $list;
+        push @kv, ["general.$prefix.count", U32, scalar @$list];
+        for my $i (0 .. $#$list) {
+            for my $f (qw(name author version organization description url doi uuid repo_url)) {
+                push @kv, ["general.$prefix.$i.$f", STR, $list->[$i]{$f}] if defined $list->[$i]{$f};
+            }
+        }
+    }
+    push @kv, ['general.tags', ARR, [STR, [@{$m->{tags}}]]] if $m->{tags} && @{$m->{tags}};
+    push @kv, ['general.languages', ARR, [STR, [@{$m->{languages}}]]] if $m->{languages} && @{$m->{languages}};
+    return @kv;
+}
+
+# gguf-py's get_total_parameter_count over the tensors written (numpy shapes: ne reversed): the total, the shared
+# parameters, the expert ones (the "_exps." tensors: a third of a tensor is one expert) and the expert count
+sub _param_counts {
+    my ($specs) = @_;
+    my ($total, $shared, $expert, $esum, $en) = (0, 0, 0, 0, 0);
+    for my $s (@$specs) {
+        my $size = 1;
+        $size *= $_ for @{$s->{ne}};
+        my @shape = reverse @{$s->{ne}};
+        if ($s->{name} =~ /_exps\./ && @shape >= 3) {
+            my $ec = $shape[$s->{name} =~ /\.bias/ ? -2 : -3];
+            $expert += int($size / $ec);
+            $esum += $ec;
+            $en++;
+        } else {
+            $shared += $size;
+        }
+        $total += $size;
+    }
+    return ($total, $shared, $expert, $en ? int($esum / $en) : 0);
+}
+
+# gguf-py's size_label: "<experts>x<shared + expert parameters>" for a MoE, else the total, rounded to two digits
+sub _size_label {
+    my ($total, $shared, $expert, $ec) = @_;
+    return $ec > 0 ? $ec . 'x' . _count_notation($shared + $expert) : _count_notation($total);
+}
+
+sub _count_notation {
+    my ($n) = @_;
+    my ($scaled, $sfx) = $n > 1e12 ? ($n * 1e-12, 'T') : $n > 1e9 ? ($n * 1e-9, 'B')
+                       : $n > 1e6 ? ($n * 1e-6, 'M') : ($n * 1e-3, 'K');
+    (my $digits = sprintf('%.0f', $scaled)) =~ s/^0+//;
+    my $fix = 2 - length $digits;
+    $fix = 0 if $fix < 0;
+    return sprintf('%.*f', $fix, $scaled) . $sfx;
+}
+
+# gguf-py's Metadata.id_to_title: "qwen3-0.6b" -> "Qwen3 0.6b"; the acronyms, versions and sizes stay
+sub _id_to_title {
+    my ($s) = @_;
+    $s =~ s/\A\s+|\s+\z//g;
+    $s =~ tr/-/ /;
+    return join ' ', map {
+        my $w = $_;
+        $w =~ /[a-z]/ && $w !~ /[A-Z]/ && $w !~ /\A(?:v\d+(?:\.\d+)*|\d.*)\z/s ? _title_word($w) : $w
+    } split ' ', $s;
+}
+
+sub _title_word { my ($w) = @_; $w =~ s/([A-Za-z]+)/\u\L$1/g; return $w }
+
+# gguf-py's Metadata.get_model_id_components: "Org/Model-3B-Instruct" as (model name, organization, basename,
+# finetune, version, size label), each undef when it has none. $total: the parameter count (0: unknown).
+sub _id_components {
+    my ($id, $total) = @_;
+    return ($id) if $id =~ / /;  # a sentence, not an id
+    my ($org, $full);
+    if ($id =~ m{/}) { ($org, $full) = split m{/}, $id, 2 } else { $full = $id }
+    $org = undef if defined $org && substr($org, 0, 1) eq '.';  # './', '../'
+    my @parts = grep { length } split /-/, $full, -1;
+    my $n = @parts;
+    my @t = map { +{} } @parts;  # the annotations of each part, as a set
+    for my $i (0 .. $n - 1) {
+        my $p = $parts[$i];
+        if ($p =~ /\A(?:v|iter)?\d+(?:[.]\d+)*\z/i) {
+            $t[$i]{version} = 1;
+        } elsif ($p =~ /\Ai?q\d(?:_\w)*\z|\Ab?fp?(?:16|32)\z/i) {
+            $t[$i]{type} = 1;
+            $parts[$i] = uc $p;
+        } elsif ($i > 0 && $p =~ /\A(?:(?:A|\d+x)?\d+(?:[._]\d+)?[KMBT]\d?|small|mini|medium|large|x?xl)\z/i) {
+            my $sz = $p =~ tr/_/./r;
+            # bloom-7b1: the digit after the unit is a decimal
+            $sz = substr($sz, 0, -2) . '.' . substr($sz, -1) . substr($sz, -2, 1) if $sz =~ /\d\z/;
+            $sz =~ s/(\d)([kmbt])\z/$1 . uc $2/e;
+            if ($total != 0 && $sz =~ /\A(\d+(?:\.\d+)?)(.)\z/s) {
+                my ($num, $unit) = ($1, $2);
+                my $label = $num * 1000 ** index(' KMBT', $unit);
+                # a size label far from the model's count is a context length: finetune, lowercase
+                if (abs($label - $total) > int(7 * $total / 8)) {
+                    $t[$i]{finetune} = 1;
+                    $sz = substr($sz, 0, -1) . lc substr($sz, -1);
+                }
+            }
+            $t[$i]{size_label} = 1 unless keys %{$t[$i]};
+            $parts[$i] = $sz;
+        } elsif ($i > 0 && $p =~ /\A(?:chat|instruct|vision|lora)\z/i) {
+            $t[$i]{finetune} = 1;
+        }
+    }
+    # a word size label (small, mini...) is ignored when a number-based one is present
+    if (grep { $t[$_]{size_label} && $parts[$_] =~ /\d/ } 0 .. $n - 1) {
+        for my $i (0 .. $n - 1) {
+            delete $t[$i]{size_label} if $t[$i]{size_label} && $parts[$i] =~ /\A[A-Za-z]+\z/;
+        }
+    }
+    my $at_start = 1;
+    for my $i (0 .. $n - 1) {
+        my $t = $t[$i];
+        if ($at_start && ((!keys %$t && $parts[$i] =~ /\A[A-Za-z]/) || $t->{version})) {
+            $t->{basename} = 1;
+        } else {
+            $at_start = 0;
+            $t->{finetune} = 1 unless keys %$t;
+        }
+    }
+    for my $i (reverse 0 .. $n - 1) {  # a trailing version is no part of the basename
+        if ($t[$i]{basename} && keys %{$t[$i]} > 1) { delete $t[$i]{basename} } else { last }
+    }
+    my $join = sub { my ($k) = @_; join '-', map { $parts[$_] } grep { $t[$_]{$k} } 0 .. $n - 1 };
+    my $bn = $join->('basename');
+    my %seen;
+    my $sl = join '-', grep { !$seen{$_}++ } map { $parts[$_] } grep { $t[$_]{size_label} } 0 .. $n - 1;
+    my $ft = $join->('finetune');
+    my $ver = join '-', map { $parts[$_] } grep { $t[$_]{version} && !$t[$_]{basename} } 0 .. $n - 1;
+    $bn = undef unless length $bn;
+    $sl = undef unless length $sl;
+    $ft = undef unless length $ft;
+    $ver = undef unless length $ver;
+    $bn = undef if !defined $sl && !defined $ft && !defined $ver;  # too ambiguous
+    return ($full, $org, $bn, $ft, $ver, $sl);
+}
+
+# convert_hf_to_gguf.py's Metadata.load for README.md's front matter (YAML), read as gguf-py does (the "no" hack, the
+# tabs). {} without one, or when it does not parse (a warning).
+sub _front_matter {
+    my ($path) = @_;
+    return {} unless -f $path;
+    my @lines = split /\r?\n/, _slurp($path);
+    return {} unless @lines && $lines[0] eq '---';
+    my @y;
+    for (@lines[1 .. $#lines]) {
+        last if $_ eq '---';
+        push @y, $_;
+    }
+    my $yaml = join("\n", @y) . "\n";
+    $yaml =~ s/- no\n/- "no"\n/g;
+    $yaml =~ s/\t/  /g;
+    my $data = eval { _yaml($yaml) };
+    if ($@) {
+        warn "$path: front matter not read: $@";
+        return {};
+    }
+    return ref $data eq 'HASH' ? $data : {};
+}
+
+# The YAML of a model card, as far as it goes: block mappings and sequences, flow sequences, plain and quoted
+# scalars, comments. Anything else dies.
+sub _yaml {
+    my ($text) = @_;
+    my @L;
+    for my $raw (split /\n/, $text) {
+        my $l = _uncomment($raw);
+        $l =~ s/\s+\z//;
+        next unless $l =~ /\S/;
+        my ($ind) = $l =~ /\A( *)/;
+        push @L, [length $ind, substr($l, length $ind)];
+    }
+    return undef unless @L;
+    my $pos = 0;
+    my $node;
+    $node = sub {
+        my ($ind) = @_;
+        if ($L[$pos][1] =~ /\A-(?:\s|\z)/) {
+            my @seq;
+            while ($pos < @L && $L[$pos][0] == $ind && $L[$pos][1] =~ /\A-(?:\s|\z)/) {
+                (my $rest = $L[$pos][1]) =~ s/\A-\s*//;
+                if ($rest eq '') {
+                    $pos++;
+                    push @seq, ($pos < @L && $L[$pos][0] > $ind) ? $node->($L[$pos][0]) : undef;
+                } elsif ($rest =~ /\A[^'"\[{#][^:]*:(?:\s|\z)/) {
+                    # a mapping in the item: its keys are in the column of the first one
+                    my $col = $L[$pos][0] + length($L[$pos][1]) - length($rest);
+                    $L[$pos] = [$col, $rest];
+                    push @seq, $node->($col);
+                } else {
+                    push @seq, _scalar($rest);
+                    $pos++;
+                }
+            }
+            return \@seq;
+        }
+        my %h;
+        while ($pos < @L && $L[$pos][0] == $ind && $L[$pos][1] !~ /\A-(?:\s|\z)/) {
+            my ($k, $v) = $L[$pos][1] =~ /\A(.*?):(?:\s+(.*))?\z/s or die "no mapping key in: $L[$pos][1]\n";
+            $k = _unquote($k);
+            $pos++;
+            my $val;
+            if (defined $v && length $v) {
+                $val = _scalar($v);
+            } elsif ($pos < @L && ($L[$pos][0] > $ind || ($L[$pos][0] == $ind && $L[$pos][1] =~ /\A-(?:\s|\z)/))) {
+                $val = $node->($L[$pos][0]);
+            }
+            $h{$k} = $val;
+        }
+        return \%h;
+    };
+    my $doc = $node->($L[0][0]);
+    die "text not read: $L[$pos][1]\n" if $pos < @L;
+    return $doc;
+}
+
+sub _uncomment {
+    my ($s) = @_;
+    my $q = '';
+    for my $i (0 .. length($s) - 1) {
+        my $c = substr $s, $i, 1;
+        if (length $q) {
+            $q = '' if $c eq $q;
+        } elsif ($c eq '"' || $c eq "'") {
+            $q = $c if $i == 0 || substr($s, $i - 1, 1) =~ /[\s\[,]/;
+        } elsif ($c eq '#' && ($i == 0 || substr($s, $i - 1, 1) =~ /\s/)) {
+            return substr($s, 0, $i);
+        }
+    }
+    return $s;
+}
+
+sub _unquote {
+    my ($s) = @_;
+    return $1 =~ s/''/'/gr if $s =~ /\A'(.*)'\z/s;
+    return $1 =~ s/\\(.)/$1/gr if $s =~ /\A"(.*)"\z/s;
+    return $s;
+}
+
+# A value: a flow sequence of scalars, a quoted or plain scalar (null and ~ are undef)
+sub _scalar {
+    my ($s) = @_;
+    if ($s =~ /\A\[(.*)\]\z/s) {
+        return [grep { defined } map { _unquote($_) } grep { length } map { s/\A\s+|\s+\z//gr } split /,/, $1];
+    }
+    die "flow mapping not supported: $s\n" if $s =~ /\A\{/;
+    return undef if $s eq '~' || $s eq 'null';
+    return _unquote($s);
 }
 
 sub text_params {
@@ -728,6 +1109,7 @@ sub convert {
     $self->kv('general.quantization_version', U32, 2);
     $self->vocab;
     my @specs = $self->tensors;
+    $self->model_card(\@specs);
     # Every checkpoint tensor is used, or skipped on purpose (the architecture's skipped(): vision, a separate MTP)
     my %used;
     for my $s (@specs) {
