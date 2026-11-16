@@ -149,7 +149,7 @@ int main(int argc, char** argv) {
 
     // Long prompt: prefill (in one call, and in three calls of 200, 200 and the rest, so that batches start at
     // pos0 > 0 inside attention's 256-position chunks whatever the micro-batch size) must leave the logits that
-    // feeding the same tokens one at a time does (bit-identical: see the comment at the checks)
+    // feeding the same tokens one at a time does (see the comment at the checks), and the two prefills the same bits
     {
         std::string text;
         for (int i = 0; i < 40; ++i) text += "The quick brown fox jumps over the lazy dog, again and again. ";
@@ -170,11 +170,13 @@ int main(int argc, char** argv) {
         for (int i = 0; i < n && rc2 == 0; ++i) rc2 = inference_decode_token(m, lt[i], &nx);
         inference_get_logits(m, ids.data(), b.data());
         inference_free_tokens(lt, n);
-        // Prefill vs token by token is NOT bit-identical with WMMA on (ARCHITECTURE.md section 5 says it should be;
-        // measured 2026-11-16 on Qwen3-0.6B-Q8_0, 561 tokens, default batch 1024: max |d| 0.399 in the logits, the
-        // top-1 token the same, 576). So this keeps the previous bound: logit cosine >= 0.995 and the same top-1
-        // token unless token by token itself has a near-tie (its logits for the two choices within 0.5). Bit
-        // identity is required only where it holds: the micro-batch test at the end of this file.
+        // Prefill against token by token (ARCHITECTURE.md section 5: exact only with WMMA off). The dot4 kernels give
+        // each output row the same arithmetic in a batch as alone, so with QMATVEC_NO_WMMA the two are bit-identical.
+        // Prefill's WMMA kernels sum in another float order, and tiny differences flip int8 activation roundings that
+        // then propagate: the bound is logit cosine >= 0.995 and the same top-1 token unless token by token itself
+        // has a near-tie (its logits for the two choices within 0.5). Measured 2026-11-16 on Qwen3-0.6B-Q8_0 (561
+        // tokens): max |d| 0.399 in the logits, the top-1 token the same. Prefill against prefill is exact with WMMA
+        // on: the last check of this block and the micro-batch test at the end of this file.
         double d = 0.0, dot = 0.0, na = 0.0, nb = 0.0;
         int ta = 0, tb = 0;
         for (int i = 0; i < V; ++i) {
@@ -207,6 +209,10 @@ int main(int argc, char** argv) {
         snprintf(what, sizeof(what), "prefill in calls of 200 tokens vs token by token: max |d| logits %.3g, cos %.7f, "
                  "top-1 %d / %d", d3, cs3, tc, tb);
         check(rc3 == 0 && (exact ? d3 == 0.0 : same_choice(tc) && cs3 >= 0.995), what);
+        // prefill against prefill (section 5): the one call's logits are the three calls' bits
+        const bool pp = memcmp(a.data(), c.data(), sizeof(float) * (size_t)V) == 0;
+        snprintf(what, sizeof(what), "prefill in one call = prefill in calls of 200 tokens: %s", pp ? "bit-identical" : "DIFFER");
+        check(rc1 == 0 && rc3 == 0 && pp, what);
     }
 
     // Opt-in int8 LM head: close to the float head's logits, and switching it off gives the float logits back

@@ -21,8 +21,6 @@ started: D (item 7, the samplers' sort: a rank sort needs a second launch per co
 1% of a frame).
 
 Next packages:
-- H the split-invariance tests demand bit-exactness (Open leads, quality: `store_verify.sh`, `seq_verify`,
-  `generate_verify`), on Qwen3-0.6B and Qwen3.5-4B.
 - I the converter's model-card keys (`general.license`, base model, size label, and the rest of upstream's card keys), byte
   for byte as `convert_hf_to_gguf.py` writes them (`tests/convert_verify.sh` compares them "aside" today).
 - J the vision tower's linears register-blocked on the host (77% of the 0.76 s pass).
@@ -1122,10 +1120,13 @@ Speed:
   matmul_f_id (no model here has them); BF16 FFN down (K 17408) the slowest shape (23 TFLOPS).
 
 Quality / correctness:
-- Prefill is split-invariant (ARCHITECTURE.md section 5). Open: the tests that allowed for the old WMMA differences
-  between cuts (store_verify.sh and seq_verify compare first tokens, generate_verify a tolerance) can demand
-  bit-exactness; the full tier's perplexity baselines of the models not run here (the Flash model, the 122B and 120B
-  files) need `tests/regress.sh --update` on those rows.
+- Prefill is split-invariant (ARCHITECTURE.md section 5), and the tests demand it since 2026-11-16 (package H):
+  `seq_verify` (a chunked prompt's and a batch's tokens equal, on Qwen3-0.6B and Qwen3.5-4B), `store_verify` (whole
+  replies equal in phases 2 to 4), `generate_verify` (the chat turns' whole replies; a prompt in micro-batches of 1500
+  and a prompt in calls of 200 bit-identical to the one call's logits). Prefill against token-by-token decoding stays a
+  bound (exact only with `QMATVEC_NO_WMMA=1`: on Qwen3-0.6B the logits differ by up to 0.399, the top token the same).
+  Open: the full tier's perplexity baselines of the models not run here (the Flash model, the 122B and 120B files) need
+  `tests/regress.sh --update` on those rows.
 - Draft events are not verified: `events_test MODEL DRAFT` is written but not run. The Flash model (122.8 GB file)
   shares the work host's 124 GB with the deployment: Flash work needs a window with the deployment stopped, or a
   generator for a tiny model with a draft head (tools/gen_qwen4exp_tiny.py writes none).
