@@ -126,16 +126,47 @@ inline float dot_f32(const float* a, const float* b, int n) {
     return acc;
 }
 
-// y[n][o] = b[o] + sum_i W[o][i] * x[n][i], over n rows. The bias is added after the dot product. Each (row, output)
-// pair is one independent dot product, so the pairs are shared out over the threads (the merger has only a few rows).
+// The eight dot products of a block: 4 input rows (x0..x3) against 2 weight rows (w0, w1), read once each per block
+// (a row-by-row product reads every weight row once per input row). Out[o][r] is the sum for weight row o, input row r
+inline void dot_block_4x2(const float* w0, const float* w1, const float* x0, const float* x1, const float* x2,
+                          const float* x3, int in_dim, float out[2][4]) {
+    float a00 = 0.f, a01 = 0.f, a02 = 0.f, a03 = 0.f, a10 = 0.f, a11 = 0.f, a12 = 0.f, a13 = 0.f;
+#pragma omp simd reduction(+ : a00, a01, a02, a03, a10, a11, a12, a13)
+    for (int i = 0; i < in_dim; ++i) {
+        const float u0 = w0[i], u1 = w1[i];
+        const float v0 = x0[i], v1 = x1[i], v2 = x2[i], v3 = x3[i];
+        a00 += u0 * v0, a01 += u0 * v1, a02 += u0 * v2, a03 += u0 * v3;
+        a10 += u1 * v0, a11 += u1 * v1, a12 += u1 * v2, a13 += u1 * v3;
+    }
+    out[0][0] = a00, out[0][1] = a01, out[0][2] = a02, out[0][3] = a03;
+    out[1][0] = a10, out[1][1] = a11, out[1][2] = a12, out[1][3] = a13;
+}
+
+// y[n][o] = b[o] + sum_i W[o][i] * x[n][i], over n rows. The bias is added after the dot product. The work is blocks of
+// 4 rows and 2 outputs (8 sums in registers, each weight and input row read once per block: the matrix product is
+// memory-bound on the weights), shared out over the threads; the edge rows and outputs are single dot products. The
+// sums are SIMD lane sums as dot_f32's (the last bits only differ from a serial order).
 void linear(const float* W, const float* b, const float* x, float* y, int n, int in_dim, int out_dim) {
-    const long pairs = (long)n * out_dim;
-#pragma omp parallel for schedule(static) if (pairs * in_dim >= VISION_PAR_MACS)
-    for (long p = 0; p < pairs; ++p) {
-        const int r = (int)(p / out_dim), o = (int)(p % out_dim);
-        const float* xr = x + (size_t)r * in_dim;
-        const float* wr = W + (size_t)o * in_dim;
-        y[(size_t)r * out_dim + o] = dot_f32(wr, xr, in_dim) + (b ? b[o] : 0.f);
+    constexpr int RB = 4, OB = 2;
+    const long rblocks = (n + RB - 1) / RB, oblocks = (out_dim + OB - 1) / OB;
+#pragma omp parallel for schedule(static) if ((long)n * out_dim * in_dim >= VISION_PAR_MACS)
+    for (long blk = 0; blk < rblocks * oblocks; ++blk) {
+        const int r0 = (int)(blk / oblocks) * RB, o0 = (int)(blk % oblocks) * OB;
+        const int nr = std::min(RB, n - r0), no = std::min(OB, out_dim - o0);
+        if (nr == RB && no == OB) {
+            float s[2][4];
+            dot_block_4x2(W + (size_t)o0 * in_dim, W + (size_t)(o0 + 1) * in_dim, x + (size_t)r0 * in_dim,
+                          x + (size_t)(r0 + 1) * in_dim, x + (size_t)(r0 + 2) * in_dim, x + (size_t)(r0 + 3) * in_dim,
+                          in_dim, s);
+            for (int oi = 0; oi < OB; ++oi)
+                for (int ri = 0; ri < RB; ++ri)
+                    y[(size_t)(r0 + ri) * out_dim + o0 + oi] = s[oi][ri] + (b ? b[o0 + oi] : 0.f);
+            continue;
+        }
+        for (int r = r0; r < r0 + nr; ++r)
+            for (int o = o0; o < o0 + no; ++o)
+                y[(size_t)r * out_dim + o] =
+                    dot_f32(W + (size_t)o * in_dim, x + (size_t)r * in_dim, in_dim) + (b ? b[o] : 0.f);
     }
 }
 
