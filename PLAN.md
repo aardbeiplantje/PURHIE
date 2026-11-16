@@ -43,7 +43,9 @@ whisper-tiny, `voices/`) and EmbeddingGemma.
    rotation. The user said it is intended; a cap or rotation is a decision for the user.
 6. **`tests/convert_verify.sh` in full.** Blocked on disk: 5.5 GB free on the filesystem that `/models` shares. The run
    needs several GB more. The user frees space, or names a directory for the outputs.
-7. **The full regression (`make regress`)** on the models here, after items 1 and 2.
+7. **Done 2026-11-16: the quick regression (`make regress`): 47 of 47 pass.** Three rows failed only because the Perl XS
+   module could not find `libinference.so.1`; `tests/regress.sh` now puts `build/` on `LD_LIBRARY_PATH`. The full tier
+   (`make regress-full`) is not run yet.
 8. **Codec host stages** (36 ms of a 142 ms piece; the talker dominates a request). Overlap or move to the kernels: low
    value, not started.
    Leads (not started): the q/k norm and rotary inside the attention, the norm once per layer, and the sampler's sort (a

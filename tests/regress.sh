@@ -26,6 +26,7 @@ set -u
 cd "$(dirname "$0")/../build/co" || exit 2
 TSV=../../tests/regress.tsv
 export REFS=${REFS:-/data/q4_0/refs}
+export LD_LIBRARY_PATH="$PWD/../../build${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"  # libinference.so.1 for the Perl XS module
 W=${WIKITEXT:-/data/hf/wikitext/wikitext-2-raw/wiki.test.raw}
 LOGS=${REGRESS_LOGS:-/tmp/regress-logs}
 mkdir -p "$LOGS"
