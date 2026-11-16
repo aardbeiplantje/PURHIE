@@ -100,6 +100,7 @@ RUN echo "apt: $APT_CACHEBUST" && apt-get update && apt-get install -y --no-inst
     ca-certificates \
     strace \
     lsof \
+    ffmpeg \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 COPY --from=rocm-runtime /opt/rocm /opt/rocm
