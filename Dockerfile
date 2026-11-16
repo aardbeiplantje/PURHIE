@@ -134,7 +134,7 @@ RUN mkdir -p /var/lib/nginx/fastcgi && chown runtime /var/lib/nginx/fastcgi
 RUN mkdir -p /var/lib/nginx/uwsgi && chown runtime /var/lib/nginx/uwsgi
 RUN mkdir -p /var/lib/nginx/scgi && chown runtime /var/lib/nginx/scgi
 
-COPY purhie.sh /
+COPY app.sh /
 WORKDIR /app
 COPY lib/ /app/lib/
 
@@ -149,4 +149,4 @@ ENV HF_HUB_DISABLE_XET=1
 ENV HF_HUB_CACHE=/hf/hub
 ENV HF_HOME=/hf
 ENV PERL5LIB=/opt/rocm-hip/perl5/lib/perl5
-ENTRYPOINT ["/purhie.sh"]
+ENTRYPOINT ["/app.sh"]
