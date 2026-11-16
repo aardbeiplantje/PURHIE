@@ -58,6 +58,6 @@ Its ROCm build clones rocm-hip from GitHub `main`, so push before a build. The i
 
 To trigger an image build, touch the trigger from the repository root: `touch .build-trigger`. The user runs
 `build-watch.sh` here, in their shell: it waits for the trigger, runs `docker buildx bake --pull`, and appends the
-output to `build-watch.log`. The build is done when that log has `done, exit N`. The user also runs `image-watch.sh`
-to restart the container. Do not run either watcher yourself, and do not check whether they are running: you cannot
+output to `build-watch.log`. The build is done when that log has `done, exit N`. The user also runs `./serve.sh`
+(the container, `run.sh`, restarted by `image-watch.sh` on each new image). Do not run either watcher yourself, and do not check whether they are running: you cannot
 see the user's shell. Touch the trigger and report. The image runs nothing by itself.
