@@ -34,20 +34,12 @@
 
 #include "fp4_common.h"
 #include "kv_cache.h"
+#include "hip_check.h"
 
 using namespace rocmfp4;
 
 // gemm_act_fp4's W_scales_f argument: nullptr selects the UE4M3 byte-scale path tested here.
 static const float* g_no_scales_f = nullptr;
-
-#define HIP_CHECK(cmd, str) \
-    do { \
-        hipError_t s_ = (cmd); \
-        if (s_ != hipSuccess) { \
-            fprintf(stderr, "ERROR: %s at %s:%d (%s)\n", hipGetErrorString(s_), __FILE__, __LINE__, str); \
-            exit(1); \
-        } \
-    } while(0)
 
 struct Cfg {
     int n_embd = 32;      // hidden size (= d_q here, so the O-projection is square)
@@ -223,7 +215,7 @@ int main(int argc, char** argv) {
     g_rng_state = 77;
     for (int i = 0; i < E; ++i) gamma[i] = __half(rndf(0.5f, 1.5f));
 
-    HIP_CHECK(hipHostRegister(base, total, hipHostRegisterDefault), "pin main mapping");
+    HIP_CHECK(hipHostRegister(base, total, hipHostRegisterDefault));
 
     // Device views of the main mapping (identity on UMA).
     void *dw_q=nullptr,*dw_qs=nullptr,*dkp=nullptr,*dks=nullptr,*dvp=nullptr,*dvs=nullptr,*dop=nullptr,*dops=nullptr;
@@ -231,22 +223,22 @@ int main(int argc, char** argv) {
     void *dqh=nullptr,*dkh=nullptr,*drks=nullptr;
     void *dtqc=nullptr,*dtqs=nullptr,*dtkc=nullptr,*dtks=nullptr;
     void *dsc=nullptr,*dp16=nullptr,*dkb2=nullptr,*dvb2=nullptr,*doh=nullptr,*doin=nullptr,*dqpos=nullptr,*doc=nullptr;
-    HIP_CHECK(hipHostGetDevicePointer(&dw_q, wq_p, 0), "wq_p");   HIP_CHECK(hipHostGetDevicePointer(&dw_qs, wq_s, 0), "wq_s");
-    HIP_CHECK(hipHostGetDevicePointer(&dkp, wk_p, 0), "wk_p");    HIP_CHECK(hipHostGetDevicePointer(&dks, wk_s, 0), "wk_s");
-    HIP_CHECK(hipHostGetDevicePointer(&dvp, wv_p, 0), "wv_p");    HIP_CHECK(hipHostGetDevicePointer(&dvs, wv_s, 0), "wv_s");
-    HIP_CHECK(hipHostGetDevicePointer(&dop, wo_p, 0), "wo_p");    HIP_CHECK(hipHostGetDevicePointer(&dops, wo_s, 0), "wo_s");
-    HIP_CHECK(hipHostGetDevicePointer(&dx, x, 0), "x");           HIP_CHECK(hipHostGetDevicePointer(&dh, hbuf, 0), "hbuf");
-    HIP_CHECK(hipHostGetDevicePointer(&dq, q, 0), "q");           HIP_CHECK(hipHostGetDevicePointer(&dkb, kbuf, 0), "kbuf");
-    HIP_CHECK(hipHostGetDevicePointer(&dvv, vbuf, 0), "vbuf");    HIP_CHECK(hipHostGetDevicePointer(&dvh, vh, 0), "vh");
-    HIP_CHECK(hipHostGetDevicePointer(&dg, gamma, 0), "gamma");
-    HIP_CHECK(hipHostGetDevicePointer(&dqh, qh, 0), "qh");        HIP_CHECK(hipHostGetDevicePointer(&dkh, kh, 0), "kh");
-    HIP_CHECK(hipHostGetDevicePointer(&drks, rks, 0), "rks");
-    HIP_CHECK(hipHostGetDevicePointer(&dtqc, tabqc, 0), "tabqc"); HIP_CHECK(hipHostGetDevicePointer(&dtqs, tabqs, 0), "tabqs");
-    HIP_CHECK(hipHostGetDevicePointer(&dtkc, tabkc, 0), "tabkc"); HIP_CHECK(hipHostGetDevicePointer(&dtks, tabks, 0), "tabks");
-    HIP_CHECK(hipHostGetDevicePointer(&dsc, sc, 0), "sc");        HIP_CHECK(hipHostGetDevicePointer(&dp16, p16, 0), "p16");
-    HIP_CHECK(hipHostGetDevicePointer(&dkb2, kexpB, 0), "kexpB"); HIP_CHECK(hipHostGetDevicePointer(&dvb2, vexpB, 0), "vexpB");
-    HIP_CHECK(hipHostGetDevicePointer(&doh, oh, 0), "oh");        HIP_CHECK(hipHostGetDevicePointer(&doin, oin, 0), "oin");
-    HIP_CHECK(hipHostGetDevicePointer(&dqpos, qpos, 0), "qpos");  HIP_CHECK(hipHostGetDevicePointer(&doc, outC, 0), "outC");
+    HIP_CHECK(hipHostGetDevicePointer(&dw_q, wq_p, 0));   HIP_CHECK(hipHostGetDevicePointer(&dw_qs, wq_s, 0));
+    HIP_CHECK(hipHostGetDevicePointer(&dkp, wk_p, 0));    HIP_CHECK(hipHostGetDevicePointer(&dks, wk_s, 0));
+    HIP_CHECK(hipHostGetDevicePointer(&dvp, wv_p, 0));    HIP_CHECK(hipHostGetDevicePointer(&dvs, wv_s, 0));
+    HIP_CHECK(hipHostGetDevicePointer(&dop, wo_p, 0));    HIP_CHECK(hipHostGetDevicePointer(&dops, wo_s, 0));
+    HIP_CHECK(hipHostGetDevicePointer(&dx, x, 0));           HIP_CHECK(hipHostGetDevicePointer(&dh, hbuf, 0));
+    HIP_CHECK(hipHostGetDevicePointer(&dq, q, 0));           HIP_CHECK(hipHostGetDevicePointer(&dkb, kbuf, 0));
+    HIP_CHECK(hipHostGetDevicePointer(&dvv, vbuf, 0));    HIP_CHECK(hipHostGetDevicePointer(&dvh, vh, 0));
+    HIP_CHECK(hipHostGetDevicePointer(&dg, gamma, 0));
+    HIP_CHECK(hipHostGetDevicePointer(&dqh, qh, 0));        HIP_CHECK(hipHostGetDevicePointer(&dkh, kh, 0));
+    HIP_CHECK(hipHostGetDevicePointer(&drks, rks, 0));
+    HIP_CHECK(hipHostGetDevicePointer(&dtqc, tabqc, 0)); HIP_CHECK(hipHostGetDevicePointer(&dtqs, tabqs, 0));
+    HIP_CHECK(hipHostGetDevicePointer(&dtkc, tabkc, 0)); HIP_CHECK(hipHostGetDevicePointer(&dtks, tabks, 0));
+    HIP_CHECK(hipHostGetDevicePointer(&dsc, sc, 0));        HIP_CHECK(hipHostGetDevicePointer(&dp16, p16, 0));
+    HIP_CHECK(hipHostGetDevicePointer(&dkb2, kexpB, 0)); HIP_CHECK(hipHostGetDevicePointer(&dvb2, vexpB, 0));
+    HIP_CHECK(hipHostGetDevicePointer(&doh, oh, 0));        HIP_CHECK(hipHostGetDevicePointer(&doin, oin, 0));
+    HIP_CHECK(hipHostGetDevicePointer(&dqpos, qpos, 0));  HIP_CHECK(hipHostGetDevicePointer(&doc, outC, 0));
 
     {   // verify device==host address identity for every region of the main mapping
         struct PV { const char* n; const void* h; void* d; };
@@ -282,7 +274,7 @@ int main(int argc, char** argv) {
     };
     hipModule_t m_ln, m_g4, m_rope, m_kvs, m_g16, m_sm;
     hipFunction_t f_ln, f_g4, f_rope, f_kvs, f_g16, f_sm;
-    HIP_CHECK(hipInit(0), "hipInit");
+    HIP_CHECK(hipInit(0));
     if (!load_mod("layernorm.co",      "rmsnorm",          m_ln,  f_ln)  ||
         !load_mod("gemm_act_fp4.co",   "gemm_act_fp4",     m_g4,  f_g4)  ||
         !load_mod("rope_embedding.co", "rope_rotate_half", m_rope,f_rope) ||
@@ -387,19 +379,19 @@ int main(int argc, char** argv) {
         if (g_maxstep >= 1) {   // 1) RMSNorm over the batch rows
             void* src=(void*)((char*)dx + (size_t)S*E*sizeof(__half)), *dst=(void*)((char*)dh + (size_t)S*E*sizeof(__half));
             void* ar[] = { &src, &dg, &dst, (void*)&T, (void*)&E, (void*)&eps };
-            HIP_CHECK(hipModuleLaunchKernel(f_ln, T, 1, 1, 32, 1, 1, 0, 0, ar, nullptr), "rmsnorm");
+            HIP_CHECK(hipModuleLaunchKernel(f_ln, T, 1, 1, 32, 1, 1, 0, 0, ar, nullptr));
         } else printf("    [maxstep] skip step 1\n");
 
         if (g_maxstep >= 2) {   // 2) Q/K/V projections from Codebook10 weights
             int M=T, K=E;
             void* dhv=(void*)h_s;
             { int N=DQ;  void* cq=(void*)q_s; void* ar[] = { &dhv,&dw_q,&dw_qs,(void*)&g_no_scales_f,&cq,(void*)&M,(void*)&N,(void*)&K };
-              HIP_CHECK(hipModuleLaunchKernel(f_g4, (T+15)/16, (DQ+15)/16, 1, 32, 1, 1, 0, 0, ar, nullptr), "proj-q"); }   // grid.x=M rows, grid.y=N cols
+              HIP_CHECK(hipModuleLaunchKernel(f_g4, (T+15)/16, (DQ+15)/16, 1, 32, 1, 1, 0, 0, ar, nullptr)); }   // grid.x=M rows, grid.y=N cols
             { int N=DKV; void* ck=(void*)k_s; void* ar[] = { &dhv,&dkp,&dks,(void*)&g_no_scales_f,&ck,(void*)&M,(void*)&N,(void*)&K };
-              HIP_CHECK(hipModuleLaunchKernel(f_g4, (T+15)/16, (DKV+15)/16, 1, 32, 1, 1, 0, 0, ar, nullptr), "proj-k"); }   // grid.x=M rows, grid.y=N cols
+              HIP_CHECK(hipModuleLaunchKernel(f_g4, (T+15)/16, (DKV+15)/16, 1, 32, 1, 1, 0, 0, ar, nullptr)); }   // grid.x=M rows, grid.y=N cols
             { int N=DKV; void* cv=(void*)v_s; void* ar[] = { &dhv,&dvp,&dvs,(void*)&g_no_scales_f,&cv,(void*)&M,(void*)&N,(void*)&K };
-              HIP_CHECK(hipModuleLaunchKernel(f_g4, (T+15)/16, (DKV+15)/16, 1, 32, 1, 1, 0, 0, ar, nullptr), "proj-v"); }   // grid.x=M rows, grid.y=N cols
-            HIP_CHECK(hipDeviceSynchronize(), "post-proj sync");   // staging copies below read GPU outputs
+              HIP_CHECK(hipModuleLaunchKernel(f_g4, (T+15)/16, (DKV+15)/16, 1, 32, 1, 1, 0, 0, ar, nullptr)); }   // grid.x=M rows, grid.y=N cols
+            HIP_CHECK(hipDeviceSynchronize());   // staging copies below read GPU outputs
         } else printf("    [maxstep] skip step 2\n");
 
         // Snapshot projection outputs immediately after their launches: lets us tell "kernel computed wrong"
@@ -450,17 +442,17 @@ int main(int argc, char** argv) {
                     void* pc=(void*)((char*)dtqc+ ((size_t)h*MAXRUN)*(HD/2)*sizeof(float));
                     void* ps=(void*)((char*)dtqs+ ((size_t)h*MAXRUN)*(HD/2)*sizeof(float));
                     void* ar[] = { &px, &pc, &ps, &px, (void*)&rows, (void*)&hd2 };
-                    HIP_CHECK(hipModuleLaunchKernel(f_rope, rows, 1, 1, 32, 1, 1, 0, 0, ar, nullptr), "rope-q");
+                    HIP_CHECK(hipModuleLaunchKernel(f_rope, rows, 1, 1, 32, 1, 1, 0, 0, ar, nullptr));
                 }
                 for (int h = 0; h < HKV; ++h) {
                     void* px=(void*)((char*)dkh + ((size_t)h*MAXRUN)*HD*sizeof(__half));
                     void* pc=(void*)((char*)dtkc+ ((size_t)h*MAXRUN)*(HD/2)*sizeof(float));
                     void* ps=(void*)((char*)dtks+ ((size_t)h*MAXRUN)*(HD/2)*sizeof(float));
                     void* ar[] = { &px, &pc, &ps, &px, (void*)&rows, (void*)&hd2 };
-                    HIP_CHECK(hipModuleLaunchKernel(f_rope, rows, 1, 1, 32, 1, 1, 0, 0, ar, nullptr), "rope-k");
+                    HIP_CHECK(hipModuleLaunchKernel(f_rope, rows, 1, 1, 32, 1, 1, 0, 0, ar, nullptr));
                 }
             }
-            HIP_CHECK(hipDeviceSynchronize(), "post-rope sync");   // rks reshape below reads rope'd kh
+            HIP_CHECK(hipDeviceSynchronize());   // rks reshape below reads rope'd kh
         } else printf("    [maxstep] skip step 3\n");
 
         if (g_maxstep >= 4) {   // 4) Reshape roped K into token-major staging + KV store into the managed cache at S..S+T-1
@@ -481,8 +473,8 @@ int main(int argc, char** argv) {
                 void* pdv=(void*)vdst_base;
                 int toks=T, dkv=DKV, pos_start=S, n_ctx=CTX;
                 void* ar[] = { &pk, &pv, &pdk, &pdv, (void*)&toks, (void*)&dkv, (void*)&pos_start, (void*)&n_ctx };
-                HIP_CHECK(hipModuleLaunchKernel(f_kvs, 8, 1, 1, 32, 1, 1, 0, 0, ar, nullptr), "kv-store");
-                HIP_CHECK(hipDeviceSynchronize(), "post-store sync");
+                HIP_CHECK(hipModuleLaunchKernel(f_kvs, 8, 1, 1, 32, 1, 1, 0, 0, ar, nullptr));
+                HIP_CHECK(hipDeviceSynchronize());
             }
         } else printf("    [maxstep] skip step 4\n");
 
@@ -511,7 +503,7 @@ int main(int argc, char** argv) {
                     int Mq=T, Nc=CTX, Ki=HD;
                     void* ps=(void*)sc_h;
                     void* ar[] = { &pa, &dkb2, &ps, (void*)&Mq, (void*)&Nc, (void*)&Ki };
-                    HIP_CHECK(hipModuleLaunchKernel(f_g16, 1, (Nc+15)/16, 1, 32, 1, 1, 0, 0, ar, nullptr), "scores-gemm");
+                    HIP_CHECK(hipModuleLaunchKernel(f_g16, 1, (Nc+15)/16, 1, 32, 1, 1, 0, 0, ar, nullptr));
                 }
 
                 {   // softmax over this head's T rows: causal ceiling from absolute positions, valid-KV bound S+T
@@ -519,9 +511,9 @@ int main(int argc, char** argv) {
                     float sc_sm = scale;
                     void* ps=(void*)sc_h;
                     void* ar[] = { &ps, (void*)&nr, (void*)&nc, (void*)&sc_sm, &qpos_h, (void*)&nvalid };
-                    HIP_CHECK(hipModuleLaunchKernel(f_sm, nr, 1, 1, 32, 1, 1, 0, 0, ar, nullptr), "softmax");
+                    HIP_CHECK(hipModuleLaunchKernel(f_sm, nr, 1, 1, 32, 1, 1, 0, 0, ar, nullptr));
                 }
-                HIP_CHECK(hipDeviceSynchronize(), "post-softmax sync");   // p16 copy below reads scores
+                HIP_CHECK(hipDeviceSynchronize());   // p16 copy below reads scores
 
                 for (int t = 0; t < T; ++t)                             // probs -> fp16 copy for the out-gemm A operand
                     for (int pp = 0; pp < CTX; ++pp) p16_h[t*CTX+pp] = __half(sc_h[t*CTX+pp]);
@@ -531,8 +523,8 @@ int main(int argc, char** argv) {
                     int Mo=T, No=HD, Ki2=CTX;
                     void* po=(void*)oh_h;
                     void* ar[] = { &pa, &dvb2, &po, (void*)&Mo, (void*)&No, (void*)&Ki2 };
-                    HIP_CHECK(hipModuleLaunchKernel(f_g16, (Mo+15)/16, (No+15)/16, 1, 32, 1, 1, 0, 0, ar, nullptr), "out-gemm");
-                    HIP_CHECK(hipDeviceSynchronize(), "post-outgemm sync");  // protect shared kexpB/vexpB from next head's rebuild
+                    HIP_CHECK(hipModuleLaunchKernel(f_g16, (Mo+15)/16, (No+15)/16, 1, 32, 1, 1, 0, 0, ar, nullptr));
+                    HIP_CHECK(hipDeviceSynchronize());  // protect shared kexpB/vexpB from next head's rebuild
                 }
             }
         } else printf("    [maxstep] skip step 5\n");
@@ -543,7 +535,7 @@ int main(int argc, char** argv) {
                 for (int h = 0; h < HQ; ++h)
                     for (int d = 0; d < HD; ++d) oin[(size_t)p*DQ + h*HD + d] = __half(oh[((size_t)h*MAXRUN+t)*HD + d]);
             }
-            HIP_CHECK(hipDeviceSynchronize(), "post-outgemm sync");   // oin flatten above reads oh of every head
+            HIP_CHECK(hipDeviceSynchronize());   // oin flatten above reads oh of every head
         } else printf("    [maxstep] skip step 6\n");
 
         if (g_maxstep >= 7) {   // 7) Output projection -> final hidden rows.
@@ -552,9 +544,9 @@ int main(int argc, char** argv) {
             int N=E;
             void* cc=(void*)(outC + (size_t)S*E);
             void* ar[] = { &ca, &dop, &dops, (void*)&g_no_scales_f,&cc, (void*)&M, (void*)&N, (void*)&K };
-            HIP_CHECK(hipModuleLaunchKernel(f_g4, 1, (N+15)/16, 1, 32, 1, 1, 0, 0, ar, nullptr), "proj-o");
+            HIP_CHECK(hipModuleLaunchKernel(f_g4, 1, (N+15)/16, 1, 32, 1, 1, 0, 0, ar, nullptr));
         } else printf("    [maxstep] skip step 7\n");
-        HIP_CHECK(hipDeviceSynchronize(), "scenario sync");
+        HIP_CHECK(hipDeviceSynchronize());
 
         // ---- intermediate sanity: GPU projection buffers vs reference (diagnostic only) ----
         long iq=0, ik=0, iv=0; float imax=0.0f; long shown=0;
@@ -665,8 +657,8 @@ if (bad_result_final(g,r)) {
             void* ca=(void*)((char*)dh + (size_t)S*E*sizeof(__half));
             void* cc=(void*)(outC + (size_t)S*E);   // scratch reuse: final-row comparison already done above
             void* ar[] = { &ca, &dw_q, &dw_qs, (void*)&g_no_scales_f,&cc, (void*)&M, (void*)&N, (void*)&K };
-            HIP_CHECK(hipModuleLaunchKernel(f_g4, (T+15)/16, (N+15)/16, 1, 32, 1, 1, 0, 0, ar, nullptr), "probeB");
-            HIP_CHECK(hipDeviceSynchronize(), "probeB sync");
+            HIP_CHECK(hipModuleLaunchKernel(f_g4, (T+15)/16, (N+15)/16, 1, 32, 1, 1, 0, 0, ar, nullptr));
+            HIP_CHECK(hipDeviceSynchronize());
             long bb=0; float mx=0;
             for (int t = 0; t < T; ++t)
                 for (int j = 0; j < DQ; ++j) {
@@ -684,7 +676,7 @@ if (bad_result_final(g,r)) {
     run_scenario("decode ", 4, 1);      // position 4, reads stored history through the cache manager
 
     kv_cache_free(kvc);
-    HIP_CHECK(hipHostUnregister(base), "unpin main mapping");
+    HIP_CHECK(hipHostUnregister(base));
     munmap(base, total); close(fd);
 
     if (total_failures == 0) {

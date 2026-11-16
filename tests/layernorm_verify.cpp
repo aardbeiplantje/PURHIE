@@ -16,15 +16,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-
-#define HIP_CHECK(cmd, str) \
-    do { \
-        hipError_t s_ = (cmd); \
-        if (s_ != hipSuccess) { \
-            fprintf(stderr, "ERROR: %s at %s:%d (%s)\n", hipGetErrorString(s_), __FILE__, __LINE__, str); \
-            exit(1); \
-        } \
-    } while(0)
+#include "hip_check.h"
 
 static uint32_t g_rng_state = 7;
 static float rnd(float lo, float hi) {   // LCG -> [lo, hi)
@@ -75,27 +67,27 @@ static bool run_shape(int tokens, int embd, float eps) {
             y_ref[t * embd + c] = (__half)((float)x[t * embd + c] * inv * (float)gamma[c]);
     }
 
-    HIP_CHECK(hipHostRegister(base, total, hipHostRegisterDefault), "pin");
+    HIP_CHECK(hipHostRegister(base, total, hipHostRegisterDefault));
 
     __half* d_x; __half* d_g; __half* d_y;
-    HIP_CHECK(hipHostGetDevicePointer((void**)&d_x, x, 0), "dev x");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&d_g, gamma, 0), "dev gamma");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&d_y, y_gpu, 0), "dev y");
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_x, x, 0));
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_g, gamma, 0));
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_y, y_gpu, 0));
 
     hipModule_t mod; hipFunction_t func;
     int kfd = open("layernorm.co", O_RDONLY);
     if (kfd < 0) { perror("layernorm.co"); return false; }
     struct stat st; fstat(kfd, &st);
     void* coData = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, kfd, 0);
-    HIP_CHECK(hipInit(0), "hipInit");
-    HIP_CHECK(hipModuleLoadData(&mod, coData), "load module");
+    HIP_CHECK(hipInit(0));
+    HIP_CHECK(hipModuleLoadData(&mod, coData));
     munmap(coData, st.st_size); close(kfd);
-    HIP_CHECK(hipModuleGetFunction(&func, mod, "rmsnorm"), "get function");
+    HIP_CHECK(hipModuleGetFunction(&func, mod, "rmsnorm"));
 
     void* args[] = { &d_x, &d_g, &d_y, (void*)&tokens, (void*)&embd, (void*)&eps };
-    HIP_CHECK(hipModuleLaunchKernel(func, tokens, 1, 1, 32, 1, 1, 0, 0, args, nullptr), "launch rmsnorm");
-    HIP_CHECK(hipDeviceSynchronize(), "sync");
-    HIP_CHECK(hipModuleUnload(mod), "unload");
+    HIP_CHECK(hipModuleLaunchKernel(func, tokens, 1, 1, 32, 1, 1, 0, 0, args, nullptr));
+    HIP_CHECK(hipDeviceSynchronize());
+    HIP_CHECK(hipModuleUnload(mod));
 
     long failures = 0; float max_diff = 0.0f;
     for (int i = 0; i < tokens * embd; ++i) {
@@ -111,7 +103,7 @@ static bool run_shape(int tokens, int embd, float eps) {
     printf("    zero-copy=%s  elements=%ld  failures=%ld  max_abs_diff=%.6f\n",
            (d_x == x && d_y == y_gpu) ? "yes" : "NO(!)", (long)(tokens * embd), failures, max_diff);
 
-    HIP_CHECK(hipHostUnregister(base), "unpin");
+    HIP_CHECK(hipHostUnregister(base));
     munmap(base, total); close(fd);
     return failures == 0;
 }

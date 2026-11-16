@@ -15,15 +15,7 @@
 #include <hip/hip_runtime.h>
 
 #include "kv_cache.h"
-
-#define HIP_CHECK(cmd, str) \
-    do { \
-        hipError_t s_ = (cmd); \
-        if (s_ != hipSuccess) { \
-            fprintf(stderr, "ERROR: %s at %s:%d (%s)\n", hipGetErrorString(s_), __FILE__, __LINE__, str); \
-            exit(1); \
-        } \
-    } while(0)
+#include "hip_check.h"
 
 struct Cfg {
     int n_layers = 4;
@@ -64,7 +56,7 @@ static bool load_kernel(const char* co_path, const char* func_name, hipModule_t&
     struct stat st; fstat(kfd, &st);
     void* coData = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, kfd, 0);
     bool ok = true;
-    HIP_CHECK(hipInit(0), "hipInit");
+    HIP_CHECK(hipInit(0));
     if (hipModuleLoadData(&mod_out, coData) != hipSuccess) { fprintf(stderr, "load %s: %s\n", co_path, hipGetErrorString(hipGetLastError())); ok = false; }
     else if (hipModuleGetFunction(&func_out, mod_out, func_name) != hipSuccess) { fprintf(stderr, "symbol %s: %s\n", func_name, hipGetErrorString(hipGetLastError())); ok = false; }
     munmap(coData, st.st_size);
@@ -157,9 +149,9 @@ int main(int argc, char* argv[]) {
     float* check_host = (float*)mmap(NULL, total_elems * sizeof(float), PROT_READ | PROT_WRITE, MAP_SHARED, sfd, 0);
     if (check_host == MAP_FAILED) { perror("mmap scratch"); return 1; }
     memset(check_host, 0, total_elems * sizeof(float));
-    HIP_CHECK(hipHostRegister(check_host, total_elems * sizeof(float), hipHostRegisterDefault), "pin scratch");
+    HIP_CHECK(hipHostRegister(check_host, total_elems * sizeof(float), hipHostRegisterDefault));
     float* dev_check = nullptr;
-    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_check, check_host, 0), "scratch dev ptr");
+    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_check, check_host, 0));
 
     void* kv_dev_base = kv_cache_device_ptr(cache);
     // Layer l's K rows start at base + 2 l * B rows, its V rows B rows later (kv_cache.h, one block)
@@ -181,8 +173,8 @@ int main(int argc, char* argv[]) {
     if (grid > 4096) grid = 4096;   // kernel is grid-stride; cap for large configs
 
     printf("  Launching kv_cache_selftest<<<%d, %d>>> over %zu slots...\n", grid, block, total_elems);
-    HIP_CHECK(hipModuleLaunchKernel(func, grid, 1, 1, block, 1, 1, 0, 0, args, nullptr), "launch selftest");
-    HIP_CHECK(hipDeviceSynchronize(), "sync selftest");
+    HIP_CHECK(hipModuleLaunchKernel(func, grid, 1, 1, block, 1, 1, 0, 0, args, nullptr));
+    HIP_CHECK(hipDeviceSynchronize());
 
     // --- verify every check element against the CPU expectation ---
     long mismatches = 0;
@@ -204,7 +196,7 @@ int main(int argc, char* argv[]) {
     printf("    elements=%zu mismatches=%ld max_diff=%.6f\n", total_elems, mismatches, max_diff);
 
     // --- cleanup ---
-    HIP_CHECK(hipHostUnregister(check_host), "unpin scratch");
+    HIP_CHECK(hipHostUnregister(check_host));
     munmap(check_host, total_elems * sizeof(float));
     close(sfd);
     kv_cache_free(cache);

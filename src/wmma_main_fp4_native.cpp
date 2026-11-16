@@ -9,17 +9,9 @@
 #include <cstring>
 #include <hip/hip_runtime.h>
 #include "fp4_common.h"
+#include "hip_check.h"
 
 using namespace rocmfp4;
-
-#define HIP_CHECK(cmd, str) \
-    do { \
-        hipError_t s = (cmd); \
-        if (s != hipSuccess) { \
-            fprintf(stderr, "ERROR: %s at %s:%d (%s)\n", hipGetErrorString(s), __FILE__, __LINE__, str); \
-            exit(1); \
-        } \
-    } while(0)
 
 // FP4 dequant helper (Codebook10 from fp4_common.h)
 __host__ __forceinline__ float fp4_dequant(uint8_t nibble, float scale) {
@@ -105,14 +97,14 @@ int main() {
     memset(C_gpu, 0, C_bytes);
 
     // Pin mmap'ed pages for GPU access
-    HIP_CHECK(hipHostRegister(hostPtr, total_bytes, hipHostRegisterDefault), "pin mmap memory");
+    HIP_CHECK(hipHostRegister(hostPtr, total_bytes, hipHostRegisterDefault));
 
     unsigned char* dev_A, *dev_B;
     float* dev_C;
 
-    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_A, (void*)A_fp4, 0), "get dev ptr A");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_B, (void*)B_fp4, 0), "get dev ptr B");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_C, (void*)C_gpu, 0), "get dev ptr C");
+    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_A, (void*)A_fp4, 0));
+    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_B, (void*)B_fp4, 0));
+    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_C, (void*)C_gpu, 0));
 
     float dev_scale = scale_val;
 
@@ -125,12 +117,12 @@ int main() {
     struct stat st; fstat(kfd, &st);
     void* coData = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, kfd, 0);
 
-    HIP_CHECK(hipInit(0), "init");
+    HIP_CHECK(hipInit(0));
     hipModule_t mod;
-    HIP_CHECK(hipModuleLoadData(&mod, coData), "load module");
+    HIP_CHECK(hipModuleLoadData(&mod, coData));
 
     hipFunction_t func;
-    HIP_CHECK(hipModuleGetFunction(&func, mod, "wmma_matmul_fp4_native"), "get function");
+    HIP_CHECK(hipModuleGetFunction(&func, mod, "wmma_matmul_fp4_native"));
 
     // Launch: 1 warp (32 threads) per tile
     dim3 block(32);
@@ -139,12 +131,12 @@ int main() {
     printf("\nLaunching wmma_matmul_fp4_native<<<%d, %d>>>...\n", grid.x, block.x);
     void* args[] = { &dev_A, &dev_B, &dev_C, &dev_scale };
     HIP_CHECK(hipModuleLaunchKernel(func, grid.x, grid.y, 1, block.x, block.y, 1,
-                                    0, 0, args, nullptr), "launch");
-    HIP_CHECK(hipDeviceSynchronize(), "sync after kernel");
+                                    0, 0, args, nullptr));
+    HIP_CHECK(hipDeviceSynchronize());
 
     munmap(coData, st.st_size);
     close(kfd);
-    HIP_CHECK(hipModuleUnload(mod), "unload");
+    HIP_CHECK(hipModuleUnload(mod));
 
     // Print GPU result
     printf("\nGPU Result C[32x16] = A[32x128] FP4 x B[16x128] FP4:\n");
@@ -195,7 +187,7 @@ int main() {
     }
 
     // Cleanup
-    HIP_CHECK(hipHostUnregister(hostPtr), "unpin memory");
+    HIP_CHECK(hipHostUnregister(hostPtr));
     munmap(hostPtr, total_bytes);
     close(fd);
 

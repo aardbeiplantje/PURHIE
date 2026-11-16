@@ -5,15 +5,7 @@
 #include <unistd.h>
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-
-#define HIP_CHECK(call) \
-    do { \
-        hipError_t err = call; \
-        if (err != hipSuccess) { \
-            fprintf(stderr, "HIP ERROR: %s at %s:%d\n", hipGetErrorString(err), __FILE__, __LINE__); \
-            exit(1); \
-        } \
-    } while(0)
+#include "hip_check.h"
 
 // Minimal test: load verify_minimal.co and launch kernel
 int main() {

@@ -24,6 +24,10 @@
 #include <unordered_map>
 #include <vector>
 
+// The loops that do not vectorize are left scalar on purpose: mixed fp16 / fp32 conversions, early exits and calls
+// (the vectorizer's remarks, -Wpass-failed, on every build of this file): not a warning to act on
+#pragma clang diagnostic ignored "-Wpass-failed"
+
 namespace {
 
 std::string g_error;

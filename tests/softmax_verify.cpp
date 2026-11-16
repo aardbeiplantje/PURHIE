@@ -17,15 +17,7 @@
 #include <unistd.h>
 
 #include <hip/hip_runtime.h>
-
-#define HIP_CHECK(cmd, str) \
-    do { \
-        hipError_t s_ = (cmd); \
-        if (s_ != hipSuccess) { \
-            fprintf(stderr, "ERROR: %s at %s:%d (%s)\n", hipGetErrorString(s_), __FILE__, __LINE__, str); \
-            exit(1); \
-        } \
-    } while(0)
+#include "hip_check.h"
 
 static uint32_t g_rng_state = 21;
 static float rnd(float lo, float hi) {   // LCG -> [lo, hi)
@@ -96,29 +88,29 @@ static bool run_case(const Case& t, const char* label) {
 
     cpu_reference(orig, t.causal ? qpos : nullptr, t.rows, t.cols, n_valid, scale, ref);
 
-    HIP_CHECK(hipHostRegister(base, total, hipHostRegisterDefault), "pin");
+    HIP_CHECK(hipHostRegister(base, total, hipHostRegisterDefault));
     float* d_s; int* d_q;
-    HIP_CHECK(hipHostGetDevicePointer((void**)&d_s, scores, 0), "dev scores");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&d_q, qpos, 0), "dev qpos");
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_s, scores, 0));
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_q, qpos, 0));
 
     hipModule_t mod; hipFunction_t func;
     int kfd = open("softmax_masked.co", O_RDONLY);
     if (kfd < 0) { perror("softmax_masked.co"); return false; }
     struct stat st; fstat(kfd, &st);
     void* coData = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, kfd, 0);
-    HIP_CHECK(hipInit(0), "hipInit");
-    HIP_CHECK(hipModuleLoadData(&mod, coData), "load module");
+    HIP_CHECK(hipInit(0));
+    HIP_CHECK(hipModuleLoadData(&mod, coData));
     munmap(coData, st.st_size); close(kfd);
-    HIP_CHECK(hipModuleGetFunction(&func, mod, "softmax_masked"), "get function");
+    HIP_CHECK(hipModuleGetFunction(&func, mod, "softmax_masked"));
 
     // NOTE: every args[] entry must be a real address -- the runtime copies from each one, so a raw
     // NULL entry segfaults. To pass "no qpos", hand over the address of a null pointer variable.
     int* qpass = t.causal ? d_q : nullptr;
     void* args[] = { &d_s, (void*)&t.rows, (void*)&t.cols, (void*)&scale,
                      &qpass, (void*)&n_valid };
-    HIP_CHECK(hipModuleLaunchKernel(func, t.rows, 1, 1, 32, 1, 1, 0, 0, args, nullptr), "launch softmax");
-    HIP_CHECK(hipDeviceSynchronize(), "sync");
-    HIP_CHECK(hipModuleUnload(mod), "unload");
+    HIP_CHECK(hipModuleLaunchKernel(func, t.rows, 1, 1, 32, 1, 1, 0, 0, args, nullptr));
+    HIP_CHECK(hipDeviceSynchronize());
+    HIP_CHECK(hipModuleUnload(mod));
 
     long failures = 0; float max_diff = 0.0f;
     for (int r = 0; r < t.rows; ++r) {
@@ -140,7 +132,7 @@ static bool run_case(const Case& t, const char* label) {
     printf("    zero-copy=%s  elements=%d  failures=%ld  max_abs_diff=%.6f\n",
            (d_s == scores) ? "yes" : "NO(!)", t.rows * t.cols, failures, max_diff);
 
-    HIP_CHECK(hipHostUnregister(base), "unpin");
+    HIP_CHECK(hipHostUnregister(base));
     munmap(base, total); close(fd);
     return failures == 0;
 }

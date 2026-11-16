@@ -18,15 +18,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-
-#define HIP_CHECK(cmd, str) \
-    do { \
-        hipError_t s_ = (cmd); \
-        if (s_ != hipSuccess) { \
-            fprintf(stderr, "ERROR: %s at %s:%d (%s)\n", hipGetErrorString(s_), __FILE__, __LINE__, str); \
-            exit(1); \
-        } \
-    } while(0)
+#include "hip_check.h"
 
 static uint32_t g_rng_state = 13;
 static float rnd(float lo, float hi) {   // LCG -> [lo, hi)
@@ -92,28 +84,28 @@ static bool run_shape(int rows, int dim, const std::vector<int>& positions) {
         }
     }
 
-    HIP_CHECK(hipHostRegister(base, total, hipHostRegisterDefault), "pin");
+    HIP_CHECK(hipHostRegister(base, total, hipHostRegisterDefault));
 
     __half* d_x; __half* d_y; float* d_c; float* d_s;
-    HIP_CHECK(hipHostGetDevicePointer((void**)&d_x, x, 0), "dev x");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&d_c, ctab, 0), "dev ctab");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&d_s, stab, 0), "dev stab");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&d_y, y_gpu, 0), "dev y");
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_x, x, 0));
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_c, ctab, 0));
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_s, stab, 0));
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_y, y_gpu, 0));
 
     hipModule_t mod; hipFunction_t func;
     int kfd = open("rope_embedding.co", O_RDONLY);
     if (kfd < 0) { perror("rope_embedding.co"); return false; }
     struct stat st; fstat(kfd, &st);
     void* coData = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, kfd, 0);
-    HIP_CHECK(hipInit(0), "hipInit");
-    HIP_CHECK(hipModuleLoadData(&mod, coData), "load module");
+    HIP_CHECK(hipInit(0));
+    HIP_CHECK(hipModuleLoadData(&mod, coData));
     munmap(coData, st.st_size); close(kfd);
-    HIP_CHECK(hipModuleGetFunction(&func, mod, "rope_rotate_half"), "get function");
+    HIP_CHECK(hipModuleGetFunction(&func, mod, "rope_rotate_half"));
 
     void* args[] = { &d_x, &d_c, &d_s, &d_y, (void*)&rows, (void*)&H };
-    HIP_CHECK(hipModuleLaunchKernel(func, rows, 1, 1, 32, 1, 1, 0, 0, args, nullptr), "launch rope");
-    HIP_CHECK(hipDeviceSynchronize(), "sync");
-    HIP_CHECK(hipModuleUnload(mod), "unload");
+    HIP_CHECK(hipModuleLaunchKernel(func, rows, 1, 1, 32, 1, 1, 0, 0, args, nullptr));
+    HIP_CHECK(hipDeviceSynchronize());
+    HIP_CHECK(hipModuleUnload(mod));
 
     long failures = 0; float max_diff = 0.0f;
     for (int i = 0; i < rows * dim; ++i) {
@@ -129,7 +121,7 @@ static bool run_shape(int rows, int dim, const std::vector<int>& positions) {
     printf("    zero-copy=%s  elements=%d  failures=%ld  max_abs_diff=%.7f\n",
            (d_x == x && d_y == y_gpu) ? "yes" : "NO(!)", rows * dim, failures, max_diff);
 
-    HIP_CHECK(hipHostUnregister(base), "unpin");
+    HIP_CHECK(hipHostUnregister(base));
     munmap(base, total); close(fd);
     return failures == 0;
 }

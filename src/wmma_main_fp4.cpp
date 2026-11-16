@@ -10,17 +10,9 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include "fp4_common.h"
+#include "hip_check.h"
 
 using namespace rocmfp4;
-
-#define HIP_CHECK(cmd, str) \
-    do { \
-        hipError_t s = (cmd); \
-        if (s != hipSuccess) { \
-            fprintf(stderr, "ERROR: %s at %s:%d (%s)\n", hipGetErrorString(s), __FILE__, __LINE__, str); \
-            exit(1); \
-        } \
-    } while(0)
 
 #define MATRIX_SIZE 16
 #define MAT_SIZE (MATRIX_SIZE * MATRIX_SIZE)
@@ -127,17 +119,17 @@ int main() {
     memset(result_gpu, 0, fp16_bytes);
 
     // Pin mmap'ed pages for GPU access
-    HIP_CHECK(hipHostRegister(hostPtr, total_bytes, hipHostRegisterDefault), "pin mmap memory");
+    HIP_CHECK(hipHostRegister(hostPtr, total_bytes, hipHostRegisterDefault));
 
     unsigned char* dev_weights_fp4;
     __half* dev_activations;
     __half* dev_result;
 
-    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_weights_fp4, (void*)weights_fp4, 0), "get dev ptr fp4");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_activations, (void*)activations, 0), "get dev ptr act");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_result, (void*)result_gpu, 0), "get dev ptr result");
+    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_weights_fp4, (void*)weights_fp4, 0));
+    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_activations, (void*)activations, 0));
+    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_result, (void*)result_gpu, 0));
     __half* dev_result_cpu;
-    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_result_cpu, (void*)result_cpu, 0), "get dev ptr cpu");
+    HIP_CHECK(hipHostGetDevicePointer((void**)&dev_result_cpu, (void*)result_cpu, 0));
 
     float dev_scale = scale_val;
 
@@ -150,12 +142,12 @@ int main() {
     struct stat st; fstat(kfd, &st);
     void* coData = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, kfd, 0);
 
-    HIP_CHECK(hipInit(0), "init");
+    HIP_CHECK(hipInit(0));
     hipModule_t mod;
-    HIP_CHECK(hipModuleLoadData(&mod, coData), "load module");
+    HIP_CHECK(hipModuleLoadData(&mod, coData));
 
     hipFunction_t func;
-    HIP_CHECK(hipModuleGetFunction(&func, mod, "wmma_matmul_fp4"), "get function");
+    HIP_CHECK(hipModuleGetFunction(&func, mod, "wmma_matmul_fp4"));
 
     // Launch kernel: 1 block of 32 threads
     dim3 block(32);
@@ -164,12 +156,12 @@ int main() {
     printf("\nLaunching wmma_matmul_fp4<<<%d, %d>>>...\n", grid.x, block.x);
     void* args[] = { &dev_weights_fp4, &dev_activations, &dev_result, &dev_scale };
     HIP_CHECK(hipModuleLaunchKernel(func, grid.x, grid.y, 1, block.x, block.y, 1,
-                                    0, 0, args, nullptr), "launch");
-    HIP_CHECK(hipDeviceSynchronize(), "sync after kernel");
+                                    0, 0, args, nullptr));
+    HIP_CHECK(hipDeviceSynchronize());
 
     munmap(coData, st.st_size);
     close(kfd);
-    HIP_CHECK(hipModuleUnload(mod), "unload");
+    HIP_CHECK(hipModuleUnload(mod));
 
     // Read results (already in host-visible memory via mmap)
    printf("\nGPU Result C = A_fp4 x B (16x16 FP16 matrix):\n");
@@ -222,7 +214,7 @@ int main() {
     }
 
     // Cleanup
-    HIP_CHECK(hipHostUnregister(hostPtr), "unpin memory");
+    HIP_CHECK(hipHostUnregister(hostPtr));
     munmap(hostPtr, total_bytes);
     close(fd);
 

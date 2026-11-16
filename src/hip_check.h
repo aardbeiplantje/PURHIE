@@ -1,5 +1,6 @@
 // hip_check.h: the HIP runtime's results are checked (hipError_t is [[nodiscard]]: a discarded result is a warning).
-// HIP_CHECK(call): on failure, throws std::runtime_error naming the call and HIP's message.
+// HIP_CHECK(call): on failure, throws std::runtime_error naming the call, its file and line, and HIP's message
+// (a program that does not catch it stops with that message).
 // HIP_WARN(call): on failure, prints the same to stderr and goes on: for cleanup that must not throw (destructors,
 // the error path of a graph capture).
 #ifndef HIP_CHECK_H
@@ -15,7 +16,8 @@
     do {                                                                                  \
         const hipError_t hip_check_e_ = (call);                                           \
         if (hip_check_e_ != hipSuccess)                                                   \
-            throw std::runtime_error(std::string(#call) + " failed: " + hipGetErrorString(hip_check_e_)); \
+            throw std::runtime_error(std::string(#call) + " failed at " + __FILE__ + ":" + std::to_string(__LINE__) + \
+                                     ": " + hipGetErrorString(hip_check_e_)); \
     } while (0)
 
 #define HIP_WARN(call)                                                                    \

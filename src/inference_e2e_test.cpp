@@ -9,15 +9,7 @@
 #include "inference.h"
 #include "tokenizer.h"
 #include "qwen_model.h"
-
-#define HIP_CHECK(call) \
-    do { \
-        hipError_t err = call; \
-        if (err != hipSuccess) { \
-            fprintf(stderr, "HIP ERROR: %s at %s:%d\n", hipGetErrorString(err), __FILE__, __LINE__); \
-            exit(1); \
-        } \
-    } while(0)
+#include "hip_check.h"
 
 int main(int argc, char** argv) {
     if (argc < 3) {

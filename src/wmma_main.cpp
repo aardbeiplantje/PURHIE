@@ -9,15 +9,7 @@
 #include <cstring>
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-
-#define HIP_CHECK(cmd, str) \
-    do { \
-        hipError_t s = (cmd); \
-        if (s != hipSuccess) { \
-            fprintf(stderr, "ERROR: %s at %s:%d (%s)\n", hipGetErrorString(s), __FILE__, __LINE__, str); \
-            exit(1); \
-        } \
-    } while(0)
+#include "hip_check.h"
 
 #define MATRIX_SIZE 16
 #define MAT_SIZE (MATRIX_SIZE * MATRIX_SIZE)
@@ -81,13 +73,13 @@ int main() {
 
     // Pin mmap'ed pages for GPU access
     // Use hipHostRegisterDefault (more portable than hipHostRegisterMapped)
-    HIP_CHECK(hipHostRegister(hostPtr, total_bytes, hipHostRegisterDefault), "pin mmap memory");
+    HIP_CHECK(hipHostRegister(hostPtr, total_bytes, hipHostRegisterDefault));
 
     // Get device pointer (may equal hostPtr on APU)
     __half* devA, *devB, *devC;
-    HIP_CHECK(hipHostGetDevicePointer((void**)&devA, (void*)a, 0), "get dev ptr A");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&devB, (void*)b, 0), "get dev ptr B");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&devC, (void*)c, 0), "get dev ptr C");
+    HIP_CHECK(hipHostGetDevicePointer((void**)&devA, (void*)a, 0));
+    HIP_CHECK(hipHostGetDevicePointer((void**)&devB, (void*)b, 0));
+    HIP_CHECK(hipHostGetDevicePointer((void**)&devC, (void*)c, 0));
 
     printf("\nMemory pointers:\n");
     printf("  host A: %p\n", (void*)a);
@@ -100,12 +92,12 @@ int main() {
     struct stat st; fstat(kfd, &st);
     void* coData = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, kfd, 0);
 
-    HIP_CHECK(hipInit(0), "init");
+    HIP_CHECK(hipInit(0));
     hipModule_t mod;
-    HIP_CHECK(hipModuleLoadData(&mod, coData), "load module");
+    HIP_CHECK(hipModuleLoadData(&mod, coData));
 
     hipFunction_t func;
-    HIP_CHECK(hipModuleGetFunction(&func, mod, "wmma_matmul"), "get function");
+    HIP_CHECK(hipModuleGetFunction(&func, mod, "wmma_matmul"));
 
     // Launch kernel: 1 block of 32 threads
     // WMMA 16x16x16 on RDNA3 requires 32 threads to cover all 16 result rows
@@ -115,12 +107,12 @@ int main() {
     printf("\nLaunching wmma_matmul<<<%d, %d>>>...\n", grid.x, block.x);
     void* args[] = { &devA, &devB, &devC };
     HIP_CHECK(hipModuleLaunchKernel(func, grid.x, grid.y, 1, block.x, block.y, 1,
-                                    0, 0, args, nullptr), "launch");
-    HIP_CHECK(hipDeviceSynchronize(), "sync after kernel");
+                                    0, 0, args, nullptr));
+    HIP_CHECK(hipDeviceSynchronize());
 
     munmap(coData, st.st_size);
     close(kfd);
-    HIP_CHECK(hipModuleUnload(mod), "unload");
+    HIP_CHECK(hipModuleUnload(mod));
 
     // Read results back (already in host-visible memory via mmap)
     printf("\nResult C = A * B (%dx%d) from GPU WMMA:\n", MATRIX_SIZE, MATRIX_SIZE);
@@ -151,7 +143,7 @@ int main() {
     }
 
     // Cleanup
-    HIP_CHECK(hipHostUnregister(hostPtr), "unpin memory");
+    HIP_CHECK(hipHostUnregister(hostPtr));
     munmap(hostPtr, total_bytes);
     close(fd);
 

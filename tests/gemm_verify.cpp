@@ -17,15 +17,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-
-#define HIP_CHECK(cmd, str) \
-    do { \
-        hipError_t s_ = (cmd); \
-        if (s_ != hipSuccess) { \
-            fprintf(stderr, "ERROR: %s at %s:%d (%s)\n", hipGetErrorString(s_), __FILE__, __LINE__, str); \
-            exit(1); \
-        } \
-    } while(0)
+#include "hip_check.h"
 
 static uint32_t g_rng_state = 42;
 static float rnd() {   // LCG -> [-2, 2)
@@ -74,12 +66,12 @@ static bool run_shape(int M, int N, int K) {
     }
     auto t1 = std::chrono::high_resolution_clock::now();
 
-    HIP_CHECK(hipHostRegister(base, total, hipHostRegisterDefault), "pin mapping");
+    HIP_CHECK(hipHostRegister(base, total, hipHostRegisterDefault));
 
     __half* d_A; __half* d_B; float* d_C;
-    HIP_CHECK(hipHostGetDevicePointer((void**)&d_A, A, 0), "dev A");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&d_B, B, 0), "dev B");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&d_C, Cgpu, 0), "dev C");
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_A, A, 0));
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_B, B, 0));
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_C, Cgpu, 0));
     bool zero_copy = (d_A == A && d_B == B && d_C == Cgpu);
 
     hipModule_t mod; hipFunction_t func;
@@ -87,16 +79,16 @@ static bool run_shape(int M, int N, int K) {
     if (kfd < 0) { perror("fp16_gemm.co"); return false; }
     struct stat st; fstat(kfd, &st);
     void* coData = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, kfd, 0);
-    HIP_CHECK(hipInit(0), "hipInit");
-    HIP_CHECK(hipModuleLoadData(&mod, coData), "load module");
+    HIP_CHECK(hipInit(0));
+    HIP_CHECK(hipModuleLoadData(&mod, coData));
     munmap(coData, st.st_size); close(kfd);
-    HIP_CHECK(hipModuleGetFunction(&func, mod, "fp16_gemm"), "get function");
+    HIP_CHECK(hipModuleGetFunction(&func, mod, "fp16_gemm"));
 
     dim3 grid((M + 15) / 16, (N + 15) / 16);
     void* args[] = { &d_A, &d_B, &d_C, (void*)&M, (void*)&N, (void*)&K };
-    HIP_CHECK(hipModuleLaunchKernel(func, grid.x, grid.y, 1, 32, 1, 1, 0, 0, args, nullptr), "launch");
-    HIP_CHECK(hipDeviceSynchronize(), "sync");
-    HIP_CHECK(hipModuleUnload(mod), "unload");
+    HIP_CHECK(hipModuleLaunchKernel(func, grid.x, grid.y, 1, 32, 1, 1, 0, 0, args, nullptr));
+    HIP_CHECK(hipDeviceSynchronize());
+    HIP_CHECK(hipModuleUnload(mod));
 
     // Tolerance calibrated against the measured FP16 per-strip rounding floor. Rounding inside the
     // WMMA accumulator grows like ~0.003*sqrt(K) worst-case (observed max_abs_diff: 0.017@K40,
@@ -127,7 +119,7 @@ static bool run_shape(int M, int N, int K) {
     printf("    zero-copy=%s  elements=%d  failures=%ld  max_abs_diff=%.4f (atol=%.4f)  max_rel_vs_raw_ref=%.2f%%  (cpu ref %.1f ms)\n",
            zero_copy ? "yes" : "NO(!)", M * N, failures, max_abs, atol, max_rel_pct, ms);
 
-    HIP_CHECK(hipHostUnregister(base), "unpin");
+    HIP_CHECK(hipHostUnregister(base));
     munmap(base, total); close(fd);
     return failures == 0;
 }

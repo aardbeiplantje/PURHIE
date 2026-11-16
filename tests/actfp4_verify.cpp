@@ -20,17 +20,9 @@
 #include <hip/hip_fp16.h>
 
 #include "fp4_common.h"
+#include "hip_check.h"
 
 using namespace rocmfp4;
-
-#define HIP_CHECK(cmd, str) \
-    do { \
-        hipError_t s_ = (cmd); \
-        if (s_ != hipSuccess) { \
-            fprintf(stderr, "ERROR: %s at %s:%d (%s)\n", hipGetErrorString(s_), __FILE__, __LINE__, str); \
-            exit(1); \
-        } \
-    } while(0)
 
 // gemm_act_fp4's W_scales_f argument: nullptr selects the UE4M3 byte-scale path tested here.
 static const float* g_no_scales_f = nullptr;
@@ -106,29 +98,29 @@ static bool run_shape(int M, int N, int K) {
             Cref[i * N + j] = sum;
         }
 
-    HIP_CHECK(hipHostRegister(base, total, hipHostRegisterDefault), "pin");
+    HIP_CHECK(hipHostRegister(base, total, hipHostRegisterDefault));
 
     __half* d_A; unsigned char* d_W; unsigned char* d_Sc; float* d_C;
-    HIP_CHECK(hipHostGetDevicePointer((void**)&d_A, A, 0), "dev A");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&d_W, W, 0), "dev W");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&d_Sc, Wscl, 0), "dev Wscl");
-    HIP_CHECK(hipHostGetDevicePointer((void**)&d_C, Cgpu, 0), "dev C");
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_A, A, 0));
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_W, W, 0));
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_Sc, Wscl, 0));
+    HIP_CHECK(hipHostGetDevicePointer((void**)&d_C, Cgpu, 0));
 
     hipModule_t mod; hipFunction_t func;
     int kfd = open("gemm_act_fp4.co", O_RDONLY);
     if (kfd < 0) { perror("gemm_act_fp4.co"); return false; }
     struct stat st; fstat(kfd, &st);
     void* coData = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, kfd, 0);
-    HIP_CHECK(hipInit(0), "hipInit");
-    HIP_CHECK(hipModuleLoadData(&mod, coData), "load module");
+    HIP_CHECK(hipInit(0));
+    HIP_CHECK(hipModuleLoadData(&mod, coData));
     munmap(coData, st.st_size); close(kfd);
-    HIP_CHECK(hipModuleGetFunction(&func, mod, "gemm_act_fp4"), "get function");
+    HIP_CHECK(hipModuleGetFunction(&func, mod, "gemm_act_fp4"));
 
     dim3 grid((M + 15) / 16, (N + 15) / 16);
     void* args[] = { &d_A, (void*)&d_W, (void*)&d_Sc, (void*)&g_no_scales_f, &d_C, (void*)&M, (void*)&N, (void*)&K };
-    HIP_CHECK(hipModuleLaunchKernel(func, grid.x, grid.y, 1, 32, 1, 1, 0, 0, args, nullptr), "launch");
-    HIP_CHECK(hipDeviceSynchronize(), "sync");
-    HIP_CHECK(hipModuleUnload(mod), "unload");
+    HIP_CHECK(hipModuleLaunchKernel(func, grid.x, grid.y, 1, 32, 1, 1, 0, 0, args, nullptr));
+    HIP_CHECK(hipDeviceSynchronize());
+    HIP_CHECK(hipModuleUnload(mod));
 
     const float atol = 0.01f * std::sqrt((float)K);   // same calibrated floor as fp16_gemm
     const float rtol = 0.01f;
@@ -146,7 +138,7 @@ static bool run_shape(int M, int N, int K) {
     printf("    zero-copy=%s  elements=%d  failures=%ld  max_abs_diff=%.5f (atol=%.4f)\n",
            (d_A == A && d_C == Cgpu) ? "yes" : "NO(!)", M * N, failures, max_abs, atol);
 
-    HIP_CHECK(hipHostUnregister(base), "unpin");
+    HIP_CHECK(hipHostUnregister(base));
     munmap(base, total); close(fd);
     return failures == 0;
 }
