@@ -36,15 +36,13 @@ gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day b
 
 **In progress** (agents resumed 2026-11-16 after the usage limit; each commits to its own worktree branch, then is
 merged here):
-- L2 (item 16) the Q8_0 rows in the device kernels (`talker_gpu.hip`: a lane takes one 34-byte block), the device against
-  the host on the Q8_0 file, the frame's time.
 - The `convert_verify.sh` run for all releases (the card keys are compared now): deferred until the disk allows, several GB.
 
 **TODO** (in order):
 1. The three formats against a real ffmpeg: M is merged (`c17f950`, merged in `cd058e5`; `ffmpeg` in the image's runtime
    packages in `ce89090`). Here the test passes 36 of 36 with a stub; its real-encoder checks (tests 31 to 36: the MP3 and
    Ogg and ADTS signatures) are skipped without `ROCM_INFERENCE_TEST_FFMPEG`. Next: run them in the container.
-2. After L2: how a user gets the Q8_0-predictor file (a converter recipe or option) and the server picking it up
+2. The Q8_0 predictor file: how a user gets it (a converter recipe or option) and the server picking it up
    (`--models-dir` prefers the BF16 talker today). BF16 stays the default.
 3. J the vision tower's linears register-blocked on the host (77% of the 0.76 s pass).
 4. K the codec's host stages overlapped with the device's work or moved to its kernels (36 ms of a 142 ms piece).
@@ -185,7 +183,7 @@ Quality and scope (decisions):
     L1 done 2026-11-16: the file is `rocm-convert -r plain -t 'pred\.blk\..*\.weight$=q8_0' -t '.*=keep' talker.gguf
     out.gguf q8_0` (the 35 matrices of `pred.blk.*`; everything else keeps its bytes; 1.85 to 1.78 GB; on this host
     `/data/predq8/qwen3tts-talker-predq8.gguf`); the loader takes Q8_0 for the predictor's blocks only, and the host path
-    runs it (`dot_q8`); such a file runs on the host until L2. Measured on the host against the BF16 file (the talker's
+    runs it (`dot_q8`); on the device since L2 (`93281dc`). Measured on the host against the BF16 file (the talker's
     stages identical): the predictor's teacher-forced logits at worst row cosine 0.9999327, largest difference 0.71 (2.4%
     of the largest logit); greedy codes differ from frame 3 (a near-tie flips a codebook and the frame's later codebooks
     follow it), the first codebook from frame 52; the speech verifier passes and Whisper reads the speech back as the
@@ -194,7 +192,11 @@ Quality and scope (decisions):
     95th percentile 4.3%, largest 6.8%; it grows with the codebook (0.8% for codebook 1, 3.6% for codebook 15); the top
     token equal in 93.9% of the rows, 48.95 of the 50 candidates shared. The control (the BF16 engine against qwen-tts's
     logits): 0.0005%, the top token always equal. So a codebook's draw differs in about 1 case of 43: a small shift of the
-    distribution, to be judged by ear before it is anyone's default. L2: the device kernels (in progress).
+    distribution, to be judged by ear before it is anyone's default. L2 done 2026-11-16 (`93281dc`): the four Q8_0
+    kernels on the device; the predictor takes 12.4 ms a frame on that file (BF16: 16.3 ms; the talker 6.6 ms either way).
+    The device and the host print the same stage lines, and the speech check passes. Open: the Q8_0 activations are read as
+    float4 from dynamic shared memory, which assumes the block's 16-byte alignment (true here, not guaranteed by the
+    language): a toolchain change would show in the device's predictor timing and codes first.
 
 Not planned:
 14. **Torch-identical sampled frames.** The engine's sampler is its own generator (splitmix); a bit match would need torch's
