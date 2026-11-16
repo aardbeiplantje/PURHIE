@@ -449,6 +449,12 @@ and the disk decides), first text 0.2-0.7 s warm, 6 s cold; prompts 31-43 tok/s 
 2026-11-12: this speed is fine).**
 
 Open leads, when it is picked up again:
+- Chat template key order (found 2026-11-16 with the tojson fix): the messages and tools reach the template as Perl
+  hashes, so `tool.items()` (GLM's tool definitions) follows Perl's hash order, and `|tojson` sorts the keys
+  (`_py_tojson`, canonical). Python's templates see the request's order in both. Perl's order differs from one process
+  to the next, and in the test render `description` came before `name` (Python: `name` first). Whether GLM's tool calls
+  suffer is not measured. Fix: keep each object's key order in the Perl data (ordered pairs from the JSON parser) and
+  render `tojson` in that order.
 - The MTP block (blk.45) as draft head: not bound yet; `index_share_for_mtp_iteration` means the draft shares the
   main index, so the verify path's rollback has to roll the index back too. Its experts are registered with the
   rest (3.6 GB).
