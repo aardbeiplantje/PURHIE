@@ -148,8 +148,8 @@ int main(int argc, char** argv) {
     }
 
     // Long prompt: prefill (in one call, and in three calls of 200, 200 and the rest, so that batches start at
-    // pos0 > 0 inside attention's 256-position chunks whatever the micro-batch size) must leave exactly the
-    // logits that feeding the same tokens one at a time does
+    // pos0 > 0 inside attention's 256-position chunks whatever the micro-batch size) must leave the logits that
+    // feeding the same tokens one at a time does (see the comment at the checks), and the two prefills the same bits
     {
         std::string text;
         for (int i = 0; i < 40; ++i) text += "The quick brown fox jumps over the lazy dog, again and again. ";
@@ -170,13 +170,13 @@ int main(int argc, char** argv) {
         for (int i = 0; i < n && rc2 == 0; ++i) rc2 = inference_decode_token(m, lt[i], &nx);
         inference_get_logits(m, ids.data(), b.data());
         inference_free_tokens(lt, n);
-        // The dot4 kernels give each output row the same arithmetic in a batch as alone, so prefill is
-        // bit-identical to token by token. The WMMA kernels (batches of 32+ tokens) sum in a different float
-        // order, and tiny differences flip int8 activation roundings that then propagate (see forward_verify):
-        // then the bound is logit cosine >= 0.995 (measured on 561 tokens: dense 4B 0.9991, MoE 35B ~0.997;
-        // MoE routing near-ties make it the more sensitive one) and the same top-1 token unless token by token
-        // itself has a near-tie: its logits for the two choices within 0.5 (the 35B's logits differ by up to
-        // ~1.5 between the two paths; on this prompt its top two are 0.16 apart).
+        // Prefill against token by token (ARCHITECTURE.md section 5: exact only with WMMA off). The dot4 kernels give
+        // each output row the same arithmetic in a batch as alone, so with QMATVEC_NO_WMMA the two are bit-identical.
+        // Prefill's WMMA kernels sum in another float order, and tiny differences flip int8 activation roundings that
+        // then propagate: the bound is logit cosine >= 0.995 and the same top-1 token unless token by token itself
+        // has a near-tie (its logits for the two choices within 0.5). Measured 2026-11-16 on Qwen3-0.6B-Q8_0 (561
+        // tokens): max |d| 0.399 in the logits, the top-1 token the same. Prefill against prefill is exact with WMMA
+        // on: the last check of this block and the micro-batch test at the end of this file.
         double d = 0.0, dot = 0.0, na = 0.0, nb = 0.0;
         int ta = 0, tb = 0;
         for (int i = 0; i < V; ++i) {
@@ -196,6 +196,7 @@ int main(int argc, char** argv) {
                  ta, tb, tb, ta, b[tb] - b[ta], exact ? " (WMMA off: must be identical)" : "");
         auto same_choice = [&](int t) { return t == tb || b[tb] - b[t] < 0.5f; };
         check(rc1 == 0 && rc2 == 0 && (exact ? d == 0.0 : same_choice(ta) && cs >= 0.995), what);
+        // Same as above for prefill in calls of 200 tokens (measured the same: max |d| 0.399, top-1 576 / 576)
         double d3 = 0.0, dot3 = 0.0, nc = 0.0;
         int tc = 0;
         for (int i = 0; i < V; ++i) {
@@ -208,6 +209,10 @@ int main(int argc, char** argv) {
         snprintf(what, sizeof(what), "prefill in calls of 200 tokens vs token by token: max |d| logits %.3g, cos %.7f, "
                  "top-1 %d / %d", d3, cs3, tc, tb);
         check(rc3 == 0 && (exact ? d3 == 0.0 : same_choice(tc) && cs3 >= 0.995), what);
+        // prefill against prefill (section 5): the one call's logits are the three calls' bits
+        const bool pp = memcmp(a.data(), c.data(), sizeof(float) * (size_t)V) == 0;
+        snprintf(what, sizeof(what), "prefill in one call = prefill in calls of 200 tokens: %s", pp ? "bit-identical" : "DIFFER");
+        check(rc1 == 0 && rc3 == 0 && pp, what);
     }
 
     // Opt-in int8 LM head: close to the float head's logits, and switching it off gives the float logits back
@@ -369,11 +374,9 @@ int main(int argc, char** argv) {
         char what[300];
         snprintf(what, sizeof(what), "chat turn 1: %d prompt tokens prefilled, reply \"%s\"", p1, a1.text.c_str());
         check(a1.rc == 0 && r1 == 0 && p1 == (int)t1.size() && !a1.text.empty(), what);
-        const bool exact = getenv("QMATVEC_NO_WMMA") != nullptr;
-        const bool same2 = exact ? a2.ids == fresh.ids : !a2.ids.empty() && !fresh.ids.empty() && a2.ids[0] == fresh.ids[0];
+        const bool same2 = a2.ids == fresh.ids;
         snprintf(what, sizeof(what), "chat turn 2: reused %d of %d prompt tokens, prefilled %d; reply %s a fresh "
-                 "prefill's%s (\"%s\")", r2, (int)t2.size(), p2, same2 ? "matches" : "DIFFERS from",
-                 exact ? " exactly" : " (first token; WMMA chunking)", a2.text.c_str());
+                 "prefill's (\"%s\")", r2, (int)t2.size(), p2, same2 ? "matches" : "DIFFERS from", a2.text.c_str());
         // Recurrent models resume at a checkpoint: turn 1 saved one min(16, n / 2) tokens before the end of its
         // prompt. Attention-only ones (Qwen3) at the divergence: the common prefix of turn 1's sequence (prompt and
         // reply) and turn 2's prompt, keeping at least the last prompt token to decode.
@@ -387,11 +390,11 @@ int main(int argc, char** argv) {
         check(a2.rc == 0 && r2 == ck1 && r2 + p2 == (int)t2.size() && same2 && r4 == 0, what);
         snprintf(what, sizeof(what), "chat: regenerating turn 2 reuses %d tokens (its own checkpoint or all but the "
                  "last), same reply: %s",
-                 r3, a3.ids == a2.ids || !exact ? "yes" : "NO");
+                 r3, a3.ids == a2.ids ? "yes" : "NO");
         // turn 2 prefilled from r2, so its checkpoint is min(16, p2 / 2) tokens before the end (attention only:
         // all of the prompt but its last token)
         const int ck2 = recurrent ? (int)t2.size() - std::min(16, p2 / 2) : (int)t2.size() - 1;
-        check(a3.rc == 0 && r3 == ck2 && (!exact || a3.ids == a2.ids), what);
+        check(a3.rc == 0 && r3 == ck2 && a3.ids == a2.ids, what);
     }
 
     sampler_params p = sampler_default_params();  // temperature 0.8, top_k 40, top_p 0.95, min_p 0.05
@@ -415,8 +418,7 @@ int main(int argc, char** argv) {
     inference_free_model(m);
 
     // The prefill micro-batch (inference_set_prefill_batch): a ~3,000-token prompt prefilled with the default
-    // (1024) and with 1500 tokens per batch gives the same logits: exactly with QMATVEC_NO_WMMA (prefill is then
-    // token by token's bits whatever the batching), else the same argmax, cosine > 0.99 (WMMA summation order)
+    // (1024) and with 1500 tokens per batch gives bit-identical logits (ARCHITECTURE.md section 5)
     {
         std::vector<float> lg[2];
         int n_long = 0;
@@ -446,21 +448,16 @@ int main(int argc, char** argv) {
             inference_kv_cache_free(mb);
             inference_free_model(mb);
         }
-        const bool exact = getenv("QMATVEC_NO_WMMA") != nullptr;
-        double dot = 0, na = 0, nb = 0, maxd = 0;
-        for (size_t i = 0; i < lg[0].size(); ++i) {
-            dot += (double)lg[0][i] * lg[1][i], na += (double)lg[0][i] * lg[0][i], nb += (double)lg[1][i] * lg[1][i];
-            maxd = std::max(maxd, (double)std::fabs(lg[0][i] - lg[1][i]));
-        }
-        const double cs = dot / std::sqrt(na * nb);
+        double maxd = 0;
+        for (size_t i = 0; i < lg[0].size(); ++i) maxd = std::max(maxd, (double)std::fabs(lg[0][i] - lg[1][i]));
+        const bool same = memcmp(lg[0].data(), lg[1].data(), lg[0].size() * sizeof(float)) == 0;
         const int a0 = (int)(std::max_element(lg[0].begin(), lg[0].end()) - lg[0].begin());
         const int a1 = (int)(std::max_element(lg[1].begin(), lg[1].end()) - lg[1].begin());
         char what[200];
         snprintf(what, sizeof(what),
-                 "prefill of %d tokens in micro-batches of 1500 = the default's logits: max |d| %.3g, cosine %.7f, "
-                 "argmax %d / %d%s",
-                 n_long, maxd, cs, a1, a0, exact ? " (exact)" : "");
-        check(exact ? maxd == 0.0 : (cs > 0.99 && a0 == a1), what);
+                 "prefill of %d tokens in micro-batches of 1500 = the default's logits: %s (max |d| %.3g), argmax %d / %d",
+                 n_long, same ? "bit-identical" : "DIFFER", maxd, a1, a0);
+        check(same && a0 == a1, what);
     }
     printf("%s (%d failed)\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;

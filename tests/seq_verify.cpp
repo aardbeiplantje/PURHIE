@@ -216,15 +216,14 @@ int main(int argc, char** argv) {
         char w[200];
         snprintf(w, sizeof w, "chunked prompt (%d tokens, all left to the steps: %s): %d steps without a token (%d), "
                  "then a's tokens; b's tokens meanwhile", L, pre_x == L && reused_x == 0 ? "yes" : "NO", silent, want);
-        const bool tok_ok = (gx[0] == a0 && gx[1] == b0) || !getenv("QMATVEC_NO_WMMA");
+        const bool tok_ok = gx[0] == a0 && gx[1] == b0;
         check(silent == want && pre_x == L && tok_ok && (int)gx[0].size() == N && (int)gx[1].size() == N, w);
         for (int i = 0; i < 2; ++i) inference_stream_free(sx[i]);
         inference_seq_free(m, qx);
         inference_seq_free(m, qy);
         inference_seq_select(m, 0);
     }
-    // (the batch's matmuls may take other kernels than one token's (WMMA tiles): exact with QMATVEC_NO_WMMA=1)
-    check(same == 3 || !getenv("QMATVEC_NO_WMMA"), "batched: each sequence's tokens = alone");
+    check(same == 3, "batched: each sequence's tokens = alone");
 
     // speed: n_batch sequences of G tokens, stepped in turn vs batched
     const int NB = argc > 3 ? atoi(argv[3]) : 8, G = 64;

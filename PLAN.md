@@ -4,38 +4,87 @@
 > Finished work, with its measurements, is in the git history (this file was pruned of it on 2026-11-05, 2026-11-06
 > and 2026-11-12).
 
-## ▶ Next (verified 2026-11-15: the work packages)
+## ▶ Next (verified 2026-11-15; progress and TODO, kept current: 2026-11-16)
 
-Verified on 2026-11-15 against the repository and this host. The 118 paths and the 11 make targets this file names exist,
-with three exceptions: `/hf/Qwen3.5-0.8B` and `/hf/Qwen3.5-4B` are gone (the vision checks run from `/data/vision-ref`:
-`q35-0.8b-mmproj.gguf`, `q35-0.8b-bf16.gguf`, `q35-0.8b/`); the BF16 talker is `/models/qwen3tts-talker.gguf` (with
-`qwen3tts-codec.gguf`, `whisper-tiny.gguf` and `voices/`; the references stay under `/data/audio-ref`); and
-`/data/minimax-ref/te/mm_te_ref.py` is gone. Free disk: `/data` and `/models` 17 GB, `/hf` 34 GB, `/comfyui` 88 GB, so
-the 38 GB of IQ downloads (item 2 of the list below) do not fit: local conversions instead.
+How the work runs (the user, 2026-11-15): this file is verified against the repository and the host, then each open item
+is a package: one Haiku agent's task in its own worktree, with exact files, commands, data paths and a check. The main
+session briefs it, reviews its commit, reruns the check on `main`, then commits, pushes and touches the image's build
+trigger (AGENTS.md). Timing packages run alone on the machine. An agent commits early: a worktree with no changes is
+removed when its agent stops, and a resumed agent then lands in the main checkout.
 
-The open work as packages. Each is one agent's task with its check; it is done when the check passes and it is committed.
-The lists below keep each item's background. Done on 2026-11-15, each recorded in its item: A (item 11, Whisper's
-temperature fallback), B (item 2 of the 2026-11-14 list, the IQ types on the GPU), C (item 9, the codec's time per layer),
-E and E2 (item 10, Whisper's host path), F (item 15, the vision tower's host path), G (the tests' reply checks). Not
-started: D (item 7, the samplers' sort: a rank sort needs a second launch per codebook, about 18 us against 28 us, under
-1% of a frame).
+The host (2026-11-15): the 118 paths and the 11 make targets this file names exist, with three exceptions:
+`/hf/Qwen3.5-0.8B` and `/hf/Qwen3.5-4B` are gone (the vision checks run from `/data/vision-ref`: `q35-0.8b-mmproj.gguf`,
+`q35-0.8b-bf16.gguf`, `q35-0.8b/`); the BF16 talker is `/models/qwen3tts-talker.gguf` (with `qwen3tts-codec.gguf`,
+`whisper-tiny.gguf` and `voices/`; the references stay under `/data/audio-ref`); `/data/minimax-ref/te/mm_te_ref.py` is
+gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day before; not this work's files), `/hf`
+34 GB, `/comfyui` 88 GB: no downloads, one converted file at a time. No ffmpeg on this host (the image gets one).
 
-Next packages:
-- H the split-invariance tests demand bit-exactness (Open leads, quality: `store_verify.sh`, `seq_verify`,
-  `generate_verify`), on Qwen3-0.6B and Qwen3.5-4B.
-- I the converter's model-card keys (`general.license`, base model, size label, and the rest of upstream's card keys), byte
-  for byte as `convert_hf_to_gguf.py` writes them (`tests/convert_verify.sh` compares them "aside" today).
-- J the vision tower's linears register-blocked on the host (77% of the 0.76 s pass).
-- K the codec's host stages overlapped with the device's work or moved to its kernels (36 ms of a 142 ms piece).
-- L (the user's decision first: quality) the code predictor's weights as Q8_0 on the device: half the bytes of the 2.5 GB
-  the predictor reads a frame, so the frame's 22.8 ms could reach about 15 ms. To measure before any default: the greedy
-  codes' agreement with the BF16 predictor and the speech.
+**Done** (each recorded in its item below):
+- 2026-11-15: item 8 (the samplers on the device: one sync a frame), item 7's first gains (a predictor stack 940 to
+  905 us), item 9 first version (the codec's convolutions on the device: 40 frames in 190 ms, 800 ms on the CPU) and its
+  time per layer (package C), package A (item 11, Whisper's temperature fallback), B (the IQ types on the GPU), E and E2
+  (item 10: a Whisper decoder token 18.3 to about 1.7 ms, the encoder 1.5 to 0.39 s, on the host), F (item 15: the vision
+  tower's pass 3.55 to 0.76 s on the host), G (the tests' reply checks).
+- 2026-11-16: package H (the split-invariance tests demand bit-exactness: Open leads, quality); package L1 (the Q8_0
+  predictor's file, loader and host path: item 16) and L1b (its sampling distributions: 2.3% total variation on average);
+  package I (the model-card keys of rocm-convert: the four releases' metadata identical to upstream's, key for key; re-run
+  here on Qwen2.5-0.5B-Instruct: 36 of 36 keys, zero difference); the image's llama.cpp remnants removed (`39f1b8c`; its
+  build not verified: see TODO 8); Alpamayo 2 Edge analysed and Qwen4 checked (TODO 9 to 11).
 
-The user's decisions: item 12 (prosody across speech pieces) and item 13 (mp3 / opus / aac). Not runnable on this host:
-the Flash measurements (its own MTP block, the PLE reads), `--parallel` and the store on the deployment,
-`events_test MODEL DRAFT`, nginx's X-Remote-User header (the docker repository). Larger and not packaged yet: the ComfyUI
-component API (milestone 1), speculative decoding under `--parallel` (three stages), FP8 as a weight type, raw
-completions' prompt arrays and logprobs.
+**In progress** (agents resumed 2026-11-16 after the usage limit; each commits to its own worktree branch, then is
+merged here):
+- L2 (item 16) the Q8_0 rows in the device kernels (`talker_gpu.hip`: a lane takes one 34-byte block), the device against
+  the host on the Q8_0 file, the frame's time.
+- M (item 13) mp3, opus and aac from `/v1/audio/speech` through an external ffmpeg (`--ffmpeg`, `ROCM_FFMPEG`), tested
+  here with a stub program.
+- The `convert_verify.sh` run for all releases (the card keys are compared now): deferred until the disk allows, several GB.
+
+**TODO** (in order):
+1. After M: `ffmpeg` in the image's Dockerfile (this repository's, not the docker submodule, which is gone), and the three
+   formats checked against the real encoder in the container (`t/69-speech-formats.t` with `ROCM_INFERENCE_TEST_FFMPEG`).
+2. After L2: how a user gets the Q8_0-predictor file (a converter recipe or option) and the server picking it up
+   (`--models-dir` prefers the BF16 talker today). BF16 stays the default.
+3. J the vision tower's linears register-blocked on the host (77% of the 0.76 s pass).
+4. K the codec's host stages overlapped with the device's work or moved to its kernels (36 ms of a 142 ms piece).
+5. After I: `tests/convert_verify.sh` in full (needs several GB free on `/data`).
+6. Item 7's leads (a few percent each): the q/k norm and rotary inside the attention, the norm once per layer; D the
+   samplers' sort (not started: about 18 us against 28 us a codebook, under 1% of a frame).
+7. Leftovers on the host paths: Whisper's encoder attention (a score vector allocated per query and head), its
+   decoder's cross-attention (six threads) and vocabulary product (memory-bound); the codec's kernel-7 inner loop.
+8. **The image (commit 39f1b8c, 2026-11-16):** the llama.cpp remnants are out (nginx's llama upstream and fixup hooks,
+   `lib/perl/llama.pm`, `lib/lua/fixup.lua`, the Vulkan and CMake packages, the GGML environment). The build is NOT verified:
+   it was not run here (no docker in this session), and the failing step is not known. Next: the failing step's output
+   (the tail of `build-watch.log` where the watcher runs) decides the next fix. `run.sh` (the host launcher) still names
+   llama (`LLAMA_DOCKER_IMAGE`, the `llama` container and volume): to change with the user's launch scripts.
+9. **NVIDIA Alpamayo 2 Edge (analysed 2026-11-16; released 2026-11-10; HF `nvidia/Alpamayo2-Edge`).** A driving
+   vision-language-action model: weights OpenMDW-1.1, code Apache-2.0 (the license to confirm with the user, as for MiniMax).
+   Config: the language model `cosmos3_edge_text` is dense (28 layers, hidden 2048, 16 query / 8 KV heads, MLP 9216, vocab
+   135168, rope theta 1e8: the engine's dense path, if its norms and activation match); the vision tower
+   `cosmos3_edge_vision` (27 layers, hidden 1152, patch 16: not Qwen3.5's, a new tower); an action expert (28 layers,
+   hidden 512, flow matching with 10 Euler steps, attending to the VLM's keys and values: a new attention mode); the
+   trajectory is in the language model's vocabulary (history ids 1000, future ids 3000, 128 tokens per future trajectory)
+   and integrated by a unicycle model over 64 waypoints at 0.1 s. Six cameras, 22 frames, about 3.2k prompt tokens; the
+   card's peak is 12 GB on an H100, so it fits this host's memory. Needs: transformers 5.17 with the custom code
+   (`NVlabs/alpamayo2-edge`: not checked out here; the reference venv has transformers 5.5.1, so an isolated environment
+   like `/data/tts-site`), then the converter (`safetensors_mmap` reads the shards), the vision tower, the expert, and the
+   trajectory decode, each checked against the reference. Not started: the modeling code is the first thing to read.
+10. **Qwen4 (checked 2026-11-16).** No `Qwen4` repository in the Qwen organisation on Hugging Face yet: the newest series
+    there is Qwen3.8 (`Qwen3.8-Flash-Next`, the engine's qwen4exp, is its preview). Watch `huggingface.co/Qwen`; when a
+    Qwen4 repository appears, read its `config.json` first: if its `architectures` is one the engine runs (qwen35moe,
+    qwen4exp), it is a registry entry; if not, it is a new architecture to analyse.
+11. **Qwen3.8-2.4T-A95B (in the Qwen organisation, about 9 days old at 2026-11-16).** Architecture `Qwen3_5MoeForCausalLM`
+    (the engine's qwen35moe): 92 layers, hidden 8192, 512 experts with 10 active, linear attention in three of four
+    layers. The engine can run the architecture; the size cannot: 2.4 trillion parameters is about 1.2 TB at 4 bits
+    against 128 GB of memory and 17 GB free on `/models`. It needs the expert pager (as GLM-5.3) and a disk of its own.
+    Not on this host: decide only if the user has such storage.
+
+**Decided by the user (2026-11-16):** item 12: the speech pieces keep their own prosody (no conditioning on the previous
+piece: closed). Item 13: ffmpeg is added (package M). Package L: built as an option.
+
+Not runnable on this host: the Flash measurements (its own MTP block, the PLE reads), `--parallel` and the store on the
+deployment, `events_test MODEL DRAFT`, nginx's X-Remote-User header (the docker repository). Larger and not packaged yet:
+the ComfyUI component API (milestone 1), speculative decoding under `--parallel` (three stages), FP8 as a weight type, raw
+completions' prompt arrays and logprobs. To clear by hand: `/data/iqtest` (336 KB of logs of package B).
 
 ## ▶ Next (2026-11-14, kept current)
 
@@ -122,9 +171,26 @@ Quality and scope (decisions):
     unchanged, the sampled passes deterministic; 2 minutes), t/64 (17) and t/66 (4). Cost: each attempt is a decoder pass
     of the window (about 2 s for 93 tokens on the host: 21 ms a token), so such a window takes six passes (t/66's long clip
     23 s, was 7 s): the decoder's speed is item 10's.
-12. **Prosody across speech pieces.** Each sentence piece is a separate talker run (pieces joined with 0.2 s of silence),
-    so the prosody restarts at each piece. Decide: keep, or condition each piece on the previous one's frames.
-13. **mp3, opus and aac.** Refused with 400 (no encoder in the image). Decide: add an encoder to the image, or keep refusing.
+12. **Prosody across speech pieces: decided 2026-11-16, kept as it is.** Each sentence piece is a separate talker run (pieces
+    joined with 0.2 s of silence), so the prosody restarts at each piece; no conditioning on the previous piece's frames.
+13. **mp3, opus and aac: decided 2026-11-16, through ffmpeg (package M, in progress).** The server pipes the speech's PCM
+    through an external ffmpeg (`--ffmpeg`, `ROCM_FFMPEG`, or the one on PATH); the image installs it. Without one the
+    three formats stay a 400.
+16. **The code predictor's weights as Q8_0 (package L; the user: built as an option, 2026-11-16).** The predictor reads about
+    2.5 GB of BF16 a frame (16 stacks of 157 MB); Q8_0 rows are 34 bytes for 32 values against 64. BF16 stays the default.
+    L1 done 2026-11-16: the file is `rocm-convert -r plain -t 'pred\.blk\..*\.weight$=q8_0' -t '.*=keep' talker.gguf
+    out.gguf q8_0` (the 35 matrices of `pred.blk.*`; everything else keeps its bytes; 1.85 to 1.78 GB; on this host
+    `/data/predq8/qwen3tts-talker-predq8.gguf`); the loader takes Q8_0 for the predictor's blocks only, and the host path
+    runs it (`dot_q8`); such a file runs on the host until L2. Measured on the host against the BF16 file (the talker's
+    stages identical): the predictor's teacher-forced logits at worst row cosine 0.9999327, largest difference 0.71 (2.4%
+    of the largest logit); greedy codes differ from frame 3 (a near-tie flips a codebook and the frame's later codebooks
+    follow it), the first codebook from frame 52; the speech verifier passes and Whisper reads the speech back as the
+    test sentence. Greedy agreement is not the measure for sampled speech. L1b done 2026-11-16: the two sampling
+    distributions (temperature 0.9, the top 50) on the 750 teacher-forced rows: total variation mean 2.3%, median 2.2%,
+    95th percentile 4.3%, largest 6.8%; it grows with the codebook (0.8% for codebook 1, 3.6% for codebook 15); the top
+    token equal in 93.9% of the rows, 48.95 of the 50 candidates shared. The control (the BF16 engine against qwen-tts's
+    logits): 0.0005%, the top token always equal. So a codebook's draw differs in about 1 case of 43: a small shift of the
+    distribution, to be judged by ear before it is anyone's default. L2: the device kernels (in progress).
 
 Not planned:
 14. **Torch-identical sampled frames.** The engine's sampler is its own generator (splitmix); a bit match would need torch's
@@ -1122,10 +1188,13 @@ Speed:
   matmul_f_id (no model here has them); BF16 FFN down (K 17408) the slowest shape (23 TFLOPS).
 
 Quality / correctness:
-- Prefill is split-invariant (ARCHITECTURE.md section 5). Open: the tests that allowed for the old WMMA differences
-  between cuts (store_verify.sh and seq_verify compare first tokens, generate_verify a tolerance) can demand
-  bit-exactness; the full tier's perplexity baselines of the models not run here (the Flash model, the 122B and 120B
-  files) need `tests/regress.sh --update` on those rows.
+- Prefill is split-invariant (ARCHITECTURE.md section 5), and the tests demand it since 2026-11-16 (package H):
+  `seq_verify` (a chunked prompt's and a batch's tokens equal, on Qwen3-0.6B and Qwen3.5-4B), `store_verify` (whole
+  replies equal in phases 2 to 4), `generate_verify` (the chat turns' whole replies; a prompt in micro-batches of 1500
+  and a prompt in calls of 200 bit-identical to the one call's logits). Prefill against token-by-token decoding stays a
+  bound (exact only with `QMATVEC_NO_WMMA=1`: on Qwen3-0.6B the logits differ by up to 0.399, the top token the same).
+  Open: the full tier's perplexity baselines of the models not run here (the Flash model, the 122B and 120B files) need
+  `tests/regress.sh --update` on those rows.
 - Draft events are not verified: `events_test MODEL DRAFT` is written but not run. The Flash model (122.8 GB file)
   shares the work host's 124 GB with the deployment: Flash work needs a window with the deployment stopped, or a
   generator for a tiny model with a draft head (tools/gen_qwen4exp_tiny.py writes none).

@@ -8,6 +8,7 @@
 #include "gguf_mmap.h"
 #include "mel.h"
 #include "qmatvec.h"
+#include "quant_types.h"
 #include "tokenizer.h"
 
 #include <hip/hip_runtime.h>
@@ -36,13 +37,20 @@ namespace {
 
 std::string g_error;
 
-// A weight matrix read in place from the GGUF map (UMA: no copy): F32, or BF16 as the checkpoint stores it (the bf16
-// values are widened inside the products: half the bytes of F32, and the same numbers).
+// A weight matrix read in place from the GGUF map (UMA: no copy): F32, BF16 as the checkpoint stores it (the bf16
+// values are widened inside the products: half the bytes of F32, and the same numbers), or Q8_0 (the code predictor's
+// blocks in the optional predq8 file only: ggml's layout, a row of cols values is cols/32 blocks of 34 bytes, each an
+// fp16 scale and 32 int8 values).
 struct Mat {
     const float* f = nullptr;     // F32 [rows][cols]
     const uint16_t* h = nullptr;  // BF16 [rows][cols]
+    const uint8_t* q = nullptr;   // Q8_0 [rows][cols/32 blocks of 34 bytes]
     int rows = 0, cols = 0;
 };
+
+constexpr int kQ8Block = 32;   // values per Q8_0 block
+constexpr int kQ8Bytes = 34;   // bytes per Q8_0 block (fp16 scale, 32 int8)
+constexpr int kGgmlQ8_0 = 8;   // ggml type id of Q8_0 (quant_types.h QT_Q8_0)
 
 inline float bf16_val(uint16_t v) {
     const uint32_t u = (uint32_t)v << 16;
@@ -66,12 +74,31 @@ inline float dot_bf16(const float* a, const uint16_t* b, int n) {
     return acc;
 }
 
-// the dot product of row r of M with x (M.cols values)
-inline float mat_dot(const Mat& M, int r, const float* x) {
-    return M.f ? dot_f32(x, M.f + (size_t)r * M.cols, M.cols) : dot_bf16(x, M.h + (size_t)r * M.cols, M.cols);
+// a Q8_0 row of n values (n/32 blocks): the sum over the blocks of scale * (sum over the block of int8 * x), in float32
+inline float dot_q8(const float* x, const uint8_t* w, int n) {
+    float acc = 0.0f;
+    for (int b = 0; b < n / kQ8Block; ++b, w += kQ8Bytes) {
+        uint16_t sh;
+        std::memcpy(&sh, w, 2);
+        const float d = qt_fp16_to_fp32(sh);
+        const int8_t* qs = reinterpret_cast<const int8_t*>(w + 2);
+        const float* xb = x + (size_t)b * kQ8Block;
+        float s = 0.0f;
+#pragma omp simd reduction(+ : s)
+        for (int j = 0; j < kQ8Block; ++j) s += xb[j] * (float)qs[j];
+        acc += d * s;
+    }
+    return acc;
 }
 
-// row r of M as floats (the embedding lookups)
+// the dot product of row r of M with x (M.cols values)
+inline float mat_dot(const Mat& M, int r, const float* x) {
+    if (M.f) return dot_f32(x, M.f + (size_t)r * M.cols, M.cols);
+    if (M.q) return dot_q8(x, M.q + (size_t)r * (M.cols / kQ8Block) * kQ8Bytes, M.cols);
+    return dot_bf16(x, M.h + (size_t)r * M.cols, M.cols);
+}
+
+// row r of M as floats (the embedding lookups; the embedding tables are F32 or BF16, never Q8_0)
 inline void mat_row(const Mat& M, int r, float* out) {
     if (M.f) {
         std::memcpy(out, M.f + (size_t)r * M.cols, sizeof(float) * M.cols);
@@ -178,17 +205,28 @@ int gguf_type_of(const gguf_model_t* g, const std::string& name) {
     return -1;
 }
 
-// a [rows][cols] matrix of the GGUF: BF16 read in place, or F32 (tensor())
-Mat mat_of(const gguf_model_t* g, const std::string& name, int rows, int cols) {
+// a [rows][cols] matrix of the GGUF: BF16 read in place, or F32 (tensor()); Q8_0 only when q8_ok (the code predictor's
+// blocks: the optional predq8 file), read in place as well
+Mat mat_of(const gguf_model_t* g, const std::string& name, int rows, int cols, bool q8_ok = false) {
     Mat M;
     M.rows = rows;
     M.cols = cols;
-    if (gguf_type_of(g, name) == 30) {  // ggml's BF16
+    const int type = gguf_type_of(g, name);
+    if (type == 30) {  // ggml's BF16
         size_t bytes = 0;
         const void* p = gguf_get_tensor_ptr(g, name.c_str(), &bytes);
         if (!p) throw std::runtime_error("qwen3tts: no tensor " + name);
         if (bytes != (size_t)rows * cols * 2) throw std::runtime_error("qwen3tts: " + name + " has the wrong size");
         M.h = static_cast<const uint16_t*>(p);
+    } else if (type == kGgmlQ8_0) {
+        if (!q8_ok) throw std::runtime_error("qwen3tts: " + name + " is Q8_0; only the code predictor's blocks may be");
+        if (cols % kQ8Block) throw std::runtime_error("qwen3tts: " + name + " has rows that are not whole Q8_0 blocks");
+        size_t bytes = 0;
+        const void* p = gguf_get_tensor_ptr(g, name.c_str(), &bytes);
+        if (!p) throw std::runtime_error("qwen3tts: no tensor " + name);
+        if (bytes != (size_t)rows * (cols / kQ8Block) * kQ8Bytes)
+            throw std::runtime_error("qwen3tts: " + name + " has the wrong size for Q8_0");
+        M.q = static_cast<const uint8_t*>(p);
     } else {
         M.f = tensor(g, name, (size_t)rows * cols);
     }
@@ -1038,36 +1076,37 @@ qwen3tts_model_t* qwen3tts_open(const char* gguf_path) {
                   tensor(m->g, "talker.text_proj.fc2.bias", m->C), m->text_C, m->C};
         m->out_norm = tensor(m->g, "talker.out_norm.weight", m->C);
         m->codec_head = {mat_of(m->g, "talker.codec_head.weight", m->codec_vocab, m->C), nullptr, m->C, m->codec_vocab};
-        auto lin = [&](const std::string& base, int in, int out, bool bias) {
+        auto lin = [&](const std::string& base, int in, int out, bool bias, bool q8_ok = false) {
             Lin L;
             L.in = in;
             L.out = out;
-            L.w = mat_of(m->g, base + ".weight", out, in);
+            L.w = mat_of(m->g, base + ".weight", out, in, q8_ok);
             L.b = bias ? tensor(m->g, base + ".bias", out) : nullptr;
             return L;
         };
-        auto block_of = [&](const std::string& p, int C, int H, int Hkv, int D, int FF) {
+        auto block_of = [&](const std::string& p, int C, int H, int Hkv, int D, int FF, bool q8_ok) {
             Block B;
             B.attn_norm = tensor(m->g, p + "attn_norm.weight", C);
             B.ffn_norm = tensor(m->g, p + "ffn_norm.weight", C);
             B.q_norm = tensor(m->g, p + "attn_q_norm.weight", D);
             B.k_norm = tensor(m->g, p + "attn_k_norm.weight", D);
-            B.q = lin(p + "attn_q", C, H * D, false);
-            B.k = lin(p + "attn_k", C, Hkv * D, false);
-            B.v = lin(p + "attn_v", C, Hkv * D, false);
-            B.o = lin(p + "attn_o", H * D, C, false);
-            B.gate = lin(p + "ffn_gate", C, FF, false);
-            B.up = lin(p + "ffn_up", C, FF, false);
-            B.down = lin(p + "ffn_down", FF, C, false);
+            B.q = lin(p + "attn_q", C, H * D, false, q8_ok);
+            B.k = lin(p + "attn_k", C, Hkv * D, false, q8_ok);
+            B.v = lin(p + "attn_v", C, Hkv * D, false, q8_ok);
+            B.o = lin(p + "attn_o", H * D, C, false, q8_ok);
+            B.gate = lin(p + "ffn_gate", C, FF, false, q8_ok);
+            B.up = lin(p + "ffn_up", C, FF, false, q8_ok);
+            B.down = lin(p + "ffn_down", FF, C, false, q8_ok);
             return B;
         };
-        for (int l = 0; l < m->n_layer; ++l) m->blk.push_back(block_of("talker.blk." + std::to_string(l) + ".", m->C, m->H, m->Hkv, m->D, m->FF));
+        for (int l = 0; l < m->n_layer; ++l)
+            m->blk.push_back(block_of("talker.blk." + std::to_string(l) + ".", m->C, m->H, m->Hkv, m->D, m->FF, false));
         for (int i = 0; i < m->ncb - 1; ++i) {
             m->pred_embd.push_back(mat_of(m->g, "pred.embd." + std::to_string(i) + ".weight", m->pvocab, m->C));
             m->pred_head.push_back(lin("pred.head." + std::to_string(i), m->pC, m->pvocab, false));
         }
-        for (int l = 0; l < m->pn_layer; ++l)
-            m->pblk.push_back(block_of("pred.blk." + std::to_string(l) + ".", m->pC, m->pH, m->pHkv, m->pD, m->pFF));
+        for (int l = 0; l < m->pn_layer; ++l)  // the code predictor's blocks may be Q8_0 (the optional predq8 file)
+            m->pblk.push_back(block_of("pred.blk." + std::to_string(l) + ".", m->pC, m->pH, m->pHkv, m->pD, m->pFF, true));
         m->pred_out_norm = tensor(m->g, "pred.out_norm.weight", m->pC);
         m->tok = tokenizer_load_from_gguf(m->g);  // (NULL when the GGUF has no vocabulary)
         // the device path: the GGUF's mapping registered (one mapping: an unsplit file; BF16 matrices, see bf16_matrices)

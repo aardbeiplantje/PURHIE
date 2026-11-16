@@ -10,8 +10,8 @@
 //   store_verify <model.gguf> <store_dir> 4   fresh store, sequences (inference_seq_*): one made before the store was
 //                                             opened publishes the prompt; another one and sequence 0 start from it
 //
-// Snapshots every 2 blocks (and at each prompt's last block boundary). Replies are compared exactly with
-// QMATVEC_NO_WMMA=1, else by their first tokens (WMMA prefill sums in a different order when cut differently).
+// Snapshots every 2 blocks (and at each prompt's last block boundary). Replies are compared token by token, all of
+// them: a prefill's bits do not depend on where it is cut (ARCHITECTURE.md section 5).
 
 #include "inference.h"
 #include "qwen_model.h"
@@ -92,7 +92,6 @@ int main(int argc, char** argv) {
     }
     const std::string dir = argv[2];
     const int phase = atoi(argv[3]);
-    const bool exact = getenv("QMATVEC_NO_WMMA") != nullptr;
     inference_model_t* m = inference_load_model(argv[1]);
     // STORE_VERIFY_DRAFT=<mtp head>: with speculative decoding (snapshots must never hold a draft)
     const char* draft = getenv("STORE_VERIFY_DRAFT");
@@ -143,7 +142,7 @@ int main(int argc, char** argv) {
             const long long att0 = st.blocks_attached;
             const std::vector<int32_t> o2 = run(m, prompt, 24, &reused, &prefilled);
             inference_store_get_stats(m, &st);
-            const bool same = exact ? o2 == out : !o2.empty() && !out.empty() && o2[0] == out[0];
+            const bool same = o2 == out;
             snprintf(what, sizeof(what), "sequence %d: %d of %zu tokens from the store (%lld blocks mapped), reply %s", q,
                      reused, prompt.size(), st.blocks_attached - att0, same ? "same" : "DIFFERS");
             check(reused == deepest && same, what);
@@ -184,10 +183,10 @@ int main(int argc, char** argv) {
         if (phase == 2) {
             const std::vector<int32_t> out = run(m, prompt, 24, &reused, &prefilled);
             inference_store_get_stats(m, &st);
-            const bool same = exact ? out == expected : !out.empty() && !expected.empty() && out[0] == expected[0];
+            const bool same = out == expected;
             snprintf(what, sizeof(what), "new process, same prompt: %d of %zu tokens from the store (%lld blocks mapped, "
                      "%lld snapshot restored), reply %s", reused, prompt.size(), st.blocks_attached,
-                     st.snapshots_restored, same ? (exact ? "identical" : "same first token") : "DIFFERS");
+                     st.snapshots_restored, same ? "identical" : "DIFFERS");
             const long long restored = recurrent ? 1 : 0;
             check(reused == deepest && st.tokens_from_store == deepest && st.snapshots_restored == restored && same,
                   what);
@@ -219,11 +218,9 @@ int main(int argc, char** argv) {
             // remaining resume point is 0 (snapshots are at 2, 4, ...), or block 0's end without recurrent state
             const std::vector<int32_t> out = run(m, prompt, 24, &reused, &prefilled);
             snprintf(what, sizeof(what), "after deleting block 1: %d tokens reused, %d prefilled, reply %s", reused,
-                     prefilled, !out.empty() && !expected.empty() && out[0] == expected[0] ? "same first token" : "DIFFERS");
+                     prefilled, out == expected ? "identical" : "DIFFERS");
             const int resume = recurrent ? 0 : B;
-            check(reused == resume && prefilled == (int)prompt.size() - resume && !out.empty() &&
-                      out[0] == expected[0],
-                  what);
+            check(reused == resume && prefilled == (int)prompt.size() - resume && out == expected, what);
             inference_store_get_stats(m, &st);
             check(st.blocks_published >= 1, "the missing block is published again");
         }
