@@ -20,6 +20,11 @@ gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day b
 34 GB, `/comfyui` 88 GB: no downloads, one converted file at a time. No ffmpeg on this host (the image gets one).
 
 **Done** (each recorded in its item below):
+- 2026-11-16, the chat templates: GLM-5.3-Flash's template failed with "chat_render: unexpected keyword arguments", since
+  it calls `tojson(ensure_ascii=False)` and the filter takes no keyword arguments. `_tojson_args` in
+  `perl/ROCm-Inference/lib/ROCm/Inference.pm` writes the tojson calls as the filter takes them (ensure_ascii=False goes:
+  the filter keeps non-ASCII text already; indent=N positional). GLM's full template renders with a tool definition, a
+  tool call and its result (checked on `/models/GLM-5.3-Flash-FAST.gguf`'s template); t/15 has three new cases (21 of 21).
 - 2026-11-16, the speech and the Q8_0 predictor: mp3, opus and aac on `/v1/audio/speech` through ffmpeg (item 13;
   `--ffmpeg`, `ROCM_FFMPEG`; `c17f950`, merged in `cd058e5`: 36 of 36 format tests with a stub, t/65 13 of 13, t/64 17 of
   17). The Q8_0 predictor on the device (item 16, L2, `93281dc`): the predictor takes 12.4 ms a frame on that file (BF16
@@ -89,6 +94,8 @@ gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day b
     layers. The engine can run the architecture; the size cannot: 2.4 trillion parameters is about 1.2 TB at 4 bits
     against 128 GB of memory and 17 GB free on `/models`. It needs the expert pager (as GLM-5.3) and a disk of its own.
     Not on this host: decide only if the user has such storage.
+12. **`t/95-quantize.t` test 10 fails ("Q6_K cannot (decoded only)"), on HEAD as well (checked 2026-11-16).** It is in the
+    quantizer (`Convert.pm`), not the chat code: find whether the test or the Q6_K check is wrong, then fix that.
 
 **Decided by the user (2026-11-16):** item 12: the speech pieces keep their own prosody (no conditioning on the previous
 piece: closed). Item 13: ffmpeg is added (package M). Package L: built as an option.

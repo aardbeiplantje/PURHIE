@@ -32,6 +32,14 @@ is(r(q[text.split('x') {{ "s.strip('.')".strip('"') }}]), q[text.split('x') s.st
    'text outside tags and inside string literals stays');
 is(r(q[{{ args|tojson }}], { args => { city => 'Gent', n => 2, l => [1, 'été'] } }),
    '{"city": "Gent", "l": [1, "été"], "n": 2}', 'tojson as json.dumps writes it');
+# the keyword arguments the templates write: ensure_ascii=False (GLM-5.3's tool definitions and call arguments) is
+# what the filter does already, indent=N is positional
+is(r(q[{{ args|tojson(ensure_ascii=False) }}], { args => { city => 'Gent', l => ['été'] } }),
+   '{"city": "Gent", "l": ["été"]}', 'tojson(ensure_ascii=False) keeps non-ASCII text');
+is(r(q[{{ args|tojson(indent=2, ensure_ascii=False) }}], { args => { n => 1 } }), "{\n  \"n\": 1\n}",
+   'tojson(indent=2, ensure_ascii=False)');
+is(r(q[{{ v | tojson(ensure_ascii=False) if v is not string else v }}|{{ w|tojson(ensure_ascii=False) }}],
+     { v => 'x', w => [1] }), 'x|[1]', 'tojson(ensure_ascii=False) in a conditional');
 is(r(q[{% if enable_thinking is false %}off{% endif %}{% if add_generation_prompt %}+{% endif %}],
      { enable_thinking => 0, add_generation_prompt => 1 }), 'off+', 'boolean template flags');
 is(r(q[{{ a }} {{ b }} {{ b.strip() }}], { a => 'été', b => ' 中文 ' }), 'été  中文  中文', 'UTF-8 text in and out');

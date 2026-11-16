@@ -160,6 +160,29 @@ sub chat_render {
     return $text;
 }
 
+# The tojson calls of a template with their keyword arguments as the filter takes them: indent=N as the positional
+# N (Llama 3's tool definitions: tojson(indent=4)); ensure_ascii=False goes (the filter keeps non-ASCII text as it
+# is, which is what ensure_ascii=False asks for: GLM-5.3's tool definitions and arguments). Any other keyword
+# argument stays, and Minijinja refuses it.
+sub _tojson_args {
+    my ($src) = @_;
+    $src =~ s/\btojson\(([^()]*)\)/_tojson_call($1)/ge;
+    return $src;
+}
+sub _tojson_call {
+    my ($inner) = @_;
+    my ($indent, @rest);
+    for my $arg (grep { length } map { s/^\s+|\s+\z//gr } split /,/, $inner) {
+        if ($arg =~ /^indent\s*=\s*(\d+)\z/) {
+            $indent = $1;
+        } elsif ($arg !~ /^ensure_ascii\s*=\s*(?:False|false)\z/) {
+            push @rest, $arg;
+        }
+    }
+    my @args = (defined $indent ? $indent : (), @rest);
+    return @args ? 'tojson(' . join(', ', @args) . ')' : 'tojson';
+}
+
 # A chat template rendered by Minijinja with the Python methods (%PY_METHODS) and tojson
 sub _render_template {
     my ($tmpl, $vars) = @_;
@@ -179,8 +202,8 @@ sub _render_template {
     Minijinja::add_function($env, 'raise_exception', sub { die(($_[0] // 'template error') . "\n") });
     # Llama 3's "Today Date" (as llama.cpp's renderer provides it)
     Minijinja::add_function($env, 'strftime_now', sub { require POSIX; POSIX::strftime($_[0] // '%Y-%m-%d', localtime) });
-    # filters take no keyword arguments here: tojson(indent=4) (Llama 3's tool definitions) as tojson(4)
-    my $src = _py_methods($tmpl) =~ s/\btojson\(\s*indent\s*=\s*(\d+)\s*\)/tojson($1)/gr;
+    # filters take no keyword arguments here: tojson's are written as the filter takes them (see _tojson_args)
+    my $src = _tojson_args(_py_methods($tmpl));
     my $text = Minijinja::render_str($env, 'chat_template', $src, \%ctx);
     croak "ROCm::Inference::chat_render: " . (Minijinja::error_detail() // 'template error') unless defined $text;
     return $text;
