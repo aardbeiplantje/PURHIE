@@ -1,24 +1,21 @@
 #!/bin/bash
-# Watches the sha of a docker image. When it changes, the command is restarted
-# with the new image. The command runs in its own process group, so a restart
-# (and Ctrl-C) also stops the processes it started. If the command exits by
-# itself, it is not restarted until the image changes.
+# image-watch.sh [-i SECONDS] [--pull] IMAGE -- COMMAND [ARGS...]
 #
-#   ./image-watch.sh IMAGE -- COMMAND [ARGS...]
-#   ./image-watch.sh -i 60 IMAGE -- COMMAND [ARGS...]   check every 60 seconds (default 30)
-#   ./image-watch.sh --pull IMAGE -- COMMAND ...        docker pull before each check (a registry image)
+# Runs COMMAND in its own process group and watches the image ID that "docker image inspect" gives for IMAGE (the
+# local tag). When the image changes, COMMAND is stopped and this exits 0: the caller runs it again (serve.sh does, so
+# its edited version takes effect with the new image). A COMMAND that ends on its own is reported once, and the watch
+# goes on until the image changes. Ctrl-C stops both.
 #
-#   ./image-watch.sh aicli:dev -- ./aicli.sh
-#
-# The sha is the image ID (sha256 of the image config) that "docker image inspect"
-# gives for the local tag. Stop with Ctrl-C.
+#   ./image-watch.sh local/ai/purhie-gfx1151:latest -- bash run.sh
+#   ./image-watch.sh -i 60 IMAGE -- COMMAND ...     check every 60 seconds (default 30)
+#   ./image-watch.sh --pull IMAGE -- COMMAND ...    docker pull before each check (a registry image)
 interval=30
 pull=0
 while [ $# -gt 0 ]; do
     case $1 in
         -i) interval=$2; shift 2 ;;
         --pull) pull=1; shift ;;
-        -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
         --) shift; break ;;
         -*) echo "image-watch: unknown option $1" >&2; exit 2 ;;
         *) break ;;
@@ -61,28 +58,24 @@ sha=
 while :; do
     [ "$pull" = 1 ] && docker pull -q "$image" >/dev/null 2>&1
     new=$(sha_of)
-    if [ -z "$new" ]; then
+    if [ -n "$new" ] && [ "$new" != "$sha" ]; then
         if [ -n "$sha" ]; then
-            echo "== $(date '+%F %T') image $image is gone, command kept running"
-        fi
-        sha=
-    elif [ "$new" != "$sha" ]; then
-        if [ -z "$sha" ]; then
-            echo "== $(date '+%F %T') image $image: $new"
-        else
-            echo "== $(date '+%F %T') image $image changed: $sha -> $new, restarting"
+            echo "== $(date '+%F %T') image $image changed: $sha -> $new, stopping the command"
             stop
+            exit 0
         fi
+        echo "== $(date '+%F %T') image $image: $new"
         sha=$new
         start "$@"
     fi
-    # the command ended on its own: report it once, keep watching the image
-    state=
-    [ -n "$pid" ] && state=$(ps -o stat= -p "$pid" 2>/dev/null)
-    if [ -n "$pid" ] && { [ -z "$state" ] || [ "${state:0:1}" = Z ]; }; then
-        wait "$pid"; rc=$?
-        pid=
-        echo "== $(date '+%F %T') command exited, exit $rc (restart on the next image change)"
+    # the command ended on its own: reported once; it runs again when the image changes
+    if [ -n "$pid" ]; then
+        state=$(ps -o stat= -p "$pid" 2>/dev/null)
+        if [ -z "$state" ] || [ "${state:0:1}" = Z ]; then
+            wait "$pid"; rc=$?
+            pid=
+            echo "== $(date '+%F %T') command exited, exit $rc (it runs again when the image changes)"
+        fi
     fi
     sleep "$interval" &
     wait $!
