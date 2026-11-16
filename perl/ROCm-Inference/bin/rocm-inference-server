@@ -13,6 +13,7 @@ use JSON::PP ();
 use MIME::Base64 qw(encode_base64 decode_base64);
 use Pod::Usage qw(pod2usage);
 use Time::HiRes ();
+use File::Temp ();
 use ROCm::Inference qw(:all);
 use ROCm::Inference::Log;
 use ROCm::Inference::Store qw(store_evict store_usage);
@@ -25,7 +26,7 @@ GetOptions(\%o, 'model=s', 'models-dir=s', 'models-max=i', 'models-margin=f', 'k
            'name=s', 'draft=s', 'store=s', 'max_tokens=i', 'swa-ring=i', 'stage=s', 'recache', 'kv-type=s',
            'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'preserve-thinking!', 'log!', 'log-level=s', 'log-format=s', 'log-color=s',
            'thinking-low=i', 'thinking-medium=i', 'thinking-high=i',
-           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'mmproj=s', 'whisper=s', 'tts=s', 'tts-codec=s', 'voices=s', 'sd=s', 'minimax=s', 'help')
+           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'mmproj=s', 'whisper=s', 'tts=s', 'tts-codec=s', 'voices=s', 'sd=s', 'minimax=s', 'ffmpeg=s', 'help')
     or pod2usage(2);
 # The log: --nolog is level none; --log-level, --log-format, --log-color are checked by the formatter
 our $LOG = eval { ROCm::Inference::Log->new(level => ($o{log} // 1) ? ($o{'log-level'} // 'info') : 'none',
@@ -69,6 +70,28 @@ if ($AUDIO_FLAG{tts}) {
     $TTS = eval { speech_load($o{tts}, $o{'tts-codec'}) };
     die "--tts $o{tts}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" unless $TTS;
     $tts_name = basename($o{tts}) =~ s/\.gguf\z//r;
+}
+# ---- ffmpeg (--ffmpeg PATH, else ROCM_FFMPEG, else ffmpeg on the PATH): the encoder of the mp3, opus and aac speech
+# formats, found once here. Without one those formats are refused (400); nothing else depends on it.
+sub find_ffmpeg {
+    my ($want) = @_;
+    my @dirs = $want =~ m{/} ? ('') : grep { length } split /:/, $ENV{PATH} // '';
+    for my $d (@dirs) {
+        my $p = length $d ? "$d/$want" : $want;
+        return $p if -f $p && -x _;
+    }
+    return undef;
+}
+our $FFMPEG = find_ffmpeg($o{ffmpeg} // $ENV{ROCM_FFMPEG} // 'ffmpeg');
+if ($FFMPEG) {
+    $LOG->info('audio', event => 'ffmpeg', msg => "mp3, opus and aac speech are encoded by $FFMPEG");
+}
+elsif ($o{ffmpeg} // $ENV{ROCM_FFMPEG}) {
+    $LOG->warn_(event => 'audio', msg => 'ffmpeg: no executable ' . ($o{ffmpeg} // $ENV{ROCM_FFMPEG})
+                . '; mp3, opus and aac speech are refused');
+}
+else {
+    $LOG->info('audio', event => 'ffmpeg', msg => 'ffmpeg: none found (--ffmpeg PATH or ffmpeg on the PATH); mp3, opus and aac speech are refused');
 }
 
 # the GGUF files of a directory and their signature (name, size, time): stat only, read before each audio request
@@ -929,15 +952,20 @@ route::post '/v1/audio/transcriptions' => sub {
 };
 
 # OpenAI's speech: a JSON body with the input text, the voice (a directory under --voices), the language (a name such as
-# english, default english), response_format (wav, pcm or flac), stream (true: the audio goes out as it is made: wav or
-# pcm), and the sampling: temperature, top_k, repetition_penalty, seed (0 by default: the same request, the same speech),
-# max_frames (the talker's bound per piece). 'model' is ignored. A long text is cut at its sentence ends into pieces of at
-# most $SPEECH_CHUNK characters; each piece is one talker run (piece i uses seed + i) with a short pause before it. The
-# server pulls the speech one piece per round (Web::Route's pull), so other requests are served between the pieces.
+# english, default english), response_format (wav, pcm, flac, or mp3, opus and aac through --ffmpeg), stream (true: the audio
+# goes out as it is made: wav or pcm), and the sampling: temperature, top_k, repetition_penalty, seed (0 by default: the same
+# request, the same speech), max_frames (the talker's bound per piece). 'model' is ignored. A long text is cut at its sentence
+# ends into pieces of at most $SPEECH_CHUNK characters; each piece is one talker run (piece i uses seed + i) with a short
+# pause before it. The server pulls the speech one piece per round (Web::Route's pull), so other requests are served
+# between the pieces. The mp3, opus and aac speech is made whole before the response starts (its status is known first),
+# so its request holds the server until the talker has said every piece.
 my $SPEECH_CHUNK = 220;     # characters per piece
 my $SPEECH_PAUSE = 0.2;     # seconds of silence between pieces
 my $SPEECH_MAX_TEXT = 20000;
 my %SPEECH_FORMAT = (wav => 'audio/wav', pcm => 'audio/L16; rate=24000', flac => 'audio/flac');
+# the formats through ffmpeg: the encoder, its bitrate, the container (-f) and the Content-Type
+my %SPEECH_FFMPEG = (mp3 => ['libmp3lame', '64k', 'mp3', 'audio/mpeg'], opus => ['libopus', '32k', 'ogg', 'audio/ogg'],
+                     aac => ['aac', '64k', 'adts', 'audio/aac']);
 
 # The pieces of a text: its sentences (ends of . ! ? and the CJK marks), joined up to $SPEECH_CHUNK characters; a sentence
 # longer than that is cut at the last space before it (or at the limit)
@@ -1010,6 +1038,10 @@ sub speech_step {
     $LOG->info('request', event => 'speech', msg => sprintf('%s: voice %s, %d pieces, %d frames, %.2f s, %s, talker on the %s%s',
                $job->{tts_name}, $job->{name}, scalar @{ $job->{pieces} }, $job->{frames}, $secs, $job->{fmt},
                $job->{gpu} ? 'gpu' : 'cpu', $job->{stream} ? ', streamed' : ''));
+    if ($job->{via}) {  # through ffmpeg: the whole body now (the route checks its error before the response starts)
+        ($job->{body}, $job->{error}) = speech_ffmpeg($job->{all}, @{ $job->{via} });
+        return undef;
+    }
     return \$out if $progressive;
     # the file goes out in slices (one per round): Web::Route closes a response with more than its max_pending unsent
     $job->{body} = $job->{fmt} eq 'wav' ? speech_wav16_file($job->{all}) : ROCm::Inference::speech_flac16($job->{all}, 24000);
@@ -1027,6 +1059,57 @@ sub speech_send {
 
 sub speech_wav16_file { return ROCm::Inference::speech_wav16($_[0], 24000) }
 
+# The samples through ffmpeg ($FFMPEG): 16-bit little-endian mono PCM at 24 kHz in a temporary file (named as the input, so
+# that no pipe fills up), the encoded audio read from its standard output (a pipe, the list form of open: no shell). Its
+# standard input is /dev/null and its standard error goes to a temporary file, whose text goes to the log when it fails.
+# Returns the body, or undef and the message for the client.
+sub speech_ffmpeg {
+    my ($samples, $codec, $bitrate, $container) = @_;
+    my $pcm = substr(speech_wav16_file($samples), 44);  # (the 16-bit PCM after the 44-byte header)
+    my $in = File::Temp->new(SUFFIX => '.s16le') or return speech_ffmpeg_fail("temporary file: $!");
+    binmode $in;
+    print {$in} $pcm or return speech_ffmpeg_fail("temporary file: $!");
+    close $in or return speech_ffmpeg_fail("temporary file: $!");
+    my $errf = File::Temp->new(SUFFIX => '.log') or return speech_ffmpeg_fail("temporary file: $!");
+    close $errf;
+    my @cmd = ($FFMPEG, qw(-hide_banner -loglevel error -f s16le -ar 24000 -ac 1 -i), $in->filename,
+               '-c:a', $codec, '-b:a', $bitrate, '-f', $container, 'pipe:1');
+    # the child's standard input and error are redirected for the open (the server's own are put back after it)
+    open my $save_in, '<&', \*STDIN;
+    open my $save_err, '>&', \*STDERR;
+    open STDIN, '<', '/dev/null' or return speech_ffmpeg_fail("/dev/null: $!");
+    open STDERR, '>', $errf->filename or return speech_ffmpeg_fail("$errf: $!");
+    my $pid = open my $out, '-|', @cmd;
+    my $why = $!;
+    open STDIN, '<&', $save_in if $save_in;
+    open STDERR, '>&', $save_err;
+    close $save_in if $save_in;
+    close $save_err;
+    return speech_ffmpeg_fail("cannot run $FFMPEG: $why") unless $pid;
+    binmode $out;
+    my $body = do { local $/; <$out> } // '';
+    my $closed = close $out;  # (waits for ffmpeg: $? is its status)
+    my $status = $?;
+    my $said = '';
+    if (open my $lf, '<', $errf->filename) {
+        local $/;
+        $said = <$lf> // '';
+        close $lf;
+    }
+    $said =~ s/\s+\z//;
+    $said =~ s/\n/ | /g;
+    return speech_ffmpeg_fail("$FFMPEG exited with status " . ($status >> 8) . ($said ne '' ? ": $said" : ''))
+        if !$closed || $status;
+    return speech_ffmpeg_fail("$FFMPEG gave no audio" . ($said ne '' ? ": $said" : '')) unless length $body;
+    return $body;
+}
+
+sub speech_ffmpeg_fail {
+    my ($detail) = @_;
+    $LOG->error(event => 'speech', msg => "ffmpeg: $detail");
+    return (undef, 'ffmpeg failed: see the log');
+}
+
 route::post '/v1/audio/speech' => sub {
     my ($req) = @_;
     audio_rescan();
@@ -1042,10 +1125,12 @@ route::post '/v1/audio/speech' => sub {
     error(503, 'no voices: start the server with --voices DIR') unless $o{voices};
     my $v = eval { ROCm::Inference::speech_voice("$o{voices}/$voice") } or error(404, "no voice '$voice' in --voices");
     my $fmt = $p->{response_format} // 'wav';
-    error(400, "response_format: wav, pcm or flac (mp3, opus and aac are not built), not '$fmt'")
-        unless $SPEECH_FORMAT{$fmt};
+    my $via = $SPEECH_FFMPEG{$fmt};
+    error(400, "response_format: wav, pcm, flac, mp3, opus or aac, not '$fmt'") unless $SPEECH_FORMAT{$fmt} || $via;
+    error(400, 'response_format: mp3, opus and aac need ffmpeg (start the server with --ffmpeg PATH, or ffmpeg on the PATH)')
+        if $via && !$FFMPEG;
     my $stream = $p->{stream} ? 1 : 0;
-    error(400, 'stream: wav or pcm (flac is written whole)') if $stream && $fmt eq 'flac';
+    error(400, 'stream: wav or pcm (flac, mp3, opus and aac are written whole)') if $stream && ($fmt eq 'flac' || $via);
     my $lang = $p->{language} // 'english';
     error(400, "language: a name such as english, not '$lang'") unless $lang =~ /\A[a-z]{3,20}\z/;
     my %smp;
@@ -1065,7 +1150,13 @@ route::post '/v1/audio/speech' => sub {
     my @pieces = speech_pieces($input);
     error(400, "'input' is required (the text to say)") unless @pieces;
     my $job = { pieces => \@pieces, next => 0, v => $v, name => $voice, lang => $lang, smp => \%smp, fmt => $fmt,
-                stream => $stream, all => '', frames => 0, t0 => Time::HiRes::time(), tts => $TTS, tts_name => $tts_name };
+                stream => $stream, all => '', frames => 0, t0 => Time::HiRes::time(), tts => $TTS, tts_name => $tts_name,
+                via => $via };
+    if ($via) {  # the whole speech first: ffmpeg's result (or its failure) decides the status
+        speech_step($job) until $job->{finished};
+        error(500, $job->{error} // 'speech failed: see the log', 'server_error') unless defined $job->{body};
+        return [ 200, [ 'Content-Type' => $via->[3] ], $job->{body} ];
+    }
     my $type = $stream && $fmt eq 'pcm' ? $SPEECH_FORMAT{pcm} : $SPEECH_FORMAT{$fmt};
     return pull(200, [ 'Content-Type' => $type ], sub { speech_step($job) }, on_close => sub {
         return if $job->{finished};
@@ -1782,6 +1873,15 @@ the model's width (else the model answers without images, with a warning). Not w
 
 A speech model (C<rocm-convert> of a Whisper checkpoint, e.g. openai/whisper-tiny) for C</v1/audio/transcriptions>.
 Runs on the host (not the GPU), one request at a time. A server with only this option needs no chat model.
+
+=item --ffmpeg F<ffmpeg>
+
+The encoder of the C<mp3>, C<opus> and C<aac> formats of C</v1/audio/speech> (its C<response_format>; C<wav>, C<pcm> and
+C<flac> need no encoder). The speech goes to it as 16-bit mono PCM at 24 kHz in a temporary file, and its standard output
+is the body: C<libmp3lame> at 64 kbit/s (C<audio/mpeg>), C<libopus> at 32 kbit/s in Ogg (C<audio/ogg>), C<aac> at 64 kbit/s
+in ADTS (C<audio/aac>). The program is the path given, else the C<ROCM_FFMPEG> environment variable, else C<ffmpeg> on the
+PATH, found once at the start (the log says which, or that none was found). Without one, those formats are refused (400),
+and a failing encoder is a 500 with its standard error in the log. The speech's C<stream> with them is refused (400).
 
 =item --draft F<file.gguf> | none
 
