@@ -17,9 +17,6 @@ variable "DOCKER_REPOSITORY" {
 variable "DOCKER_IMAGE_NAME" {
   default = "purhie"
 }
-variable "LEMONADE_LLAMACPP_VERSION" {
-  default = "b9586"
-}
 variable "DOCKER_TAG" {
   default = "latest"
 }
@@ -38,7 +35,6 @@ target "_common" {
   target = "runtime"
   args = {
     CACHEBUST = "${CACHEBUST}"
-    LEMONADE_LLAMACPP_VERSION = "${LEMONADE_LLAMACPP_VERSION}"
   }
   progress = ["plain", "tty"]
 }

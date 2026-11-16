@@ -10,13 +10,9 @@ export ROCM_PATH=${ROCM_PATH:-/opt/rocm}
 export LD_LIBRARY_PATH=${ROCM_PATH}/lib
 export PATH=${ROCM_PATH}/bin:$PATH
 export HSA_OVERRIDE_GFX_VERSION=11.5.1
-export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
 export HIP_VISIBLE_DEVICES=0
 # HIP_LAUNCH_BLOCKING=1 / AMD_SERIALIZE_KERNEL=1 serialize every kernel launch (debugging, or a workaround for
 # GPU hangs): off unless set (run.sh passes them through)
-export GGML_HIP_FORCE_RS_GPU=1
-export GGML_HIP_FORCE_KV_GPU=1
-export GGML_HIP_ALLOC_GRAPH_RESERVE=2048
 export ROCM_METADATA_WAIT_TIMEOUT=1000
 export ROCM_ALLOW_INT8_MIXED_PRECISION=1
 export HIP_FORCE_DEV_KERNARG=1
@@ -31,12 +27,6 @@ export XDG_CACHE_HOME=/hf
 # --- Mode-specific overrides ---
 export ROCBLAS_USE_HIPBLASLT=${ROCBLAS_USE_HIPBLASLT:-0}
 export HSA_ENABLE_SDMA=${HSA_ENABLE_SDMA:-0}
-export GGML_HIP_GRAPHS=${GGML_HIP_GRAPHS:-0}
-export GGML_CUDA_FORCE_MMQ=${GGML_CUDA_FORCE_MMQ:-1}
-
-# --- Resolve binary paths ---
-APP_DIR=${APP_DIR:-/app}
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${APP_DIR}/bin
 
 # --- ROCm::Inference (rocm-hip): rocm-inference-server, OpenAI-compatible, on /tmp/rocm-inference.sock, reached
 # through nginx at /rocm/v1/... ROCM_MODEL=<model.gguf>: that model, loaded at start; else every model in
@@ -107,8 +97,7 @@ case "$SUBCMD" in
         echo "                    no model: every model in /models, loaded on request)"
         echo "  help              Show this help"
         echo ""
-        echo "Default quantize type: Q4_0_ROCMFP4_STRIX_LEAN (4.38 BPW, memory-efficient)"
-        ;;
+                ;;
 
     *)
         echo "Unknown subcommand: $SUBCMD" >&2

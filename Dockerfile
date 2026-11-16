@@ -11,16 +11,9 @@ RUN apt update && apt install -y --no-install-recommends \
     gcc \
     g++ \
     git \
-    cmake \
-    ninja-build \
     build-essential \
     clang \
     pkg-config \
-    glslc \
-    glslang-tools \
-    vulkan-tools \
-    libvulkan-dev \
-    spirv-headers \
     curl \
     perl \
     zlib1g-dev \
@@ -102,15 +95,11 @@ RUN echo "apt: $APT_CACHEBUST" && apt-get update && apt-get install -y --no-inst
     perl \
     curl \
     nginx \
-    libnginx-mod-http-lua \
-    libnginx-mod-http-perl \
-    libnginx-mod-http-auth-pam \
     libjson-xs-perl \
     libsys-mmap-perl \
     ca-certificates \
     strace \
     lsof \
-    lua-cjson \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 COPY --from=rocm-runtime /opt/rocm /opt/rocm
@@ -136,7 +125,6 @@ RUN mkdir -p /var/lib/nginx/scgi && chown runtime /var/lib/nginx/scgi
 
 COPY app.sh /
 WORKDIR /app
-COPY lib/ /app/lib/
 
 USER runtime
 RUN nginx -t -c /nginx.conf
