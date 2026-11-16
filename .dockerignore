@@ -19,3 +19,6 @@ perl-minijinja-xs/Makefile
 perl-minijinja-xs/lib/Minijinja.c
 perl/ROCm-Inference/Inference.c
 **/*~
+.git
+.claude
+MiniMax-H3-Image
