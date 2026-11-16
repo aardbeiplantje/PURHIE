@@ -421,8 +421,9 @@ sub chat {
         # an image chat: the prompt is prefilled whole from a reset (its pad tokens must not match a cached prefix of
         # another image), with the images' features and M-RoPE positions as its overrides
         croak 'ROCm::Inference::chat: images need a vision model (vision => vision_load($mmproj))' unless $vision;
-        $prompt = image_prompt($m, $vision, $prompt, $images);
+        # (the reset first: it takes the sequence's image rows and RoPE offset away, and the prompt's set after it)
         ROCm::Inference::reset($m);
+        $prompt = image_prompt($m, $vision, $prompt, $images);
         $g{reuse_prefix} = 0;
     }
     while (1) {
@@ -584,6 +585,7 @@ sub chat_start {
     my %o = %{ $opts // {} };
     my %vars = %{ delete $o{vars} // {} };
     my $budget = delete $o{max_thinking_tokens};
+    my ($images, $vision) = delete @o{qw(images vision)};
     croak "ROCm::Inference::chat_start: no on_delta / on_token (step returns the deltas)"
         if exists $o{on_delta} || exists $o{on_token};
     my $text = chat_render($m, $messages, %vars);
@@ -597,8 +599,17 @@ sub chat_start {
     $c->{split} = _reply_splitter(rindex($gen, $open) > rindex($gen, $close) ? 'reasoning' : 'content',
                                   sub { push @{ $c->{deltas} }, [@_]; 0 }, $tags);
     my $ids = tokenize($m, $text);
+    my %g = (reuse_prefix => 1, %o);
+    if ($images && @$images) {
+        # an image chat: its prompt is prefilled whole from a reset of the current sequence (as chat does), with the
+        # images' features and M-RoPE positions as the sequence's overrides (they go with the sequence)
+        croak 'ROCm::Inference::chat_start: images need a vision model (vision => vision_load($mmproj))' unless $vision;
+        ROCm::Inference::reset($m);  # (the builtin reset is not this one)
+        $ids = image_prompt($m, $vision, $ids, $images);
+        $g{reuse_prefix} = 0;
+    }
     $c->{prompt_n} = @$ids;
-    $c->{stream} = stream_begin($m, $ids, { reuse_prefix => 1, %o });
+    $c->{stream} = stream_begin($m, $ids, \%g);
     return $c;
 }
 

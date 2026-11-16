@@ -615,12 +615,22 @@ struct QwenModel {
     // Sequences (inference_seq_*): each its own recurrent state, sliding-window ring mark and last logits; the
     // current one's live in rs / ring_hi / s.logits, the others in their slots (swapped on select, no copy). Slot 0
     // is the default sequence (its own data sits in the model until another one is selected).
+    // The image overrides (qwen_model_set_mm) and the RoPE offset are per sequence too: a sequence with image rows
+    // decodes at its own offset while another sequence decodes plain, in one batch.
     struct SeqSlot {
         RecurrentState rs;
         int ring_hi = 0;
         float* logits = nullptr;
         ShmRegion logits_mem;
         bool used = false;
+        int mm_base = 0, mm_n = 0;
+        const float* mm_emb = nullptr;         // (into mm_emb_v: the vector's buffer moves with a swap)
+        const unsigned char* mm_use = nullptr;  // (into mm_use_v)
+        std::vector<float> mm_emb_v;
+        std::vector<unsigned char> mm_use_v;
+        std::vector<int32_t> mm_pos;
+        int rope_delta = 0;
+        int mm_span = 0;
     };
     std::vector<SeqSlot> seqs = std::vector<SeqSlot>(1);
     int cur_seq = 0;
@@ -629,6 +639,15 @@ struct QwenModel {
         std::swap(rs, o.rs);
         std::swap(ring_hi, o.ring_hi);
         std::swap(s.logits, o.logits);
+        std::swap(mm_base, o.mm_base);
+        std::swap(mm_n, o.mm_n);
+        std::swap(mm_emb, o.mm_emb);
+        std::swap(mm_use, o.mm_use);
+        std::swap(mm_emb_v, o.mm_emb_v);
+        std::swap(mm_use_v, o.mm_use_v);
+        std::swap(mm_pos, o.mm_pos);
+        std::swap(rope_delta, o.rope_delta);
+        std::swap(mm_span, o.mm_span);
     }
 
     int seq_new() {
@@ -1191,7 +1210,8 @@ struct QwenModel {
         prof.start();
         // a prompt's overrides (qwen_model_set_mm): the image rows' embeddings and this batch's M-RoPE positions
         const int64_t g0 = (int64_t)pos0 - mm_base;
-        const bool mm_on = mm_emb && mm_n > 0 && g0 >= 0 && g0 + T <= mm_n;
+        // (not for a batch of sequences: its rows are decode tokens, each on its own sequence's overrides)
+        const bool mm_on = !bat && mm_emb && mm_n > 0 && g0 >= 0 && g0 + T <= mm_n;
         mpos_active = mm_on && !mm_pos.empty();
         if (mpos_active) {
             if (mpos_cap < 3 * T) {
@@ -2891,9 +2911,14 @@ int qwen_model_rope_delta(const qwen_model_t* model) { return model ? model->rop
 int qwen_model_image_span(const qwen_model_t* model) { return model ? model->mm_span : 0; }
 
 void qwen_model_truncate(qwen_model_t* model, int len) {
-    if (model && len < model->mm_span) {  // the sequence loses its image rows: plain RoPE from here on
+    if (model && len < model->mm_span) {  // the sequence loses its image rows: plain RoPE from here on, and the
+                                          // overrides go (a text prompt prefilled from 0 must not take their rows)
         model->mm_span = 0;
         model->rope_delta = 0;
+        model->mm_emb = nullptr;
+        model->mm_use = nullptr;
+        model->mm_n = 0;
+        model->mm_pos.clear();
     }
 }
 

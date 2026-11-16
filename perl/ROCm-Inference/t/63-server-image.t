@@ -85,6 +85,46 @@ my %q = (temperature => 0, max_tokens => 40, chat_template_kwargs => { enable_th
 }
 
 {
+    # --parallel 2: an image chat is a job of its sequence (the same answer as the sequential server, greedy); an image
+    # job and a text job at once (their decode is batched; each keeps its own RoPE offset and its own history)
+    my @srv = start_server('--mmproj', $mmproj, '--parallel', 2);
+    ok(-S $sock, 'the server with --mmproj and --parallel 2 listens') or BAIL_OUT('no server');
+    my ($st, $body) = http(POST => '/v1/chat/completions', { %q, messages => \@image_msg });
+    is($st, 200, 'an image chat with --parallel 2') or diag $body;
+    my $solo = eval { $J->decode($body)->{choices}[0]{message}{content} } // '';
+    like($solo, qr/red/i, "its answer names the red shape: $solo");
+    my $text_msg = [ { role => 'user', content => 'Name three primary colors.' } ];
+    my ($ssolo_st, $tsolo_body) = http(POST => '/v1/chat/completions', { %q, messages => $text_msg });
+    my $tsolo = eval { $J->decode($tsolo_body)->{choices}[0]{message}{content} } // '';
+    my $img_file = "$dir/img_reply.txt";
+    my $child = fork;
+    die "fork: $!" unless defined $child;
+    if (!$child) {
+        my ($cst, $cbody) = http(POST => '/v1/chat/completions', { %q, messages => \@image_msg });
+        open my $o, '>', $img_file or die "$img_file: $!";
+        print $o $cst, "\n", $cbody;
+        close $o;
+        exit 0;
+    }
+    my ($tst, $tbody) = http(POST => '/v1/chat/completions', { %q, messages => $text_msg });
+    waitpid $child, 0;
+    is($tst, 200, 'a text chat at the same time as an image chat') or diag $tbody;
+    my $ttogether = eval { $J->decode($tbody)->{choices}[0]{message}{content} } // '';
+    like($ttogether, qr/red|blue|yellow/i, 'the text answer');
+    is($ttogether, $tsolo, 'the text answer is the one it gives alone (its own RoPE offset, no image rows)');
+    open my $in, '<', $img_file or die "$img_file: $!";
+    my ($ist, $ibody) = split /\n/, do { local $/; <$in> }, 2;
+    close $in;
+    is($ist, 200, 'the image chat beside it') or diag $ibody;
+    my $together = eval { $J->decode($ibody)->{choices}[0]{message}{content} } // '';
+    like($together, qr/red/i, "its answer, with the text job running: $together");
+    like($together, qr/blue/i, 'and the blue one');
+    is($together, $solo, 'the image answer is the one it gives alone (its own RoPE offset, the text job beside it)');
+    stop_server(@srv);
+    ok(!-e $sock, 'SIGTERM: the --parallel server stops');
+}
+
+{
     my @srv = start_server();
     ok(-S $sock, 'the server without --mmproj listens') or BAIL_OUT('no server');
     my ($st, $body) = http(POST => '/v1/chat/completions', { %q, messages => \@image_msg });

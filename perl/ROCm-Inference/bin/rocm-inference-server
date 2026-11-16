@@ -1285,9 +1285,9 @@ route::post '/v1/chat/completions' => sub {
     my @images;
     my ($messages, $opts) = (messages($p->{messages}, \@images), options($p, $r));
     if (@images) {
-        # the images go to chat with the model's vision tower: its own prefill (no prefix reuse, no store)
+        # the images go to chat with the model's vision tower: its own prefill (no prefix reuse, no store); with
+        # --parallel the job's prefill takes the images the same way (chat_start, from a reset of its sequence)
         error(400, "$name has no vision tower: start the server with --mmproj") unless $r->{vision};
-        error(400, 'images: not with --parallel > 1 (one conversation at a time: start with --parallel 1)') if $parallel > 1;
         @$opts{qw(images vision)} = (\@images, $r->{vision});
     }
     start_line($q, $p, $opts);
@@ -1889,7 +1889,8 @@ The model id in the API (default: the file name without F<.gguf>).
 
 The vision tower (C<rocm-convert --mmproj> of a Qwen3.5 checkpoint) for images in chat requests: a message's content
 parts of type C<image_url> take a C<data:image/...;base64,...> URL (the server does not fetch URLs). Its output must be
-the model's width (else the model answers without images, with a warning). Not with C<--parallel> above 1.
+the model's width (else the model answers without images, with a warning). With C<--parallel>, an image chat's
+prefill is its own (taken from a reset of its sequence; the images are encoded when the job starts).
 
 =item --whisper F<whisper.gguf>
 
