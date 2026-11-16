@@ -65,3 +65,8 @@ requests*.log
 
 # Audio files (test clips, speech output): generated or copied, never committed
 *.wav
+
+*.log
+.build-trigger
+
+MiniMax-H3-Image

@@ -1,14 +1,6 @@
 # The build context of docker-bake.hcl (context "."): only what the image is built from. The rocm-hip build reads
 # Makefile, src, perl and perl-minijinja-xs; the runtime COPYs app.sh and nginx.conf. Not the Rust minijinja
 # checkout, build outputs, or the rest of the repository
-*
-!Dockerfile
-!Makefile
-!src
-!perl
-!perl-minijinja-xs
-!app.sh
-!nginx.conf
 perl-minijinja-xs/minijinja
 perl-minijinja-xs/.git
 **/blib
@@ -18,7 +10,12 @@ perl-minijinja-xs/.git
 **/*.o
 **/*.bs
 **/*.so
+**/*.so.*
+**/*.a
+build
+llama.cpp
 perl/*/Makefile
 perl-minijinja-xs/Makefile
 perl-minijinja-xs/lib/Minijinja.c
 perl/ROCm-Inference/Inference.c
+**/*~

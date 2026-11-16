@@ -126,6 +126,7 @@ RUN mkdir -p /var/lib/nginx/scgi && chown runtime /var/lib/nginx/scgi
 
 COPY app.sh /
 WORKDIR /app
+COPY lib /app/lib
 
 USER runtime
 RUN nginx -t -c /nginx.conf

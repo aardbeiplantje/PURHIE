@@ -1,5 +1,5 @@
 #!/bin/bash
-LLAMA_DOCKER_IMAGE=${LLAMA_DOCKER_IMAGE:-local/ai/llama.cpp-gfx1151:latest}
+DOCKER_IMAGE=${DOCKER_IMAGE:-local/ai/purhie-gfx1151:latest}
 HERE="$BASH_SOURCE"
 HERE="${HERE%/*}"
 
@@ -7,36 +7,11 @@ HERE="${HERE%/*}"
 DOCKER_OPTS=${DOCKER_OPTS:-""}
 case "${1:-}" in
     rocm-server)
-        D=llama
+        D=purhie
         DOCKER_OPTS="$DOCKER_OPTS -d"
         ;;
-    quantize|cli|bench)
-        D=$LOGNAME-${1}
-        DOCKER_OPTS="$DOCKER_OPTS -it"
-        ;;
-    convert)
-        D=$LOGNAME-${1}
-        DOCKER_OPTS="$DOCKER_OPTS -it"
-        ;;
-    bash)
-        D=$LOGNAME-${1}
-        DOCKER_OPTS="$DOCKER_OPTS -it"
-        ;;
-    server)
-        D=llama
-        if [ "$*" != "" ]; then
-            DOCKER_OPTS="$DOCKER_OPTS -it"
-        else
-            DOCKER_OPTS="$DOCKER_OPTS -d"
-        fi
-        ;;
-    tail)
-        # Just tail the logs, don't start the container
-        docker logs -f llama
-        exit $?
-        ;;
     *)
-        D=llama
+        D=purhie
         DOCKER_OPTS="$DOCKER_OPTS -d"
         ;;
 esac
@@ -69,9 +44,7 @@ exec docker run \
     --tmpfs /tmp:rw,suid,exec,size=1G \
     --tmpfs /var/tmp:rw,suid,exec,size=1G \
     $([ -n "$MODELS_DIR"    ] && echo "-v $MODELS_DIR:/models:rw") \
-    $([ -n "$LLAMA_PRESETS" ] && echo "-v $LLAMA_PRESETS:/llamacpp_presets.ini:ro") \
     $([ -n "$ROCM_STORE_DIR" ] && echo "-v $ROCM_STORE_DIR:/kvstore:rw") \
-    -v llama.cpp-data:/llama.cpp:rw \
     $([ -n "$HF_HOME" ] && echo "-v $HF_HOME:/hf:rw") \
     -e XDG_CACHE_HOME=${XDG_CACHE_HOME:-/dev/shm} \
     -e HF_HOME=${HF_HOME:-/hf} \
@@ -80,10 +53,8 @@ exec docker run \
     -e MODEL=${MODEL:-} \
     -e MODEL_PATH=${MODEL_PATH:-/models} \
     -e MODELS_DIR=${MODELS_DIR:-} \
-    -e LLAMA_PRESETS=${LLAMA_PRESETS:-} \
-    -e PRESET_FILE=${PRESET_FILE:-/llamacpp_presets.ini} \
     -e MODELS=${MODELS:-} \
-    -e LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-/opt/rocm/lib:/llama/bin} \
+    -e LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-/opt/rocm/lib:/app/bin} \
     -e HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION:-11.5.1} \
     -e GGML_CUDA_ENABLE_UNIFIED_MEMORY=${GGML_CUDA_ENABLE_UNIFIED_MEMORY:-1} \
     -e GGML_HIP_FORCE_RS_GPU=${GGML_HIP_FORCE_RS_GPU:-1} \
@@ -103,5 +74,5 @@ exec docker run \
     -e ROCM_ARGS="${ROCM_ARGS:-}" \
     $([ -n "$QMATVEC_PREFILL_SPLIT_VARIANT" ] && echo "-e QMATVEC_PREFILL_SPLIT_VARIANT=$QMATVEC_PREFILL_SPLIT_VARIANT") \
     $DOCKER_OPTS \
-        $LLAMA_DOCKER_IMAGE \
+        $DOCKER_IMAGE \
             "$@"
