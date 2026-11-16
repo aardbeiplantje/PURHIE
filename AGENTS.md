@@ -54,10 +54,16 @@ find src tests -name '*.cpp' -o -name '*.h' -o -name '*.hpp' -o -name '*.hip' | 
 
 The image is built from this repository's `Dockerfile` (`docker-bake.hcl`, the image `local/ai/purhie-gfx1151:latest`).
 Its ROCm build clones rocm-hip from GitHub `main`, so push before a build. The image's own files are `app.sh`,
-`nginx.conf` and the runtime packages; `.dockerignore` keeps the build context small.
+`nginx.conf` and the runtime packages; `.dockerignore` keeps the build context small. The image carries `/version`
+(the rocm-hip commit, and this project's commit when `build-watch.sh` passes it).
 
 To trigger an image build, touch the trigger from the repository root: `touch .build-trigger`. The user runs
-`build-watch.sh` here, in their shell: it waits for the trigger, runs `docker buildx bake --pull`, and appends the
-output to `build-watch.log`. The build is done when that log has `done, exit N`. The user also runs `./serve.sh`
-(the container, `run.sh`, restarted by `image-watch.sh` on each new image). Do not run either watcher yourself, and do not check whether they are running: you cannot
-see the user's shell. Touch the trigger and report. The image runs nothing by itself.
+`build-watch.sh` here, in their shell: it waits for the trigger, runs `docker buildx bake --pull` with the project's
+HEAD commit, and appends the output to `build-watch.log`. The build is done when that log has `done, exit N`.
+
+The user runs `./serve.sh` to serve the container (`run.sh`). `image-watch.sh` stops the container and exits when the
+image changes; `serve.sh` then runs its own file again, so an edit to `serve.sh` takes effect with the next build.
+`serve.sh` runs no docker commands itself: the container is `run.sh`'s and the watch is `image-watch.sh`'s.
+
+Do not run the watchers or `serve.sh` yourself, and do not check whether they are running: you cannot see the user's
+shell. Touch the trigger and report. The image runs nothing by itself.

@@ -20,44 +20,54 @@ gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day b
 34 GB, `/comfyui` 88 GB: no downloads, one converted file at a time. No ffmpeg on this host (the image gets one).
 
 **Done** (each recorded in its item below):
-- 2026-11-16 (later): mp3, opus and aac on `/v1/audio/speech` through ffmpeg (item 13; `--ffmpeg`, `ROCM_FFMPEG`; 36 of 36
-  format tests with a stub, t/65 13 of 13, t/64 17 of 17); the first real image build log and the build-context fix
-  (`8251416`).
+- 2026-11-16, the speech and the Q8_0 predictor: mp3, opus and aac on `/v1/audio/speech` through ffmpeg (item 13;
+  `--ffmpeg`, `ROCM_FFMPEG`; `c17f950`, merged in `cd058e5`: 36 of 36 format tests with a stub, t/65 13 of 13, t/64 17 of
+  17). The Q8_0 predictor on the device (item 16, L2, `93281dc`): the predictor takes 12.4 ms a frame on that file (BF16
+  16.3 ms); the speech check passes. The model-card keys of `rocm-convert` (package I, `2c4676a`): the four releases'
+  metadata identical to upstream's; re-run here on Qwen2.5-0.5B-Instruct: 36 of 36 keys.
+- 2026-11-16, the image: the llama.cpp remnants removed (`39f1b8c`); the build context fixed (`8251416`, `339e3ae`: `.git`,
+  `.claude`, `MiniMax-H3-Image`, build outputs, `llama.cpp`, editor backups excluded); ffmpeg in the runtime (`ce89090`);
+  `/version` again (`44be8f7`). The build now passes: exit 0 at 13:32 and 13:38, the nginx configuration test ok, the
+  `/version` stage shows the rocm-hip commit. The build's warnings: the discarded HIP results (13, in `qwen3tts.cpp`) are
+  checked now (`70fa01a`, `src/hip_check.h`); the expert pager's initialiser order fixed (`137a699`). The build's other
+  notes are the `src/sd.cpp` loop-vectorisation messages (TODO 8).
+- 2026-11-16, serving: `image-watch.sh` (`021e2c4`) and `serve.sh` (`2944bb1`, `2c29978`): on a new image the watcher stops
+  the container and exits, and `serve.sh` runs its own file again (an edit takes effect with the next build). Ctrl-C
+  stops it. Tested with a fake docker. The deployed service (checked 2026-11-16 at 13:38, before the restart): 11 models,
+  the voice `test`, WAV speech 115 KB in 2 s, the transcription back to the input, mp3 (ID3, Lavf 61.7.1), opus (Ogg), aac
+  (ADTS).
+- 2026-11-16, earlier: package H (the split-invariance tests demand bit-exactness, `fbc876f`, `89ed4a0`); package L1 (the
+  Q8_0 predictor's file, loader and host path: `8ee0c10`, `e7cf085`) and L1b (its sampling distributions: 2.3% total
+  variation on average, `9080a12`); the Whisper temperature fallback (item 11, `c9605c4`); the Whisper host path (E, E2,
+  `b71ac94`, `7f11ec4`: a decoder token 3.5 to 1.7 ms, the encoder 1.5 to 0.39 s); the vision tower's host path (F,
+  `b31d693`: 3.55 to 0.76 s a pass); the codec's time per layer (C, `dfef8b6`); the IQ types on the GPU (B: all nine pass,
+  `2508c19`); the tests' reply checks (G, `d29b798`).
 - 2026-11-15: item 8 (the samplers on the device: one sync a frame), item 7's first gains (a predictor stack 940 to
-  905 us), item 9 first version (the codec's convolutions on the device: 40 frames in 190 ms, 800 ms on the CPU) and its
-  time per layer (package C), package A (item 11, Whisper's temperature fallback), B (the IQ types on the GPU), E and E2
-  (item 10: a Whisper decoder token 18.3 to about 1.7 ms, the encoder 1.5 to 0.39 s, on the host), F (item 15: the vision
-  tower's pass 3.55 to 0.76 s on the host), G (the tests' reply checks).
-- 2026-11-16: package H (the split-invariance tests demand bit-exactness: Open leads, quality); package L1 (the Q8_0
-  predictor's file, loader and host path: item 16) and L1b (its sampling distributions: 2.3% total variation on average);
-  package I (the model-card keys of rocm-convert: the four releases' metadata identical to upstream's, key for key; re-run
-  here on Qwen2.5-0.5B-Instruct: 36 of 36 keys, zero difference); the image's llama.cpp remnants removed (`39f1b8c`; its
-  build not verified: see TODO 8); Alpamayo 2 Edge analysed and Qwen4 checked (TODO 9 to 11).
+  905 us), item 9 first version (the codec's convolutions on the device: 40 frames in 190 ms, 800 ms on the CPU).
 
-**In progress** (agents resumed 2026-11-16 after the usage limit; each commits to its own worktree branch, then is
-merged here):
-- The `convert_verify.sh` run for all releases (the card keys are compared now): deferred until the disk allows, several GB.
+**In progress:** nothing running. The waiting parts are on the user's side (TODO 1 and 2).
 
 **TODO** (in order):
-1. The three formats against a real ffmpeg: M is merged (`c17f950`, merged in `cd058e5`; `ffmpeg` in the image's runtime
-   packages in `ce89090`). Here the test passes 36 of 36 with a stub; its real-encoder checks (tests 31 to 36: the MP3 and
-   Ogg and ADTS signatures) are skipped without `ROCM_INFERENCE_TEST_FFMPEG`. Next: run them in the container.
-2. The Q8_0 predictor file: how a user gets it (a converter recipe or option) and the server picking it up
-   (`--models-dir` prefers the BF16 talker today). BF16 stays the default.
-3. J the vision tower's linears register-blocked on the host (77% of the 0.76 s pass).
-4. K the codec's host stages overlapped with the device's work or moved to its kernels (36 ms of a 142 ms piece).
-5. After I: `tests/convert_verify.sh` in full (needs several GB free on `/data`).
-6. Item 7's leads (a few percent each): the q/k norm and rotary inside the attention, the norm once per layer; D the
-   samplers' sort (not started: about 18 us against 28 us a codebook, under 1% of a frame).
-7. Leftovers on the host paths: Whisper's encoder attention (a score vector allocated per query and head), its
-   decoder's cross-attention (six threads) and vocabulary product (memory-bound); the codec's kernel-7 inner loop.
-8. **The image (commits 39f1b8c and 8251416, 2026-11-16).** The llama.cpp remnants are out (nginx's llama upstream and
-   fixup hooks, `lib/perl/llama.pm`, `lib/lua/fixup.lua`, the Vulkan and CMake packages, the GGML environment). The first
-   real build log (the user's, 2026-11-16) showed: every ROCm stage cached and fine; the failure was the build context:
-   `.dockerignore` (`*` with a few re-includes) excluded `nginx.conf` and `app.sh`, so their COPY steps failed. Fixed in
-   8251416. The user's checkout still had an older Dockerfile (`COPY lib`): it needs `git pull`. Not yet verified: the
-   build after the pull (the `nginx -t` step and the runtime's `ldd` check come after the COPYs). `run.sh` (the host launcher) still names
-   llama (`LLAMA_DOCKER_IMAGE`, the `llama` container and volume): to change with the user's launch scripts.
+1. The deployed container: the 13:38 check was before the restart, and `/` answered 200 (the current `nginx.conf` has no
+   `/` location, so 404 is expected from it). After the restart at 13:38:39 the same. Check which image the container runs
+   (`docker ps`), and that it is the latest build (`docker inspect`, or `/version` in the container).
+2. Restart `build-watch.sh` in the user's shell: the running watcher predates the `/version` change, so its builds show
+   `project unknown`. After the restart, one build and `docker run --rm --entrypoint cat local/ai/purhie-gfx1151:latest /version`.
+3. The real-encoder checks of `t/69-speech-formats.t` (tests 31 to 36: the MP3, Ogg and ADTS signatures) need
+   `ROCM_INFERENCE_TEST_FFMPEG` on a host with ffmpeg. The deployed server already returns correct MP3, Ogg and ADTS bytes.
+4. The Q8_0 predictor for users: the `rocm-convert` recipe is in item 16 and the server takes the file through `--tts`
+   (`--models-dir` prefers the BF16 talker, and stays so). BF16 stays the default. Watch the float4 alignment note in
+   item 16 (a toolchain change would show in the predictor's timing and codes first).
+5. J: the vision tower's linears register-blocked on the host (77% of the 0.76 s pass).
+6. K: the codec's host stages overlapped with the device's work or moved to its kernels (36 ms of a 142 ms piece).
+7. `tests/convert_verify.sh` in full, with the card keys compared (needs several GB free on `/data`: about 6 GB at the last
+   check). Item 7's leads (the q/k norm and rotary inside the attention, the norm once per layer) and D (the samplers' sort,
+   about 18 us against 28 us a codebook: under 1% of a frame).
+8. Cleanup: (a) the per-file `HIP_CHECK` copies in `tests/` and some `src/` demos could use `src/hip_check.h` (asked; the user
+   has not answered); (b) `src/sd.cpp`'s loop-vectorisation notes in each build; (c) the Dockerfile's `COPY lib` (the
+   directory has no tracked files now; the build passes); (d) the host-path leftovers: Whisper's encoder attention
+   (a score vector per query and head), its decoder's cross-attention (six threads) and vocabulary product (memory-bound);
+   the codec's kernel-7 inner loop; (e) `~/rocm-hip.git` needs `git pull`: its older `run.sh` and Dockerfile are behind.
 9. **NVIDIA Alpamayo 2 Edge (analysed 2026-11-16; released 2026-11-10; HF `nvidia/Alpamayo2-Edge`).** A driving
    vision-language-action model: weights OpenMDW-1.1, code Apache-2.0 (the license to confirm with the user, as for MiniMax).
    Config: the language model `cosmos3_edge_text` is dense (28 layers, hidden 2048, 16 query / 8 KV heads, MLP 9216, vocab
