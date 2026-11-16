@@ -1,10 +1,14 @@
-# As a Docker build context (llama.cpp-rocm-gfx1151-docker's rocm-hip-src): only what `make install` and the
-# Perl modules build from; not the llama.cpp reference, build outputs or the Rust minijinja checkout
+# The build context of docker-bake.hcl (context "."): only what the image is built from. The rocm-hip build reads
+# Makefile, src, perl and perl-minijinja-xs; the runtime COPYs app.sh and nginx.conf. Not the Rust minijinja
+# checkout, build outputs, or the rest of the repository
 *
+!Dockerfile
 !Makefile
 !src
 !perl
 !perl-minijinja-xs
+!app.sh
+!nginx.conf
 perl-minijinja-xs/minijinja
 perl-minijinja-xs/.git
 **/blib
