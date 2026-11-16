@@ -25,20 +25,22 @@ gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day b
   time per layer (package C), package A (item 11, Whisper's temperature fallback), B (the IQ types on the GPU), E and E2
   (item 10: a Whisper decoder token 18.3 to about 1.7 ms, the encoder 1.5 to 0.39 s, on the host), F (item 15: the vision
   tower's pass 3.55 to 0.76 s on the host), G (the tests' reply checks).
-- 2026-11-16: package H (the split-invariance tests demand bit-exactness: Open leads, quality).
+- 2026-11-16: package H (the split-invariance tests demand bit-exactness: Open leads, quality); package L1 (the Q8_0
+  predictor's file, loader and host path: item 16) and L1b (its sampling distributions: 2.3% total variation on average);
+  package I (the model-card keys of rocm-convert: the four releases' metadata identical to upstream's, key for key; re-run
+  here on Qwen2.5-0.5B-Instruct: 36 of 36 keys, zero difference); the image's llama.cpp remnants removed (`39f1b8c`; its
+  build not verified: see TODO 8); Alpamayo 2 Edge analysed and Qwen4 checked (TODO 9 to 11).
 
-**In progress** (agents running, 2026-11-16):
-- I the converter's model-card keys (`general.license`, base model, size label and the rest of upstream's card keys) as
-  `convert_hf_to_gguf.py` writes them, for the four releases under `/data/conv`. Upstream's key lists are known (the
-  first attempt's dumps); the port into `Convert.pm` is being written. Then `tests/convert_verify.sh` compares them (it
-  sets them "aside" today): to run when the disk allows.
+**In progress** (agents resumed 2026-11-16 after the usage limit; each commits to its own worktree branch, then is
+merged here):
 - L2 (item 16) the Q8_0 rows in the device kernels (`talker_gpu.hip`: a lane takes one 34-byte block), the device against
   the host on the Q8_0 file, the frame's time.
 - M (item 13) mp3, opus and aac from `/v1/audio/speech` through an external ffmpeg (`--ffmpeg`, `ROCM_FFMPEG`), tested
   here with a stub program.
+- The `convert_verify.sh` run for all releases (the card keys are compared now): deferred until the disk allows, several GB.
 
 **TODO** (in order):
-1. After M: `ffmpeg` in the image (the docker repository's Dockerfile), the submodule's commit taken here, and the three
+1. After M: `ffmpeg` in the image's Dockerfile (this repository's, not the docker submodule, which is gone), and the three
    formats checked against the real encoder in the container (`t/69-speech-formats.t` with `ROCM_INFERENCE_TEST_FFMPEG`).
 2. After L2: how a user gets the Q8_0-predictor file (a converter recipe or option) and the server picking it up
    (`--models-dir` prefers the BF16 talker today). BF16 stays the default.
