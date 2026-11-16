@@ -32,8 +32,6 @@ gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day b
   `convert_hf_to_gguf.py` writes them, for the four releases under `/data/conv`. Upstream's key lists are known (the
   first attempt's dumps); the port into `Convert.pm` is being written. Then `tests/convert_verify.sh` compares them (it
   sets them "aside" today): to run when the disk allows.
-- L1b (item 16) the Q8_0 predictor's sampling distributions against the BF16 one's (total variation and KL per codebook,
-  teacher-forced). L1 is done (the file, the loader, the host path: item 16).
 - L2 (item 16) the Q8_0 rows in the device kernels (`talker_gpu.hip`: a lane takes one 34-byte block), the device against
   the host on the Q8_0 file, the frame's time.
 - M (item 13) mp3, opus and aac from `/v1/audio/speech` through an external ffmpeg (`--ffmpeg`, `ROCM_FFMPEG`), tested
@@ -159,8 +157,12 @@ Quality and scope (decisions):
     stages identical): the predictor's teacher-forced logits at worst row cosine 0.9999327, largest difference 0.71 (2.4%
     of the largest logit); greedy codes differ from frame 3 (a near-tie flips a codebook and the frame's later codebooks
     follow it), the first codebook from frame 52; the speech verifier passes and Whisper reads the speech back as the
-    test sentence. Greedy agreement is not the measure for sampled speech: L1b measures the distance between the two
-    sampling distributions (temperature 0.9, top 50) per codebook. L2: the device kernels.
+    test sentence. Greedy agreement is not the measure for sampled speech. L1b done 2026-11-16: the two sampling
+    distributions (temperature 0.9, the top 50) on the 750 teacher-forced rows: total variation mean 2.3%, median 2.2%,
+    95th percentile 4.3%, largest 6.8%; it grows with the codebook (0.8% for codebook 1, 3.6% for codebook 15); the top
+    token equal in 93.9% of the rows, 48.95 of the 50 candidates shared. The control (the BF16 engine against qwen-tts's
+    logits): 0.0005%, the top token always equal. So a codebook's draw differs in about 1 case of 43: a small shift of the
+    distribution, to be judged by ear before it is anyone's default. L2: the device kernels (in progress).
 
 Not planned:
 14. **Torch-identical sampled frames.** The engine's sampler is its own generator (splitmix); a bit match would need torch's
