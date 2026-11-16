@@ -22,12 +22,17 @@ the speech files (`qwen3tts-talker.gguf`, `qwen3tts-talker-f32.gguf`, `/data/pre
 whisper-tiny, `voices/`) and EmbeddingGemma.
 
 **Open items, in order** (the user picks what to start; each has its check):
-1. **Lazy KV on the sliding-window ring (Gemma-4).** The KV registration change (`74fda6e`) covers the ring's cache too, but
-   nothing has run through it. Check: `generate_verify`, `seq_verify` and `store_verify` on the Gemma-4 26B file, and the
-   sliding-window output against the same run before the change (build the HEAD of `74fda6e`^ in a worktree). Fix what fails.
-2. **Lazy KV on the MTP draft path.** The draft cache registers as the draft attends (`kv_cache_reserve` in the same
-   attention launch). Check: `mtp_verify` and `events_test MODEL DRAFT` on `Qwen3.5-4B-ROCMFP4.gguf` (2.9 GB), the tokens
-   against the eager build (`74fda6e`^). Fix what fails.
+1. **Done 2026-11-16: lazy KV on the sliding-window ring (Gemma-4 26B).** The ring is active at a prefill batch of 64 (ring
+   2048 positions). A 2600-token prompt and 40 greedy tokens wrap it: the ring and the no-ring run give identical logits
+   (max difference 0) and 40 of 40 tokens. `seq_verify` passes; `store_verify` passes (on `/dev/shm`). `generate_verify`'s
+   output is identical to the baseline (commit `2bc24ea`, before the change), with five checks failing in both builds:
+   prefill against token-by-token decoding differs by 16 logits (cosine 0.994); the streamed greedy tokens differ from
+   `inference_generate_ex`'s; the chat checks assume Qwen's end token and template. New open item (below).
+2. **Done 2026-11-16: lazy KV on the MTP draft path.** `mtp_verify` refuses qwen35 models (draft heads are for qwen4exp
+   only). `tests/mtp_own_verify.sh` with the tiny qwen4exp pair generated from the Flash header: the own block drafts what the
+   sidecar drafts (240 drafts), at temperature 0 and 0.8 with 1 draft, 3 drafts and adaptive drafts, mapped and staged: all
+   pass, and the check results equal the baseline's line for line. `events_test` with the draft: the draft events fire and
+   the speculative output equals the plain one; five prefill-progress checks fail in both builds (a pre-existing gap, below).
 3. **The deployed service on the new image.** The watcher restarts the container from the 19:42 image. Check: `GET
    /rocm/v1/models`, one short chat through `/rocm/` (the fixup: `conv_id` and `id_slot` added), one short speech request.
    The user runs these, or the agent runs the GETs if the user allows it.
@@ -62,6 +67,11 @@ whisper-tiny, `voices/`) and EmbeddingGemma.
     deployment's GPU pins (tabled: GLM runs on the CPU).
 12. **Clear by hand:** `/data/iqtest` (336 KB of logs), and `nginx.conf~` in the repository root (the user's editor backup,
     excluded from the image; git lists it as untracked).
+
+13. **New, from items 1 and 2 (2026-11-16, both builds):** (a) Gemma-4 26B: prefill against token-by-token decoding differs by
+    16 logits (cosine 0.994), and the streamed greedy tokens differ from `inference_generate_ex`'s; its chat checks assume
+    Qwen's template. (b) `events_test`: five PREFILL_PROGRESS checks fail (a long prompt reports no progress; the progress
+    counts; a nonzero return does not cancel the prefill). Both are present before the lazy-KV change; not yet diagnosed.
 
 **Done 2026-11-16 (the detail is in the items above and in git):** `edbbd32` the Q8_0 predictor talker is loaded after the
 BF16 one by its tensors (not its name), and `t/64-multipart.t` split out of `t/64-audio.t`; `bcefaa3` and `bb64c61` the nginx
