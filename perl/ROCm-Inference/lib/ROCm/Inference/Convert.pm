@@ -1108,8 +1108,9 @@ sub convert {
     my $q = $a{quant};
     $self->general;
     $self->text_params;
-    $self->params;
+    # general.file_type ends the base keys (TextModel.set_gguf_parameters): the architecture's own come after it
     $self->kv('general.file_type', U32, $q ? $q->ftype : $self->ref_ftype);
+    $self->params;
     $self->kv('general.quantization_version', U32, 2);
     $self->vocab;
     my @specs = $self->tensors;
