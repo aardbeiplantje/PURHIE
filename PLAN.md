@@ -32,17 +32,18 @@ gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day b
   `convert_hf_to_gguf.py` writes them, for the four releases under `/data/conv`. Upstream's key lists are known (the
   first attempt's dumps); the port into `Convert.pm` is being written. Then `tests/convert_verify.sh` compares them (it
   sets them "aside" today): to run when the disk allows.
-- L1 (item 16) the code predictor's block matrices as Q8_0: the file (`/data/predq8/qwen3tts-talker-predq8.gguf`), the
-  loader and the host path, and the quality numbers (the predictor's logits, the greedy codes' agreement, the speech).
+- L1b (item 16) the Q8_0 predictor's sampling distributions against the BF16 one's (total variation and KL per codebook,
+  teacher-forced). L1 is done (the file, the loader, the host path: item 16).
+- L2 (item 16) the Q8_0 rows in the device kernels (`talker_gpu.hip`: a lane takes one 34-byte block), the device against
+  the host on the Q8_0 file, the frame's time.
 - M (item 13) mp3, opus and aac from `/v1/audio/speech` through an external ffmpeg (`--ffmpeg`, `ROCM_FFMPEG`), tested
   here with a stub program.
 
 **TODO** (in order):
 1. After M: `ffmpeg` in the image (the docker repository's Dockerfile), the submodule's commit taken here, and the three
    formats checked against the real encoder in the container (`t/69-speech-formats.t` with `ROCM_INFERENCE_TEST_FFMPEG`).
-2. After L1, if its numbers hold: L2 the Q8_0 rows in the device kernels (`talker_gpu.hip`: a lane takes one 34-byte
-   block; the frame's 22.8 ms could reach about 16 ms), the device against the host on the Q8_0 file, the frame's time.
-   Then how a user gets the file (a converter recipe or option) and the server picking it up. BF16 stays the default.
+2. After L2: how a user gets the Q8_0-predictor file (a converter recipe or option) and the server picking it up
+   (`--models-dir` prefers the BF16 talker today). BF16 stays the default.
 3. J the vision tower's linears register-blocked on the host (77% of the 0.76 s pass).
 4. K the codec's host stages overlapped with the device's work or moved to its kernels (36 ms of a 142 ms piece).
 5. After I: `tests/convert_verify.sh` in full (needs several GB free on `/data`).
@@ -150,8 +151,16 @@ Quality and scope (decisions):
     through an external ffmpeg (`--ffmpeg`, `ROCM_FFMPEG`, or the one on PATH); the image installs it. Without one the
     three formats stay a 400.
 16. **The code predictor's weights as Q8_0 (package L; the user: built as an option, 2026-11-16).** The predictor reads about
-    2.5 GB of BF16 a frame (16 stacks of 157 MB); Q8_0 rows are 34 bytes for 32 values against 64. L1 (in progress): the
-    file, the loader, the host path, the quality numbers. L2: the device kernels. BF16 stays the default.
+    2.5 GB of BF16 a frame (16 stacks of 157 MB); Q8_0 rows are 34 bytes for 32 values against 64. BF16 stays the default.
+    L1 done 2026-11-16: the file is `rocm-convert -r plain -t 'pred\.blk\..*\.weight$=q8_0' -t '.*=keep' talker.gguf
+    out.gguf q8_0` (the 35 matrices of `pred.blk.*`; everything else keeps its bytes; 1.85 to 1.78 GB; on this host
+    `/data/predq8/qwen3tts-talker-predq8.gguf`); the loader takes Q8_0 for the predictor's blocks only, and the host path
+    runs it (`dot_q8`); such a file runs on the host until L2. Measured on the host against the BF16 file (the talker's
+    stages identical): the predictor's teacher-forced logits at worst row cosine 0.9999327, largest difference 0.71 (2.4%
+    of the largest logit); greedy codes differ from frame 3 (a near-tie flips a codebook and the frame's later codebooks
+    follow it), the first codebook from frame 52; the speech verifier passes and Whisper reads the speech back as the
+    test sentence. Greedy agreement is not the measure for sampled speech: L1b measures the distance between the two
+    sampling distributions (temperature 0.9, top 50) per codebook. L2: the device kernels.
 
 Not planned:
 14. **Torch-identical sampled frames.** The engine's sampler is its own generator (splitmix); a bit match would need torch's
