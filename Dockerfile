@@ -76,10 +76,13 @@ RUN mkdir -p /opt/rocm \
         "*/lib/rocblas/*" \
         "*/lib/hipblaslt/*"
 
-# /version: the commits of this project (its .git, the bake file's named context docker-git: .dockerignore keeps
-# .git out of the main context) and of rocm-hip. Its own stage, copied last: a new commit here rebuilds only that
+# /version: the commit of this project (PROJECT_VERSION: build-watch.sh passes the HEAD commit, since .git is not in the
+# build context) and of rocm-hip (cloned from GitHub main). Its own stage, copied last into the runtime: a new commit
+# rebuilds only this layer. `cat /version` in the image shows both
 FROM base AS version
+ARG PROJECT_VERSION=unknown
 COPY --from=rocm-hip-build /rocm-hip.version /rocm-hip.version
+RUN { echo "project $PROJECT_VERSION"; cat /rocm-hip.version; } > /version && cat /version
 
 FROM debian:trixie-slim AS runtime
 WORKDIR /app
@@ -139,4 +142,7 @@ ENV HF_HUB_DISABLE_XET=1
 ENV HF_HUB_CACHE=/hf/hub
 ENV HF_HOME=/hf
 ENV PERL5LIB=/opt/rocm-hip/perl5/lib/perl5
+# /version (the version stage), copied last
+COPY --from=version /version /version
+
 ENTRYPOINT ["/app.sh"]

@@ -23,6 +23,9 @@ variable "DOCKER_TAG" {
 variable "GFX_VERSION" {
   default = "-gfx1151"
 }
+variable "PROJECT_VERSION" {
+  default = "unknown"
+}
 variable "CACHEBUST" {
   default = "2026-11-14-10"
 }
@@ -35,6 +38,7 @@ target "_common" {
   target = "runtime"
   args = {
     CACHEBUST = "${CACHEBUST}"
+    PROJECT_VERSION = "${PROJECT_VERSION}"
   }
   progress = ["plain", "tty"]
 }

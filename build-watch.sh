@@ -16,6 +16,7 @@ while :; do
         rm -f "$trigger"
         {
             echo "== $(date '+%F %T') docker buildx bake --pull"
+            PROJECT_VERSION="$(git log -1 --date=iso-strict --format='%H %cd %s' 2>/dev/null)$(git diff --quiet 2>/dev/null || echo ' (uncommitted changes)')" \
             CACHEBUST=$(date +%s) docker buildx bake --pull 2>&1
             rc=$?
             echo "== $(date '+%F %T') done, exit $rc"
