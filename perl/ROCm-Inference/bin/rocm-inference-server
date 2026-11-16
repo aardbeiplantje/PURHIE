@@ -15,6 +15,7 @@ use Pod::Usage qw(pod2usage);
 use Time::HiRes ();
 use File::Temp ();
 use ROCm::Inference qw(:all);
+use ROCm::Inference::GGUF qw(gguf_read gguf_type_id);
 use ROCm::Inference::Log;
 use ROCm::Inference::Store qw(store_evict store_usage);
 use ROCm::Inference::Multipart;
@@ -152,8 +153,25 @@ sub audio_load_tts {
     $LOG->info('audio', event => 'load', msg => "speech (--tts $talker --tts-codec $codec, voices " . ($o{voices} // 'none') . ')');
 }
 
+# A talker's rank for --models-dir, by the bytes of its tensors: 0 the weights BF16 or F16 (the default; the device path
+# reads these), 1 with Q8_0 matrices (the predictor's Q8_0 recipe: rocm-convert -t 'pred\.blk\..*\.weight$=q8_0'), 2 most
+# of the bytes F32. A file that does not read ranks last.
+sub talker_rank {
+    my ($path) = @_;
+    my $g = eval { gguf_read($path) } or return 3;
+    my ($T32, $TQ8) = (gguf_type_id('f32'), gguf_type_id('q8_0'));
+    my ($all, $f32, $q8) = (0, 0, 0);
+    for my $t (@{ $g->{tensors} }) {
+        $all += $t->{bytes};
+        $f32 += $t->{bytes} if $t->{type} == $T32;
+        $q8 += $t->{bytes} if $t->{type} == $TQ8;
+    }
+    return 3 unless $all;
+    return $f32 * 2 > $all ? 2 : $q8 ? 1 : 0;
+}
+
 # The models found in --models-dir, when its files changed since the last look: the speech recognizer (the first Whisper
-# file) and the talker (a BF16 one before an F32 one: the device path reads BF16) with the codec (the first one)
+# file) and the talker (the lowest talker_rank, then the name) with the codec (the first one)
 sub audio_rescan {
     my $dir = $o{'models-dir'} or return;
     return if $AUDIO_FLAG{whisper} && $AUDIO_FLAG{tts};
@@ -184,7 +202,9 @@ sub audio_rescan {
         }
     }
     if (!$AUDIO_FLAG{tts}) {
-        my ($talker) = $a{tts} ? sort { ($a =~ /f32/i) <=> ($b =~ /f32/i) || $a cmp $b } @{ $a{tts} } : ();
+        my ($talker) = $a{tts}
+            ? map { $_->[1] } sort { $a->[0] <=> $b->[0] || $a->[1] cmp $b->[1] } map { [talker_rank($_), $_] } @{ $a{tts} }
+            : ();
         my $codec = $a{codec} ? $a{codec}[0] : undef;
         my $ok = defined $talker && defined $codec;
         my $key = $ok ? audio_key($talker) . ' ' . audio_key($codec) : '';
@@ -1780,7 +1800,9 @@ context and KV cache type C<--ctx> / C<--kv-type> give, by default from its own 
 The audio models in the directory are served without flags: a Whisper GGUF (C<--whisper>, for
 C</v1/audio/transcriptions>), and a Qwen3-TTS talker with its speech tokenizer (C<--tts> and C<--tts-codec>, for
 C</v1/audio/speech>), whose voices are the directory's C<voices> subdirectory (C<--voices>, created when missing).
-The flags, when given, name other files. The directory is looked at before each speech, transcription or voice request:
+With several talkers in the directory the BF16 one is used, then one with a Q8_0 predictor (the code predictor's Q8_0 recipe
+in the TTS notes: the same speech, smaller and slower to sample), then an F32 one. The flags, when given, name other files.
+The directory is looked at before each speech, transcription or voice request:
 a model copied in, replaced or removed is loaded again (or dropped) then, and a request in progress keeps the model it started
 with.
 

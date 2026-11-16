@@ -58,16 +58,16 @@ gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day b
 **In progress:** nothing running. The waiting parts are on the user's side (TODO 1 and 2).
 
 **TODO** (in order):
-1. The deployed container: the 13:38 check was before the restart, and `/` answered 200 (the current `nginx.conf` has no
-   `/` location, so 404 is expected from it). After the restart at 13:38:39 the same. Check which image the container runs
-   (`docker ps`), and that it is the latest build (`docker inspect`, or `/version` in the container).
-2. Restart `build-watch.sh` in the user's shell: the running watcher predates the `/version` change, so its builds show
-   `project unknown`. After the restart, one build and `docker run --rm --entrypoint cat local/ai/purhie-gfx1151:latest /version`.
-3. The real-encoder checks of `t/69-speech-formats.t` (tests 31 to 36: the MP3, Ogg and ADTS signatures) need
-   `ROCM_INFERENCE_TEST_FFMPEG` on a host with ffmpeg. The deployed server already returns correct MP3, Ogg and ADTS bytes.
-4. The Q8_0 predictor for users: the `rocm-convert` recipe is in item 16 and the server takes the file through `--tts`
-   (`--models-dir` prefers the BF16 talker, and stays so). BF16 stays the default. Watch the float4 alignment note in
-   item 16 (a toolchain change would show in the predictor's timing and codes first).
+1. **Done (the user, 2026-11-16):** the deployed container's image and `/version` checked.
+2. **Done (the user, 2026-11-16):** `build-watch.sh` restarted in the user's shell; its builds now carry the project commit.
+3. **Done 2026-11-16:** ffmpeg 6.1.1 installed on this host (`apt`, with the user's go-ahead). `t/69-speech-formats.t`
+   passes 37 of 37 with `ROCM_INFERENCE_TEST_FFMPEG=/usr/bin/ffmpeg`, including the real encoders (tests 31 to 36).
+4. **The Q8_0 predictor talker: BF16 by default, Q8_0 allowed (the user, 2026-11-16).** A `--models-dir` with several
+   talkers loads the BF16 one, then one with Q8_0 matrices (the predictor's recipe), then an F32 one: the rank is the
+   tensors' bytes (`talker_rank` in `bin/rocm-inference-server`). The name sort had put `talker-predq8` before
+   `talker.gguf` (`-` sorts before `.`), so a directory with both would have loaded the Q8_0 file. `t/65-talker.t` (3
+   checks: BF16 before Q8_0, the same in either listing order, Q8_0 before F32); `t/65-speech.t` 13 of 13 with the Q8_0
+   talker (speech through the server). The POD says which talker is used.
 5. **J, done 2026-11-16 (`vision.cpp`'s `linear`: blocks of 4 rows and 2 outputs).** The linear stage of `vision_verify`
    falls from 720-740 ms to 290-325 ms a pass (same load, alternating runs); the pass is 2x faster on that stage and the
    check passes (cosine 1.0). A 4x4 block was tried and fails the check (an OpenMP reduction over array elements: wrong
@@ -92,33 +92,31 @@ gone. Free disk on 2026-11-16: `/data` and `/models` about 4 GB (17 GB the day b
    both measured and gave no gain, reverted), its decoder's cross-attention (six threads) and vocabulary product
    (memory-bound); the codec's kernel-7 inner loop; (e) `~/rocm-hip.git` (not on this host) needs `git pull`: its older
    `run.sh` and Dockerfile are behind.
-9. **NVIDIA Alpamayo 2 Edge (analysed 2026-11-16; released 2026-11-10; HF `nvidia/Alpamayo2-Edge`).** A driving
-   vision-language-action model: weights OpenMDW-1.1, code Apache-2.0 (the license to confirm with the user, as for MiniMax).
-   Config: the language model `cosmos3_edge_text` is dense (28 layers, hidden 2048, 16 query / 8 KV heads, MLP 9216, vocab
-   135168, rope theta 1e8: the engine's dense path, if its norms and activation match); the vision tower
-   `cosmos3_edge_vision` (27 layers, hidden 1152, patch 16: not Qwen3.5's, a new tower); an action expert (28 layers,
-   hidden 512, flow matching with 10 Euler steps, attending to the VLM's keys and values: a new attention mode); the
-   trajectory is in the language model's vocabulary (history ids 1000, future ids 3000, 128 tokens per future trajectory)
-   and integrated by a unicycle model over 64 waypoints at 0.1 s. Six cameras, 22 frames, about 3.2k prompt tokens; the
-   card's peak is 12 GB on an H100, so it fits this host's memory. Needs: transformers 5.17 with the custom code
-   (`NVlabs/alpamayo2-edge`: not checked out here; the reference venv has transformers 5.5.1, so an isolated environment
-   like `/data/tts-site`), then the converter (`safetensors_mmap` reads the shards), the vision tower, the expert, and the
-   trajectory decode, each checked against the reference. Not started: the modeling code is the first thing to read.
-10. **Qwen4 (checked 2026-11-16).** No `Qwen4` repository in the Qwen organisation on Hugging Face yet: the newest series
-    there is Qwen3.8 (`Qwen3.8-Flash-Next`, the engine's qwen4exp, is its preview). Watch `huggingface.co/Qwen`; when a
-    Qwen4 repository appears, read its `config.json` first: if its `architectures` is one the engine runs (qwen35moe,
-    qwen4exp), it is a registry entry; if not, it is a new architecture to analyse.
-11. **Qwen3.8-2.4T-A95B (in the Qwen organisation, about 9 days old at 2026-11-16).** Architecture `Qwen3_5MoeForCausalLM`
-    (the engine's qwen35moe): 92 layers, hidden 8192, 512 experts with 10 active, linear attention in three of four
-    layers. The engine can run the architecture; the size cannot: 2.4 trillion parameters is about 1.2 TB at 4 bits
-    against 128 GB of memory and 17 GB free on `/models`. It needs the expert pager (as GLM-5.3) and a disk of its own.
-    Not on this host: decide only if the user has such storage.
+9. **NVIDIA Alpamayo 2 Edge: the licence is confirmed (the user, 2026-11-16); the modeling code is the blocker.** The
+   weights (OpenMDW-1.1) are on Hugging Face (`nvidia/Alpamayo2-Edge`, about 5.4 GB in BF16, two shards, 907 tensors);
+   the config and the tensor headers were read with range requests, the weights not downloaded. The layout: the language
+   model is 28 layers, hidden 2048, 16 query / 8 KV heads of 128, an ungated `relu2` MLP (fc1 9216, fc2 back; no gate
+   projection), no q/k norm, M-RoPE `[24, 20, 20]` (theta 1e8), vocab 135168 with an untied head. The vision tower is not
+   Qwen3.5's: 27 layers, hidden 1152, 16 heads, MLP 4304 (gelu tanh), biases on every linear, LayerNorm with eps 1e-6, a
+   16x16 grid of learned absolute positions (256), patch 16 (768 inputs). The projector: LayerNorm 1152, the 2x2 merge
+   (4608), fc1 11520, fc2 2048. The action expert: 28 layers, hidden 512, 16 / 8 heads of 128, MLP 3840 `relu2`, non-causal
+   attention that reads the VLM's keys and values; `action_in_proj` (a per-waypoint encoder over 60 inputs, Fourier
+   features), `action_out_proj` 512 to 2. Not in the Hugging Face repo: its `.py` files; PyPI has no package. The
+   modeling code (the flow matching and its guidance settings, the attention mode, the action space, the trajectory
+   tokenizer) is in GitHub `NVlabs/alpamayo2-edge`, which is outside this session's GitHub scope: to continue, the user
+   attaches that repo (or allows it), then the reads and the reference checks begin.
+10. **Qwen4: not there yet (the user noted it, 2026-11-16).** No `Qwen4` repository in the Qwen organisation on Hugging
+    Face. The newest series is Qwen3.8 (`Qwen3.8-Flash-Next`, the engine's qwen4exp, is its preview). When a Qwen4
+    repository appears, read its `config.json` first: if its `architectures` is one the engine runs (qwen35moe, qwen4exp),
+    it is a registry entry; if not, it is a new architecture to analyse.
+11. **Qwen3.8-2.4T-A95B: tabled (the user, 2026-11-16).** The engine can run the architecture (`Qwen3_5MoeForCausalLM`,
+    92 layers, 512 experts with 10 active), but the size (about 1.2 TB at 4 bits) is beyond this host's memory and disk.
 12. **`t/95-quantize.t`: done 2026-11-16.** The test still asserted that Q6_K was decode-only; its native encoder came in
     `7062531` (verified byte-identical to ggml). The test now asserts that Q6_K encodes and that Q8_K (an activation
     format) does not. 35 of 35 pass.
-13. **Memory on the deployment (2026-11-16).** After the lazy GLM state and the 64 GB expert cap: measure `VmLck`,
-    `RssAnon`, `RssFile` and `RssShmem` of the server (`/proc/<pid>/status`) at a long conversation, and the speed against
-    the cap (the default was unlimited; 4.3-7.6 tok/s). Then decide whether 64 GB stays.
+13. **Memory on the deployment: tabled (the user, 2026-11-16).** GLM-5.3 runs on the CPU now, so the GPU expert pins
+    and the GLM state no longer apply to it; the CPU-only path allocates no GPU state (`74fda6e`). The 64 GB expert cap in
+    `run.sh` stays as a default for GPU runs.
 14. **Failing checks that predate the memory change (HEAD, 2026-11-16): diagnosed, one open decision.**
     (a) `t/45-store-lru.t` tests 4, 5 and 10: the eager run's store holds exactly the bytes the test's limit asks for
     (`bytes > need` is false by equality), since the store deletes superseded prompt ends when it writes them: nothing is
