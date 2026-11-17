@@ -46,7 +46,7 @@ sub start_server {
     my $pid = open my $srv, '-|', $^X, (map { "-I$_" } @INC), 'bin/rocm-inference-server', '--model', $path,
         '--listen', $sock, '--ctx', 4096, '--name', 'test-model', '--nolog', @extra;
     die "cannot start the server: $!" unless $pid;
-    for (1 .. 600) { last if -S $sock; sleep 0.1 }
+    for (1 .. 6000) { last if -S $sock; sleep 0.1 }  # (a 67 GB model takes minutes to load)
     return ($pid, $srv);
 }
 
