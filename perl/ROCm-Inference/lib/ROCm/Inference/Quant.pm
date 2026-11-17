@@ -42,7 +42,7 @@ our %RECIPE = (
 # Tensors a quantization leaves alone whatever the target (the same set as llama.cpp's llama-quantize): 1-D
 # tensors, names not ending in "weight", norms, routers (expert gating), convolutions, position / token-type
 # embeddings and vision-encoder parts
-my @NEVER = (qr/_norm\.weight$/, qr/ffn_gate_inp\.weight/, qr/ffn_gate_tid2eid\.weight/, qr/ssm_conv1d/,
+my @NEVER = (qr/_norm\.weight$/, qr/ffn_gate_inp\.weight/, qr/ffn_gate_inp_shexp\.weight/, qr/ffn_gate_tid2eid\.weight/, qr/ssm_conv1d/,
              qr/shortconv\.conv\.weight/, qr/altup/, qr/laurel/, qr/per_layer_model_proj/, qr/^position_embd\./,
              qr/^token_types\./, qr/time_mix_(?:first|w[012]|[av][012]|a[012]|g[12]|decay_w[12]|lerp_fused)\.weight/,
              qr/attn_rel_b\.weight/, qr/\.position_embd/, qr/sam\.(?:pos_embd|neck\.|net_)/, qr/\.rel_pos/,
