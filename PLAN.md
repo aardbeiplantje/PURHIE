@@ -119,6 +119,18 @@ run alone on the machine.
 15. **Watch or table:** Qwen4 (not on Hugging Face yet); Qwen3.8-2.4T-A95B (tabled); the memory measurement of the
     deployment's GPU pins (tabled: GLM runs on the CPU).
 
+16. **Read-only `/models` and voices.** Voice creation writes `VOICES/NAME`. In a container whose `/models` is read-only, it fails
+    with a bare 500 ("internal server error") rather than saying why. The server should name the cause, or the deployment's voices
+    directory should be writable (the test runs used `--voices` on a scratch directory).
+
+17. **Eviction with the 122B, the Perl suite on the 122B, and the vision tower's memory.** The combined server (`--models-dir` with the
+    122B, its sidecar, whisper, the TTS talker and codec, sd-turbo; `--parallel 2`) answered every endpoint, but not under memory
+    pressure: the 122B's 67 GB against the others is not tested. The full Perl suite on the 122B has not finished: `t/10` and `t/15`
+    fail with `hipHostRegister failed (-3)` on an in-process load of the 122B (the server's load of the same file works), `t/65-models-dir`
+    hung once on a server (killed), and `t/70-stage` ran for hours (killed). The cause of the `hipHostRegister` failure is not known.
+    A model's vision tower (1.8 GB for the 122B) loads with the model but is not counted in `make_room`'s footprint (its files and KV
+    only), so the memory check under-counts by that much. Option: load the tower on the first image request instead.
+
 ## Audio, vision and image: status
 
 Verified against the references in the sections that follow. Each row says what works, what is open, and where it runs.
@@ -127,14 +139,32 @@ Verified against the references in the sections that follow. Each row says what 
 |---|---|---|
 | **Speech output** (`/v1/audio/speech`, Qwen3-TTS 0.6B) | `wav`, `pcm`, `flac` native; `stream` for `wav` and `pcm`; `mp3`, `opus`, `aac` through ffmpeg in the image (`t/69`: 37 of 37); voices from audio (`POST /v1/audio/voices`, a voice clone from new audio); long texts in pieces with the seed per piece; the BF16 talker is the default, the Q8_0 predictor an option | Pieces do not share prosody (decided: kept); a streamed WAV's header is not a finished file; the sampled frames are not torch's (its generator); one request at a time per talker |
 | **Speech input** (`/v1/audio/transcriptions`, Whisper tiny) | `json` and `text`; any length, in 30 s windows with the timestamp seek rule and the temperature fallback; `task` transcribe or translate; WAV decode for any rate (band-limited resampler, soxr-like) | The cut between windows is a pause, not a timestamp; the timestamp rules are the decoder's own choices; languages other than English are checked only on the token table (plus one French clip); the GPU path (the host runs it: about 0.4 s for the encoder per window) |
-| **Vision** (`image_url` in chat, Qwen3.5-0.8B checked) | `--mmproj` with `data:` URLs (a URL is refused; an image without `--mmproj` is a 400); with `--parallel`, an image is a job's own prefill (its sequence reset, its image rows and RoPE offset per sequence; a text job beside it gives the same answers, exact); the image's chat matches transformers (cosine 0.999987, the reply tokens equal) | the tower runs on the host in float32 (a GPU path would save at most 0.5 s an image: not started); the 4B and the 122B share the architecture but are not checked; the store does not share image sequences |
-| **Image generation, sd-turbo** (`/v1/images/generations`) | PNG (`b64_json` or `png`), sizes 64 to 1024 in multiples of 8, the GPU path by default (512 x 512 in 3.3 s) | One image at a time; the seeded noise is not torch's (the reference is the proof of the arithmetic); only sd-turbo's one-step sampler; the VAE's convolutions (the GEMM) are next for speed |
+| **Vision** (`image_url` in chat, Qwen3.5-0.8B checked) | a vision tower per model: a sidecar `NAME.mmproj.gguf` beside `NAME.gguf` in `--models-dir` (looked for at each load), or `--mmproj` with `--model` (`data:` URLs; a URL is refused; an image without a tower is a 400); with `--parallel`, an image is a job's own prefill (its sequence reset, its image rows and RoPE offset per sequence; a text job beside it gives the same answers, exact); the image's chat matches transformers (cosine 0.999987, the reply tokens equal) | the tower runs on the host in float32 (a GPU path would save at most 0.5 s an image: not started); the 122B's tower matches transformers (the features of the test image: cosine min 0.999999, relative L2 3.3e-4, 140 x 3072; `ref_vision.py` and `verify_vision.py` in `/data/rocm-work/q35-122b/`); the 4B is not checked; t/63 on the 122B FP4 file: 22 of 24 (the two misses are the text chat's answer cut at 40 tokens, after a preamble; the image answers and the `--parallel 2` exactness pass), and the 122B's sidecar answers the test image in the combined server; t/63 on Qwen3.5-0.8B: 24 of 24; the reply's "black and green stripe at the bottom" describes the test image's black band and green-yellow strip, so it is not shown to be wrong; the store does not share image sequences |
+| **Image generation, sd-turbo** (`/v1/images/generations`) | PNG (`b64_json` or `png`), sizes 64 to 1024 in multiples of 8, the GPU path by default (512 x 512 in 3.3 s); a flag (`--sd`) or a file in `--models-dir` (arch `sd`), a unit of the memory policy (loaded on its first request, unloaded when another model needs the room) | One image at a time; the seeded noise is not torch's (the reference is the proof of the arithmetic); only sd-turbo's one-step sampler; the VAE's convolutions (the GEMM) are next for speed |
 | **Image generation, MiniMax-H3-Image** (`--minimax DIR`) | the pipeline end to end on the original checkpoints (the DiT, PDD heads and VAE read in place; the text encoder from its GGUF); 256 x 256 in about 166 s; the Q8_0 and ROCmFP4 DiT on the device; the last 32 prompts' embeddings cached; images queue, one at a time | Item 8 above (the released-pipeline check, FP8, the text encoder's source, block-30 drift) |
 | **Qwen3.5 text** | qwen35 and qwen35moe run; the plain-text attention checks pass; plain Qwen3.5 text was not re-run after the M-RoPE change | None listed |
 
-Not on this host, or not checked: the 4B and 122B vision towers; the Whisper GPU path (only whisper-tiny is here); other
+Not on this host, or not checked: the 4B vision tower; the Whisper GPU path (only whisper-tiny is here); other
 languages' transcription beyond the French clip; ffmpeg's encoders on any host other than the image (t/69 uses the one
 installed here).
+
+## One server, all the models (the combined setup)
+
+One `rocm-inference-server` can serve every model kind at once: `--models-dir DIR` (chat and embedding models, loaded on request,
+least recently used unloaded first), a vision tower per chat model (the sidecar), and the speech and image models in the same
+directory (whisper, the TTS talker and codec, sd-turbo), each loaded by its first request. The speech and image models are units
+of the same memory policy as the chat models (no idle timer, as for the chat models). Tested with the 122B and its sidecar, whisper,
+the talker and codec, and sd-turbo (`--parallel 2`, `--ctx 4096`): the image chat, transcription, speech (after a voice is created),
+image generation, and the model list all answered. The `--voices` default is `DIR/voices`, set when the talker is first known.
+Tests: `t/65-models-dir` (44 of 44), `t/64-audio` (11 of 11), `t/67-image`, and `t/63` on Qwen3.5-0.8B (24 of 24) pass with this code.
+The model list (`GET /v1/models`, `GET /v1/models/{id}`) names every model with `kind` (`chat`, `embedding`, `transcription`, `speech`,
+`image`), `endpoints` (the routes it is served at) and `capabilities` (`completion` and `tools` for a chat model, `vision` when it has a
+tower, loaded or as its sidecar; `embedding`; `transcription`; `speech`; `image`). A chat request that names a speech or image model
+gets a 400 that names the endpoint. The model names and `/models/load` / `/models/unload` follow llama.cpp's router; `kind` and
+`capabilities` follow the layout Ollama and OpenRouter use (checked 2026-11-18: a model's capabilities, not one type label; no
+standard endpoint field exists, so `endpoints` is this server's). Not done: the read-only voices directory (item 16), eviction under
+the 122B's memory and the vision tower's memory (item 17). This code is committed to `main` with this note.
+
 
 ## Per-model gaps
 

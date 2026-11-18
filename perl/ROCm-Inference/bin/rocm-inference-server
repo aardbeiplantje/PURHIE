@@ -48,29 +48,80 @@ die "--store-snapshots: lazy or eager\n" unless $o{'store-snapshots'} =~ /\A(?:l
 die "--store-snapshot-every N: 0 or more\n" if ($o{'store-snapshot-every'} // 4) < 0;
 die "--parallel: not with --draft (speculative decoding is single-sequence)\n" if $parallel > 1 && $o{draft};
 die "--mmproj: no file $o{mmproj}\n" if $o{mmproj} && !-f $o{mmproj};
-# ---- The audio models: the speech recognizer (--whisper FILE: /v1/audio/transcriptions) and the speech synthesizer
-# (--tts TALKER --tts-codec CODEC --voices DIR: /v1/audio/speech, /v1/audio/voices). A model is given by its flags, or, with
-# --models-dir, found there by its architecture (whisper; qwen3tts with qwen3tts_codec; the voices are DIR/voices). A model
-# found in the directory is rescanned: before each speech, transcription or voice request the directory's GGUF files are
-# checked (names, sizes, times), and a model whose file changed (copied in, replaced, removed) is loaded again, or dropped.
-# A job in progress keeps the model it started with. The models named by flags are loaded once; their errors end the start.
+my $stamp = 0;  # (the use counter: the least recently used model)
+# ---- The audio and image models: speech recognition (whisper: /v1/audio/transcriptions), speech synthesis (tts: a talker
+# and its codec: /v1/audio/speech, /v1/audio/voices) and the image model (sd: /v1/images/generations). Each is a unit of the
+# memory policy, as a chat model is (make_room): loaded by the first request that needs it, unloaded when another model
+# needs the memory (least recently used first, when no request is running on it). A model's file comes from a flag
+# (--whisper; --tts with --tts-codec; --sd: checked at the start, an error ends it, and it is then one of the models
+# above) or from --models-dir, found there by its architecture (whisper; qwen3tts with qwen3tts_codec; sd; the voices
+# are DIR/voices). The directory is rescanned before each such request: its GGUF files are checked (names, sizes, times),
+# and a model whose file changed (copied in, replaced, removed) is unloaded and taken up again on its next request.
 die "--whisper: no file $o{whisper}\n" if $o{whisper} && !-f $o{whisper};
 die "--tts needs --tts-codec\n" if $o{tts} && !$o{'tts-codec'};
 die "--tts: no file $o{tts}\n" if $o{tts} && !-f $o{tts};
 die "--tts-codec: no file $o{'tts-codec'}\n" if $o{'tts-codec'} && !-f $o{'tts-codec'};
 die "--voices: no directory $o{voices}\n" if $o{voices} && !-d $o{voices};
-my %AUDIO_FLAG = (whisper => defined $o{whisper} ? 1 : 0, tts => defined $o{tts} ? 1 : 0);
-my ($WHISPER, $whisper_name, $TTS, $tts_name);
-my (%AUDIO_KEY, $AUDIO_DIR_SIG);  # the files each audio model was loaded from (and the last directory signature)
-if ($AUDIO_FLAG{whisper}) {
-    $WHISPER = eval { whisper_load($o{whisper}) };
-    die "--whisper $o{whisper}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" unless $WHISPER;
-    $whisper_name = basename($o{whisper}) =~ s/\.gguf\z//r;
+die "--sd: no file $o{sd}\n" if $o{sd} && !-f $o{sd};
+my (%AUX, %AUX_FLAG);  # kind (whisper, tts, sd) -> its record; the kinds given by flags
+# The kinds of the models in GET /v1/models and the endpoints each one is served at (the client routes by these)
+my %ENDPOINTS = (chat => ["/v1/chat/completions", "/v1/completions"], embedding => ["/v1/embeddings"],
+                 transcription => ["/v1/audio/transcriptions"], speech => ["/v1/audio/speech", "/v1/audio/voices"],
+                 image => ["/v1/images/generations"]);
+my %AUX_KIND = (whisper => "transcription", tts => "speech", sd => "image");
+my ($AUDIO_DIR_SIG);   # the last signature of --models-dir's GGUF files
+# a record: id (the name a request gives), path, codec (tts), info {bytes} (its files), m (the model when loaded), used
+# (for the least recently used), queue / running (no job on it: idle), and dir (it is a unit of the memory policy)
+sub aux_record {
+    my ($kind, $path, $codec) = @_;
+    my $bytes = 0;
+    for my $f (grep { defined } $path, $codec) { $bytes += (stat $f)[7] // 0 }
+    # the voices of a talker in --models-dir: its voices subdirectory (set before the voices request is checked: the talker
+    # is loaded by the first request, and that check comes first)
+    if ($kind eq 'tts' && !$o{voices} && $o{'models-dir'}) {
+        my $v = "$o{'models-dir'}/voices";
+        $o{voices} = $v if -d $v || mkdir $v;
+    }
+    return { id => basename($path) =~ s/\.gguf\z//r, aux => $kind, path => $path, codec => $codec, info => { bytes => $bytes },
+             dir => 1, m => undef, used => 0, queue => [], running => [] };
 }
-if ($AUDIO_FLAG{tts}) {
-    $TTS = eval { speech_load($o{tts}, $o{'tts-codec'}) };
-    die "--tts $o{tts}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" unless $TTS;
-    $tts_name = basename($o{tts}) =~ s/\.gguf\z//r;
+for my $kind (qw(whisper tts sd)) {
+    my ($path, $codec) = $kind eq 'whisper' ? ($o{whisper}) : $kind eq 'tts' ? ($o{tts}, $o{'tts-codec'}) : ($o{sd});
+    next unless $path;
+    $AUX{$kind} = aux_record($kind, $path, $codec);
+    $AUX_FLAG{$kind} = 1;
+}
+sub aux_load {
+    my ($kind) = @_;
+    my $a = $AUX{$kind} or return undef;
+    return $a->{m} if $a->{m};
+    make_room($a);
+    my $m = eval {
+        $kind eq 'whisper' ? whisper_load($a->{path})
+      : $kind eq 'tts'     ? speech_load($a->{path}, $a->{codec})
+      :                      sd_load($a->{path});
+    };
+    if (!$m) {
+        my $why = ($@ || 'no model') =~ s/ at \S+ line \d+\.?\n?\z//r;
+        $LOG->error(event => 'audio', msg => "$kind $a->{path}: $why");
+        die "$why\n";
+    }
+    $a->{m} = $m;
+    $a->{used} = ++$stamp;
+    $LOG->info('audio', event => 'load', msg => $kind eq 'tts' ? "speech $a->{path} (codec $a->{codec})" : "$kind $a->{path}");
+    return $m;
+}
+# the loaded model of a kind for a request (loaded now when it is not; it stays loaded until another model needs the room)
+sub aux_get {
+    my ($kind) = @_;
+    my $a = $AUX{$kind} or return undef;
+    my $m = aux_load($kind);
+    $a->{used} = ++$stamp;
+    return $m;
+}
+# a flag's model is loaded at the start: an error there ends the start
+for my $kind (sort grep { $AUX_FLAG{$_} } keys %AUX) {
+    eval { aux_load($kind); 1 } or die "--$kind: " . ($@ =~ s/\n\z//r) . "\n";
 }
 # ---- ffmpeg (--ffmpeg PATH, else ROCM_FFMPEG, else ffmpeg on the PATH): the encoder of the mp3, opus and aac speech
 # formats, found once here. Without one those formats are refused (400); nothing else depends on it.
@@ -117,42 +168,6 @@ sub audio_key {
     return "$path:$st[7]:$st[9]";
 }
 
-sub audio_load_whisper {
-    my ($path) = @_;
-    if (!defined $path) {
-        return unless $WHISPER;
-        ($WHISPER, $whisper_name) = (undef, undef);
-        $LOG->info('audio', event => 'unload', msg => 'speech recognition: no Whisper model in --models-dir');
-        return;
-    }
-    my $w = eval { whisper_load($path) };
-    if (!$w) {
-        $LOG->error(event => 'audio', msg => "speech recognition $path: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r));
-        return;
-    }
-    ($WHISPER, $whisper_name) = ($w, basename($path) =~ s/\.gguf\z//r);
-    $LOG->info('audio', event => 'load', msg => "speech recognition (--whisper): $path");
-}
-
-sub audio_load_tts {
-    my ($talker, $codec) = @_;
-    if (!defined $talker) {
-        return unless $TTS;
-        ($TTS, $tts_name) = (undef, undef);
-        $LOG->info('audio', event => 'unload', msg => 'speech: no talker and codec in --models-dir');
-        return;
-    }
-    my $t = eval { speech_load($talker, $codec) };
-    if (!$t) {
-        $LOG->error(event => 'audio', msg => "speech $talker: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r));
-        return;
-    }
-    ($TTS, $tts_name) = ($t, basename($talker) =~ s/\.gguf\z//r);
-    my $voices = "$o{'models-dir'}/voices";
-    $o{voices} //= $voices if -d $voices || mkdir $voices;
-    $LOG->info('audio', event => 'load', msg => "speech (--tts $talker --tts-codec $codec, voices " . ($o{voices} // 'none') . ')');
-}
-
 # A talker's rank for --models-dir, by the bytes of its tensors: 0 the weights BF16 or F16 (the default; the device path
 # reads these), 1 with Q8_0 matrices (the predictor's Q8_0 recipe: rocm-convert -t 'pred\.blk\..*\.weight$=q8_0'), 2 most
 # of the bytes F32. A file that does not read ranks last.
@@ -170,11 +185,31 @@ sub talker_rank {
     return $f32 * 2 > $all ? 2 : $q8 ? 1 : 0;
 }
 
+# A model found in --models-dir (unless a flag gives one of its kind): the record for its file, or none when the file
+# is gone. A record whose file changed is dropped (unloaded) and taken up again on its next request.
+sub aux_dir_set {
+    my ($kind, $path, $codec) = @_;
+    return if $AUX_FLAG{$kind};
+    my $cur = $AUX{$kind};
+    if (!defined $path) {
+        return unless $cur;
+        delete $AUX{$kind};
+        $LOG->info('audio', event => 'unload', msg => "$kind: no model in --models-dir any more");
+        return;
+    }
+    my $key = audio_key($path) . (defined $codec ? ' ' . audio_key($codec) : '');
+    return if $cur && ($cur->{key} // '') eq $key;
+    my $rec = aux_record($kind, $path, $codec);
+    $rec->{key} = $key;
+    $AUX{$kind} = $rec;
+    $LOG->info('audio', event => 'rescan', msg => "$kind: " . $rec->{id} . ($cur ? ' (replaced: unloaded, loaded on its next request)' : ''));
+}
+
 # The models found in --models-dir, when its files changed since the last look: the speech recognizer (the first Whisper
-# file) and the talker (the lowest talker_rank, then the name) with the codec (the first one)
+# file), the talker (the lowest talker_rank, then the name) with the codec (the first one), and the image model (the first
+# sd file)
 sub audio_rescan {
     my $dir = $o{'models-dir'} or return;
-    return if $AUDIO_FLAG{whisper} && $AUDIO_FLAG{tts};
     my ($files, $sig) = audio_listing($dir);
     return if defined $AUDIO_DIR_SIG && $sig eq $AUDIO_DIR_SIG;
     $AUDIO_DIR_SIG = $sig;
@@ -185,46 +220,30 @@ sub audio_rescan {
         if    ($arch eq 'whisper')        { push @{ $a{whisper} }, $path }
         elsif ($arch eq 'qwen3tts')       { push @{ $a{tts} },     $path }
         elsif ($arch eq 'qwen3tts_codec') { push @{ $a{codec} },   $path }
+        elsif ($arch eq 'sd')             { push @{ $a{sd} },      $path }
     }
-    # one line per change of the directory: the audio models it holds now (a load or an unload follows, if they changed)
+    # one line per change of the directory: the audio and image models it holds now
     my @found;
-    for my $kind (qw(whisper tts codec)) {
+    for my $kind (qw(whisper tts codec sd)) {
         push @found, map { basename($_) . " ($kind)" } @{ $a{$kind} // [] };
     }
-    $LOG->info('audio', event => 'rescan', msg => sprintf('%s: %d GGUF files changed; audio models: %s', $dir, scalar @$files,
+    $LOG->info('audio', event => 'rescan', msg => sprintf('%s: %d GGUF files changed; audio and image models: %s', $dir, scalar @$files,
                @found ? join(', ', @found) : 'none'));
-    if (!$AUDIO_FLAG{whisper}) {
-        my $path = $a{whisper} ? $a{whisper}[0] : undef;
-        my $key = defined $path ? audio_key($path) : '';
-        if ($key ne ($AUDIO_KEY{whisper} // '')) {
-            $AUDIO_KEY{whisper} = $key;
-            audio_load_whisper($path);
-        }
-    }
-    if (!$AUDIO_FLAG{tts}) {
-        my ($talker) = $a{tts}
-            ? map { $_->[1] } sort { $a->[0] <=> $b->[0] || $a->[1] cmp $b->[1] } map { [talker_rank($_), $_] } @{ $a{tts} }
-            : ();
-        my $codec = $a{codec} ? $a{codec}[0] : undef;
-        my $ok = defined $talker && defined $codec;
-        my $key = $ok ? audio_key($talker) . ' ' . audio_key($codec) : '';
-        if ($key ne ($AUDIO_KEY{tts} // '')) {
-            $AUDIO_KEY{tts} = $key;
-            audio_load_tts($talker, $codec) if $ok;
-            audio_load_tts() unless $ok;
-        }
-    }
+    aux_dir_set('whisper', $a{whisper} ? $a{whisper}[0] : undef);
+    my ($talker) = $a{tts}
+        ? map { $_->[1] } sort { $a->[0] <=> $b->[0] || $a->[1] cmp $b->[1] } map { [talker_rank($_), $_] } @{ $a{tts} }
+        : ();
+    my $codec = $a{codec} ? $a{codec}[0] : undef;
+    aux_dir_set('tts', defined $talker && defined $codec ? $talker : undef, $codec);
+    aux_dir_set('sd', $a{sd} ? $a{sd}[0] : undef);
 }
 audio_rescan() if $o{'models-dir'};  # (the models found at the start; the flags' ones are loaded above)
-# the image model (--sd FILE.gguf, rocm-convert of a diffusers pipeline such as sd-turbo): /v1/images/generations
-die "--sd: no file $o{sd}\n" if $o{sd} && !-f $o{sd};
-my $IMAGE = $o{sd} ? eval { sd_load($o{sd}) } : undef;
-die "--sd $o{sd}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" if $o{sd} && !$IMAGE;
-my $sd_name = $o{sd} ? basename($o{sd}) =~ s/\.gguf\z//r : undef;
-# the MiniMax-H3-Image pipeline (--minimax DIR: the four GGUFs of ROCm::Inference::MiniMaxImage); its name is "minimax-h3-image"
+# the MiniMax-H3-Image pipeline (--minimax DIR: the four GGUFs of ROCm::Inference::MiniMaxImage); its name is "minimax-h3-image".
+# Not a unit of the memory policy: it is a directory of files, loaded at the start.
 die "--minimax $o{minimax}: not a directory\n" if $o{minimax} && !-d $o{minimax};
 my $MINIMAX = $o{minimax} ? eval { ROCm::Inference::MiniMaxImage->new($o{minimax}) } : undef;
 die "--minimax $o{minimax}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" if $o{minimax} && !$MINIMAX;
+
 my $kv_type = $o{'kv-type'} // 'auto';
 die "--kv-type: auto, f16, q8_0 or q4_0\n" unless $kv_type =~ /\A(?:auto|f16|q8_0|q4_0)\z/;
 my $created = time;
@@ -235,7 +254,6 @@ my $J = JSON::PP->new->utf8->canonical;
 # and requests (queue, running), used (for least recently used). --model / --embedding-model are loaded at start
 # and stay; --models-dir adds the directory's models, loaded when a request names one.
 my (%M, %default);  # id -> record; kind -> the record a request without 'model' gets
-my $stamp = 0;
 
 sub model_id { basename($_[0]) =~ s/(?:-\d{5}-of-\d{5})?\.gguf\z//r }
 
@@ -257,7 +275,7 @@ sub scan {
     opendir my $dh, $dir or return;
     my (%seen, @drafts);
     for my $f (sort readdir $dh) {
-        next unless $f =~ /\.gguf\z/ && $f !~ /^mmproj/i;
+        next unless $f =~ /\.gguf\z/ && $f !~ /^mmproj/i && $f !~ /\.mmproj\.gguf\z/;  # (a sidecar vision tower: mmproj_of)
         next if $f =~ /-(\d{5})-of-\d{5}\.gguf\z/ && $1 != 1;
         my $path = "$dir/$f";
         my @st = stat $path or next;
@@ -307,9 +325,20 @@ sub settings {
     return ($ctx, $kvt_for->($ctx));
 }
 
+# A chat model's vision tower: a model in --models-dir has its own, the sidecar NAME.mmproj.gguf beside NAME.gguf (of a
+# split model, beside its first file's name without the -00001-of-N part), looked for at each load; --model takes --mmproj
+sub mmproj_of {
+    my ($r) = @_;
+    return $o{mmproj} unless $r->{dir};
+    (my $s = $r->{path}) =~ s/-\d{5}-of-\d{5}\.gguf\z/.gguf/;
+    $s =~ s/\.gguf\z/.mmproj.gguf/;
+    return -f $s ? $s : undef;
+}
+
 # What a model takes while loaded: its files (pinned) and its KV caches (estimated from model_info)
 sub footprint {
     my ($r) = @_;
+    return $r->{info}{bytes} if $r->{aux};  # (a speech or image model: its files)
     my ($ctx, $kvt) = settings($r);
     return $r->{info}{bytes} + $r->{info}{kv_bytes_per_token} * $ctx * seqs($r) * $kv_factor{$kvt};
 }
@@ -327,6 +356,11 @@ sub idle { my ($r) = @_; !@{ $r->{queue} } && !@{ $r->{running} } && !$r->{busy}
 sub unload {
     my ($r) = @_;
     return unless $r->{m};
+    if ($r->{aux}) {  # a speech or image model: its record stays (loaded again by its next request)
+        undef $r->{m};
+        $LOG->info('audio', event => 'unload', msg => "$r->{aux}: $r->{id}, memory for another model");
+        return;
+    }
     @$r{qw(pool queue running)} = ([], [], []);
     delete $default{ $r->{info}{kind} } if ($default{ $r->{info}{kind} } // 0) == $r && $r->{dir};
     undef $r->{m};  # (the only reference: unmapped and unpinned now)
@@ -342,12 +376,12 @@ sub unload {
 sub make_room {
     my ($r) = @_;
     my $need = footprint($r);
-    my @lru = sort { $a->{used} <=> $b->{used} } grep { $_->{m} && $_->{dir} && $_ != $r } values %M;
+    my @lru = sort { $a->{used} <=> $b->{used} } grep { $_->{m} && $_->{dir} && $_ != $r } values %M, values %AUX;
     while (1) {
         my $avail = mem_available();
-        if (defined $avail) { $avail -= $_->{info}{bytes} for grep { $_->{m} } values %M }
+        if (defined $avail) { $avail -= $_->{info}{bytes} for grep { $_->{m} } values %M, values %AUX }
         my $fits = !defined $avail || $avail - $o{'models-margin'} * 2**30 >= $need;
-        my $count_ok = !$o{'models-max'} || (grep { $_->{m} } values %M) < $o{'models-max'};
+        my $count_ok = !$o{'models-max'} || (grep { $_->{m} } values %M, values %AUX) < $o{'models-max'};
         last if $fits && $count_ok;
         my ($victim) = grep { idle($_) } @lru or last;
         @lru = grep { $_ != $victim } @lru;
@@ -414,18 +448,19 @@ sub load {
     }
     # --parallel N: N sequences (conversations at once), each a KV cache of the context; sequence 0 and N - 1 more
     $r->{pool} = [ map { { seq => $_, job => undef, prompt => [] } } 0, $emb ? () : map { seq_new($m) } 2 .. $parallel ];
-    if ($o{mmproj} && !$emb) {
-        # --mmproj: the vision tower (images in chat requests); its output must be the model's width
-        my $v = eval { vision_load($o{mmproj}) };
+    my $mm = mmproj_of($r);
+    if ($mm && !$emb) {
+        # the vision tower (images in chat requests): the model's sidecar NAME.mmproj.gguf, or --mmproj for --model; its output must be the model's width
+        my $v = eval { vision_load($mm) };
         if (!$v) {
-            $LOG->warn_(model => $r->{id}, event => 'load', msg => "--mmproj $o{mmproj}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r));
+            $LOG->warn_(model => $r->{id}, event => 'load', msg => "vision tower $mm: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r));
         } elsif ($v->n_out != hidden_size($m)) {
             $LOG->warn_(model => $r->{id}, event => 'load',
-                        msg => sprintf('--mmproj %s: its output is %d wide, the model %d: no images for this model',
-                                       $o{mmproj}, $v->n_out, hidden_size($m)));
+                        msg => sprintf('vision tower %s: its output is %d wide, the model %d: no images for this model',
+                                       $mm, $v->n_out, hidden_size($m)));
         } else {
             $r->{vision} = $v;
-            $LOG->info('model', model => $r->{id}, event => 'vision', msg => "vision tower $o{mmproj}");
+            $LOG->info('model', model => $r->{id}, event => 'vision', msg => "vision tower $mm");
         }
     }
     @$r{qw(m ctx kvt)} = ($m, $ctx, $kvt);
@@ -496,6 +531,11 @@ sub pick {
     my $want = ref $p eq 'HASH' && defined $p->{model} && !ref $p->{model} && length $p->{model} ? $p->{model} : undef;
     my $r = defined $want ? $M{$want} : undef;
     if (!$r) {
+        if (defined $want) {  # a speech or image model asked for in a chat: the endpoint it is served at
+            my ($aux) = grep { $_->{id} eq $want } values %AUX;
+            my $kind = $aux ? $AUX_KIND{ $aux->{aux} } : $want eq 'minimax-h3-image' && $MINIMAX ? 'image' : undef;
+            error(400, "'$want' is a $kind model: use $ENDPOINTS{$kind}[0]") if $kind;
+        }
         error(404, "model '$want' not found (GET /v1/models lists them)", 'not_found_error')
             if defined $want && $o{'models-dir'};
         $r = $default{$kind};
@@ -541,20 +581,46 @@ sub model_entry {
     my ($ctx) = $r->{m} ? $r->{ctx} : settings($r);
     return { id => $r->{id}, object => 'model', created => $created, owned_by => 'rocm-inference',
              status => { value => $r->{m} ? 'loaded' : 'unloaded' }, kind => $r->{info}{kind}, arch => $r->{info}{arch},
-             context_length => $ctx, n_ctx_train => $r->{info}{n_ctx_train}, bytes => $r->{info}{bytes} };
+             endpoints => $ENDPOINTS{ $r->{info}{kind} }, capabilities => capabilities($r), context_length => $ctx, n_ctx_train => $r->{info}{n_ctx_train},
+             bytes => $r->{info}{bytes} };
+}
+# What a model can do, as GET /v1/models lists it (the client picks a model by these): a chat model has completion and
+# tools, and vision when it has a vision tower (loaded, or its sidecar file in --models-dir / the --mmproj of --model)
+sub capabilities {
+    my ($r) = @_;
+    return ['embedding'] if $r->{info}{kind} eq 'embedding';
+    my $vision = $r->{m} ? $r->{vision} : mmproj_of($r);
+    return ['completion', 'tools', ($vision ? ('vision') : ())];
+}
+# a speech or image model (--whisper, --tts, --sd, or in --models-dir) and MiniMax-H3-Image, as GET /v1/models lists them
+sub aux_entry {
+    my ($a) = @_;
+    my $kind = $AUX_KIND{ $a->{aux} };
+    return { id => $a->{id}, object => 'model', created => $created, owned_by => 'rocm-inference',
+             status => { value => $a->{m} ? 'loaded' : 'unloaded' }, kind => $kind, arch => undef, endpoints => $ENDPOINTS{$kind}, capabilities => [$kind],
+             context_length => undef, n_ctx_train => undef, bytes => $a->{info}{bytes} };
+}
+sub listed_models {  # every model the server serves: the chat and embedding ones, then the speech and image ones
+    audio_rescan();
+    scan();
+    my @aux = sort { $a->{id} cmp $b->{id} } values %AUX;
+    return ((map { model_entry($M{$_}) } sort keys %M), (map { aux_entry($_) } @aux),
+            ($MINIMAX ? { id => 'minimax-h3-image', object => 'model', created => $created, owned_by => 'rocm-inference',
+                          status => { value => 'loaded' }, kind => 'image', arch => undef, endpoints => $ENDPOINTS{image}, capabilities => ['image'],
+                          context_length => undef, n_ctx_train => undef, bytes => undef } : ()));
 }
 
 route::get '/health' => sub { { status => 'ok' } };
 
 route::get '/v1/models' => sub {
-    scan();
-    { object => 'list', data => [ map { model_entry($M{$_}) } sort keys %M ] };
+    { object => 'list', data => [ listed_models() ] };
 };
 route::get '/v1/models/*id' => sub {
     my ($req) = @_;
-    scan();
-    my $r = $M{ $req->{params}{id} } or error(404, "no model '$req->{params}{id}'", 'not_found_error');
-    model_entry($r);
+    my $id = $req->{params}{id};
+    my ($one) = grep { $_->{id} eq $id } listed_models();
+    $one or error(404, "no model '$id'", 'not_found_error');
+    $one;
 };
 
 # llama.cpp's router: load a model now, or unload one that serves no request ({"model": id})
@@ -951,7 +1017,7 @@ route::post '/v1/audio/transcriptions' => sub {
     audio_rescan();
     my $ct = $req->{headers}{'content-type'} // '';
     error(400, 'expected multipart/form-data with the audio file in the part "file"') unless $ct =~ m{multipart/form-data}i;
-    error(503, 'no speech model: start the server with --whisper FILE.gguf', 'server_error') unless $WHISPER;
+    error(503, 'no speech model: start the server with --whisper FILE.gguf', 'server_error') unless $AUX{whisper};
     my $parts = eval { ROCm::Inference::Multipart::parse($req->{body}, $ct) }
         or error(400, 'bad multipart body: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r));
     my $file = $parts->{file} or error(400, "'file' is required (a WAV file)");
@@ -962,11 +1028,12 @@ route::post '/v1/audio/transcriptions' => sub {
     error(400, "response_format: json or text, not '$fmt'") unless $fmt =~ /\A(?:json|text)\z/;
     my $task = $field->('task') // 'transcribe';
     error(400, "task: transcribe or translate, not '$task'") unless $task =~ /\A(?:transcribe|translate)\z/;
-    my ($text) = eval { $WHISPER->transcribe($file->{data}, language => $lang, task => $task) };
+    my $W = eval { aux_get('whisper') } or error(500, 'speech recognition: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r));
+    my ($text) = eval { $W->transcribe($file->{data}, language => $lang, task => $task) };
     error(400, $@ =~ s/ at \S+ line \d+\.?\n?\z//r) if $@;
     $text =~ s/\A\s+|\s+\z//g;
     $LOG->info('request', event => 'transcription', msg => sprintf('%s: %d bytes, language %s, task %s, %d chars of text',
-                                                               $whisper_name, length $file->{data}, $lang, $task, length $text));
+                                                               $AUX{whisper}{id}, length $file->{data}, $lang, $task, length $text));
     return text($text) if $fmt eq 'text';
     return { text => $text };
 };
@@ -1134,7 +1201,7 @@ route::post '/v1/audio/speech' => sub {
     my ($req) = @_;
     audio_rescan();
     error(503, 'no speech model: start the server with --tts TALKER.gguf --tts-codec CODEC.gguf --voices DIR', 'server_error')
-        unless $TTS;
+        unless $AUX{tts};
     my $p = $req->{json};
     ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
     my $input = $p->{input};
@@ -1169,8 +1236,9 @@ route::post '/v1/audio/speech' => sub {
     $smp{seed} //= 0;
     my @pieces = speech_pieces($input);
     error(400, "'input' is required (the text to say)") unless @pieces;
+    my $T = eval { aux_get('tts') } or error(500, 'speech: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r));
     my $job = { pieces => \@pieces, next => 0, v => $v, name => $voice, lang => $lang, smp => \%smp, fmt => $fmt,
-                stream => $stream, all => '', frames => 0, t0 => Time::HiRes::time(), tts => $TTS, tts_name => $tts_name,
+                stream => $stream, all => '', frames => 0, t0 => Time::HiRes::time(), tts => $T, tts_name => $AUX{tts}{id},
                 via => $via };
     if ($via) {  # the whole speech first: ffmpeg's result (or its failure) decides the status
         speech_step($job) until $job->{finished};
@@ -1193,7 +1261,7 @@ route::post '/v1/audio/voices' => sub {
     my ($req) = @_;
     audio_rescan();
     error(503, 'no speech model: start the server with --tts TALKER.gguf --tts-codec CODEC.gguf --voices DIR', 'server_error')
-        unless $TTS;
+        unless $AUX{tts};
     error(503, 'no voices directory: start the server with --voices DIR') unless $o{voices};
     my $ct = $req->{headers}{'content-type'} // '';
     error(400, 'expected multipart/form-data with the clip in the part "file"') unless $ct =~ m{multipart/form-data}i;
@@ -1213,7 +1281,8 @@ route::post '/v1/audio/voices' => sub {
         or error(400, 'the clip: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r));
     my $seconds = length($samples) / 4 / 24000;
     error(400, 'the clip: 0.5 to 60 seconds of speech') if $seconds < 0.5 || $seconds > 60;
-    my ($codes, $frames, $spk) = eval { $TTS->make_voice($samples) };
+    my $T = eval { aux_get('tts') } or error(500, 'speech: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r));
+    my ($codes, $frames, $spk) = eval { $T->make_voice($samples) };
     error(400, 'the clip: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r)) if $@;
     ROCm::Inference::speech_voice_write($dir, { ref_text => $ref_text, frames => $frames, codes => $codes, spk => $spk });
     $LOG->info('request', event => 'voice', msg => sprintf('%s: %d frames, %.2f s, from a clip of %.2f s', $name, $frames, $seconds, $seconds));
@@ -1241,13 +1310,14 @@ route::post '/v1/images/generations' => sub {
     my ($req) = @_;
     my $p = $req->{json};
     ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
-    # the model: minimax-h3-image (--minimax) or the sd-turbo file's name (--sd); with no model given, the first one started
+    my $sd_name = $AUX{sd} ? $AUX{sd}{id} : undef;
+    # the model: minimax-h3-image (--minimax) or the sd-turbo file's name (--sd, or in --models-dir); with no model given, the first one started
     my $model = $p->{model} // ($MINIMAX ? 'minimax-h3-image' : $sd_name);
     my $backend;
     if ($MINIMAX && $model eq 'minimax-h3-image') { $backend = $MINIMAX; $model = 'minimax-h3-image' }
-    elsif ($IMAGE && $model eq $sd_name)         { $backend = $IMAGE }
+    elsif ($AUX{sd} && $model eq $sd_name)     { $backend = eval { aux_get('sd') } or error(500, 'image model: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r)) }
     else {
-        error(503, 'no image model: start the server with --sd FILE.gguf or --minimax DIR', 'server_error') unless $IMAGE || $MINIMAX;
+        error(503, 'no image model: start the server with --sd FILE.gguf or --minimax DIR', 'server_error') unless $AUX{sd} || $MINIMAX;
         error(400, "model: '$model' is not served (this server has " . join(' and ', grep { defined } ($sd_name, $MINIMAX ? 'minimax-h3-image' : undef)) . ')');
     }
     my $prompt = $p->{prompt};
@@ -1287,7 +1357,7 @@ route::post '/v1/chat/completions' => sub {
     if (@images) {
         # the images go to chat with the model's vision tower: its own prefill (no prefix reuse, no store); with
         # --parallel the job's prefill takes the images the same way (chat_start, from a reset of its sequence)
-        error(400, "$name has no vision tower: start the server with --mmproj") unless $r->{vision};
+        error(400, "$name has no vision tower: NAME.mmproj.gguf beside its model (--models-dir), or --mmproj with --model") unless $r->{vision};
         @$opts{qw(images vision)} = (\@images, $r->{vision});
     }
     start_line($q, $p, $opts);
@@ -1740,7 +1810,7 @@ if ($o{'models-dir'}) {
         ($parallel > 1 ? ", $parallel conversations at once" : ''));
 } else {
     $LOG->info('model', event => 'serve', msg => "serving on $o{listen}: no chat model" .
-        ($WHISPER ? ", speech model $whisper_name" : '') . ($TTS ? ", speech synthesis $tts_name" : '') . ($IMAGE ? ", images $sd_name" : ''));
+        ($AUX{whisper} ? ", speech model $AUX{whisper}{id}" : '') . ($AUX{tts} ? ", speech synthesis $AUX{tts}{id}" : '') . ($AUX{sd} ? ", images $AUX{sd}{id}" : ''));
 }
 run(listen => $o{listen}, log => $LOG->enabled('info') ? \&access_line : 0, defined $o{mode} ? (mode => oct $o{mode}) : (),
     $parallel > 1 ? (tick => \&tick) : ());
@@ -1797,14 +1867,17 @@ block, else a draft (MTP) head in the directory, is used for the model it fits (
 C<--parallel>). Each model gets the
 context and KV cache type C<--ctx> / C<--kv-type> give, by default from its own trained context (C<--kv-budget>).
 
-The audio models in the directory are served without flags: a Whisper GGUF (C<--whisper>, for
-C</v1/audio/transcriptions>), and a Qwen3-TTS talker with its speech tokenizer (C<--tts> and C<--tts-codec>, for
-C</v1/audio/speech>), whose voices are the directory's C<voices> subdirectory (C<--voices>, created when missing).
-With several talkers in the directory the BF16 one is used, then one with a Q8_0 predictor (the code predictor's Q8_0 recipe
-in the TTS notes: the same speech, smaller and slower to sample), then an F32 one. The flags, when given, name other files.
-The directory is looked at before each speech, transcription or voice request:
-a model copied in, replaced or removed is loaded again (or dropped) then, and a request in progress keeps the model it started
-with.
+The audio and image models in the directory are served without flags: a Whisper GGUF (for C</v1/audio/transcriptions>),
+a Qwen3-TTS talker with its speech tokenizer (for C</v1/audio/speech>, with its voices in the directory's C<voices>
+subdirectory: C<--voices>, created when missing), and an sd GGUF (for C</v1/images/generations>). With several talkers in
+the directory the BF16 one is used, then one with a Q8_0 predictor (the code predictor's Q8_0 recipe in the TTS notes:
+the same speech, smaller and slower to sample), then an F32 one. The flags (C<--whisper>, C<--tts> with C<--tts-codec>,
+C<--sd>) name other files; a flag's model is loaded at the start. Each such model is a unit of the memory policy, as a
+chat model is: loaded by the first request that needs it, and unloaded (least recently used first) when another model
+needs the memory. There is no timer: a model stays loaded until memory is needed.
+The directory is looked at before each speech, transcription, voice or image request: a model copied in, replaced or
+removed is taken up (or dropped) then; a model whose file changed is unloaded and loaded again by its next request.
+A job in progress keeps the model it started with.
 
 =item --models-max N
 
@@ -1887,6 +1960,8 @@ The model id in the API (default: the file name without F<.gguf>).
 
 =item --mmproj F<mmproj.gguf>
 
+For C<--model> only: a model in C<--models-dir> has its vision tower beside it, as a sidecar file NAME.mmproj.gguf
+beside NAME.gguf (looked for at each load, so a sidecar added or removed shows at the model's next load).
 The vision tower (C<rocm-convert --mmproj> of a Qwen3.5 checkpoint) for images in chat requests: a message's content
 parts of type C<image_url> take a C<data:image/...;base64,...> URL (the server does not fetch URLs). Its output must be
 the model's width (else the model answers without images, with a warning). With C<--parallel>, an image chat's
