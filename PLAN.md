@@ -83,6 +83,9 @@ run alone on the machine.
       engine: `forward_seqs` refuses a model with a draft head, and the head's state is one per model. Measure first: the
       k+1 rows' cost (`step_chats` at 2 sequences vs 1 on Qwen3.5-4B, then the verify rows' pass time). The sequential
       sidecar gave about 38 -> 50 tok/s.
+      Measured (2026-11-18, `step_chats` on Qwen3.5-4B ROCmFP4, one run, greedy, 128 new tokens, 2 prompts): one sequence
+      15.8 ms a step (63.5 tok/s); two sequences 23.7 ms a step (84.2 tok/s together), a 1.33x gain from the batch. The verify rows'
+      pass time is not measured yet.
     - Watch on the deployment: the store's resume (the `kv` line's mapped blocks), and `--parallel` on the 27B and 35B
       (the tests ran on Qwen3.5-4B). `--store-max` 32 or more (one 130k-token 27B conversation is about 14 GB).
     - The 10 identical resends in opencode's log (5 each before two compactions, at about 210k tokens) look like failed
@@ -119,9 +122,9 @@ run alone on the machine.
 15. **Watch or table:** Qwen4 (not on Hugging Face yet); Qwen3.8-2.4T-A95B (tabled); the memory measurement of the
     deployment's GPU pins (tabled: GLM runs on the CPU).
 
-16. **Read-only `/models` and voices.** Voice creation writes `VOICES/NAME`. In a container whose `/models` is read-only, it fails
-    with a bare 500 ("internal server error") rather than saying why. The server should name the cause, or the deployment's voices
-    directory should be writable (the test runs used `--voices` on a scratch directory).
+16. **Read-only `/models` and voices (done).** A voice that cannot be written returns a 500 that names the path and the error
+    ("voice 'clip2' not written: /models/.../voices/clip2: Read-only file system"), and the directory it started is removed. The
+    deployment's voices directory must still be writable for voices to be created.
 
 17. **Eviction with the 122B, the Perl suite on the 122B, and the vision tower's memory.** The combined server (`--models-dir` with the
     122B, its sidecar, whisper, the TTS talker and codec, sd-turbo; `--parallel 2`) answered every endpoint, but not under memory

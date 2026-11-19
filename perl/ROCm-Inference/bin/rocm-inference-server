@@ -1284,7 +1284,16 @@ route::post '/v1/audio/voices' => sub {
     my $T = eval { aux_get('tts') } or error(500, 'speech: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r));
     my ($codes, $frames, $spk) = eval { $T->make_voice($samples) };
     error(400, 'the clip: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r)) if $@;
-    ROCm::Inference::speech_voice_write($dir, { ref_text => $ref_text, frames => $frames, codes => $codes, spk => $spk });
+    # the voice's files: a failure (a read-only --voices, a full disk) says why; the directory it started is removed, so the
+    # voice can be tried again (409 is for a voice that exists)
+    my $written = eval { ROCm::Inference::speech_voice_write($dir, { ref_text => $ref_text, frames => $frames, codes => $codes, spk => $spk }); 1 };
+    if (!$written) {
+        my $why = ($@ // 'unknown error') =~ s/\s+\z//r;
+        unlink glob("$dir/*");
+        rmdir $dir;
+        $LOG->error(event => 'request', msg => "voice '$name' not written: $why");
+        error(500, "voice '$name' not written: $why", 'server_error');
+    }
     $LOG->info('request', event => 'voice', msg => sprintf('%s: %d frames, %.2f s, from a clip of %.2f s', $name, $frames, $seconds, $seconds));
     return { name => $name, frames => $frames, seconds => $seconds + 0 };
 };
