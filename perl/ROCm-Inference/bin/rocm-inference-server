@@ -296,6 +296,12 @@ sub scan {
     push @{ $dir_drafts{ $_->[1] } }, $_->[0] for @drafts;
 }
 
+# MemAvailable in GB, for the log (the memory a load can count on)
+sub mem_gb {
+    my $a = mem_available();
+    return defined $a ? sprintf('%.1f GB', $a / 2**30) : 'unknown';
+}
+
 sub mem_available {
     open my $fh, '<', '/proc/meminfo' or return;
     while (<$fh>) { return $1 * 1024 if /^MemAvailable:\s+(\d+)/ }
@@ -368,7 +374,7 @@ sub unload {
     undef $r->{m};  # (the only reference: unmapped and unpinned now)
     delete $r->{vision};
     delete $r->{tower_bytes};
-    $LOG->info('model', model => $r->{id}, event => 'unload', msg => 'unloaded');
+    $LOG->info('model', model => $r->{id}, event => 'unload', msg => "unloaded, MemAvailable " . mem_gb());
 }
 
 # Before loading r: unload idle models (least recently used first, never --model / --embedding-model) until r fits
@@ -402,6 +408,8 @@ sub load {
     local $ENV{GGUF_RECACHE} = $o{recache} ? 1 : $ENV{GGUF_RECACHE};
     delete $ENV{GGUF_RECACHE} unless defined $ENV{GGUF_RECACHE};
     my $t_load = Time::HiRes::time();
+    # (the memory available is logged at each load: a load that fails on hipHostRegister is not a memory shortage)
+    $LOG->info('model', model => $r->{id}, event => 'load-start', msg => 'MemAvailable ' . mem_gb());
     my $m = eval { load_model($r->{path}, { stage => $o{stage} }) };
     $m or die "cannot load $r->{path}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r || last_error()) . "\n";
     my $pages = stage_info($m);

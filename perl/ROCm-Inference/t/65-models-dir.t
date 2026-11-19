@@ -24,7 +24,9 @@ my $dir = tempdir(CLEANUP => 1);
 my $models = "$dir/models";
 mkdir $models or die;
 symlink $path, "$models/alpha.gguf" or die;
-symlink $path, "$models/beta.gguf" or die;
+# beta: the second model if ROCM_INFERENCE_TEST_MODEL_2 names one (two different models: the switch itself, without loading
+# the same big file twice), else the same file under another name
+symlink(($ENV{ROCM_INFERENCE_TEST_MODEL_2} // $path), "$models/beta.gguf") or die;
 symlink $path, "$models/big-00002-of-00003.gguf" or die;  # not a first shard: left out
 { open my $fh, '>', "$models/notes.gguf" or die; print $fh "not a GGUF\n" }
 symlink $emb, "$models/embed.gguf" or die if $emb && -f $emb;
@@ -53,6 +55,7 @@ sub chat {
     my ($st, $body) = http(POST => '/v1/chat/completions', { temperature => 0, max_tokens => 16,
         chat_template_kwargs => { enable_thinking => JSON::PP::false }, defined $model ? (model => $model) : (),
         messages => [ { role => 'user', content => 'Name a primary color.' } ], %x });
+    diag("chat " . ($model // "-") . ": HTTP $st: $body") if $st != 200;  # (the reason the server gives, when a chat fails)
     return ($st, $st == 200 ? $J->decode($body) : $body);
 }
 
@@ -60,7 +63,7 @@ for my $parallel (1, 2) {
     note("--parallel $parallel");
     unlink $sock;
     my $pid = open my $srv, '-|', $^X, (map { "-I$_" } @INC), 'bin/rocm-inference-server', '--models-dir', $models,
-        '--models-max', 1, '--listen', $sock, '--ctx', 4096, '--nolog', '--parallel', $parallel;
+        '--models-max', 1, '--listen', $sock, '--ctx', 4096, '--log-level', 'info', '--parallel', $parallel;  # (the server's log on stderr: a failed load says why)
     die "cannot start the server: $!" unless $pid;
     for (1 .. 600) { last if -S $sock; sleep 0.1 }
     ok(-S $sock, 'the server listens') or BAIL_OUT('no server');
