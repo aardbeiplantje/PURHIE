@@ -365,14 +365,22 @@ void ExpertPager::release_all() {
     INFER_LOG("[expert_pager] %lld of %zu experts' tensors registered (%lld released again) in %lld calls, %.0f ms (%.0f of "
               "them releasing); %zu of %zu MB registered at the end (budget %zu MB)\n", st_registered, units.size(),
               st_released, st_calls, st_ms, st_release_ms, registered >> 20, total >> 20, budget >> 20);
+    // unregister, then map the file over the range again: the driver keeps a range registered until its mapping is
+    // replaced (release() and edge_unref() do the same). Without the remap, a model unloaded here leaves its ranges
+    // with the driver, and a model loaded after it cannot register its own (hipHostRegister: invalid value)
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
     for (Unit& u : units)
         if (u.reg) {
             (void)hipHostUnregister(u.p);
+            (void)gguf_remap(gguf, u.p, u.len);
             u.reg = false;
             u.prev = u.next = -1;
         }
     for (Edge& e : edges) {
-        if (e.refs > 0) (void)hipHostUnregister(e.p);
+        if (e.refs > 0) {
+            (void)hipHostUnregister(e.p);
+            (void)gguf_remap(gguf, e.p, page);
+        }
         e.refs = 0;
     }
     head = tail = -1;
