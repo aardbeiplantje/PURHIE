@@ -85,7 +85,7 @@ run alone on the machine.
       sidecar gave about 38 -> 50 tok/s.
       Measured (2026-11-18, `step_chats` on Qwen3.5-4B ROCmFP4, one run, greedy, 128 new tokens, 2 prompts): one sequence
       15.8 ms a step (63.5 tok/s); two sequences 23.7 ms a step (84.2 tok/s together), a 1.33x gain from the batch. The verify rows'
-      pass time is not measured yet.
+      pass time is not measured yet (the MTP head the verify pass needs is not on this host for the 4B). A batched forward (qwen_model_prefill) of 1, 2, 3 and 4 rows, same position: 31.3, 33.4, 35.2, 35.9 ms; a plain decode step (qwen_model_forward) 15.6 ms. The batched path has about 15 ms of fixed cost at one row, so its rows cost 1.1 to 2.2 ms each on top of that; the verify path itself is not what this measured, so the break-even for speculation is still open.
     - Watch on the deployment: the store's resume (the `kv` line's mapped blocks), and `--parallel` on the 27B and 35B
       (the tests ran on Qwen3.5-4B). `--store-max` 32 or more (one 130k-token 27B conversation is about 14 GB).
     - The 10 identical resends in opencode's log (5 each before two compactions, at about 210k tokens) look like failed
