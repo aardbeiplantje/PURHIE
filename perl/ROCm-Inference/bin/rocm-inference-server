@@ -340,7 +340,9 @@ sub footprint {
     my ($r) = @_;
     return $r->{info}{bytes} if $r->{aux};  # (a speech or image model: its files)
     my ($ctx, $kvt) = settings($r);
-    return $r->{info}{bytes} + $r->{info}{kv_bytes_per_token} * $ctx * seqs($r) * $kv_factor{$kvt};
+    # the files, the KV caches, and the vision tower (its file, read as the model's pages are: counted the same way)
+    my $tower = $r->{m} ? ($r->{tower_bytes} // 0) : do { my $p = mmproj_of($r); defined $p ? (-s $p // 0) : 0 };
+    return $r->{info}{bytes} + $tower + $r->{info}{kv_bytes_per_token} * $ctx * seqs($r) * $kv_factor{$kvt};
 }
 
 sub seqs { my ($r) = @_; $r->{info}{kind} eq 'chat' ? $parallel : 1 }
@@ -365,6 +367,7 @@ sub unload {
     delete $default{ $r->{info}{kind} } if ($default{ $r->{info}{kind} } // 0) == $r && $r->{dir};
     undef $r->{m};  # (the only reference: unmapped and unpinned now)
     delete $r->{vision};
+    delete $r->{tower_bytes};
     $LOG->info('model', model => $r->{id}, event => 'unload', msg => 'unloaded');
 }
 
@@ -379,7 +382,7 @@ sub make_room {
     my @lru = sort { $a->{used} <=> $b->{used} } grep { $_->{m} && $_->{dir} && $_ != $r } values %M, values %AUX;
     while (1) {
         my $avail = mem_available();
-        if (defined $avail) { $avail -= $_->{info}{bytes} for grep { $_->{m} } values %M, values %AUX }
+        if (defined $avail) { $avail -= $_->{info}{bytes} + ($_->{tower_bytes} // 0) for grep { $_->{m} } values %M, values %AUX }
         my $fits = !defined $avail || $avail - $o{'models-margin'} * 2**30 >= $need;
         my $count_ok = !$o{'models-max'} || (grep { $_->{m} } values %M, values %AUX) < $o{'models-max'};
         last if $fits && $count_ok;
@@ -460,6 +463,7 @@ sub load {
                                        $mm, $v->n_out, hidden_size($m)));
         } else {
             $r->{vision} = $v;
+            $r->{tower_bytes} = -s $mm // 0;  # (counted in the memory check while the model is loaded)
             $LOG->info('model', model => $r->{id}, event => 'vision', msg => "vision tower $mm");
         }
     }

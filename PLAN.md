@@ -126,13 +126,10 @@ run alone on the machine.
     ("voice 'clip2' not written: /models/.../voices/clip2: Read-only file system"), and the directory it started is removed. The
     deployment's voices directory must still be writable for voices to be created.
 
-17. **Eviction with the 122B, the Perl suite on the 122B, and the vision tower's memory.** The combined server (`--models-dir` with the
-    122B, its sidecar, whisper, the TTS talker and codec, sd-turbo; `--parallel 2`) answered every endpoint, but not under memory
-    pressure: the 122B's 67 GB against the others is not tested. The full Perl suite on the 122B has not finished: `t/10` and `t/15`
+17. **Eviction with the 122B and the Perl suite on the 122B (the vision tower's memory: done).** The combined server (`--models-dir` with the
+    122B, its sidecar, whisper, the TTS talker and codec, sd-turbo; `--parallel 2`) answered every endpoint. Under memory pressure (`--models-margin 60`), loading Qwen3-0.6B unloaded the 122B (load and unload lines in the log), and the 122B's image answer came through its sidecar before that. A model's vision tower is now counted in the memory check (`footprint` and the `make_room` subtraction: its file size, while loaded); the small-model image, models-dir and server tests pass with it (130 tests). The full Perl suite on the 122B has not finished: `t/10` and `t/15`
     fail with `hipHostRegister failed (-3)` on an in-process load of the 122B (the server's load of the same file works), `t/65-models-dir`
     hung once on a server (killed), and `t/70-stage` ran for hours (killed). The cause of the `hipHostRegister` failure is not known.
-    A model's vision tower (1.8 GB for the 122B) loads with the model but is not counted in `make_room`'s footprint (its files and KV
-    only), so the memory check under-counts by that much. Option: load the tower on the first image request instead.
 
 ## Audio, vision and image: status
 
