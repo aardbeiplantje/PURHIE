@@ -266,9 +266,17 @@ int main(int argc, char** argv) {
         char what[256];
         snprintf(what, sizeof(what), "stream: greedy tokens equal inference_generate_ex's (%d tokens, stop reason %d)",
                  a.n, (int)a.reason);
-        check(a.rc == 0 && std::vector<int>(a.ids.begin(), a.ids.end()) == ref &&
-                  (a.reason == INFERENCE_STOP_MAX_TOKENS ? a.n == SN : eog),
-              what);
+        const std::vector<int> sids(a.ids.begin(), a.ids.end());
+        if (sids != ref) {  // (the two lists, when they differ: the first position where they do)
+            size_t k = 0;
+            while (k < sids.size() && k < ref.size() && sids[k] == ref[k]) ++k;
+            printf("    stream %zu tokens:", sids.size());
+            for (int t : sids) printf(" %d", t);
+            printf("\n    generate %zu tokens:", ref.size());
+            for (int t : ref) printf(" %d", t);
+            printf("\n    first difference at %zu\n", k);
+        }
+        check(a.rc == 0 && sids == ref && (a.reason == INFERENCE_STOP_MAX_TOKENS ? a.n == SN : eog), what);
         bool chunks_ok = true;
         for (const std::string& c : a.chunks) chunks_ok &= valid_utf8(c);
         check(a.text == detok(m, a.ids) && chunks_ok, "stream: callback text = detokenized tokens, every chunk valid UTF-8");
@@ -313,19 +321,24 @@ int main(int argc, char** argv) {
         check(inference_token_is_eog(m, inference_vocab_size(m) + 5) == 0, "inference_token_is_eog: out of range is not EOG");
 
         // A chat turn ends at the end-of-turn token, which is neither emitted nor in the text
-        int ne = 0;
-        int32_t* et = inference_tokenize(m, "<|im_end|>", &ne);
-        const bool im_end = ne == 1 && inference_token_is_eog(m, et[0]);
-        inference_free_tokens(et, ne);
+        // (the end-of-turn marker is the model's: <|im_end|> (Qwen), <end_of_turn> (Gemma))
+        const char* turn_end = nullptr;
+        bool im_end = false;
+        for (const char* marker : {"<|im_end|>", "<end_of_turn>"}) {
+            int ne = 0;
+            int32_t* et = inference_tokenize(m, marker, &ne);
+            if (!im_end && ne == 1 && inference_token_is_eog(m, et[0])) { im_end = true; turn_end = marker; }
+            inference_free_tokens(et, ne);
+        }
         int nc = 0;
         int32_t* ct = inference_tokenize(m, "<|im_start|>user\nReply with just the word OK.<|im_end|>\n"
                                             "<|im_start|>assistant\n<think>\n\n</think>\n\n", &nc);
         const std::vector<int32_t> cp(ct, ct + nc);
         inference_free_tokens(ct, nc);
         const Stream e = stream(m, cp, 64, greedy);
-        snprintf(what, sizeof(what), "stream: chat turn ends at <|im_end|> (EOG token: %s; %d tokens, reason %d, \"%s\")",
-                 im_end ? "yes" : "NO", e.n, (int)e.reason, e.text.c_str());
-        check(im_end && e.rc == 0 && e.reason == INFERENCE_STOP_EOG && e.text.find("<|im_end|>") == std::string::npos,
+        snprintf(what, sizeof(what), "stream: chat turn ends at an end-of-generation token (marker %s, EOG %s; %d tokens, reason %d, \"%s\")",
+                 turn_end ? turn_end : "not one token here", im_end ? "yes" : "no", e.n, (int)e.reason, e.text.c_str());
+        check(e.rc == 0 && e.reason == INFERENCE_STOP_EOG && (!im_end || e.text.find(turn_end) == std::string::npos),
               what);
     }
 
@@ -333,7 +346,7 @@ int main(int argc, char** argv) {
     // whole re-rendered conversation, generated with reuse_prefix, so only the changed tail is prefilled
     {
         const char* tmpl = inference_chat_template(m, nullptr);
-        check(tmpl && strstr(tmpl, "<|im_start|>") && inference_chat_template(m, "no-such-name") == nullptr,
+        check(tmpl && tmpl[0] && inference_chat_template(m, "no-such-name") == nullptr,
               "inference_chat_template: the GGUF's template (and NULL for a missing named one)");
         auto toks = [&](const std::string& text) {
             int nt = 0;

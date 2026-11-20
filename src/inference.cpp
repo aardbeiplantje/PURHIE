@@ -2301,6 +2301,8 @@ int inference_generate_ex(inference_model_t* model, const int32_t* prompt_ids, i
     *out_len = 0;
     sampler_params prm = params ? *params : sampler_default_params();
     sampler_t* smp = sampler_create(&prm);
+    // end of generation: every end token of the model (the streaming path's check too: a Gemma turn ends at its
+    // end-of-turn token, which is not the tokenizer's EOS), else the EOS alone
     const int eos = model->tokenizer ? tokenizer_eos_id(model->tokenizer) : -1;
 
     // New sequence: prefill the prompt in batches, then sample from the logits in place (no copy)
@@ -2309,7 +2311,7 @@ int inference_generate_ex(inference_model_t* model, const int32_t* prompt_ids, i
     for (int i = 0; i < prompt_len; ++i) sampler_accept(smp, prompt_ids[i]);
     for (int step = 0; step < max_new_tokens && rc == 0; ++step) {
         const int next = sampler_sample(smp, qwen_model_logits(model->qwen), model->vocab_size);
-        if (next == eos) break;
+        if (next == eos || (model->tokenizer && tokenizer_is_eog(model->tokenizer, next))) break;
         out_ids[(*out_len)++] = next;
         sampler_accept(smp, next);
         if (step + 1 < max_new_tokens) rc = forward_next(model, next);

@@ -112,9 +112,11 @@ run alone on the machine.
       scale, a `--rope-factor` option, a quality check). The 16 GB KV budget caps it at about 600k positions at F16.
     - The fork's qwen4exp is behind upstream's (`recurrent_layers` as indices, not bool flags): the user's to port.
 
-13. **Gemma-4 26B, chat and streaming checks** (nice to have). `generate_verify` fails 3 checks: the streamed greedy tokens
-    differ from `inference_generate_ex`'s; the chat checks assume Qwen's end token and template. The prefill is exact now
-    (see "Done in this round").
+13. **Gemma-4 26B, chat and streaming checks (done).** `generate_verify` passes on Gemma-4 26B. The streamed greedy tokens
+    differed from `inference_generate_ex`'s because the non-streaming generate stopped only at the tokenizer's EOS, not at every
+    end-of-generation token (a turn ends at Gemma's end-of-turn token); it now uses the same check. The chat and template checks
+    had assumed Qwen's markers; they now accept the engine's own end-of-generation and the GGUF's template. The quick regression
+    tier passes (47 of 47).
 
 14. **Clear by hand (the user):** `/data/iqtest` (336 KB of logs), and `nginx.conf~` in the repository root (the editor's
     backup, excluded from the image).
