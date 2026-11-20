@@ -316,17 +316,64 @@ sub mem_available {
 # Qwen3-30B-A3B at 31k 27.9 -> 30.0 tok/s, Qwen3.6-35B at 112k 32.4 -> 35.2), f16 below that and where the model's
 # cache rows do not suit q8_0 (a multiple of 256 values: not Qwen2.5-0.5B's 2 x 64)
 my %kv_factor = (f16 => 1, q8_0 => 17 / 32, q4_0 => 9 / 32);
+# ---- Per-model settings: parallel, ctx and kv_type. A model's own value is the first of: its sidecar NAME.json (beside
+# the model file, read at each load: {"parallel": 1}), the host rules below (defaults for this host: gfx1151, 128 GB of
+# unified memory), and the global flags (--parallel, --ctx, --kv-type). An unknown key or a bad value fails the load.
+my %MODEL_KEY_OK = (
+    parallel => sub { $_[0] =~ /\A[1-9]\d*\z/ },
+    ctx      => sub { $_[0] =~ /\A\d+\z/ && $_[0] >= 256 },
+    kv_type  => sub { $_[0] =~ /\A(?:auto|f16|q8_0|q4_0)\z/ },
+);
+# The host's defaults: a rule sets keys for the models it matches (it overrides the global flags; the sidecar overrides it)
+my @HOST_RULES = (
+    { why => 'a Qwen3.5 MoE of 60 GB or more: at parallel 2 the next such model fails to load (PLAN.md item 18)',
+      match => sub { $_[0]{info}{arch} eq 'qwen35moe' && $_[0]{info}{bytes} >= 60 * 2**30 },
+      set   => { parallel => 1 } },
+);
+sub model_config {
+    my ($r) = @_;
+    my %c = (parallel => $parallel, ctx => $o{ctx}, kv_type => $kv_type);  # the global flags
+    for my $rule (@HOST_RULES) { %c = (%c, %{ $rule->{set} }) if $rule->{match}->($r) }
+    (my $path = $r->{path} // '') =~ s/-\d{5}-of-\d{5}\.gguf\z/.gguf/;
+    $path =~ s/\.gguf\z/.json/;
+    if (length $path && -f $path) {
+        open my $fh, '<:raw', $path or die "$path: $!\n";
+        local $/;
+        my $cfg = eval { JSON::PP->new->decode(<$fh>) };
+        die "$path: not a JSON object\n" unless ref $cfg eq 'HASH';
+        for my $k (sort keys %$cfg) {
+            die "$path: unknown key '$k' (parallel, ctx or kv_type)\n" unless $MODEL_KEY_OK{$k};
+            my $v = defined $cfg->{$k} && !ref $cfg->{$k} ? "$cfg->{$k}" : '';
+            die "$path: $k '$v' is not allowed\n" unless $MODEL_KEY_OK{$k}->($v);
+            $c{$k} = $v;
+        }
+    }
+    return \%c;
+}
+# a model's settings: as its last load read them while it is loaded; otherwise as they would be now (a bad sidecar
+# is logged and the global flags stand in, so that the model list still works)
+sub cfg_of {
+    my ($r) = @_;
+    return $r->{cfg} if $r->{m} && $r->{cfg};
+    my $c = eval { model_config($r) };
+    return $c if $c;
+    my $why = ($@ // '') =~ s/\s+\z//r;
+    $LOG->warn_(model => $r->{id}, event => 'config', msg => "settings not read: $why; the global flags are used");
+    return { parallel => $parallel, ctx => $o{ctx}, kv_type => $kv_type };
+}
+
 sub settings {
     my ($r) = @_;
+    my $c = cfg_of($r);
     my $trained = $r->{info}{n_ctx_train} || 4096;
     if ($r->{info}{kind} eq 'embedding') { return ($trained < 2048 ? $trained : 2048, 'f16') }
-    my $kvt_for = sub { $kv_type eq 'auto' ? ($_[0] >= 32768 ? 'q8_0' : 'f16') : $kv_type };
-    return ($o{ctx}, $kvt_for->($o{ctx})) if $o{ctx};
-    my $per = $r->{info}{kv_bytes_per_token} * $parallel;
+    my $kvt_for = sub { $c->{kv_type} eq 'auto' ? ($_[0] >= 32768 ? 'q8_0' : 'f16') : $c->{kv_type} };
+    return ($c->{ctx}, $kvt_for->($c->{ctx})) if $c->{ctx};
+    my $per = $r->{info}{kv_bytes_per_token} * $c->{parallel};
     my $fit = sub { $per ? int($o{'kv-budget'} * 2**30 / ($per * $kv_factor{ $_[0] }) / 256) * 256 : $trained };
     my $ctx = $trained;
     $ctx = $fit->($kvt_for->($ctx)) if $fit->($kvt_for->($ctx)) < $ctx;
-    $ctx = $fit->('f16') if $kv_type eq 'auto' && $ctx < 32768 && $fit->('f16') < $ctx;  # (f16 below 32768)
+    $ctx = $fit->('f16') if $c->{kv_type} eq 'auto' && $ctx < 32768 && $fit->('f16') < $ctx;  # (f16 below 32768)
     $ctx = 256 if $ctx < 256;
     return ($ctx, $kvt_for->($ctx));
 }
@@ -351,7 +398,7 @@ sub footprint {
     return $r->{info}{bytes} + $tower + $r->{info}{kv_bytes_per_token} * $ctx * seqs($r) * $kv_factor{$kvt};
 }
 
-sub seqs { my ($r) = @_; $r->{info}{kind} eq 'chat' ? $parallel : 1 }
+sub seqs { my ($r) = @_; $r->{info}{kind} eq 'chat' ? cfg_of($r)->{parallel} : 1 }
 
 # A loaded model's KV caches (every sequence's)
 sub kv_bytes {
@@ -401,6 +448,7 @@ sub make_room {
 sub load {
     my ($r) = @_;
     return $r if $r->{m};
+    $r->{cfg} = model_config($r);  # the settings as the sidecar and the host rules give them now
     make_room($r);
     my ($ctx, $kvt) = settings($r);
     # --recache: drop the model file's cached pages first, so that it is read again as 2 MB pages (the GPU reads the
@@ -430,7 +478,7 @@ sub load {
     if (!$emb) {
         if ($r->{draft}) {
             set_draft_model($m, $r->{draft});
-        } elsif (!$no_draft && $parallel == 1) {
+        } elsif (!$no_draft && $r->{cfg}{parallel} == 1) {
             # the model's own MTP block (Qwen3.8-Flash-Next from the BF16: nothing more to load), else a draft head
             # of the directory that fits this model
             for my $d ($r->{path}, $r->{dir} ? @{ $dir_drafts{ $r->{info}{arch} } // [] } : ()) {
@@ -458,7 +506,7 @@ sub load {
         }
     }
     # --parallel N: N sequences (conversations at once), each a KV cache of the context; sequence 0 and N - 1 more
-    $r->{pool} = [ map { { seq => $_, job => undef, prompt => [] } } 0, $emb ? () : map { seq_new($m) } 2 .. $parallel ];
+    $r->{pool} = [ map { { seq => $_, job => undef, prompt => [] } } 0, $emb ? () : map { seq_new($m) } 2 .. $r->{cfg}{parallel} ];
     my $mm = mmproj_of($r);
     if ($mm && !$emb) {
         # the vision tower (images in chat requests): the model's sidecar NAME.mmproj.gguf, or --mmproj for --model; its output must be the model's width
@@ -593,7 +641,7 @@ sub model_entry {
     my ($ctx) = $r->{m} ? $r->{ctx} : settings($r);
     return { id => $r->{id}, object => 'model', created => $created, owned_by => 'rocm-inference',
              status => { value => $r->{m} ? 'loaded' : 'unloaded' }, kind => $r->{info}{kind}, arch => $r->{info}{arch},
-             endpoints => $ENDPOINTS{ $r->{info}{kind} }, capabilities => capabilities($r), context_length => $ctx, n_ctx_train => $r->{info}{n_ctx_train},
+             endpoints => $ENDPOINTS{ $r->{info}{kind} }, capabilities => capabilities($r), parallel => cfg_of($r)->{parallel}, context_length => $ctx, n_ctx_train => $r->{info}{n_ctx_train},
              bytes => $r->{info}{bytes} };
 }
 # What a model can do, as GET /v1/models lists it (the client picks a model by these): a chat model has completion and
@@ -1425,7 +1473,7 @@ route::post '/v1/chat/completions' => sub {
           total_tokens => $prompt_tokens + $completion_tokens };
     };
 
-    return start_job($r, $id, $opts, $p, $q, messages => $messages) if $parallel > 1;
+    return start_job($r, $id, $opts, $p, $q, messages => $messages) if cfg_of($r)->{parallel} > 1;
 
     unless ($p->{stream}) {
         local $r->{busy} = 1;
@@ -1512,7 +1560,7 @@ route::post '/v1/completions' => sub {
     delete @$opts{qw(vars max_thinking_tokens)};
     start_line($q, $p, $opts);
     my $ids = tokenize($m, $p->{prompt});
-    return start_job($r, $id, $opts, $p, $q, prompt => $ids) if $parallel > 1;
+    return start_job($r, $id, $opts, $p, $q, prompt => $ids) if cfg_of($r)->{parallel} > 1;
     my ($completion, $text, $write) = (0, '');
     my $usage = sub {
         { prompt_tokens => scalar @$ids, completion_tokens => $completion, total_tokens => @$ids + $completion };
@@ -1834,7 +1882,7 @@ if ($o{'models-dir'}) {
         ($AUX{whisper} ? ", speech model $AUX{whisper}{id}" : '') . ($AUX{tts} ? ", speech synthesis $AUX{tts}{id}" : '') . ($AUX{sd} ? ", images $AUX{sd}{id}" : ''));
 }
 run(listen => $o{listen}, log => $LOG->enabled('info') ? \&access_line : 0, defined $o{mode} ? (mode => oct $o{mode}) : (),
-    $parallel > 1 ? (tick => \&tick) : ());
+    (tick => \&tick));  # (a tick is a no-op for a model with no queued job)
 
 # SIGINT / SIGTERM: the stores closed before the exit, so that the snapshots held in memory (--store-snapshots lazy)
 # are written (the exit's own clean-up runs in no set order)

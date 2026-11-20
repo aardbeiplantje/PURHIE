@@ -133,6 +133,24 @@ run alone on the machine.
     fail with `hipHostRegister failed (-3)` on an in-process load of the 122B (the server's load of the same file works), `t/65-models-dir`
     hung once on a server (killed), and `t/70-stage` ran for hours (killed). The cause of the `hipHostRegister` failure is not known.
 
+18. **`--parallel 2` and the second big model (122B).** With `--parallel 2`, a server that loads the 122B and then switches to
+    another 122B-sized file (alpha, beta, alpha, all under `--models-max 1`) fails at beta's load: `hipHostRegister of 66353926592
+    bytes (a GGUF map) failed: invalid argument (-3)`. The same switch with `--parallel 1` passes, in one process and across two
+    processes; so does a single 122B load, and Flash (122.8 GB, pager path) loads twice in two processes. What was ruled out: the
+    KV size (`--ctx 2048` at parallel 2 still fails; `--ctx 8192` at parallel 1 passes), the second sequence's logits
+    registration, and its recurrent-state registration (each removed on its own: still fails). Not found: what `--parallel 2`
+    changes at load time. Later, not now: find what `--parallel 2` changes at load time, and whether the other large
+    models hit it. The host rule in item 19 is the workaround until then. **Until this is found, run the 122B with `--parallel 1`** when another 122B-sized model may be loaded
+    in the same server. Per-model parallel settings are item 19.
+
+19. **Per-model settings (done).** Each model's `parallel`, `ctx` and `kv_type` come from, in order: its sidecar `NAME.json` (beside the model,
+    read at each load; an unknown key or a bad value fails the load and names the file), the host rules in `bin/rocm-inference-server`
+    (`@HOST_RULES`: defaults for this host, gfx1151, 128 GB unified memory; now one rule: a Qwen3.5 MoE of 60 GB or more gets
+    parallel 1, PLAN.md item 18), then the global flags. `GET /v1/models` shows each chat model's `parallel`. Measured: with the
+    global `--parallel 2` and the 122B alpha, beta, alpha switch, all three return 200 (the rule keeps the 122B at 1); the
+    small-model test `t/71-model-config.t` (sidecar override, bad key) and the server, audio, image and models-dir tests pass
+    (8 files, 211 tests). To add a rule or a key: a line in `@HOST_RULES` or `%MODEL_KEY_OK`.
+
 ## Audio, vision and image: status
 
 Verified against the references in the sections that follow. Each row says what works, what is open, and where it runs.
