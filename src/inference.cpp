@@ -113,6 +113,15 @@ static std::string report_page_sizes(gguf_model_t* gguf) {
     return b;
 }
 
+// Why the last pin failed (what hipHostRegister returned, and for how many bytes): the load's error says it
+static char g_pin_error[256] = "";
+// INFERENCE_PIN_CHUNK_MB: a GGUF map is registered in pieces of that many MB (0, the default: as one range)
+static size_t pin_chunk_bytes() {
+    const char* e = getenv("INFERENCE_PIN_CHUNK_MB");
+    const long mb = e ? atol(e) : 0;
+    return mb > 0 ? (size_t)mb << 20 : 0;
+}
+
 static bool pin_gguf(gguf_model_t* gguf, std::vector<const QuantWeight*> cpu_only_w,
                      std::vector<std::pair<void*, size_t>>& pinned, size_t& pinned_bytes, size_t& unpinned_bytes,
                      std::string* pages = nullptr, const ExpertPager* pager = nullptr) {
@@ -149,14 +158,22 @@ static bool pin_gguf(gguf_model_t* gguf, std::vector<const QuantWeight*> cpu_onl
         auto pin = [&](const char* end) {
             if (end <= cur) return true;
             if (pager) (void)mlock(cur, (size_t)(end - cur));  // (as the pager's units: expert_pager.cpp)
-            hipError_t e = hipHostRegister((void*)cur, (size_t)(end - cur), hipHostRegisterReadOnly);
-            if (e != hipSuccess) {
-                INFER_LOG("[pin_model] hipHostRegister(GGUF map %d, %zu bytes, ReadOnly) failed: %s\n", i,
-                          (size_t)(end - cur), hipGetErrorString(e));
-                return false;
+            // the range in pieces of pin_chunk_bytes() (one piece when that is 0)
+            const size_t chunk = pin_chunk_bytes();
+            for (const char* p = cur; p < end;) {
+                const char* q = chunk && (size_t)(end - p) > chunk ? p + chunk : end;
+                const hipError_t e = hipHostRegister((void*)p, (size_t)(q - p), hipHostRegisterReadOnly);
+                if (e != hipSuccess) {
+                    snprintf(g_pin_error, sizeof g_pin_error, "hipHostRegister of %zu bytes (a GGUF map, piece of %zu) failed: %s",
+                             (size_t)(q - p), (size_t)(end - cur), hipGetErrorString(e));
+                    INFER_LOG("[pin_model] hipHostRegister(GGUF map %d, %zu bytes, ReadOnly) failed: %s\n", i,
+                              (size_t)(q - p), hipGetErrorString(e));
+                    return false;
+                }
+                pinned.push_back({(void*)p, (size_t)(q - p)});
+                pinned_bytes += (size_t)(q - p);
+                p = q;
             }
-            pinned.push_back({(void*)cur, (size_t)(end - cur)});
-            pinned_bytes += (size_t)(end - cur);
             return true;
         };
         for (const auto& r : skip) {
@@ -199,7 +216,10 @@ static bool pin_tensors(gguf_model_t* g, int il, std::vector<std::pair<void*, si
     for (size_t i = 0; i < r.size();) {  // merged: a page may hold the ends of two tensors
         uintptr_t b = r[i].first, e = r[i].second;
         for (++i; i < r.size() && r[i].first <= e; ++i) e = std::max(e, r[i].second);
-        if (hipHostRegister((void*)b, (size_t)(e - b), hipHostRegisterReadOnly) != hipSuccess) {
+        const hipError_t er = hipHostRegister((void*)b, (size_t)(e - b), hipHostRegisterReadOnly);
+        if (er != hipSuccess) {
+            snprintf(g_pin_error, sizeof g_pin_error, "hipHostRegister of %zu bytes (a tensor range) failed: %s",
+                     (size_t)(e - b), hipGetErrorString(er));
             unpin(pinned);
             return false;
         }
@@ -255,6 +275,8 @@ static bool pin_model_memory(inference_model* m) {
     if (m->stage.base) {  // every tensor the GPU reads is in the stage: pin it, leave the GGUF mapping to the CPU
         const hipError_t e = hipHostRegister(m->stage.base, m->stage.bytes, hipHostRegisterReadOnly);
         if (e != hipSuccess) {
+            snprintf(g_pin_error, sizeof g_pin_error, "hipHostRegister of %zu bytes (the stage) failed: %s", m->stage.bytes,
+                     hipGetErrorString(e));
             INFER_LOG("[pin_model] hipHostRegister(stage, %zu bytes) failed: %s\n", m->stage.bytes, hipGetErrorString(e));
             return false;
         }
@@ -1392,7 +1414,7 @@ inference_model_t* inference_load_model_ex(const char* gguf_path, const inferenc
     m->tokenizer = tokenizer_load_from_gguf(m->gguf);
 
     if (!pin_model_memory(m)) {
-        set_error("hipHostRegister failed");
+        set_error("%s", g_pin_error[0] ? g_pin_error : "hipHostRegister failed");
         unpin_model_memory(m);
         delete m;
         return nullptr;
