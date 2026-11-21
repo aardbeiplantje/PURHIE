@@ -293,13 +293,16 @@ Quality and correctness:
   [1, 256, 3840], cap_embedder [32, 3840], context_refiner.0/1 [1, 32, 3840], layers.0 and layers.29 [1, 288, 3840] (32 text + 256
   image rows), final_layer, and `dit/out.pt` holds the output [16, 1, 32, 32]. Engine port (2026-11-21): the host stages are REFERENCE-ONLY (AGENTS.md, Architecture): `src/zimage_dit.{h,cpp}` (host path: safetensors reader, timestep embedder, patchify, patch embedding,
   caption embedder) and `tests/zimage_dit_verify.cpp` pass against the oracle (relative 0.1-0.24%, cosine > 0.999998; build line in
-  Device path (AGENTS.md rules: the mapping registered and read in place, activations in shared memory, no copies): the timestep
-  embedding, the patch embedding, the caption embedder and the first noise refiner block run on the GPU (`dev_timestep_embed`,
-  `dev_patch_embed`, `dev_caption_embed`, `dev_refiner_block`; `linear_bf16` on the file's BF16 weights; `sd_rms_norm`,
-  `zimage_modulate`, `zimage_gate_add`, `zimage_swiglu`, `zimage_rope` in sd_gpu.hip). `tests/zimage_dit_verify` passes against the
-  oracle (relative 0.11%, 0.24%, 0.1%, and 1.1% for the whole block). Next: noise_refiner.1 (the same block), context_refiner.0 and .1
-  (no modulation), the 30 main layers over the joint sequence (text rows then image rows), the final layer and unpatchify, each on
-  the device and checked against the oracle.
+  Device path (AGENTS.md rules: the mapping registered and read in place, activations in shared memory, no copies): the whole DiT
+  forward runs on the GPU and matches the reference's output (`tests/zimage_dit_verify`, the device checks): the timestep, patch and
+  caption embeddings, the two noise refiners, the two context refiners, the 30 main layers over the joint sequence (image rows,
+  then caption rows, in one buffer), and the output (final layer, unpatchify). Relative errors: 0.1-0.24% for the embeddings,
+  about 1% for the refiners, 0.6-0.7% for the layers, 0.3% for the final layer alone; the whole stack's output is 3.3% (cosine
+  0.99989) from accumulated bf16 rounding (the reference rounds the same way). Kernels in sd_gpu.hip: sd_rms_norm,
+  zimage_modulate, zimage_gate_add, zimage_swiglu, zimage_rope, zimage_layer_norm_plain. Next: the sampler (the flow-matching
+  Euler steps, 8 steps, shift 3, guidance 0), the text encoder on the device (Qwen3-4B: the engine's qwen3 path reads GGUF; the
+  ComfyUI safetensors need a loader or a conversion), the Flux AE decoder (16 latent channels: not the SD VAE of sd.cpp), and the
+  end-to-end image against `/data/zimage-ref/out/image.png`.
   the test). Not yet: the refiner blocks (AdaLN, joint attention with three-axis RoPE, QK-norm, SwiGLU), the 30 main layers, the
   final layer, unpatchify, and the GPU path. Those are next, stage by stage against `dit/stages.pt`.
 - **Z-Image-Turbo** (`diffusion_models/z_image_turbo_bf16`, S3-DiT, 30 blocks, dim 3840, text dim 2560 = Qwen3-4B, which the

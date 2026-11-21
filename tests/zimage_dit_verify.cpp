@@ -29,7 +29,8 @@ static bool read_raw(const std::string& path, std::vector<float>& v) {
     return got == (size_t)n;
 }
 
-static int compare(const char* what, const std::vector<float>& got, const std::vector<float>& want, double tol) {
+static int compare(const char* what, const std::vector<float>& got, const std::vector<float>& want, double tol,
+                   double cos_min = 0.9999) {
     if (got.size() != want.size()) {
         printf("[FAIL] %s: %zu values, the reference has %zu\n", what, got.size(), want.size());
         return 1;
@@ -42,7 +43,7 @@ static int compare(const char* what, const std::vector<float>& got, const std::v
         dot += a * b; ng += a * a; nw += b * b;
     }
     const double cos = dot / std::sqrt(ng * nw + 1e-30);
-    const bool ok = maxabs <= tol * std::fmax(maxref, 1e-12) && cos > 0.9999;
+    const bool ok = maxabs <= tol * std::fmax(maxref, 1e-12) && cos > cos_min;
     printf("[%s] %s: max abs %.3g (ref max %.3g, relative %.2g), cosine %.7f\n", ok ? "PASS" : "FAIL", what, maxabs,
            maxref, maxabs / std::fmax(maxref, 1e-12), cos);
     return ok ? 0 : 1;
@@ -101,6 +102,83 @@ int main(int argc, char** argv) {
             std::vector<float> cv(cd, cd + (size_t)Lc * 3840);
             fails += compare("device cap_embedder (RMS norm kernel + GEMM)", cv, want, 2e-2);
         } else fails++;
+        /* the second noise refiner block on the output of the first (in place in xd) */
+        if (zimage::dev_refiner_block(st, "noise_refiner.1", xd, N, td, fr) && read_raw(dir + "/noise_refiner_1.f32", want)) {
+            std::vector<float> rv(xd, xd + (size_t)N * 3840);
+            fails += compare("device noise_refiner.1", rv, want, 2e-2);
+        } else fails++;
+        /* the caption: its pad rows take the pad token, then the two context refiners (no modulation; RoPE ids (1 + t, 0, 0)) */
+        if (cd && Lc == 32) {
+            zimage::dev_caption_pad_rows(st, cd, 15, Lc);
+            int ids[32 * 3];
+            for (int t2 = 0; t2 < 32; ++t2) { ids[t2 * 3] = 1 + t2; ids[t2 * 3 + 1] = 0; ids[t2 * 3 + 2] = 0; }
+            float* frc = static_cast<float*>(sddev::alloc(sizeof(float) * 32 * 64 * 2, false));
+            zimage::rope_table_ids(ids, 32, frc);
+            if (zimage::dev_refiner_block(st, "context_refiner.0", cd, Lc, nullptr, frc, false) && read_raw(dir + "/context_refiner_0.f32", want)) {
+                std::vector<float> cv0(cd, cd + (size_t)Lc * 3840);
+                fails += compare("device context_refiner.0", cv0, want, 2e-2);
+            } else fails++;
+            if (zimage::dev_refiner_block(st, "context_refiner.1", cd, Lc, nullptr, frc, false) && read_raw(dir + "/context_refiner_1.f32", want)) {
+                std::vector<float> cv1(cd, cd + (size_t)Lc * 3840);
+                fails += compare("device context_refiner.1", cv1, want, 2e-2);
+            } else fails++;
+        }
+        /* the whole device stack over one joint buffer J ([288][3840]: the image rows, then the caption rows, written in place):
+         * the embeddings, the refiners, the 30 main layers, the output; the layers and the output against the oracle */
+        {
+            const int NI = 256, LC = 32, S = NI + LC, DIM = 3840;
+            float* J = static_cast<float*>(sddev::alloc(sizeof(float) * (size_t)S * DIM, false));
+            float* jx = J;
+            int nx = 0;
+            zimage::dev_patch_embed(st, x.data(), 16, 32, 32, &jx, nx);
+            float* jt = static_cast<float*>(sddev::alloc(sizeof(float) * 256, false));
+            zimage::dev_timestep_embed(st, t[0], jt);
+            float* fri = static_cast<float*>(sddev::alloc(sizeof(float) * NI * 64 * 2, false));
+            zimage::rope_table_image(16, 16, 33, fri);
+            bool ok = zimage::dev_refiner_block(st, "noise_refiner.0", J, NI, jt, fri) &&
+                      zimage::dev_refiner_block(st, "noise_refiner.1", J, NI, jt, fri);
+            float* jc = J + (size_t)NI * DIM;
+            int lc = 0;
+            ok = ok && zimage::dev_caption_embed(st, cap.data(), (int)(cap.size() / 2560), &jc, lc);
+            zimage::dev_caption_pad_rows(st, jc, 15, LC);
+            int ids[32 * 3];
+            for (int t2 = 0; t2 < LC; ++t2) { ids[t2 * 3] = 1 + t2; ids[t2 * 3 + 1] = 0; ids[t2 * 3 + 2] = 0; }
+            float* frc = static_cast<float*>(sddev::alloc(sizeof(float) * LC * 64 * 2, false));
+            zimage::rope_table_ids(ids, LC, frc);
+            ok = ok && zimage::dev_refiner_block(st, "context_refiner.0", jc, LC, nullptr, frc, false) &&
+                 zimage::dev_refiner_block(st, "context_refiner.1", jc, LC, nullptr, frc, false);
+            int idj[288 * 3];
+            for (int r = 0; r < NI; ++r) { idj[r * 3] = 33; idj[r * 3 + 1] = r / 16; idj[r * 3 + 2] = r % 16; }
+            for (int r = 0; r < LC; ++r) { idj[(NI + r) * 3] = 1 + r; idj[(NI + r) * 3 + 1] = 0; idj[(NI + r) * 3 + 2] = 0; }
+            float* frj = static_cast<float*>(sddev::alloc(sizeof(float) * S * 64 * 2, false));
+            zimage::rope_table_ids(idj, S, frj);
+            for (int layer = 0; ok && layer < 30; ++layer) {
+                ok = zimage::dev_refiner_block(st, "layers." + std::to_string(layer), J, S, jt, frj, true);
+                if (layer == 0 && ok && read_raw(dir + "/layers_0.f32", want)) {
+                    std::vector<float> lv(J, J + (size_t)S * DIM);
+                    fails += compare("device layers.0 (joint sequence)", lv, want, 2e-2);
+                }
+                if (layer == 29 && ok && read_raw(dir + "/layers_29.f32", want)) {
+                    std::vector<float> lv(J, J + (size_t)S * DIM);
+                    fails += compare("device layers.29 (joint sequence)", lv, want, 2e-2);
+                }
+            }
+            std::vector<float> lat(16 * 32 * 32);
+            if (ok && zimage::dev_output(st, J, jt, lat.data()) && read_raw(dir + "/out.f32", want))
+                /* 5%: the error of the whole stack (34 blocks, each rounding its activations to bf16 as the reference does): the
+                 * final layer alone matches to 0.3% (the check below), the layers to 0.6-0.7% each */
+                fails += compare("device output (final layer, unpatchify; whole stack)", lat, want, 5e-2, 0.9998);
+            /* the device output alone, on the reference's own layers.29 (isolates the final layer from the layers' error) */
+            if (read_raw(dir + "/layers_29.f32", want)) {
+                float* J29 = static_cast<float*>(sddev::alloc(sizeof(float) * (size_t)S * DIM, false));
+                for (size_t i = 0; i < want.size(); ++i) J29[i] = want[i];
+                std::vector<float> lat2(16 * 32 * 32);
+                std::vector<float> ref_out;
+                if (zimage::dev_output(st, J29, jt, lat2.data()) && read_raw(dir + "/out.f32", ref_out))
+                    fails += compare("device output on the reference layers.29 (final layer alone)", lat2, ref_out, 2e-2);
+            }
+            else { printf("[FAIL] device stack did not complete\n"); fails++; }
+        }
     } else {
         printf("[SKIP] device path: %s\n", sddev::enabled() ? "the mapping cannot be registered" : "no device");
     }

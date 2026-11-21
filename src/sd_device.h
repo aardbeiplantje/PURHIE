@@ -101,6 +101,8 @@ void rms_norm(const float* x, int T, int C, const uint16_t* w, float eps, float*
 // Z-Image's block ops (sd_gpu.hip): x[t][c] *= s[c]; out[t][c] += g[c] * y[t][c]; g = silu(a) * b; the RoPE rotation of
 // q [T][heads][128] by fr [T][64][2] = (cos, sin) per pair
 void modulate(float* x, int T, int C, const float* s);
+// LayerNorm of each row without weights: y = (x - mean) rsqrt(var + eps)
+void layer_norm_plain(const float* x, int T, int C, float eps, float* y);
 void gate_add(float* out, int T, int C, const float* g, const float* y);
 void swiglu(const float* a, const float* b, float* g, size_t n);
 void rope(float* q, int T, int heads, const float* fr);  // y = x rsqrt(mean(x^2) + eps) w

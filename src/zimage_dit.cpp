@@ -309,7 +309,7 @@ bool dev_patch_embed(const SafeTensors& st, const float* latent, int C, int H, i
                     for (int c = 0; c < C; ++c)
                         tok[(ph * 2 + pw) * C + c] = latent[((size_t)c * H + ht * 2 + ph) * W + wt * 2 + pw];
         }
-    *out = static_cast<float*>(sddev::alloc(sizeof(float) * (size_t)N * dim, false));
+    if (!*out) *out = static_cast<float*>(sddev::alloc(sizeof(float) * (size_t)N * dim, false));  /* (or the caller's rows) */
     sddev::linear_bf16(tokens, N, w, in, dim, b, *out);
     return true;
 }
@@ -330,7 +330,7 @@ bool dev_caption_embed(const SafeTensors& st, const float* cap, int L, float** o
     for (int t = 0; t < Lpad; ++t) memcpy(padded + (size_t)t * D, cap + (size_t)(t < L ? t : L - 1) * D, sizeof(float) * D);
     float* normed = static_cast<float*>(sddev::alloc(sizeof(float) * (size_t)Lpad * D, false));
     sddev::rms_norm(padded, Lpad, D, wn, 1e-5f, normed);
-    *out = static_cast<float*>(sddev::alloc(sizeof(float) * (size_t)Lpad * dim, false));
+    if (!*out) *out = static_cast<float*>(sddev::alloc(sizeof(float) * (size_t)Lpad * dim, false));  /* (or the caller's rows) */
     sddev::linear_bf16(normed, Lpad, w, D, dim, b, *out);
     return true;
 }
@@ -357,29 +357,38 @@ bool named(const SafeTensors& st, const std::string& name, std::vector<size_t> s
 }
 }  // namespace
 
-void rope_table_image(int Ht, int Wt, int start, float* fr) {
+void rope_table_ids(const int* ids, int N, float* fr) {
     const int dims[3] = {32, 48, 48};
-    for (int ht = 0; ht < Ht; ++ht)
-        for (int wt = 0; wt < Wt; ++wt) {
-            const int ids[3] = {start, ht, wt};
-            float* row = fr + (size_t)(ht * Wt + wt) * 64 * 2;
-            int p = 0;
-            for (int ax = 0; ax < 3; ++ax)
-                for (int k = 0; k < dims[ax] / 2; ++k, ++p) {
-                    const double f = 1.0 / std::pow(256.0, (double)(2 * k) / (double)dims[ax]);
-                    const double ang = (double)ids[ax] * f;
-                    row[p * 2] = (float)std::cos(ang);
-                    row[p * 2 + 1] = (float)std::sin(ang);
-                }
-        }
+    for (int n = 0; n < N; ++n) {
+        float* row = fr + (size_t)n * 64 * 2;
+        int p = 0;
+        for (int ax = 0; ax < 3; ++ax)
+            for (int k = 0; k < dims[ax] / 2; ++k, ++p) {
+                const double f = 1.0 / std::pow(256.0, (double)(2 * k) / (double)dims[ax]);
+                const double ang = (double)ids[n * 3 + ax] * f;
+                row[p * 2] = (float)std::cos(ang);
+                row[p * 2 + 1] = (float)std::sin(ang);
+            }
+    }
 }
 
-bool dev_refiner_block(const SafeTensors& st, const std::string& pre, float* x, int N, const float* t256, const float* fr) {
+void rope_table_image(int Ht, int Wt, int start, float* fr) {
+    std::vector<int> ids((size_t)Ht * Wt * 3);
+    for (int ht = 0; ht < Ht; ++ht)
+        for (int wt = 0; wt < Wt; ++wt) {
+            int* t = ids.data() + (size_t)(ht * Wt + wt) * 3;
+            t[0] = start; t[1] = ht; t[2] = wt;
+        }
+    rope_table_ids(ids.data(), Ht * Wt, fr);
+}
+
+bool dev_refiner_block(const SafeTensors& st, const std::string& pre, float* x, int N, const float* t256, const float* fr,
+                       bool modulated) {
     if (!sddev::enabled()) { fprintf(stderr, "zimage: no device\n"); return false; }
     const int dim = 3840, H = 30, D = 128, F = 10240;
     const uint16_t *wada = nullptr, *wn1 = nullptr, *wn2 = nullptr, *wfn1 = nullptr, *wfn2 = nullptr, *wqkv = nullptr,
                    *wqn = nullptr, *wkn = nullptr, *wout = nullptr, *w1 = nullptr, *w2 = nullptr, *w3 = nullptr;
-    if (!named(st, pre + ".adaLN_modulation.0.weight", {4 * dim, 256}, wada) ||
+    if ((modulated && !named(st, pre + ".adaLN_modulation.0.weight", {4 * dim, 256}, wada)) ||
         !named(st, pre + ".attention_norm1.weight", {dim}, wn1) || !named(st, pre + ".attention_norm2.weight", {dim}, wn2) ||
         !named(st, pre + ".ffn_norm1.weight", {dim}, wfn1) || !named(st, pre + ".ffn_norm2.weight", {dim}, wfn2) ||
         !named(st, pre + ".attention.qkv.weight", {3 * dim, dim}, wqkv) ||
@@ -388,30 +397,30 @@ bool dev_refiner_block(const SafeTensors& st, const std::string& pre, float* x, 
         !named(st, pre + ".feed_forward.w1.weight", {F, dim}, w1) || !named(st, pre + ".feed_forward.w2.weight", {dim, F}, w2) ||
         !named(st, pre + ".feed_forward.w3.weight", {F, dim}, w3))
         return false;
-    /* the bias of the modulation as floats (small), and zero biases for the GEMMs without one */
-    std::vector<float> bada_h;
-    {
-        std::vector<size_t> s;
-        std::vector<float> tmp;
-        if (!st.get(pre + ".adaLN_modulation.0.bias", tmp, s) || s.size() != 1 || (int)s[0] != 4 * dim) {
+    /* the modulation: scale_msa = 1 + m0, gate_msa = tanh(m1), scale_mlp = 1 + m2, gate_mlp = tanh(m3); unmodulated
+     * blocks (the context refiners) use 1 for all four (exact: x * 1, x + 1 * y) */
+    DevBuf sc_msa(dim), g_msa(dim), sc_mlp(dim), g_mlp(dim);
+    if (modulated) {
+        std::vector<size_t> sb;
+        std::vector<float> bada_h;
+        if (!st.get(pre + ".adaLN_modulation.0.bias", bada_h, sb) || sb.size() != 1 || (int)sb[0] != 4 * dim) {
             fprintf(stderr, "zimage: %s.adaLN_modulation.0.bias missing\n", pre.c_str());
             return false;
         }
-        bada_h.swap(tmp);
+        DevBuf bada(4 * dim);
+        for (int i2 = 0; i2 < 4 * dim; ++i2) bada.p[i2] = bada_h[i2];
+        DevBuf mod(4 * dim);
+        sddev::linear_bf16(t256, 1, wada, 256, 4 * dim, bada.p, mod.p);
+        for (int c = 0; c < dim; ++c) {
+            sc_msa.p[c] = 1.0f + mod.p[c];
+            g_msa.p[c] = std::tanh(mod.p[dim + c]);
+            sc_mlp.p[c] = 1.0f + mod.p[2 * dim + c];
+            g_mlp.p[c] = std::tanh(mod.p[3 * dim + c]);
+        }
+    } else {
+        for (int c = 0; c < dim; ++c) sc_msa.p[c] = g_msa.p[c] = sc_mlp.p[c] = g_mlp.p[c] = 1.0f;
     }
-    DevBuf bada(4 * dim);
-    for (int i = 0; i < 4 * dim; ++i) bada.p[i] = bada_h[i];
     DevBuf zeros(3 * dim, true);  /* zeros: the biases of the GEMMs without one (11520 >= every output here) */
-    /* the modulation: scale_msa = 1 + m0, gate_msa = tanh(m1), scale_mlp = 1 + m2, gate_mlp = tanh(m3) */
-    DevBuf mod(4 * dim);
-    sddev::linear_bf16(t256, 1, wada, 256, 4 * dim, bada.p, mod.p);
-    DevBuf sc_msa(dim), g_msa(dim), sc_mlp(dim), g_mlp(dim);
-    for (int c = 0; c < dim; ++c) {
-        sc_msa.p[c] = 1.0f + mod.p[c];
-        g_msa.p[c] = std::tanh(mod.p[dim + c]);
-        sc_mlp.p[c] = 1.0f + mod.p[2 * dim + c];
-        g_mlp.p[c] = std::tanh(mod.p[3 * dim + c]);
-    }
     const float eps = 1e-5f;
     /* attention */
     DevBuf h(static_cast<size_t>(N) * dim);
@@ -445,6 +454,55 @@ bool dev_refiner_block(const SafeTensors& st, const std::string& pre, float* x, 
     sddev::linear_bf16(a.p, N, w2, F, dim, zeros.p, f.p);
     sddev::rms_norm(f.p, N, dim, wfn2, eps, f.p);
     sddev::gate_add(x, N, dim, g_mlp.p, f.p);
+    return true;
+}
+
+
+bool dev_caption_pad_rows(const SafeTensors& st, float* cap, int L, int Lpad) {
+    const uint16_t* pt = nullptr;
+    std::vector<size_t> s2;
+    if (!st.bf16_in_place("cap_pad_token", pt, s2) || s2.size() != 2 || s2[0] != 1 || s2[1] != 3840) {
+        fprintf(stderr, "zimage: cap_pad_token missing\n");
+        return false;
+    }
+    for (int t = L; t < Lpad; ++t)
+        for (int c = 0; c < 3840; ++c) cap[(size_t)t * 3840 + c] = bf16_to_f32(pt[c]);
+    return true;
+}
+
+
+bool dev_output(const SafeTensors& st, const float* J, const float* t256, float* lat) {
+    if (!sddev::enabled()) { fprintf(stderr, "zimage: no device\n"); return false; }
+    const int dim = 3840, Npix = 256, C = 64;
+    const uint16_t *wada = nullptr, *wlin = nullptr;
+    if (!named(st, "final_layer.adaLN_modulation.1.weight", {dim, 256}, wada) ||
+        !named(st, "final_layer.linear.weight", {C, dim}, wlin))
+        return false;
+    float *bada = nullptr, *blin = nullptr;
+    if (!bias_f32(st, "final_layer.adaLN_modulation.1.bias", dim, bada) || !bias_f32(st, "final_layer.linear.bias", C, blin))
+        return false;
+    /* the modulation: scale = 1 + Linear(SiLU(t)) */
+    DevBuf silu_t(256);
+    for (int i = 0; i < 256; ++i) silu_t.p[i] = t256[i] / (1.0f + std::exp(-t256[i]));
+    DevBuf scale(dim);
+    sddev::linear_bf16(silu_t.p, 1, wada, 256, dim, bada, scale.p);
+    for (int c = 0; c < dim; ++c) scale.p[c] += 1.0f;
+    /* norm_final (LayerNorm without affine), the scale, then the linear to 64 values per token */
+    DevBuf y(static_cast<size_t>(Npix) * dim);
+    sddev::layer_norm_plain(J, Npix, dim, 1e-6f, y.p);
+    sddev::modulate(y.p, Npix, dim, scale.p);
+    DevBuf tok(static_cast<size_t>(Npix) * C);
+    sddev::linear_bf16(y.p, Npix, wlin, dim, C, blin, tok.p);
+    /* unpatchify (the inverse of patchify): tok [16 x 16 tokens][(ph, pw, c)] -> lat [c][32][32] */
+    const int H = 32, W = 32, Wt = 16;
+    for (int ht = 0; ht < 16; ++ht)
+        for (int wt = 0; wt < Wt; ++wt) {
+            const float* t = tok.p + (size_t)(ht * Wt + wt) * C;
+            for (int ph = 0; ph < 2; ++ph)
+                for (int pw = 0; pw < 2; ++pw)
+                    for (int c = 0; c < 16; ++c)
+                        lat[((size_t)c * H + ht * 2 + ph) * W + wt * 2 + pw] = t[(ph * 2 + pw) * 16 + c];
+        }
     return true;
 }
 

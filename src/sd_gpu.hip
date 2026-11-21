@@ -264,6 +264,20 @@ sd_rms_norm(const float* x, int C, const uint16_t* w, float eps, float* y) {
     for (int i = threadIdx.x; i < C; i += SD_THREADS) yr[i] = xr[i] * inv * bf2f(w[i]);  /* BF16 weights (the Z-Image norms) */
 }
 
+// LayerNorm without weights (the Z-Image final layer): y = (x - mean) rsqrt(var + eps) of each row x[t][C]
+extern "C" __global__ void __launch_bounds__(SD_THREADS) zimage_layer_norm_plain(const float* x, int C, float eps, float* y) {
+    __shared__ float red[SD_THREADS];
+    const float* xr = x + (long)blockIdx.x * C;
+    float* yr = y + (long)blockIdx.x * C;
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) s += xr[i];
+    const float mean = block_sum(s, red) / (float)C;
+    float q = 0.0f;
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) q += (xr[i] - mean) * (xr[i] - mean);
+    const float inv = rsqrtf(block_sum(q, red) / (float)C + eps);
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) yr[i] = (xr[i] - mean) * inv;
+}
+
 // ---- Z-Image's block ops (zimage_dit.cpp): the AdaLN scale, the gated residual, SwiGLU and the RoPE rotation ----
 // x[i] *= s[i % C]: the scale of each channel over all tokens (x [T][C] row-major)
 extern "C" __global__ void __launch_bounds__(SD_THREADS) zimage_modulate(float* x, const float* s, int C, long n) {

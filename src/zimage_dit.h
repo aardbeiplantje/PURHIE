@@ -78,11 +78,23 @@ bool dev_caption_embed(const SafeTensors& st, const float* cap, int L, float** o
  * fr [N][64][2] = (cos, sin) per complex pair; axes (32, 48, 48) at theta 256 */
 void rope_table_image(int Ht, int Wt, int start, float* fr);
 
+/* the RoPE table of N tokens with ids (ids [N][3]: the time axis, h, w) */
+void rope_table_ids(const int* ids, int N, float* fr);
+
+/* the caption's pad rows (the rows from L on, of the padded [Lpad][3840] in shared memory) take the learned pad token
+ * (cap_pad_token, BF16 [1][3840]) as the reference does before the refiner */
+bool dev_caption_pad_rows(const SafeTensors& st, float* cap, int L, int Lpad);
+
 /* One noise refiner block (the modulated attention and SwiGLU blocks, as the reference's ZImageTransformerBlock) on the
  * device: x [N][3840] in shared memory, updated in place; t256: the timestep embedding (shared memory); fr: the RoPE table
  * of the N tokens. prefix: "noise_refiner.0" (the file's names). */
-bool dev_refiner_block(const SafeTensors& st, const std::string& prefix, float* x, int N, const float* t256, const float* fr);
+bool dev_refiner_block(const SafeTensors& st, const std::string& prefix, float* x, int N, const float* t256, const float* fr,
+                       bool modulated = true);
 
+
+/* The output: the final layer (LayerNorm, the scale 1 + Linear(SiLU(t)), the linear to 64) over the image rows of J (the
+ * first 256 rows of the joint sequence, [288][3840]), then unpatchify into lat [16][32][32] (host memory, the result) */
+bool dev_output(const SafeTensors& st, const float* J, const float* t256, float* lat);
 
 }  // namespace zimage
 
