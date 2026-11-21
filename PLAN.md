@@ -299,10 +299,12 @@ Quality and correctness:
   then caption rows, in one buffer), and the output (final layer, unpatchify). Relative errors: 0.1-0.24% for the embeddings,
   about 1% for the refiners, 0.6-0.7% for the layers, 0.3% for the final layer alone; the whole stack's output is 3.3% (cosine
   0.99989) from accumulated bf16 rounding (the reference rounds the same way). Kernels in sd_gpu.hip: sd_rms_norm,
-  zimage_modulate, zimage_gate_add, zimage_swiglu, zimage_rope, zimage_layer_norm_plain. Next: the sampler (the flow-matching
-  Euler steps, 8 steps, shift 3, guidance 0), the text encoder on the device (Qwen3-4B: the engine's qwen3 path reads GGUF; the
-  ComfyUI safetensors need a loader or a conversion), the Flux AE decoder (16 latent channels: not the SD VAE of sd.cpp), and the
-  end-to-end image against `/data/zimage-ref/out/image.png`.
+  zimage_modulate, zimage_gate_add, zimage_swiglu, zimage_rope, zimage_layer_norm_plain. The sampler is done (`dev_sample`: 8 flow-matching Euler steps from the reference's noise for seed 0, sigmas linspace(1, 1/8, 8) with a
+  static shift 3, the pipeline's negated velocity; 6.3% relative to the reference's final latent, cosine 0.99997, under 5 s on the GPU).
+  Assumption to verify: the shift 3 is the Z-Image scheduler's static shift (the reference run set it by hand; the official scheduler
+  config is not on this host). Next: the Flux AE decoder (16 latent channels: not the SD VAE of sd.cpp), checked against
+  `/data/zimage-ref/out/image.png`; then the text encoder on the device (Qwen3-4B: the engine's qwen3 path reads GGUF, the ComfyUI
+  safetensors need a loader or a conversion, and the hidden state at layer -2 must be exposed).
   the test). Not yet: the refiner blocks (AdaLN, joint attention with three-axis RoPE, QK-norm, SwiGLU), the 30 main layers, the
   final layer, unpatchify, and the GPU path. Those are next, stage by stage against `dit/stages.pt`.
 - **Z-Image-Turbo** (`diffusion_models/z_image_turbo_bf16`, S3-DiT, 30 blocks, dim 3840, text dim 2560 = Qwen3-4B, which the

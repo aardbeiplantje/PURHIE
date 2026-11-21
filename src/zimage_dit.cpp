@@ -506,4 +506,61 @@ bool dev_output(const SafeTensors& st, const float* J, const float* t256, float*
     return true;
 }
 
+
+bool dev_dit_forward(const SafeTensors& st, const float* lat, const float* cap, int L, float t, float* vel) {
+    if (!sddev::enabled()) { fprintf(stderr, "zimage: no device\n"); return false; }
+    const int NI = 256, LC = 32, S = NI + LC, DIM = 3840;
+    if (L < 1 || L > LC) { fprintf(stderr, "zimage: the caption has %d rows (1 to 32)\n", L); return false; }
+    /* the latent [16][1][32][32] as the patch embedding reads it (the sampler's latent, shared memory) */
+    float* J = static_cast<float*>(sddev::alloc(sizeof(float) * (size_t)S * DIM, false));
+    float* jx = J;
+    int nx = 0;
+    if (!dev_patch_embed(st, lat, 16, 32, 32, &jx, nx)) return false;
+    float* jt = static_cast<float*>(sddev::alloc(sizeof(float) * 256, false));
+    if (!dev_timestep_embed(st, t, jt)) return false;
+    float* fri = static_cast<float*>(sddev::alloc(sizeof(float) * NI * 64 * 2, false));
+    rope_table_image(16, 16, LC + 1, fri);
+    if (!dev_refiner_block(st, "noise_refiner.0", J, NI, jt, fri) || !dev_refiner_block(st, "noise_refiner.1", J, NI, jt, fri))
+        return false;
+    float* jc = J + (size_t)NI * DIM;
+    int lc = 0;
+    if (!dev_caption_embed(st, cap, L, &jc, lc)) return false;
+    /* the caption rows past L take the pad token (the reference's padding to 32) */
+    dev_caption_pad_rows(st, jc, L, LC);
+    int ids[LC * 3];
+    for (int r = 0; r < LC; ++r) { ids[r * 3] = 1 + r; ids[r * 3 + 1] = 0; ids[r * 3 + 2] = 0; }
+    float* frc = static_cast<float*>(sddev::alloc(sizeof(float) * LC * 64 * 2, false));
+    rope_table_ids(ids, LC, frc);
+    if (!dev_refiner_block(st, "context_refiner.0", jc, LC, nullptr, frc, false) ||
+        !dev_refiner_block(st, "context_refiner.1", jc, LC, nullptr, frc, false))
+        return false;
+    int idj[S * 3];
+    for (int r = 0; r < NI; ++r) { idj[r * 3] = LC + 1; idj[r * 3 + 1] = r / 16; idj[r * 3 + 2] = r % 16; }
+    for (int r = 0; r < LC; ++r) { idj[(NI + r) * 3] = 1 + r; idj[(NI + r) * 3 + 1] = 0; idj[(NI + r) * 3 + 2] = 0; }
+    float* frj = static_cast<float*>(sddev::alloc(sizeof(float) * S * 64 * 2, false));
+    rope_table_ids(idj, S, frj);
+    for (int layer = 0; layer < 30; ++layer)
+        if (!dev_refiner_block(st, "layers." + std::to_string(layer), J, S, jt, frj, true)) return false;
+    return dev_output(st, J, jt, vel);
+}
+
+bool dev_sample(const SafeTensors& st, const float* noise, const float* cap, int L, int steps, float shift, float* out) {
+    /* the sigmas: linspace(1, 1/steps, steps), shifted (shift * s / (1 + (shift - 1) s)), then 0 */
+    std::vector<double> sig(steps + 1);
+    for (int i = 0; i < steps; ++i) {
+        const double s0 = steps == 1 ? 1.0 : 1.0 + (1.0 / steps - 1.0) * i / (steps - 1);
+        sig[i] = shift * s0 / (1.0 + (shift - 1.0) * s0);
+    }
+    sig[steps] = 0.0;
+    std::vector<float> x(noise, noise + 16 * 32 * 32), vel(16 * 32 * 32);
+    for (int i = 0; i < steps; ++i) {
+        /* the model's timestep: (1000 - t) / 1000 with t = sigma * 1000, i.e. 1 - sigma */
+        if (!dev_dit_forward(st, x.data(), cap, L, (float)(1.0 - sig[i]), vel.data())) return false;
+        const float dt = (float)(sig[i + 1] - sig[i]);
+        for (size_t k = 0; k < x.size(); ++k) x[k] += dt * (-vel[k]);  /* the pipeline negates the output */
+    }
+    std::copy(x.begin(), x.end(), out);
+    return true;
+}
+
 }  // namespace zimage

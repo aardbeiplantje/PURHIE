@@ -96,6 +96,15 @@ bool dev_refiner_block(const SafeTensors& st, const std::string& prefix, float* 
  * first 256 rows of the joint sequence, [288][3840]), then unpatchify into lat [16][32][32] (host memory, the result) */
 bool dev_output(const SafeTensors& st, const float* J, const float* t256, float* lat);
 
+/* One forward of the DiT on the device: lat [16][32][32] (the latent: the sampler's), cap [L][2560] the caption's embeddings
+ * (L 1 to 32; the rows past L take the pad token), t the model's timestep (1 - sigma), vel [16][32][32] the velocity (host) */
+bool dev_dit_forward(const SafeTensors& st, const float* lat, const float* cap, int L, float t, float* vel);
+
+/* The sampler: the flow-matching Euler steps from the noise [16][32][32]; sigmas linspace(1, 1/steps, steps) shifted by shift,
+ * then 0; each step's velocity is negated (the pipeline's convention) and x += (sigma_next - sigma) * (-velocity). out: the final
+ * latent [16][32][32] */
+bool dev_sample(const SafeTensors& st, const float* noise, const float* cap, int L, int steps, float shift, float* out);
+
 }  // namespace zimage
 
 #endif /* ZIMAGE_DIT_H */

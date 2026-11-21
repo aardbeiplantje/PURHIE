@@ -179,6 +179,17 @@ int main(int argc, char** argv) {
             }
             else { printf("[FAIL] device stack did not complete\n"); fails++; }
         }
+        /* the sampler: 8 steps from the reference's initial noise (the pipeline's noise for seed 0), shift 3, against its final
+         * latent (the reference run used the same schedule; each step is a full device forward pass) */
+        {
+            std::vector<float> noise, latf(16 * 32 * 32);
+            if (read_raw(dir + "/noise.f32", noise) && zimage::dev_sample(st, noise.data(), cap.data(), (int)(cap.size() / 2560), 8, 3.0f, latf.data()) &&
+                read_raw(dir + "/latent_final.f32", want))
+                /* 10%: eight forward passes, each with the accumulated bf16 rounding (the whole stack alone: 3.3%); the cosine
+                 * (0.99997) is what shows the trajectory and the schedule agree */
+                fails += compare("device sampler (8 steps from the reference noise)", latf, want, 1e-1, 0.9999);
+            else { printf("[FAIL] device sampler did not run\n"); fails++; }
+        }
     } else {
         printf("[SKIP] device path: %s\n", sddev::enabled() ? "the mapping cannot be registered" : "no device");
     }
