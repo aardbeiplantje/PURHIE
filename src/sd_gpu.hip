@@ -312,6 +312,51 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) zimage_to_chw(const flo
     y[(long)c * HW + p] = x[i];
 }
 
+// ---- the text encoder (Qwen3, zimage_text.cpp) ----
+// RoPE, rotate-half convention: x [T][heads][128]; pairs (p, p + 64) of each head rotated by cos/sin [T][64]
+extern "C" __global__ void __launch_bounds__(SD_THREADS)
+zq_rope_half(float* x, int T, int heads, const float* cs, const float* sn, long n_pairs) {
+    const long j = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (j >= n_pairs) return;
+    const int P = 64, D = 128;
+    const long t = j / (heads * P);
+    const long rem = j % (heads * P);
+    const int h = (int)(rem / P), p = (int)(rem % P);
+    float* v = x + t * heads * D + h * D;
+    const float c = cs[t * P + p], s0 = sn[t * P + p];
+    const float a = v[p], b = v[p + P];
+    v[p] = a * c - b * s0;
+    v[p + P] = b * c + a * s0;
+}
+// causal attention with grouped KV heads: out[t][h][d] = softmax_j<=t(q[t][h] . k[j][h / (H / KVH)] / sqrt(128)) v[j][kvh][d].
+// One block per (query t, head h); T <= 64 (the scores in shared memory).
+extern "C" __global__ void __launch_bounds__(128)
+zq_causal_attn(const float* q, const float* k, const float* v, int T, int H, int KVH, float* out) {
+    __shared__ float sc[64];
+    const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    const int D = 128, kvh = h / (H / KVH);
+    const float scale = rsqrtf((float)D);
+    const float* qv = q + ((long)t * H + h) * D;
+    for (int j = d; j <= t; j += 128) {
+        const float* kv = k + ((long)j * KVH + kvh) * D;
+        float acc = 0.0f;
+        for (int e = 0; e < D; ++e) acc += qv[e] * kv[e];
+        sc[j] = acc * scale;
+    }
+    __syncthreads();
+    if (d == 0) {
+        float mx = -1e30f;
+        for (int j = 0; j <= t; ++j) mx = fmaxf(mx, sc[j]);
+        float sum = 0.0f;
+        for (int j = 0; j <= t; ++j) { sc[j] = expf(sc[j] - mx); sum += sc[j]; }
+        for (int j = 0; j <= t; ++j) sc[j] /= sum;
+    }
+    __syncthreads();
+    float acc = 0.0f;
+    for (int j = 0; j <= t; ++j) acc += sc[j] * v[((long)j * KVH + kvh) * D + d];
+    out[((long)t * H + h) * D + d] = acc;
+}
+
 // ---- Z-Image's block ops (zimage_dit.cpp): the AdaLN scale, the gated residual, SwiGLU and the RoPE rotation ----
 // x[i] *= s[i % C]: the scale of each channel over all tokens (x [T][C] row-major)
 extern "C" __global__ void __launch_bounds__(SD_THREADS) zimage_modulate(float* x, const float* s, int C, long n) {

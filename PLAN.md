@@ -304,9 +304,12 @@ Quality and correctness:
   Assumption to verify: the shift 3 is the Z-Image scheduler's static shift (the reference run set it by hand; the official scheduler
   config is not on this host). The Flux AE decoder is done (`src/zimage_vae.cpp`, `dev_vae_decode`: F32 weights read in place, the
   decoder's convolutions via `sd_device`'s `conv2d_f32`, GroupNorm via `group_norm_f32`, the mid attention on tokens: 3e-6 relative
-  to the reference decode of the final latent). Next: the text encoder on the device (Qwen3-4B: the engine's qwen3 path reads GGUF,
-  the ComfyUI safetensors need a loader or a conversion, and the hidden state at layer -2 must be exposed), then the whole pipeline
-  from the prompt to the image, against `/data/zimage-ref/out/image.png`.
+  to the reference decode of the final latent). The text encoder is on the device (`src/zimage_text.{h,cpp}`, `dev_text_encode`:
+  Qwen3-4B read in place from the ComfyUI safetensors, 35 layers, the hidden state before the final norm (layer -2 of the
+  reference), causal attention; 2.2% relative, cosine 0.999983 against the reference's ids and embeddings). The whole chain from the
+  prompt's ids (text encoder, 8-step sampler, Flux AE decode) runs on the device: against `/data/zimage-ref/out/image.png` (8-bit)
+  23% of the values match exactly, 79% within one level, mean absolute difference 1.03 levels. Next: the official Z-Image
+  scheduler shift (the static shift 3 is assumed), then the server's image path.
 - **Z-Image-Turbo** (`diffusion_models/z_image_turbo_bf16`, S3-DiT, 30 blocks, dim 3840, text dim 2560 = Qwen3-4B, which the
   engine runs as `qwen3`); VAE `vae/ae.safetensors` (16 channels, flow matching).
 - **SD1.5 family:** `checkpoints/DreamShaper_8_pruned` (LDM key names, 768-wide CLIP-L), `vae/vae-ft-mse-840000-ema-pruned`,

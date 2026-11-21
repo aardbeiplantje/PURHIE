@@ -12,6 +12,7 @@
 #include "zimage_dit.h"
 #include "sd_device.h"
 #include "zimage_vae.h"
+#include "zimage_text.h"
 
 #include <cmath>
 #include <cstdio>
@@ -201,6 +202,22 @@ int main(int argc, char** argv) {
                 zimage::dev_vae_decode(vae, lat0.data(), dec.data()))
                 fails += compare("device VAE decode (Flux AE, 16 channels)", dec, dec_ref, 2e-2, 0.9999);
             else { printf("[FAIL] device VAE did not run\n"); fails++; }
+        }
+        /* the text encoder (Qwen3-4B, its own mapping) on the prompt's chat-templated ids, against the reference's embeddings */
+        {
+            zimage::SafeTensors te("/comfyui/text_encoders/qwen_3_4b.safetensors");
+            std::vector<float> idsf, tref;
+            if (!te.ok() || !te.register_device()) { printf("[FAIL] the text encoder file: %s\n", te.error().c_str()); fails++; }
+            else if (read_raw(dir + "/te_ids.f32", idsf) && read_raw(dir + "/te_ref.f32", tref)) {
+                std::vector<int> ids(idsf.size());
+                for (size_t i = 0; i < ids.size(); ++i) ids[i] = (int)idsf[i];
+                std::vector<float> tout(tref.size());
+                if (zimage::dev_text_encode(te, ids.data(), (int)ids.size(), tout.data()))
+                    /* 3%: the same precision as a float32 run of the encoder against the bf16 reference (1.8%, cosine 0.999997): the
+                     * device's F32 activations with BF16 weights land at 2.2%, cosine 0.99998 */
+                    fails += compare("device text encoder (Qwen3-4B, layer -2)", tout, tref, 3e-2, 0.9999);
+                else { printf("[FAIL] device text encoder did not run\n"); fails++; }
+            } else { printf("[FAIL] the text encoder inputs are missing\n"); fails++; }
         }
     } else {
         printf("[SKIP] device path: %s\n", sddev::enabled() ? "the mapping cannot be registered" : "no device");

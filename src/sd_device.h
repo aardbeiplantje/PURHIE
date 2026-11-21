@@ -107,6 +107,10 @@ void modulate(float* x, int T, int C, const float* s);
 void layer_norm_plain(const float* x, int T, int C, float eps, float* y);
 // GroupNorm with F32 affine weights on the channel-major [C][HW] x: y = groupnorm(x) * gamma + beta (per channel)
 // transposes between channel-major [C][HW] and token-major [HW][C]
+// Qwen3's text encoder ops (sd_gpu.hip): RoPE by rotate-half (x [T][heads][128], cos/sin [T][64]); causal attention with
+// grouped KV heads (T <= 64): out [T][H][128] from q [T][H][128], k and v [T][KVH][128]
+void rope_half(float* x, int T, int heads, const float* cos, const float* sin);
+void causal_attn(const float* q, const float* k, const float* v, int T, int H, int KVH, float* out);
 void to_tokens(const float* x, int C, int HW, float* y);
 void to_chw(const float* x, int C, int HW, float* y);
 void group_norm_f32(const float* x, int C, int HW, int groups, const float* gamma, const float* beta, float eps, float* y);
