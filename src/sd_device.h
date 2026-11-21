@@ -89,6 +89,8 @@ void linear_tok(const float* x, int T, const uint16_t* W, int in, int out, const
 void linear_cm(const float* x, int T, const uint16_t* W, int in, int out, const uint16_t* b, float* y);
 // The same with float32 weights and bias (b may be null): y[t][o] = b[o] + sum_i x[t][i] W[o][i]
 void linear_f32(const float* x, int T, const float* W, int in, int out, const float* b, float* y);
+// conv2d with F32 weights [cout][cin][k][k] (read in place) and F32 bias; the same im2col + GEMM as conv2d
+void conv2d_f32(const float* x, int cin, int H, int W, const float* w, int cout, const float* b, int k, int p, int st, float* y, int Ho, int Wo);
 // The same with bfloat16 weights (the checkpoint's BF16, raw bits): y[t][o] = b[o] + sum_i x[t][i] W[o][i]
 void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, const float* b, float* y);
 void linear_to_cm(const float* x, int T, const uint16_t* W, int in, int out, const uint16_t* b, float* y, bool accumulate);
@@ -103,6 +105,11 @@ void rms_norm(const float* x, int T, int C, const uint16_t* w, float eps, float*
 void modulate(float* x, int T, int C, const float* s);
 // LayerNorm of each row without weights: y = (x - mean) rsqrt(var + eps)
 void layer_norm_plain(const float* x, int T, int C, float eps, float* y);
+// GroupNorm with F32 affine weights on the channel-major [C][HW] x: y = groupnorm(x) * gamma + beta (per channel)
+// transposes between channel-major [C][HW] and token-major [HW][C]
+void to_tokens(const float* x, int C, int HW, float* y);
+void to_chw(const float* x, int C, int HW, float* y);
+void group_norm_f32(const float* x, int C, int HW, int groups, const float* gamma, const float* beta, float eps, float* y);
 void gate_add(float* out, int T, int C, const float* g, const float* y);
 void swiglu(const float* a, const float* b, float* g, size_t n);
 void rope(float* q, int T, int heads, const float* fr);  // y = x rsqrt(mean(x^2) + eps) w

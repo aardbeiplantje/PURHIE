@@ -11,6 +11,7 @@
 //     -lamdhip64 -lhsa-runtime64 -Wl,-rpath,/opt/rocm/lib -fopenmp -lz -o zimage_dit_verify
 #include "zimage_dit.h"
 #include "sd_device.h"
+#include "zimage_vae.h"
 
 #include <cmath>
 #include <cstdio>
@@ -50,7 +51,7 @@ static int compare(const char* what, const std::vector<float>& got, const std::v
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) { fprintf(stderr, "usage: %s dit.safetensors raw_dir\n", argv[0]); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: %s dit.safetensors raw_dir [ae.safetensors]\n", argv[0]); return 2; }
     const std::string dir = argv[2];
     zimage::SafeTensors st(argv[1]);
     if (!st.ok()) { fprintf(stderr, "%s\n", st.error().c_str()); return 1; }
@@ -77,7 +78,10 @@ int main(int argc, char** argv) {
     if (read_raw(dir + "/cap_embedder.f32", want)) fails += compare("cap_embedder (RMSNorm + linear, padded)", ce, want, 2e-2);
 
     /* the device path: the mapping registered (read in place), the activations in shared memory */
-    if (sddev::enabled() && st.register_device()) {
+    /* the autoencoder (the VAE's file) for the decoder: its own mapping */
+    zimage::SafeTensors vae(argc > 3 ? argv[3] : "/comfyui/vae/ae.safetensors");
+    if (!vae.ok()) { fprintf(stderr, "%s\n", vae.error().c_str()); return 1; }
+    if (sddev::enabled() && st.register_device() && vae.register_device()) {
         float* td = static_cast<float*>(sddev::alloc(sizeof(float) * 256, false));
         if (zimage::dev_timestep_embed(st, t[0], td) && read_raw(dir + "/t_embedder.f32", want)) {
             std::vector<float> tv(td, td + 256);
@@ -189,6 +193,14 @@ int main(int argc, char** argv) {
                  * (0.99997) is what shows the trajectory and the schedule agree */
                 fails += compare("device sampler (8 steps from the reference noise)", latf, want, 1e-1, 0.9999);
             else { printf("[FAIL] device sampler did not run\n"); fails++; }
+        }
+        /* the Flux AE decoder on the reference's final latent, against the reference decode (float pixels) */
+        {
+            std::vector<float> lat0, dec_ref, dec(3 * 256 * 256);
+            if (read_raw(dir + "/vae_latent.f32", lat0) && read_raw(dir + "/vae_decode.f32", dec_ref) &&
+                zimage::dev_vae_decode(vae, lat0.data(), dec.data()))
+                fails += compare("device VAE decode (Flux AE, 16 channels)", dec, dec_ref, 2e-2, 0.9999);
+            else { printf("[FAIL] device VAE did not run\n"); fails++; }
         }
     } else {
         printf("[SKIP] device path: %s\n", sddev::enabled() ? "the mapping cannot be registered" : "no device");

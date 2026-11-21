@@ -278,6 +278,40 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) zimage_layer_norm_plain
     for (int i = threadIdx.x; i < C; i += SD_THREADS) yr[i] = (xr[i] - mean) * inv;
 }
 
+// GroupNorm with F32 affine weights on [C][HW] (channel-major): one block per group; y = (x - mean) rsqrt(var + eps) * g + b
+extern "C" __global__ void __launch_bounds__(SD_THREADS)
+zimage_group_norm_f32(const float* x, int C, int HW, int groups, const float* g, const float* bt, float eps, float* y) {
+    __shared__ float red[SD_THREADS];
+    const int per = C / groups;
+    const int grp = blockIdx.x;
+    const long n = (long)per * HW;
+    const float* xg = x + (long)grp * per * HW;
+    float s = 0.0f;
+    for (long i = threadIdx.x; i < n; i += SD_THREADS) s += xg[i];
+    const float mean = block_sum(s, red) / (float)n;
+    float q = 0.0f;
+    for (long i = threadIdx.x; i < n; i += SD_THREADS) { const float d = xg[i] - mean; q += d * d; }
+    const float inv = rsqrtf(block_sum(q, red) / (float)n + eps);
+    for (long i = threadIdx.x; i < n; i += SD_THREADS) {
+        const int c = grp * per + (int)(i / HW);
+        y[(long)grp * per * HW + i] = (xg[i] - mean) * inv * g[c] + bt[c];
+    }
+}
+
+// [C][HW] -> [HW][C] and back (the decoder's attention works on tokens)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) zimage_to_tokens(const float* x, int C, int HW, float* y) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= (long)C * HW) return;
+    const int c = (int)(i / HW), p = (int)(i % HW);
+    y[(long)p * C + c] = x[i];
+}
+extern "C" __global__ void __launch_bounds__(SD_THREADS) zimage_to_chw(const float* x, int C, int HW, float* y) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= (long)C * HW) return;
+    const int p = (int)(i / C), c = (int)(i % C);
+    y[(long)c * HW + p] = x[i];
+}
+
 // ---- Z-Image's block ops (zimage_dit.cpp): the AdaLN scale, the gated residual, SwiGLU and the RoPE rotation ----
 // x[i] *= s[i % C]: the scale of each channel over all tokens (x [T][C] row-major)
 extern "C" __global__ void __launch_bounds__(SD_THREADS) zimage_modulate(float* x, const float* s, int C, long n) {

@@ -30,7 +30,7 @@ int g_state = -1;  // -1: not tried, 0: host only, 1: device
 hipModule_t g_mod = nullptr;
 hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn_sum = nullptr, f_gn_sq = nullptr,
               f_gn_apply = nullptr, f_silu = nullptr, f_add = nullptr, f_upsample2 = nullptr, f_softmax = nullptr,
-              f_layer_norm = nullptr, f_rms_norm = nullptr, f_zm_modulate = nullptr, f_zm_gate_add = nullptr, f_zm_swiglu = nullptr, f_zm_rope = nullptr, f_zm_ln_plain = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma256b = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
+              f_layer_norm = nullptr, f_rms_norm = nullptr, f_zm_modulate = nullptr, f_zm_gate_add = nullptr, f_zm_swiglu = nullptr, f_zm_rope = nullptr, f_zm_ln_plain = nullptr, f_gn_f32 = nullptr, f_to_tok = nullptr, f_to_chw = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma256b = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
               f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr;
 
 constexpr int kThreads = 256;
@@ -60,7 +60,7 @@ bool init() {
         {&f_transpose_pad, "sd_transpose_pad"}, {&f_softmax_bf16, "sd_softmax_bf16"}, {&f_softmax_bf16w, "sd_softmax_bf16_w"},
         {&f_gn_sum, "sd_gn_sum"},       {&f_gn_sq, "sd_gn_sq"},         {&f_gn_apply, "sd_gn_apply"},
         {&f_silu, "sd_silu"},           {&f_add, "sd_add"},             {&f_upsample2, "sd_upsample2"},
-        {&f_softmax, "sd_softmax"},     {&f_layer_norm, "sd_layer_norm"}, {&f_rms_norm, "sd_rms_norm"}, {&f_zm_modulate, "zimage_modulate"}, {&f_zm_gate_add, "zimage_gate_add"}, {&f_zm_swiglu, "zimage_swiglu"}, {&f_zm_rope, "zimage_rope"}, {&f_zm_ln_plain, "zimage_layer_norm_plain"}, {&f_geglu, "sd_geglu"},
+        {&f_softmax, "sd_softmax"},     {&f_layer_norm, "sd_layer_norm"}, {&f_rms_norm, "sd_rms_norm"}, {&f_zm_modulate, "zimage_modulate"}, {&f_zm_gate_add, "zimage_gate_add"}, {&f_zm_swiglu, "zimage_swiglu"}, {&f_zm_rope, "zimage_rope"}, {&f_zm_ln_plain, "zimage_layer_norm_plain"}, {&f_gn_f32, "zimage_group_norm_f32"}, {&f_to_tok, "zimage_to_tokens"}, {&f_to_chw, "zimage_to_chw"}, {&f_geglu, "sd_geglu"},
     };
     for (const Entry& e : entries)
         if (hipModuleGetFunction(e.f, g_mod, e.name) != hipSuccess) return false;
@@ -161,6 +161,25 @@ void conv2d(const float* x, int cin, int H, int W, const uint16_t* w, int cout, 
         const dim3 g((unsigned)((nc + kThreads - 1) / kThreads), (unsigned)K, 1);
         launch(f_im2col, g, a1);
         gemm<uint16_t>(f_gemm_ah, w, K, col, nc, 1, y + n0l, HWo, 1, b, 1.0f, 0.0f, cout, nc, K);
+    }
+    sync();
+    release(col, sizeof(float) * (size_t)K * nc_max);
+}
+
+void conv2d_f32(const float* x, int cin, int H, int W, const float* w, int cout, const float* b, int k, int p, int st, float* y,
+                int Ho, int Wo) {
+    const long HWo = (long)Ho * Wo;
+    const int K = cin * k * k;
+    if (HWo <= 0 || K <= 0) return;
+    const long nc_max = std::max<long>(1, std::min<long>(HWo, (long)(kColFloats / (size_t)K)));
+    float* col = static_cast<float*>(alloc(sizeof(float) * (size_t)K * nc_max));
+    for (long n0l = 0; n0l < HWo; n0l += nc_max) {
+        const int n0 = (int)n0l;
+        const int nc = (int)std::min<long>(nc_max, HWo - n0l);
+        void* a1[] = {(void*)&x, (void*)&cin, (void*)&H, (void*)&W, (void*)&k, (void*)&p, (void*)&st, (void*)&Wo, (void*)&n0, (void*)&nc, (void*)&col};
+        const dim3 g((unsigned)((nc + kThreads - 1) / kThreads), (unsigned)K, 1);
+        launch(f_im2col, g, a1);
+        gemm<float>(f_gemm_af, w, K, col, nc, 1, y + n0l, HWo, 1, nullptr, 1.0f, 0.0f, cout, nc, K, b);
     }
     sync();
     release(col, sizeof(float) * (size_t)K * nc_max);
@@ -295,6 +314,26 @@ void upsample2(const float* x, int C, int H, int W, float* y) {
     const size_t total = (size_t)C * 2 * H * 2 * W;
     void* a[] = {(void*)&x, (void*)&C, (void*)&H, (void*)&W, (void*)&y};
     launch(f_upsample2, dim3(blocks(total), 1, 1), a);
+    sync();
+}
+
+void to_tokens(const float* x, int C, int HW, float* y) {
+    const long n = (long)C * HW;
+    void* a[] = {(void*)&x, (void*)&C, (void*)&HW, (void*)&y};
+    launch(f_to_tok, dim3((unsigned)((n + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void to_chw(const float* x, int C, int HW, float* y) {
+    const long n = (long)C * HW;
+    void* a[] = {(void*)&x, (void*)&C, (void*)&HW, (void*)&y};
+    launch(f_to_chw, dim3((unsigned)((n + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void group_norm_f32(const float* x, int C, int HW, int groups, const float* gamma, const float* beta, float eps, float* y) {
+    void* a[] = {(void*)&x, (void*)&C, (void*)&HW, (void*)&groups, (void*)&gamma, (void*)&beta, (void*)&eps, (void*)&y};
+    launch(f_gn_f32, dim3((unsigned)groups, 1, 1), a);
     sync();
 }
 

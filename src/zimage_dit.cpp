@@ -154,6 +154,14 @@ bool SafeTensors::bf16_in_place(const std::string& name, const uint16_t*& ptr, s
     return true;
 }
 
+bool SafeTensors::f32_in_place(const std::string& name, const float*& ptr, std::vector<size_t>& shape) const {
+    auto it = t_.find(name);
+    if (it == t_.end() || it->second.dtype != "F32") return false;
+    ptr = reinterpret_cast<const float*>(base_ + data_ + it->second.begin);
+    shape = it->second.shape;
+    return true;
+}
+
 void linear(const float* x, int T, int in, const std::vector<float>& W, int out, const std::vector<float>& b, float* y) {
     for (int t = 0; t < T; ++t) {
         const float* xt = x + (size_t)t * in;

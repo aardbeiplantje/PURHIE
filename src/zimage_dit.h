@@ -30,6 +30,8 @@ public:
     bool register_device() const;
     /* a BF16 tensor's bits in the mapping (read in place by the GPU), its shape; false if absent or not BF16 */
     bool bf16_in_place(const std::string& name, const uint16_t*& ptr, std::vector<size_t>& shape) const;
+    /* an F32 tensor's floats in the mapping (read in place by the GPU) */
+    bool f32_in_place(const std::string& name, const float*& ptr, std::vector<size_t>& shape) const;
 
 private:
     struct Entry { std::string dtype; std::vector<size_t> shape; size_t begin, end; };
