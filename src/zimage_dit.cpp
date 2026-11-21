@@ -335,4 +335,117 @@ bool dev_caption_embed(const SafeTensors& st, const float* cap, int L, float** o
     return true;
 }
 
+
+/* ---- one noise refiner block on the device ---- */
+namespace {
+/* a device buffer of count floats, released at its end */
+struct DevBuf {
+    float* p = nullptr;
+    size_t n = 0;
+    explicit DevBuf(size_t count, bool zero = false) : n(count) { p = static_cast<float*>(sddev::alloc(sizeof(float) * count, zero)); }
+    ~DevBuf() { if (p) sddev::release(p, sizeof(float) * n); }
+    DevBuf(const DevBuf&) = delete;
+    DevBuf& operator=(const DevBuf&) = delete;
+};
+bool named(const SafeTensors& st, const std::string& name, std::vector<size_t> shape, const uint16_t*& ptr) {
+    std::vector<size_t> s;
+    if (!st.bf16_in_place(name, ptr, s) || s != shape) {
+        fprintf(stderr, "zimage: %s missing or of the wrong shape\n", name.c_str());
+        return false;
+    }
+    return true;
+}
+}  // namespace
+
+void rope_table_image(int Ht, int Wt, int start, float* fr) {
+    const int dims[3] = {32, 48, 48};
+    for (int ht = 0; ht < Ht; ++ht)
+        for (int wt = 0; wt < Wt; ++wt) {
+            const int ids[3] = {start, ht, wt};
+            float* row = fr + (size_t)(ht * Wt + wt) * 64 * 2;
+            int p = 0;
+            for (int ax = 0; ax < 3; ++ax)
+                for (int k = 0; k < dims[ax] / 2; ++k, ++p) {
+                    const double f = 1.0 / std::pow(256.0, (double)(2 * k) / (double)dims[ax]);
+                    const double ang = (double)ids[ax] * f;
+                    row[p * 2] = (float)std::cos(ang);
+                    row[p * 2 + 1] = (float)std::sin(ang);
+                }
+        }
+}
+
+bool dev_refiner_block(const SafeTensors& st, const std::string& pre, float* x, int N, const float* t256, const float* fr) {
+    if (!sddev::enabled()) { fprintf(stderr, "zimage: no device\n"); return false; }
+    const int dim = 3840, H = 30, D = 128, F = 10240;
+    const uint16_t *wada = nullptr, *wn1 = nullptr, *wn2 = nullptr, *wfn1 = nullptr, *wfn2 = nullptr, *wqkv = nullptr,
+                   *wqn = nullptr, *wkn = nullptr, *wout = nullptr, *w1 = nullptr, *w2 = nullptr, *w3 = nullptr;
+    if (!named(st, pre + ".adaLN_modulation.0.weight", {4 * dim, 256}, wada) ||
+        !named(st, pre + ".attention_norm1.weight", {dim}, wn1) || !named(st, pre + ".attention_norm2.weight", {dim}, wn2) ||
+        !named(st, pre + ".ffn_norm1.weight", {dim}, wfn1) || !named(st, pre + ".ffn_norm2.weight", {dim}, wfn2) ||
+        !named(st, pre + ".attention.qkv.weight", {3 * dim, dim}, wqkv) ||
+        !named(st, pre + ".attention.q_norm.weight", {D}, wqn) || !named(st, pre + ".attention.k_norm.weight", {D}, wkn) ||
+        !named(st, pre + ".attention.out.weight", {dim, dim}, wout) ||
+        !named(st, pre + ".feed_forward.w1.weight", {F, dim}, w1) || !named(st, pre + ".feed_forward.w2.weight", {dim, F}, w2) ||
+        !named(st, pre + ".feed_forward.w3.weight", {F, dim}, w3))
+        return false;
+    /* the bias of the modulation as floats (small), and zero biases for the GEMMs without one */
+    std::vector<float> bada_h;
+    {
+        std::vector<size_t> s;
+        std::vector<float> tmp;
+        if (!st.get(pre + ".adaLN_modulation.0.bias", tmp, s) || s.size() != 1 || (int)s[0] != 4 * dim) {
+            fprintf(stderr, "zimage: %s.adaLN_modulation.0.bias missing\n", pre.c_str());
+            return false;
+        }
+        bada_h.swap(tmp);
+    }
+    DevBuf bada(4 * dim);
+    for (int i = 0; i < 4 * dim; ++i) bada.p[i] = bada_h[i];
+    DevBuf zeros(3 * dim, true);  /* zeros: the biases of the GEMMs without one (11520 >= every output here) */
+    /* the modulation: scale_msa = 1 + m0, gate_msa = tanh(m1), scale_mlp = 1 + m2, gate_mlp = tanh(m3) */
+    DevBuf mod(4 * dim);
+    sddev::linear_bf16(t256, 1, wada, 256, 4 * dim, bada.p, mod.p);
+    DevBuf sc_msa(dim), g_msa(dim), sc_mlp(dim), g_mlp(dim);
+    for (int c = 0; c < dim; ++c) {
+        sc_msa.p[c] = 1.0f + mod.p[c];
+        g_msa.p[c] = std::tanh(mod.p[dim + c]);
+        sc_mlp.p[c] = 1.0f + mod.p[2 * dim + c];
+        g_mlp.p[c] = std::tanh(mod.p[3 * dim + c]);
+    }
+    const float eps = 1e-5f;
+    /* attention */
+    DevBuf h(static_cast<size_t>(N) * dim);
+    sddev::rms_norm(x, N, dim, wn1, eps, h.p);
+    sddev::modulate(h.p, N, dim, sc_msa.p);
+    const size_t sq = (size_t)dim * dim;
+    DevBuf q(static_cast<size_t>(N) * dim), k(static_cast<size_t>(N) * dim), v(static_cast<size_t>(N) * dim);
+    sddev::linear_bf16(h.p, N, wqkv, dim, dim, zeros.p, q.p);
+    sddev::linear_bf16(h.p, N, wqkv + sq, dim, dim, zeros.p, k.p);
+    sddev::linear_bf16(h.p, N, wqkv + 2 * sq, dim, dim, zeros.p, v.p);
+    sddev::rms_norm(q.p, N * H, D, wqn, eps, q.p);   /* the per-head QK norms: rows of 128 */
+    sddev::rms_norm(k.p, N * H, D, wkn, eps, k.p);
+    sddev::rope(q.p, N, H, fr);
+    sddev::rope(k.p, N, H, fr);
+    DevBuf att(static_cast<size_t>(N) * dim);
+    sddev::attention(q.p, N, k.p, v.p, N, dim, H, att.p);
+    DevBuf o(static_cast<size_t>(N) * dim);
+    sddev::linear_bf16(att.p, N, wout, dim, dim, zeros.p, o.p);
+    sddev::rms_norm(o.p, N, dim, wn2, eps, o.p);
+    sddev::gate_add(x, N, dim, g_msa.p, o.p);
+    /* feed-forward (SwiGLU) */
+    DevBuf h2(static_cast<size_t>(N) * dim);
+    sddev::rms_norm(x, N, dim, wfn1, eps, h2.p);
+    sddev::modulate(h2.p, N, dim, sc_mlp.p);
+    DevBuf zerosF(F, true);
+    DevBuf a(static_cast<size_t>(N) * F), b(static_cast<size_t>(N) * F);
+    sddev::linear_bf16(h2.p, N, w1, dim, F, zerosF.p, a.p);
+    sddev::linear_bf16(h2.p, N, w3, dim, F, zerosF.p, b.p);
+    sddev::swiglu(a.p, b.p, a.p, (size_t)N * F);
+    DevBuf f(static_cast<size_t>(N) * dim);
+    sddev::linear_bf16(a.p, N, w2, F, dim, zeros.p, f.p);
+    sddev::rms_norm(f.p, N, dim, wfn2, eps, f.p);
+    sddev::gate_add(x, N, dim, g_mlp.p, f.p);
+    return true;
+}
+
 }  // namespace zimage

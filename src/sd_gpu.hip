@@ -264,6 +264,37 @@ sd_rms_norm(const float* x, int C, const uint16_t* w, float eps, float* y) {
     for (int i = threadIdx.x; i < C; i += SD_THREADS) yr[i] = xr[i] * inv * bf2f(w[i]);  /* BF16 weights (the Z-Image norms) */
 }
 
+// ---- Z-Image's block ops (zimage_dit.cpp): the AdaLN scale, the gated residual, SwiGLU and the RoPE rotation ----
+// x[i] *= s[i % C]: the scale of each channel over all tokens (x [T][C] row-major)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) zimage_modulate(float* x, const float* s, int C, long n) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i < n) x[i] *= s[i % C];
+}
+// out[i] += g[i % C] * y[i]: the gated residual
+extern "C" __global__ void __launch_bounds__(SD_THREADS) zimage_gate_add(float* out, const float* g, const float* y, int C, long n) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i < n) out[i] += g[i % C] * y[i];
+}
+// SwiGLU: g[i] = silu(a[i]) * b[i]
+extern "C" __global__ void __launch_bounds__(SD_THREADS) zimage_swiglu(const float* a, const float* b, float* g, long n) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i < n) g[i] = a[i] / (1.0f + expf(-a[i])) * b[i];
+}
+// RoPE on q [T][heads][D] (D = 128: 64 complex pairs; the pairs (2p, 2p+1) of each head), fr [T][64][2] = (cos, sin)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) zimage_rope(float* q, const float* fr, int T, int heads, long n_pairs) {
+    const long j = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (j >= n_pairs) return;
+    const int D = 128, P = 64;
+    const long t = j / (heads * P);
+    const long rem = j % (heads * P);
+    const int h = (int)(rem / P), p = (int)(rem % P);
+    float* v = q + t * heads * D + h * D + 2 * p;
+    const float c = fr[(t * P + p) * 2], sn = fr[(t * P + p) * 2 + 1];
+    const float re = v[0], im = v[1];
+    v[0] = re * c - im * sn;
+    v[1] = re * sn + im * c;
+}
+
 // GEGLU: g[t][j] = hid * gelu(gate) for pj[t] = (hid [ff], gate [ff])
 extern "C" __global__ void __launch_bounds__(SD_THREADS) sd_geglu(const float* pj, long rows, int ff, float* g) {
     const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;

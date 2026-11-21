@@ -30,7 +30,7 @@ int g_state = -1;  // -1: not tried, 0: host only, 1: device
 hipModule_t g_mod = nullptr;
 hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn_sum = nullptr, f_gn_sq = nullptr,
               f_gn_apply = nullptr, f_silu = nullptr, f_add = nullptr, f_upsample2 = nullptr, f_softmax = nullptr,
-              f_layer_norm = nullptr, f_rms_norm = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma256b = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
+              f_layer_norm = nullptr, f_rms_norm = nullptr, f_zm_modulate = nullptr, f_zm_gate_add = nullptr, f_zm_swiglu = nullptr, f_zm_rope = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma256b = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
               f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr;
 
 constexpr int kThreads = 256;
@@ -60,7 +60,7 @@ bool init() {
         {&f_transpose_pad, "sd_transpose_pad"}, {&f_softmax_bf16, "sd_softmax_bf16"}, {&f_softmax_bf16w, "sd_softmax_bf16_w"},
         {&f_gn_sum, "sd_gn_sum"},       {&f_gn_sq, "sd_gn_sq"},         {&f_gn_apply, "sd_gn_apply"},
         {&f_silu, "sd_silu"},           {&f_add, "sd_add"},             {&f_upsample2, "sd_upsample2"},
-        {&f_softmax, "sd_softmax"},     {&f_layer_norm, "sd_layer_norm"}, {&f_rms_norm, "sd_rms_norm"}, {&f_geglu, "sd_geglu"},
+        {&f_softmax, "sd_softmax"},     {&f_layer_norm, "sd_layer_norm"}, {&f_rms_norm, "sd_rms_norm"}, {&f_zm_modulate, "zimage_modulate"}, {&f_zm_gate_add, "zimage_gate_add"}, {&f_zm_swiglu, "zimage_swiglu"}, {&f_zm_rope, "zimage_rope"}, {&f_geglu, "sd_geglu"},
     };
     for (const Entry& e : entries)
         if (hipModuleGetFunction(e.f, g_mod, e.name) != hipSuccess) return false;
@@ -295,6 +295,34 @@ void upsample2(const float* x, int C, int H, int W, float* y) {
     const size_t total = (size_t)C * 2 * H * 2 * W;
     void* a[] = {(void*)&x, (void*)&C, (void*)&H, (void*)&W, (void*)&y};
     launch(f_upsample2, dim3(blocks(total), 1, 1), a);
+    sync();
+}
+
+void modulate(float* x, int T, int C, const float* s) {
+    long n = (long)T * C;
+    void* a[] = {(void*)&x, (void*)&s, (void*)&C, (void*)&n};
+    launch(f_zm_modulate, dim3((unsigned)((n + kThreads - 1) / kThreads)), a);
+    sync();
+}
+
+void gate_add(float* out, int T, int C, const float* g, const float* y) {
+    long n = (long)T * C;
+    void* a[] = {(void*)&out, (void*)&g, (void*)&y, (void*)&C, (void*)&n};
+    launch(f_zm_gate_add, dim3((unsigned)((n + kThreads - 1) / kThreads)), a);
+    sync();
+}
+
+void swiglu(const float* a0, const float* b0, float* g, size_t n0) {
+    long n = (long)n0;
+    void* a[] = {(void*)&a0, (void*)&b0, (void*)&g, (void*)&n};
+    launch(f_zm_swiglu, dim3((unsigned)((n + kThreads - 1) / kThreads)), a);
+    sync();
+}
+
+void rope(float* q, int T, int heads, const float* fr) {
+    long n = (long)T * heads * 64;
+    void* a[] = {(void*)&q, (void*)&fr, (void*)&T, (void*)&heads, (void*)&n};
+    launch(f_zm_rope, dim3((unsigned)((n + kThreads - 1) / kThreads)), a);
     sync();
 }
 

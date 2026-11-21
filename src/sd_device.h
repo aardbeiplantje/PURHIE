@@ -97,7 +97,13 @@ void silu(float* x, size_t n);
 void add(float* out, const float* x, size_t n);
 void upsample2(const float* x, int C, int H, int W, float* y);
 void layer_norm(const float* x, int T, int C, const uint16_t* w, const uint16_t* b, float eps, float* y);
-void rms_norm(const float* x, int T, int C, const uint16_t* w, float eps, float* y);  // y = x rsqrt(mean(x^2) + eps) w
+void rms_norm(const float* x, int T, int C, const uint16_t* w, float eps, float* y);
+// Z-Image's block ops (sd_gpu.hip): x[t][c] *= s[c]; out[t][c] += g[c] * y[t][c]; g = silu(a) * b; the RoPE rotation of
+// q [T][heads][128] by fr [T][64][2] = (cos, sin) per pair
+void modulate(float* x, int T, int C, const float* s);
+void gate_add(float* out, int T, int C, const float* g, const float* y);
+void swiglu(const float* a, const float* b, float* g, size_t n);
+void rope(float* q, int T, int heads, const float* fr);  // y = x rsqrt(mean(x^2) + eps) w
 void geglu(const float* pj, long rows, int ff, float* g);
 // The attention over token rows: q [Tq][C], k and v [Tk][C] (heads of width C / heads), out [Tq][C]; scores scaled by 1/sqrt(D).
 void attention(const float* q, int Tq, const float* k, const float* v, int Tk, int C, int heads, float* out);

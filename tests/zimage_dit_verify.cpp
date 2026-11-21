@@ -88,6 +88,13 @@ int main(int argc, char** argv) {
             std::vector<float> xv(xd, xd + (size_t)N * 3840);
             fails += compare("device x_embedder (patchify + GEMM)", xv, want, 2e-2);
         } else fails++;
+        /* the first noise refiner block on the device, from the embeddings above (in place in xd) */
+        float* fr = static_cast<float*>(sddev::alloc(sizeof(float) * 256 * 64 * 2, false));
+        zimage::rope_table_image(16, 16, 33, fr);
+        if (zimage::dev_refiner_block(st, "noise_refiner.0", xd, N, td, fr) && read_raw(dir + "/noise_refiner0.f32", want)) {
+            std::vector<float> rv(xd, xd + (size_t)N * 3840);
+            fails += compare("device noise_refiner.0 (AdaLN, joint RoPE attention, SwiGLU)", rv, want, 2e-2);
+        } else fails++;
         float* cd = nullptr;
         int Lc = 0;
         if (zimage::dev_caption_embed(st, cap.data(), (int)(cap.size() / 2560), &cd, Lc) && read_raw(dir + "/cap_embedder.f32", want)) {

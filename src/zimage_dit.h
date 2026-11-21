@@ -74,6 +74,16 @@ bool dev_patch_embed(const SafeTensors& st, const float* latent, int C, int H, i
  * to 32 by repeating the last row) */
 bool dev_caption_embed(const SafeTensors& st, const float* cap, int L, float** out, int& Lpad);
 
+/* The RoPE table of the image tokens of an Ht x Wt patch grid (ids (start, h, w) as the reference: the time axis is start):
+ * fr [N][64][2] = (cos, sin) per complex pair; axes (32, 48, 48) at theta 256 */
+void rope_table_image(int Ht, int Wt, int start, float* fr);
+
+/* One noise refiner block (the modulated attention and SwiGLU blocks, as the reference's ZImageTransformerBlock) on the
+ * device: x [N][3840] in shared memory, updated in place; t256: the timestep embedding (shared memory); fr: the RoPE table
+ * of the N tokens. prefix: "noise_refiner.0" (the file's names). */
+bool dev_refiner_block(const SafeTensors& st, const std::string& prefix, float* x, int N, const float* t256, const float* fr);
+
+
 }  // namespace zimage
 
 #endif /* ZIMAGE_DIT_H */
