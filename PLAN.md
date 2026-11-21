@@ -272,6 +272,29 @@ Quality and correctness:
 
 `/comfyui` holds the user's model library: 28 model files, about 167 GB (safetensors; all valid). Nothing is wired yet.
 
+- **Z-Image-Turbo, status (2026-11-20).** Headers read (no weights loaded by us): the DiT is 453 BF16 tensors, `layers.N` (30)
+  with `attention.qkv` (11520 x 3840: 30 heads of 128 for q, k, v), `attention.out`, per-head `q_norm`/`k_norm`, `adaLN_modulation`
+  (256 -> 15360: four 3840 vectors), a SwiGLU feed-forward (`w1`, `w3` 10240 x 3840; `w2` 3840 x 10240), four RMSNorms; two
+  `noise_refiner.N` and two `context_refiner.N` blocks of the same shape; `x_embedder` (64 -> 3840: 2 x 2 x 16 patches),
+  `t_embedder` (1024), `cap_embedder` (2560 -> 3840), `final_layer`. The text encoder is `text_encoders/qwen_3_4b.safetensors`
+  (398 BF16 tensors, HF names `model.layers.N...`, hidden 2560, MLP 9728, 32 q heads, 8 kv heads of 128). The VAE is
+  `vae/ae.safetensors` (244 F32 tensors, Flux AE: `encoder.*`, `decoder.*`, 16 latent channels).
+  Reference: `diffusers` 0.43.0 (the newest index entry with `ZImagePipeline`) installed in `/data/zimage-lib2` (use
+  `PYTHONPATH=/data/zimage-lib2` with the system python: torch 2.9.1 ROCm, transformers 5.5.1); it loads the ComfyUI-format
+  DiT with `ZImageTransformer2DModel.from_single_file` (config: patch 2, 16 channels, dim 3840, 30 layers, 2 refiners, 30
+  heads, QK-norm, cap width 2560, rope theta 256, t_scale 1000). Not yet: the Qwen3-4B tokenizer (not on this host; the
+  text encoder's config and tokenizer come from the Hugging Face repo), the reference image, and the engine's DiT forward.
+  Reference run (2026-11-21): `/data/zimage-ref/ref_gen.py` runs the whole pipeline on the ComfyUI files, with the official Qwen3-4B
+  config and tokenizer (`/data/zimage-ref/qwen3-4b`, downloaded from Hugging Face) and the Flux AE config written by hand
+  (`/data/zimage-ref/flux-ae`: 16 latent channels, scaling 0.3611, shift 0.1159, no quant convs). 256 x 256, 8 steps, guidance 0,
+  seed 0, prompt "a red square on a blue background": a red square on blue (`out/image.png`); `out/prompt_embeds.pt` and
+  `out/latent.pt` are the checks for the engine. DiT stage oracle (2026-11-21, `/data/zimage-ref/ref_dit_dump.py`): one DiT call on a seeded latent [16, 1, 32, 32], t = 0.5, the
+  prompt's embeddings: `dit/stages.pt` holds t_embedder [1, 256], x_embedder [256, 3840] (16 x 16 patches), noise_refiner.0/1
+  [1, 256, 3840], cap_embedder [32, 3840], context_refiner.0/1 [1, 32, 3840], layers.0 and layers.29 [1, 288, 3840] (32 text + 256
+  image rows), final_layer, and `dit/out.pt` holds the output [16, 1, 32, 32]. Engine port (2026-11-21): `src/zimage_dit.{h,cpp}` (host path: safetensors reader, timestep embedder, patchify, patch embedding,
+  caption embedder) and `tests/zimage_dit_verify.cpp` pass against the oracle (relative 0.1-0.24%, cosine > 0.999998; build line in
+  the test). Not yet: the refiner blocks (AdaLN, joint attention with three-axis RoPE, QK-norm, SwiGLU), the 30 main layers, the
+  final layer, unpatchify, and the GPU path. Those are next, stage by stage against `dit/stages.pt`.
 - **Z-Image-Turbo** (`diffusion_models/z_image_turbo_bf16`, S3-DiT, 30 blocks, dim 3840, text dim 2560 = Qwen3-4B, which the
   engine runs as `qwen3`); VAE `vae/ae.safetensors` (16 channels, flow matching).
 - **SD1.5 family:** `checkpoints/DreamShaper_8_pruned` (LDM key names, 768-wide CLIP-L), `vae/vae-ft-mse-840000-ema-pruned`,
@@ -286,8 +309,16 @@ Quality and correctness:
 - **Utility models:** BiRefNet (`background_removal/birefnet`), MoGe-2 (`geometry_estimation/moge_2_vitl_normal`), DINOv3
   (`clip_vision/dino_v3_L_naf_fp32`). Also TRELLIS.2 and Pixal3D in `diffusion_models` (3D: deferred).
 
-Plan: the component API first (handles for the text encoder, the diffusion model and the VAE that stay mapped; verified on
-sd-turbo), then the node package. The image models stay BF16 (safetensors is BF16 or F32 for most); GGUF quants only as an
+Decisions (2026-11-20): the component API and the node package are on hold until the engine supports the models. The node API is
+ComfyUI's, not ours: a node is a Python class (`INPUT_TYPES` classmethod, `RETURN_TYPES`, `FUNCTION`, `CATEGORY`; registered
+through `NODE_CLASS_MAPPINGS`, or `comfy_entrypoint()` in V3), and nodes pass typed values (MODEL, CLIP, VAE, CONDITIONING, LATENT,
+IMAGE) between each other. What is ours is the step set those nodes call (encode text, sample, decode), which the component
+API would define. Memory policy: load per request; a new request that needs room evicts the least recently used idle model
+(the server's `make_room`). Engine support comes first, starting with Z-Image-Turbo.
+
+Plan (before the decisions above): the component API first (handles for the text encoder, the diffusion model and the VAE that
+stay mapped; verified on sd-turbo), then the node package.
+ The image models stay BF16 (safetensors is BF16 or F32 for most); GGUF quants only as an
 explicit choice; FP8 sources stay FP8 in the engine's FP8 operand path. Open: the UMA budget policy (load per request, or
 keep the last model); ComfyUI's node JSON; diffusers 0.35.2 has no Z-Image or Flux.2 pipeline, so those references need a
 newer diffusers or ComfyUI on CPU.
