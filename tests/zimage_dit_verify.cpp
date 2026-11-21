@@ -88,6 +88,12 @@ int main(int argc, char** argv) {
             std::vector<float> xv(xd, xd + (size_t)N * 3840);
             fails += compare("device x_embedder (patchify + GEMM)", xv, want, 2e-2);
         } else fails++;
+        float* cd = nullptr;
+        int Lc = 0;
+        if (zimage::dev_caption_embed(st, cap.data(), (int)(cap.size() / 2560), &cd, Lc) && read_raw(dir + "/cap_embedder.f32", want)) {
+            std::vector<float> cv(cd, cd + (size_t)Lc * 3840);
+            fails += compare("device cap_embedder (RMS norm kernel + GEMM)", cv, want, 2e-2);
+        } else fails++;
     } else {
         printf("[SKIP] device path: %s\n", sddev::enabled() ? "the mapping cannot be registered" : "no device");
     }

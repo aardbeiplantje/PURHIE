@@ -314,4 +314,25 @@ bool dev_patch_embed(const SafeTensors& st, const float* latent, int C, int H, i
     return true;
 }
 
+
+bool dev_caption_embed(const SafeTensors& st, const float* cap, int L, float** out, int& Lpad) {
+    if (!sddev::enabled()) { fprintf(stderr, "zimage: no device\n"); return false; }
+    const int D = 2560, dim = 3840;
+    const uint16_t *wn = nullptr, *w = nullptr;
+    float* b = nullptr;
+    std::vector<size_t> s;
+    if (!st.bf16_in_place("cap_embedder.0.weight", wn, s) || s.size() != 1 || (int)s[0] != D ||
+        !weight_in_place(st, "cap_embedder.1.weight", dim, D, w) || !bias_f32(st, "cap_embedder.1.bias", dim, b))
+        return false;
+    Lpad = L + (32 - L % 32) % 32;
+    /* the caption rows padded to a multiple of 32 by repeating the last row, written into shared memory */
+    float* padded = static_cast<float*>(sddev::alloc(sizeof(float) * (size_t)Lpad * D, false));
+    for (int t = 0; t < Lpad; ++t) memcpy(padded + (size_t)t * D, cap + (size_t)(t < L ? t : L - 1) * D, sizeof(float) * D);
+    float* normed = static_cast<float*>(sddev::alloc(sizeof(float) * (size_t)Lpad * D, false));
+    sddev::rms_norm(padded, Lpad, D, wn, 1e-5f, normed);
+    *out = static_cast<float*>(sddev::alloc(sizeof(float) * (size_t)Lpad * dim, false));
+    sddev::linear_bf16(normed, Lpad, w, D, dim, b, *out);
+    return true;
+}
+
 }  // namespace zimage

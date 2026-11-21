@@ -294,10 +294,11 @@ Quality and correctness:
   image rows), final_layer, and `dit/out.pt` holds the output [16, 1, 32, 32]. Engine port (2026-11-21): the host stages are REFERENCE-ONLY (AGENTS.md, Architecture): `src/zimage_dit.{h,cpp}` (host path: safetensors reader, timestep embedder, patchify, patch embedding,
   caption embedder) and `tests/zimage_dit_verify.cpp` pass against the oracle (relative 0.1-0.24%, cosine > 0.999998; build line in
   Device path (AGENTS.md rules: the mapping registered and read in place, activations in shared memory, no copies): the timestep
-  embedding and the patch embedding run on the GPU (`dev_timestep_embed`, `dev_patch_embed`; `linear_bf16` on the file's BF16
-  weights; `tests/zimage_dit_verify` checks them: relative 0.11% and 0.24%). Next: the caption embedder needs an RMS norm kernel (a
-  new `.hip` file built to a `.co`, as sd_gpu.hip), then the refiner blocks (AdaLN, joint attention with three-axis RoPE, QK-norm,
-  SwiGLU), the main layers, the final layer and unpatchify, each on the device and checked against the oracle.
+  embedding, the patch embedding and the caption embedder run on the GPU (`dev_timestep_embed`, `dev_patch_embed`,
+  `dev_caption_embed`; `linear_bf16` on the file's BF16 weights; `sd_rms_norm` in sd_gpu.hip for the RMS norm). The
+  `tests/zimage_dit_verify` device checks pass against the oracle (relative 0.11%, 0.24%, 0.1%). Next: the refiner blocks (AdaLN,
+  joint attention with three-axis RoPE, QK-norm, SwiGLU), the main layers, the final layer and unpatchify, each on the device and
+  checked against the oracle.
   the test). Not yet: the refiner blocks (AdaLN, joint attention with three-axis RoPE, QK-norm, SwiGLU), the 30 main layers, the
   final layer, unpatchify, and the GPU path. Those are next, stage by stage against `dit/stages.pt`.
 - **Z-Image-Turbo** (`diffusion_models/z_image_turbo_bf16`, S3-DiT, 30 blocks, dim 3840, text dim 2560 = Qwen3-4B, which the

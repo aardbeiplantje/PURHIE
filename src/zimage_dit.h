@@ -70,6 +70,10 @@ bool dev_timestep_embed(const SafeTensors& st, float t, float* out256);
 /* the patch embedding of a latent [C][1][H][W] (p = 2) into *out ([N][3840] in sddev::alloc memory; N set) */
 bool dev_patch_embed(const SafeTensors& st, const float* latent, int C, int H, int W, float** out, int& N);
 
+/* the caption embedder (RMS norm on the GPU, then the linear) of cap [L][2560] into *out ([Lpad][3840], Lpad = L padded
+ * to 32 by repeating the last row) */
+bool dev_caption_embed(const SafeTensors& st, const float* cap, int L, float** out, int& Lpad);
+
 }  // namespace zimage
 
 #endif /* ZIMAGE_DIT_H */

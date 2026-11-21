@@ -252,6 +252,18 @@ sd_layer_norm(const float* x, int C, const uint16_t* w, const uint16_t* b, float
     for (int i = threadIdx.x; i < C; i += SD_THREADS) yr[i] = (xr[i] - mean) * inv * h2f(w[i]) + h2f(b[i]);
 }
 
+// RMSNorm of each row x[t][C] (no mean subtraction): y = x * rsqrt(mean(x^2) + eps) * w, w BF16 (Z-Image's norms)
+extern "C" __global__ void __launch_bounds__(SD_THREADS)
+sd_rms_norm(const float* x, int C, const uint16_t* w, float eps, float* y) {
+    __shared__ float red[SD_THREADS];
+    const float* xr = x + (long)blockIdx.x * C;
+    float* yr = y + (long)blockIdx.x * C;
+    float q = 0.0f;
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) q += xr[i] * xr[i];
+    const float inv = rsqrtf(block_sum(q, red) / (float)C + eps);
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) yr[i] = xr[i] * inv * bf2f(w[i]);  /* BF16 weights (the Z-Image norms) */
+}
+
 // GEGLU: g[t][j] = hid * gelu(gate) for pj[t] = (hid [ff], gate [ff])
 extern "C" __global__ void __launch_bounds__(SD_THREADS) sd_geglu(const float* pj, long rows, int ff, float* g) {
     const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
