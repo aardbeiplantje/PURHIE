@@ -1,7 +1,8 @@
 /* Z-Image-Turbo's diffusion transformer (S3-DiT) in the engine, first the host (CPU) path: the weights are read from the
  * ComfyUI-format safetensors file (BF16, names as the file has them: x_embedder.weight, cap_embedder.1.weight, ...). The
- * stages so far are the timestep embedder, the patch embedding and the caption embedder; each is checked against the
- * reference (diffusers' ZImageTransformer2DModel) by tests/zimage_dit_verify.cpp. */
+ * stages so far are the timestep embedder, the patch embedding and the caption embedder. The host functions are the reference-only
+ * path (the oracle check); the dev_ functions are the device path (AGENTS.md: the weights registered and read in place, the
+ * activations in shared memory). tests/zimage_dit_verify.cpp checks both against diffusers' ZImageTransformer2DModel. */
 #ifndef ZIMAGE_DIT_H
 #define ZIMAGE_DIT_H
 
@@ -23,8 +24,12 @@ public:
     bool ok() const { return base_ != nullptr; }
     const std::string& error() const { return error_; }
     bool has(const std::string& name) const { return t_.count(name) != 0; }
-    /* the tensor as float (BF16 converted), its shape; false if absent */
+    /* the tensor as float (BF16 converted), its shape; false if absent (host path) */
     bool get(const std::string& name, std::vector<float>& out, std::vector<size_t>& shape) const;
+    /* device path: the mapping registered for the GPU (read in place, no copy); false if the registration fails */
+    bool register_device() const;
+    /* a BF16 tensor's bits in the mapping (read in place by the GPU), its shape; false if absent or not BF16 */
+    bool bf16_in_place(const std::string& name, const uint16_t*& ptr, std::vector<size_t>& shape) const;
 
 private:
     struct Entry { std::string dtype; std::vector<size_t> shape; size_t begin, end; };
@@ -53,6 +58,17 @@ void caption_embed(const SafeTensors& st, const float* cap, int L, std::vector<f
 
 /* The image's patch embedding: Linear(64, 3840) on the patches */
 void patch_embed(const SafeTensors& st, const std::vector<float>& tokens, int N, std::vector<float>& out);
+
+/* ---- The device path (AGENTS.md, Architecture): the file's mapping is registered (register_device) and its BF16
+ * weights are read in place by the GPU's GEMM (sddev::linear_bf16); the activations are in sddev::alloc memory (shared
+ * with the CPU, no copies); the host only writes small vectors into that memory (the timestep's frequencies, the
+ * patches). Each returns false on an error (its message on stderr). */
+
+/* the timestep embedding into out256 (sddev::alloc memory, 256 floats) */
+bool dev_timestep_embed(const SafeTensors& st, float t, float* out256);
+
+/* the patch embedding of a latent [C][1][H][W] (p = 2) into *out ([N][3840] in sddev::alloc memory; N set) */
+bool dev_patch_embed(const SafeTensors& st, const float* latent, int C, int H, int W, float** out, int& N);
 
 }  // namespace zimage
 

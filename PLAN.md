@@ -291,8 +291,13 @@ Quality and correctness:
   `out/latent.pt` are the checks for the engine. DiT stage oracle (2026-11-21, `/data/zimage-ref/ref_dit_dump.py`): one DiT call on a seeded latent [16, 1, 32, 32], t = 0.5, the
   prompt's embeddings: `dit/stages.pt` holds t_embedder [1, 256], x_embedder [256, 3840] (16 x 16 patches), noise_refiner.0/1
   [1, 256, 3840], cap_embedder [32, 3840], context_refiner.0/1 [1, 32, 3840], layers.0 and layers.29 [1, 288, 3840] (32 text + 256
-  image rows), final_layer, and `dit/out.pt` holds the output [16, 1, 32, 32]. Engine port (2026-11-21): `src/zimage_dit.{h,cpp}` (host path: safetensors reader, timestep embedder, patchify, patch embedding,
+  image rows), final_layer, and `dit/out.pt` holds the output [16, 1, 32, 32]. Engine port (2026-11-21): the host stages are REFERENCE-ONLY (AGENTS.md, Architecture): `src/zimage_dit.{h,cpp}` (host path: safetensors reader, timestep embedder, patchify, patch embedding,
   caption embedder) and `tests/zimage_dit_verify.cpp` pass against the oracle (relative 0.1-0.24%, cosine > 0.999998; build line in
+  Device path (AGENTS.md rules: the mapping registered and read in place, activations in shared memory, no copies): the timestep
+  embedding and the patch embedding run on the GPU (`dev_timestep_embed`, `dev_patch_embed`; `linear_bf16` on the file's BF16
+  weights; `tests/zimage_dit_verify` checks them: relative 0.11% and 0.24%). Next: the caption embedder needs an RMS norm kernel (a
+  new `.hip` file built to a `.co`, as sd_gpu.hip), then the refiner blocks (AdaLN, joint attention with three-axis RoPE, QK-norm,
+  SwiGLU), the main layers, the final layer and unpatchify, each on the device and checked against the oracle.
   the test). Not yet: the refiner blocks (AdaLN, joint attention with three-axis RoPE, QK-norm, SwiGLU), the 30 main layers, the
   final layer, unpatchify, and the GPU path. Those are next, stage by stage against `dit/stages.pt`.
 - **Z-Image-Turbo** (`diffusion_models/z_image_turbo_bf16`, S3-DiT, 30 blocks, dim 3840, text dim 2560 = Qwen3-4B, which the

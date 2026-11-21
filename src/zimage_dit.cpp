@@ -1,6 +1,7 @@
 /* Z-Image-Turbo's diffusion transformer, host path: see zimage_dit.h. The formulas are the reference's
  * (diffusers' ZImageTransformer2DModel, the timestep embedder, the RMS norm, the patchify and the padding). */
 #include "zimage_dit.h"
+#include "sd_device.h"
 
 #include <cmath>
 #include <cstdio>
@@ -141,6 +142,18 @@ bool SafeTensors::get(const std::string& name, std::vector<float>& out, std::vec
     return true;
 }
 
+bool SafeTensors::register_device() const {
+    return base_ != nullptr && sddev::register_weights(base_, size_);
+}
+
+bool SafeTensors::bf16_in_place(const std::string& name, const uint16_t*& ptr, std::vector<size_t>& shape) const {
+    auto it = t_.find(name);
+    if (it == t_.end() || it->second.dtype != "BF16") return false;
+    ptr = reinterpret_cast<const uint16_t*>(base_ + data_ + it->second.begin);
+    shape = it->second.shape;
+    return true;
+}
+
 void linear(const float* x, int T, int in, const std::vector<float>& W, int out, const std::vector<float>& b, float* y) {
     for (int t = 0; t < T; ++t) {
         const float* xt = x + (size_t)t * in;
@@ -229,6 +242,76 @@ void patch_embed(const SafeTensors& st, const std::vector<float>& tokens, int N,
     }
     out.assign((size_t)N * dim, 0.0f);
     linear(tokens.data(), N, in, W, dim, b, out.data());
+}
+
+
+/* ---- device path ---- */
+namespace {
+/* a BF16 bias as floats in sddev::alloc memory (small: one row of the output) */
+bool bias_f32(const SafeTensors& st, const std::string& name, int n, float*& out) {
+    const uint16_t* p = nullptr;
+    std::vector<size_t> s;
+    if (!st.bf16_in_place(name, p, s) || (int)s.size() != 1 || (int)s[0] != n) {
+        fprintf(stderr, "zimage: %s missing or not [%d]\n", name.c_str(), n);
+        return false;
+    }
+    out = static_cast<float*>(sddev::alloc(sizeof(float) * (size_t)n, false));
+    for (int i = 0; i < n; ++i) out[i] = bf16_to_f32(p[i]);
+    return true;
+}
+bool weight_in_place(const SafeTensors& st, const std::string& name, int out_dim, int in_dim, const uint16_t*& w) {
+    std::vector<size_t> s;
+    if (!st.bf16_in_place(name, w, s) || s.size() != 2 || (int)s[0] != out_dim || (int)s[1] != in_dim) {
+        fprintf(stderr, "zimage: %s missing or not [%d, %d]\n", name.c_str(), out_dim, in_dim);
+        return false;
+    }
+    return true;
+}
+}  // namespace
+
+bool dev_timestep_embed(const SafeTensors& st, float t, float* out256) {
+    if (!sddev::enabled()) { fprintf(stderr, "zimage: no device\n"); return false; }
+    const uint16_t *w0 = nullptr, *w2 = nullptr;
+    float *b0 = nullptr, *b2 = nullptr;
+    if (!weight_in_place(st, "t_embedder.mlp.0.weight", 1024, 256, w0) ||
+        !weight_in_place(st, "t_embedder.mlp.2.weight", 256, 1024, w2) ||
+        !bias_f32(st, "t_embedder.mlp.0.bias", 1024, b0) || !bias_f32(st, "t_embedder.mlp.2.bias", 256, b2))
+        return false;
+    /* the frequencies (t x 1000, cos then sin of 128 frequencies), written into shared memory */
+    float* freq = static_cast<float*>(sddev::alloc(sizeof(float) * 256, false));
+    const double arg_scale = (double)t * 1000.0;
+    for (int i = 0; i < 128; ++i) {
+        const double f = std::exp(-std::log(10000.0) * (double)i / 128.0);
+        freq[i] = (float)std::cos(arg_scale * f);
+        freq[128 + i] = (float)std::sin(arg_scale * f);
+    }
+    float* h = static_cast<float*>(sddev::alloc(sizeof(float) * 1024, false));
+    sddev::linear_bf16(freq, 1, w0, 256, 1024, b0, h);
+    sddev::silu(h, 1024);
+    sddev::linear_bf16(h, 1, w2, 1024, 256, b2, out256);
+    return true;
+}
+
+bool dev_patch_embed(const SafeTensors& st, const float* latent, int C, int H, int W, float** out, int& N) {
+    if (!sddev::enabled()) { fprintf(stderr, "zimage: no device\n"); return false; }
+    const uint16_t* w = nullptr;
+    float* b = nullptr;
+    const int in = 2 * 2 * C, dim = 3840;
+    if (!weight_in_place(st, "x_embedder.weight", dim, in, w) || !bias_f32(st, "x_embedder.bias", dim, b)) return false;
+    N = (H / 2) * (W / 2);
+    /* the patches written straight into shared memory (the GEMM reads them there) */
+    float* tokens = static_cast<float*>(sddev::alloc(sizeof(float) * (size_t)N * in, false));
+    for (int ht = 0; ht < H / 2; ++ht)
+        for (int wt = 0; wt < W / 2; ++wt) {
+            float* tok = tokens + (size_t)(ht * (W / 2) + wt) * in;
+            for (int ph = 0; ph < 2; ++ph)
+                for (int pw = 0; pw < 2; ++pw)
+                    for (int c = 0; c < C; ++c)
+                        tok[(ph * 2 + pw) * C + c] = latent[((size_t)c * H + ht * 2 + ph) * W + wt * 2 + pw];
+        }
+    *out = static_cast<float*>(sddev::alloc(sizeof(float) * (size_t)N * dim, false));
+    sddev::linear_bf16(tokens, N, w, in, dim, b, *out);
+    return true;
 }
 
 }  // namespace zimage

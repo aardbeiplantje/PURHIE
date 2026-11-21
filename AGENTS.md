@@ -23,6 +23,22 @@ All binaries use the same zero-copy approach:
 3. Launch kernel with **no `hipMemcpy`** — GPU reads/writes CPU-visible file-backed RAM directly
 4. Kernels pre-compiled to `.co` objects (`hipcc --genco`) loaded at runtime via `hipModuleLoadData`
 
+## Architecture (the rules every model path follows)
+
+- **The target is gfx1151 (Strix Halo) only**: one GPU sharing 128 GB of unified memory with the CPU. There is no
+  separate VRAM budget; `rocm-smi`'s VRAM and GTT figures are not a memory limit here.
+- **Zero copy:** weights stay in their mapped file (mmap, registered with `hipHostRegister` via `register_weights`) and
+  the GPU reads them in place; activations and KV live in `/dev/shm` buffers (`alloc`). No `hipMemcpy`, no
+  host-to-device staging, no conversion copies of weights.
+- **GPU first, CPU too:** the GPU runs the model; the CPU runs what it does better (the tokenizer, small per-step vectors
+  such as timestep embeddings written into shared memory) and is never a second copy of the model.
+- **Host (CPU) code is reference-only.** A CPU implementation exists to check the device path against an oracle (for
+  example `src/zimage_dit.cpp` with `tests/zimage_dit_verify.cpp`). It is not a serving path. A new model's device path
+  must pass the same stage checks before it is served.
+- **One service:** the server (`bin/rocm-inference-server`) serves every model kind (chat, embeddings, speech, images)
+  from one process, with per-model settings (`NAME.json`, host rules) and least-recently-used eviction under the memory
+  check (`make_room`). New model kinds join that policy; they do not get their own process.
+
 ## Temp Snippets and Debugging
 
 For temporary code snippets, test scripts, and debugging runs, use files in `/tmp/`. On error or syntax issues, update the temp file using the **Edit tool** rather than rewriting it via `cat`, `echo`, or `bash` heredocs. File edit tools are preferred over inline command-line scripts because:

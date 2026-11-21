@@ -4,9 +4,13 @@
 //
 // raw dir: the oracle as raw float32 files (export from /data/zimage-ref/dit: x.f32 [16][32][32] the latent, cap.f32 [15][2560]
 // the caption's embeddings, t.f32 the step (0.5), t_embedder.f32 [256], x_embedder.f32 [256][3840], cap_embedder.f32
-// [32][3840]). Each stage prints its max abs error and cosine against the reference. Build (host only):
-//   clang++ -O2 -std=c++17 -Isrc tests/zimage_dit_verify.cpp src/zimage_dit.cpp -o zimage_dit_verify
+// [32][3840]). Each stage prints its max abs error and cosine against the reference. The host stages always run; the device stages run
+// when the GPU is present (the mapping is registered for it). Build (the image device library, as tests/mtp_verify):
+//   clang++ -O3 -I/opt/rocm/include -Isrc -D__HIP_PLATFORM_AMD__ -D__HIP_ENABLE_AMD_HSA__ -I. tests/zimage_dit_verify.cpp \
+//     src/zimage_dit.cpp -Wl,--start-group build/libqwen.a build/libinference.a -Wl,--end-group -L/opt/rocm/lib \
+//     -lamdhip64 -lhsa-runtime64 -Wl,-rpath,/opt/rocm/lib -fopenmp -lz -o zimage_dit_verify
 #include "zimage_dit.h"
+#include "sd_device.h"
 
 #include <cmath>
 #include <cstdio>
@@ -71,6 +75,22 @@ int main(int argc, char** argv) {
     zimage::caption_embed(st, cap.data(), (int)(cap.size() / 2560), ce, Lpad);
     if (read_raw(dir + "/cap_embedder.f32", want)) fails += compare("cap_embedder (RMSNorm + linear, padded)", ce, want, 2e-2);
 
+    /* the device path: the mapping registered (read in place), the activations in shared memory */
+    if (sddev::enabled() && st.register_device()) {
+        float* td = static_cast<float*>(sddev::alloc(sizeof(float) * 256, false));
+        if (zimage::dev_timestep_embed(st, t[0], td) && read_raw(dir + "/t_embedder.f32", want)) {
+            std::vector<float> tv(td, td + 256);
+            fails += compare("device t_embedder", tv, want, 2e-2);
+        } else fails++;
+        float* xd = nullptr;
+        int N = 0;
+        if (zimage::dev_patch_embed(st, x.data(), 16, 32, 32, &xd, N) && read_raw(dir + "/x_embedder.f32", want)) {
+            std::vector<float> xv(xd, xd + (size_t)N * 3840);
+            fails += compare("device x_embedder (patchify + GEMM)", xv, want, 2e-2);
+        } else fails++;
+    } else {
+        printf("[SKIP] device path: %s\n", sddev::enabled() ? "the mapping cannot be registered" : "no device");
+    }
     printf("%s\n", fails ? "FAILED" : "all stages PASS");
     return fails ? 1 : 0;
 }
