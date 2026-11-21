@@ -841,6 +841,53 @@ sub DESTROY {
     $img->{h} = 0;
 }
 
+# Z-Image-Turbo (text to image, 256 x 256 for now): the ComfyUI files of a directory in ComfyUI's layout
+# (diffusion_models/z_image_turbo_bf16.safetensors, vae/ae.safetensors, text_encoders/qwen_3_4b.safetensors), read in place,
+# and the Qwen3 tokenizer.json beside the text encoder (text_encoders/tokenizer.json: ComfyUI ships none; take it from the
+# Hugging Face Qwen3-4B repository). The pipeline is engine code (src/zimage_pipe.h); the prompt's chat template is its own.
+package ROCm::Inference::ZImage;
+
+sub new {
+    my ($class, $dir, %o) = @_;
+    my %f = (dit => "$dir/diffusion_models/z_image_turbo_bf16.safetensors", vae => "$dir/vae/ae.safetensors",
+             te => "$dir/text_encoders/qwen_3_4b.safetensors", tokenizer => $o{tokenizer} // "$dir/text_encoders/tokenizer.json");
+    for my $file (values %f) { die "zimage: no file $file\n" unless -f $file }
+    my ($vocab, $merges) = _tokenizer($f{tokenizer});
+    my $h = ROCm::Inference::_zi_open(@f{qw(dit vae te)}, $vocab, $merges);
+    return bless { h => $h, dir => $dir }, $class;
+}
+
+# the vocabulary by id (the added tokens by their content, a gap as [PADn]) and the merges as "a b" strings, from tokenizer.json
+sub _tokenizer {
+    my ($file) = @_;
+    open my $fh, '<:raw', $file or die "zimage: $file: $!\n";
+    my $tj = ROCm::Inference::json_decode(do { local $/; <$fh> });
+    my %id2tok = reverse %{ $tj->{model}{vocab} };
+    my %added = map { $_->{id} => $_->{content} } @{ $tj->{added_tokens} || [] };
+    my $n = 0;
+    $n = $_ + 1 for (keys %id2tok, keys %added);
+    my @vocab = map { $added{$_} // $id2tok{$_} // "[PAD$_]" } 0 .. $n - 1;
+    my @merges = map { ref $_ ? join(' ', @$_) : $_ } @{ $tj->{model}{merges} };
+    return (\@vocab, \@merges);
+}
+
+# $img->generate($prompt, size => 'WIDTHxHEIGHT', seed => N): PNG bytes (256 x 256 only)
+sub generate {
+    my ($img, $prompt, %o) = @_;
+    my ($w, $h) = (256, 256);
+    if (defined $o{size}) {
+        ($w, $h) = $o{size} =~ /\A(\d+)x(\d+)\z/ or die "size: WIDTHxHEIGHT, not '$o{size}'\n";
+    }
+    die "size: 256x256 only for now\n" unless $w == 256 && $h == 256;
+    return ROCm::Inference::_zi_generate_png($img->{h}, $prompt, $o{seed} // 0, $w, $h);
+}
+
+sub DESTROY {
+    my ($img) = @_;
+    ROCm::Inference::_zi_close($img->{h}) if $img->{h};
+    $img->{h} = 0;
+}
+
 package ROCm::Inference::Speech;
 
 sub new {

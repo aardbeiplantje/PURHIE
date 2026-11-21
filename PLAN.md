@@ -301,15 +301,24 @@ Quality and correctness:
   0.99989) from accumulated bf16 rounding (the reference rounds the same way). Kernels in sd_gpu.hip: sd_rms_norm,
   zimage_modulate, zimage_gate_add, zimage_swiglu, zimage_rope, zimage_layer_norm_plain. The sampler is done (`dev_sample`: 8 flow-matching Euler steps from the reference's noise for seed 0, sigmas linspace(1, 1/8, 8) with a
   static shift 3, the pipeline's negated velocity; 6.3% relative to the reference's final latent, cosine 0.99997, under 5 s on the GPU).
-  Assumption to verify: the shift 3 is the Z-Image scheduler's static shift (the reference run set it by hand; the official scheduler
-  config is not on this host). The Flux AE decoder is done (`src/zimage_vae.cpp`, `dev_vae_decode`: F32 weights read in place, the
+  The shift 3 is verified: the Hugging Face Z-Image-Turbo `scheduler/scheduler_config.json` (FlowMatchEulerDiscreteScheduler,
+  `shift` 3.0, `use_dynamic_shifting` false) and diffusers 0.43.0's pipeline (sigmas `linspace(1, 1/steps, steps)`) both match
+  `dev_sample`. The Flux AE decoder is done (`src/zimage_vae.cpp`, `dev_vae_decode`: F32 weights read in place, the
   decoder's convolutions via `sd_device`'s `conv2d_f32`, GroupNorm via `group_norm_f32`, the mid attention on tokens: 3e-6 relative
   to the reference decode of the final latent). The text encoder is on the device (`src/zimage_text.{h,cpp}`, `dev_text_encode`:
   Qwen3-4B read in place from the ComfyUI safetensors, 35 layers, the hidden state before the final norm (layer -2 of the
   reference), causal attention; 2.2% relative, cosine 0.999983 against the reference's ids and embeddings). The whole chain from the
   prompt's ids (text encoder, 8-step sampler, Flux AE decode) runs on the device: against `/data/zimage-ref/out/image.png` (8-bit)
-  23% of the values match exactly, 79% within one level, mean absolute difference 1.03 levels. Next: the official Z-Image
-  scheduler shift (the static shift 3 is assumed), then the server's image path.
+  23% of the values match exactly, 79% within one level, mean absolute difference 1.03 levels. The scheduler shift is verified
+  (see above). The pipeline is `src/zimage_pipe.{h,cpp}` (`zi_open`, `zi_generate`, `zi_generate_with_noise`): the Qwen3 chat
+  template and the tokenizer (the vocabulary and merges from tokenizer.json, passed in by the caller), the three files read in
+  place, 256 x 256 only (the DiT's grid is 32 x 32 latents), prompts of at most 32 tokens (the caption length). The verifier
+  `tests/zimage_pipe_verify.cpp` (the Makefile's ZIMAGE_PIPE_VERIFY) runs the whole chain with the reference's noise: 22.5% of the
+  8-bit values exact, 79.4% within one level, mean absolute difference 1.02 levels; a seeded run is not flat. The server serves it:
+  `--zimage DIR` (the ComfyUI layout plus `text_encoders/tokenizer.json`, the Qwen3-4B tokenizer), model `z-image-turbo` on
+  `/v1/images/generations` at 256 x 256, listed in `/v1/models` as kind image; `ROCm::Inference::ZImage` in the Perl module and
+  `t/68-zimage.t` (env-gated). Not yet: the memory policy (the pipeline stays loaded for the server's life, as MiniMax does; the
+  load-per-request and eviction policy from the decisions above is open), other sizes, the server's text chat for the prompt.
 - **Z-Image-Turbo** (`diffusion_models/z_image_turbo_bf16`, S3-DiT, 30 blocks, dim 3840, text dim 2560 = Qwen3-4B, which the
   engine runs as `qwen3`); VAE `vae/ae.safetensors` (16 channels, flow matching).
 - **SD1.5 family:** `checkpoints/DreamShaper_8_pruned` (LDM key names, 768-wide CLIP-L), `vae/vae-ft-mse-840000-ema-pruned`,

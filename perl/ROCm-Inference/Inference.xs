@@ -25,6 +25,7 @@
 #include "audio.h"
 #include "sd.h"
 #include "minimax_pipe.h"
+#include "zimage_pipe.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -1619,6 +1620,73 @@ _mm_generate_png(h, prompt, seed, width, height)
     if (mm_generate(INT2PTR(mm_pipe_t*, h), SvPV_nolen(prompt), height, width, (unsigned long long)seed, rgb) != 0) {
         free(rgb);
         croak("ROCm::Inference: mm_generate: %s", mm_last_error());
+    }
+    if (sd_encode_png(rgb, width, height, &png, &n) != 0) {
+        free(rgb);
+        croak("ROCm::Inference: sd_encode_png: %s", sd_last_error());
+    }
+    free(rgb);
+    RETVAL = newSVpvn((const char*)png, (STRLEN)n);
+    sd_free_png(png);
+  OUTPUT:
+    RETVAL
+
+IV
+_zi_open(dit, vae, te, vocab, merges)
+    const char* dit
+    const char* vae
+    const char* te
+    SV* vocab
+    SV* merges
+  CODE:
+    /* the Z-Image-Turbo pipeline (zimage_pipe.h): the vocabulary and the merges are arrays of strings (the Qwen3 tokenizer.json) */
+    AV* va;
+    AV* ma;
+    SSize_t nv, nm, i;
+    const char** vp;
+    const char** mp;
+    zi_pipe_t* p;
+    if (!SvROK(vocab) || SvTYPE(SvRV(vocab)) != SVt_PVAV || !SvROK(merges) || SvTYPE(SvRV(merges)) != SVt_PVAV)
+        croak("ROCm::Inference: _zi_open: the vocabulary and the merges are array references");
+    va = (AV*)SvRV(vocab);
+    ma = (AV*)SvRV(merges);
+    nv = av_len(va) + 1;
+    nm = av_len(ma) + 1;
+    vp = (const char**)malloc(sizeof(char*) * (size_t)(nv ? nv : 1));
+    mp = (const char**)malloc(sizeof(char*) * (size_t)(nm ? nm : 1));
+    if (!vp || !mp) croak("ROCm::Inference: out of memory");
+    for (i = 0; i < nv; ++i) vp[i] = SvPV_nolen(*av_fetch(va, i, 0));
+    for (i = 0; i < nm; ++i) mp[i] = SvPV_nolen(*av_fetch(ma, i, 0));
+    p = zi_open(dit, vae, te, vp, (size_t)nv, mp, (size_t)nm);
+    free(vp);
+    free(mp);
+    if (!p) croak("ROCm::Inference: zi_open: %s", zi_last_error());
+    RETVAL = PTR2IV(p);
+  OUTPUT:
+    RETVAL
+
+void
+_zi_close(h)
+    IV h
+  CODE:
+    zi_close(INT2PTR(zi_pipe_t*, h));
+
+SV*
+_zi_generate_png(h, prompt, seed, width, height)
+    IV h
+    SV* prompt
+    UV seed
+    int width
+    int height
+  CODE:
+    /* one image of the Z-Image-Turbo pipeline, as PNG bytes */
+    unsigned char* rgb = (unsigned char*)malloc((size_t)3 * width * height);
+    uint8_t* png = NULL;
+    size_t n = 0;
+    if (!rgb) croak("ROCm::Inference: out of memory");
+    if (zi_generate(INT2PTR(zi_pipe_t*, h), SvPV_nolen(prompt), height, width, (unsigned long long)seed, rgb) != 0) {
+        free(rgb);
+        croak("ROCm::Inference: zi_generate: %s", zi_last_error());
     }
     if (sd_encode_png(rgb, width, height, &png, &n) != 0) {
         free(rgb);

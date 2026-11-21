@@ -27,14 +27,14 @@ GetOptions(\%o, 'model=s', 'models-dir=s', 'models-max=i', 'models-margin=f', 'k
            'name=s', 'draft=s', 'store=s', 'max_tokens=i', 'swa-ring=i', 'stage=s', 'recache', 'kv-type=s',
            'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'preserve-thinking!', 'log!', 'log-level=s', 'log-format=s', 'log-color=s',
            'thinking-low=i', 'thinking-medium=i', 'thinking-high=i',
-           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'mmproj=s', 'whisper=s', 'tts=s', 'tts-codec=s', 'voices=s', 'sd=s', 'minimax=s', 'ffmpeg=s', 'help')
+           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'mmproj=s', 'whisper=s', 'tts=s', 'tts-codec=s', 'voices=s', 'sd=s', 'minimax=s', 'zimage=s', 'ffmpeg=s', 'help')
     or pod2usage(2);
 # The log: --nolog is level none; --log-level, --log-format, --log-color are checked by the formatter
 our $LOG = eval { ROCm::Inference::Log->new(level => ($o{log} // 1) ? ($o{'log-level'} // 'info') : 'none',
                                               format => $o{'log-format'} // 'text', color => $o{'log-color'} // 'auto') }
     or die "--log-level, --log-format, --log-color: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n";
 pod2usage(-verbose => 2, -exitval => 0) if $o{help};
-pod2usage("--model, --models-dir, --whisper, --tts, --sd or --minimax is required\n") unless $o{model} || $o{'models-dir'} || $o{whisper} || $o{tts} || $o{sd} || $o{minimax};
+pod2usage("--model, --models-dir, --whisper, --tts, --sd, --minimax or --zimage is required\n") unless $o{model} || $o{'models-dir'} || $o{whisper} || $o{tts} || $o{sd} || $o{minimax} || $o{zimage};
 ROCm::Inference::_require_minijinja()
     or die "rocm-inference-server needs the Minijinja module $ROCm::Inference::MINIJINJA_VERSION\n";
 my $no_draft = ($o{draft} // '') eq 'none';  # (no draft head, not even a model's own MTP block)
@@ -243,6 +243,10 @@ audio_rescan() if $o{'models-dir'};  # (the models found at the start; the flags
 die "--minimax $o{minimax}: not a directory\n" if $o{minimax} && !-d $o{minimax};
 my $MINIMAX = $o{minimax} ? eval { ROCm::Inference::MiniMaxImage->new($o{minimax}) } : undef;
 die "--minimax $o{minimax}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" if $o{minimax} && !$MINIMAX;
+# the Z-Image-Turbo pipeline (--zimage DIR: the ComfyUI files of ROCm::Inference::ZImage); its name is "z-image-turbo".
+die "--zimage $o{zimage}: not a directory\n" if $o{zimage} && !-d $o{zimage};
+my $ZIMAGE = $o{zimage} ? eval { ROCm::Inference::ZImage->new($o{zimage}) } : undef;
+die "--zimage $o{zimage}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" if $o{zimage} && !$ZIMAGE;
 
 my $kv_type = $o{'kv-type'} // 'auto';
 die "--kv-type: auto, f16, q8_0 or q4_0\n" unless $kv_type =~ /\A(?:auto|f16|q8_0|q4_0)\z/;
@@ -593,7 +597,8 @@ sub pick {
     if (!$r) {
         if (defined $want) {  # a speech or image model asked for in a chat: the endpoint it is served at
             my ($aux) = grep { $_->{id} eq $want } values %AUX;
-            my $kind = $aux ? $AUX_KIND{ $aux->{aux} } : $want eq 'minimax-h3-image' && $MINIMAX ? 'image' : undef;
+            my $kind = $aux ? $AUX_KIND{ $aux->{aux} } : $want eq 'minimax-h3-image' && $MINIMAX ? 'image'
+                : $want eq 'z-image-turbo' && $ZIMAGE ? 'image' : undef;
             error(400, "'$want' is a $kind model: use $ENDPOINTS{$kind}[0]") if $kind;
         }
         error(404, "model '$want' not found (GET /v1/models lists them)", 'not_found_error')
@@ -667,7 +672,10 @@ sub listed_models {  # every model the server serves: the chat and embedding one
     return ((map { model_entry($M{$_}) } sort keys %M), (map { aux_entry($_) } @aux),
             ($MINIMAX ? { id => 'minimax-h3-image', object => 'model', created => $created, owned_by => 'rocm-inference',
                           status => { value => 'loaded' }, kind => 'image', arch => undef, endpoints => $ENDPOINTS{image}, capabilities => ['image'],
-                          context_length => undef, n_ctx_train => undef, bytes => undef } : ()));
+                          context_length => undef, n_ctx_train => undef, bytes => undef } : ()),
+            ($ZIMAGE ? { id => 'z-image-turbo', object => 'model', created => $created, owned_by => 'rocm-inference',
+                         status => { value => 'loaded' }, kind => 'image', arch => undef, endpoints => $ENDPOINTS{image}, capabilities => ['image'],
+                         context_length => undef, n_ctx_train => undef, bytes => undef } : ()));
 }
 
 route::get '/health' => sub { { status => 'ok' } };
@@ -1381,20 +1389,21 @@ route::post '/v1/images/generations' => sub {
     ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
     my $sd_name = $AUX{sd} ? $AUX{sd}{id} : undef;
     # the model: minimax-h3-image (--minimax) or the sd-turbo file's name (--sd, or in --models-dir); with no model given, the first one started
-    my $model = $p->{model} // ($MINIMAX ? 'minimax-h3-image' : $sd_name);
+    my $model = $p->{model} // ($MINIMAX ? 'minimax-h3-image' : $sd_name // ($ZIMAGE ? 'z-image-turbo' : undef));
     my $backend;
     if ($MINIMAX && $model eq 'minimax-h3-image') { $backend = $MINIMAX; $model = 'minimax-h3-image' }
+    elsif ($ZIMAGE && $model eq 'z-image-turbo') { $backend = $ZIMAGE }
     elsif ($AUX{sd} && $model eq $sd_name)     { $backend = eval { aux_get('sd') } or error(500, 'image model: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r)) }
     else {
-        error(503, 'no image model: start the server with --sd FILE.gguf or --minimax DIR', 'server_error') unless $AUX{sd} || $MINIMAX;
-        error(400, "model: '$model' is not served (this server has " . join(' and ', grep { defined } ($sd_name, $MINIMAX ? 'minimax-h3-image' : undef)) . ')');
+        error(503, 'no image model: start the server with --sd FILE.gguf, --minimax DIR or --zimage DIR', 'server_error') unless $AUX{sd} || $MINIMAX || $ZIMAGE;
+        error(400, "model: '$model' is not served (this server has " . join(' and ', grep { defined } ($sd_name, $MINIMAX ? 'minimax-h3-image' : undef, $ZIMAGE ? 'z-image-turbo' : undef)) . ')');
     }
     my $prompt = $p->{prompt};
     error(400, "'prompt' is required") unless defined $prompt && !ref $prompt && length $prompt;
     error(400, 'prompt: at most 1000 characters') if length $prompt > 1000;
     my $n = $p->{n} // 1;
     error(400, 'n: 1 (one image per request)') unless $n =~ /\A1\z/;
-    my $size = $p->{size} // ($backend == $MINIMAX ? '1024x1024' : '512x512');
+    my $size = $p->{size} // ($model eq 'minimax-h3-image' ? '1024x1024' : $model eq 'z-image-turbo' ? '256x256' : '512x512');
     error(400, "size: WIDTHxHEIGHT, not '$size'") unless $size =~ /\A\d+x\d+\z/;
     my $fmt = $p->{response_format} // 'b64_json';
     error(400, "response_format: b64_json or png, not '$fmt'") unless $fmt =~ /\A(?:b64_json|png)\z/;
