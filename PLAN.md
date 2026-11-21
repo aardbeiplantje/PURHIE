@@ -302,11 +302,11 @@ Quality and correctness:
   zimage_modulate, zimage_gate_add, zimage_swiglu, zimage_rope, zimage_layer_norm_plain. The sampler is done (`dev_sample`: 8 flow-matching Euler steps from the reference's noise for seed 0, sigmas linspace(1, 1/8, 8) with a
   static shift 3, the pipeline's negated velocity; 6.3% relative to the reference's final latent, cosine 0.99997, under 5 s on the GPU).
   Assumption to verify: the shift 3 is the Z-Image scheduler's static shift (the reference run set it by hand; the official scheduler
-  config is not on this host). Next: the Flux AE decoder (16 latent channels: not the SD VAE of sd.cpp), checked against
-  `/data/zimage-ref/out/image.png`; then the text encoder on the device (Qwen3-4B: the engine's qwen3 path reads GGUF, the ComfyUI
-  safetensors need a loader or a conversion, and the hidden state at layer -2 must be exposed).
-  the test). Not yet: the refiner blocks (AdaLN, joint attention with three-axis RoPE, QK-norm, SwiGLU), the 30 main layers, the
-  final layer, unpatchify, and the GPU path. Those are next, stage by stage against `dit/stages.pt`.
+  config is not on this host). The Flux AE decoder is done (`src/zimage_vae.cpp`, `dev_vae_decode`: F32 weights read in place, the
+  decoder's convolutions via `sd_device`'s `conv2d_f32`, GroupNorm via `group_norm_f32`, the mid attention on tokens: 3e-6 relative
+  to the reference decode of the final latent). Next: the text encoder on the device (Qwen3-4B: the engine's qwen3 path reads GGUF,
+  the ComfyUI safetensors need a loader or a conversion, and the hidden state at layer -2 must be exposed), then the whole pipeline
+  from the prompt to the image, against `/data/zimage-ref/out/image.png`.
 - **Z-Image-Turbo** (`diffusion_models/z_image_turbo_bf16`, S3-DiT, 30 blocks, dim 3840, text dim 2560 = Qwen3-4B, which the
   engine runs as `qwen3`); VAE `vae/ae.safetensors` (16 channels, flow matching).
 - **SD1.5 family:** `checkpoints/DreamShaper_8_pruned` (LDM key names, 768-wide CLIP-L), `vae/vae-ft-mse-840000-ema-pruned`,
