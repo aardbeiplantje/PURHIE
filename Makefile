@@ -103,6 +103,7 @@ SD_UNET_VERIFY = $(BINDIR)/sd_unet_verify  # the image engine's UNet, one predic
 SD_VAE_VERIFY = $(BINDIR)/sd_vae_verify  # the image engine's VAE decoder vs diffusers (tests/sd_vae_verify.cpp)
 SD_TEXT_VERIFY = $(BINDIR)/sd_text_verify  # the image engine's CLIP tokenizer and text encoder vs transformers (tests/sd_text_verify.cpp)
 QWENIMAGE_VERIFY = $(BINDIR)/qwenimage_verify  # Qwen-Image's FP8 linear layers on the device vs a host reference (tests/qwenimage_verify.cpp; run from build/co)
+ZIMAGE_1024_VERIFY = $(BINDIR)/zimage_1024_verify  # Z-Image-Turbo at 1024 x 1024 vs diffusers, and the time (tests/zimage_1024_verify.cpp; run from build/co)
 ZIMAGE_PIPE_VERIFY = $(BINDIR)/zimage_pipe_verify  # Z-Image-Turbo from the prompt to the image vs the reference (tests/zimage_pipe_verify.cpp; run from build/co)
 SPEAKER_VERIFY = $(BINDIR)/speaker_verify  # the TTS speaker encoder and the speaker mel vs qwen-tts (tests/speaker_verify.cpp)
 AUDIO_VERIFY = $(BINDIR)/audio_verify  # the band-limited resampler and the WAV decode vs librosa's soxr_hq (tests/audio_verify.cpp)
@@ -439,6 +440,9 @@ MM_PIPE_VERIFY = $(BINDIR)/mm_pipe_verify  # MiniMax-H3-Image end to end: one PN
 $(QWENIMAGE_VERIFY): $(TESTSDIR)/qwenimage_verify.cpp $(SRCDIR)/sd_device.cpp $(SRCDIR)/sd_device.h $(SRCDIR)/qwenimage_text.cpp $(SRCDIR)/qwenimage_text.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/qwenimage_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
 
+$(ZIMAGE_1024_VERIFY): $(TESTSDIR)/zimage_1024_verify.cpp $(SRCDIR)/zimage_pipe.cpp $(SRCDIR)/zimage_pipe.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/zimage_1024_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
+
 $(ZIMAGE_PIPE_VERIFY): $(TESTSDIR)/zimage_pipe_verify.cpp $(SRCDIR)/zimage_pipe.cpp $(SRCDIR)/zimage_pipe.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/zimage_pipe_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
 
@@ -590,4 +594,4 @@ verify_minimal: $(TEST_TARGET)
 	./$(TEST_TARGET) 2>&1 || echo "Test exited with code $?"
 
 # Last, so that every variable above is defined when its prerequisites are expanded
-all: $(WMMA_TARGET) $(QWENIMAGE_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(EXPERT_CPU_BENCH) $(VISION_VERIFY) $(MROPE_VERIFY) $(MM_VERIFY) $(IMAGE_VERIFY) $(MEL_VERIFY) $(WHISPER_VERIFY) $(WHISPER_FALLBACK_VERIFY) $(AUDIO_VERIFY) $(AUDIO_FLAC_VERIFY) $(CODEC_AFTER_VERIFY) $(TALKER_SAMPLE_VERIFY) $(QWEN3TTS_VERIFY) $(QWEN3TTS_CODEC_VERIFY) $(QWEN3TTS_SPEECH_VERIFY) $(SPEAKER_VERIFY) $(SD_TEXT_VERIFY) $(SD_VAE_VERIFY) $(SD_UNET_VERIFY) $(SD_IMAGE_VERIFY) $(MM_TE_VERIFY) $(MM_VAE_VERIFY) $(MM_DIT_VERIFY) $(CODEC_ENCODE_VERIFY) $(HEAD_Q8_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(ATTN_DECODE_VERIFY) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(PERPLEXITY) $(PASSKEY) $(GENERATE_VERIFY) $(EVENTS_TEST) $(GEMMA4_VERIFY) $(SEQ_VERIFY) $(EMBED_VERIFY) $(QWEN4EXP_VERIFY) $(GLM5NEXT_VERIFY) $(MTP_VERIFY) $(MTP_OWN_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY) $(CAPI_SMOKE) $(STORE_VERIFY) $(SPLIT_VERIFY) $(ATTN_SPLIT_VERIFY) $(ATTN_BENCH) $(ZIMAGE_PIPE_VERIFY)
+all: $(WMMA_TARGET) $(QWENIMAGE_VERIFY) $(ZIMAGE_1024_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(EXPERT_CPU_BENCH) $(VISION_VERIFY) $(MROPE_VERIFY) $(MM_VERIFY) $(IMAGE_VERIFY) $(MEL_VERIFY) $(WHISPER_VERIFY) $(WHISPER_FALLBACK_VERIFY) $(AUDIO_VERIFY) $(AUDIO_FLAC_VERIFY) $(CODEC_AFTER_VERIFY) $(TALKER_SAMPLE_VERIFY) $(QWEN3TTS_VERIFY) $(QWEN3TTS_CODEC_VERIFY) $(QWEN3TTS_SPEECH_VERIFY) $(SPEAKER_VERIFY) $(SD_TEXT_VERIFY) $(SD_VAE_VERIFY) $(SD_UNET_VERIFY) $(SD_IMAGE_VERIFY) $(MM_TE_VERIFY) $(MM_VAE_VERIFY) $(MM_DIT_VERIFY) $(CODEC_ENCODE_VERIFY) $(HEAD_Q8_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(ATTN_DECODE_VERIFY) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(PERPLEXITY) $(PASSKEY) $(GENERATE_VERIFY) $(EVENTS_TEST) $(GEMMA4_VERIFY) $(SEQ_VERIFY) $(EMBED_VERIFY) $(QWEN4EXP_VERIFY) $(GLM5NEXT_VERIFY) $(MTP_VERIFY) $(MTP_OWN_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY) $(CAPI_SMOKE) $(STORE_VERIFY) $(SPLIT_VERIFY) $(ATTN_SPLIT_VERIFY) $(ATTN_BENCH) $(ZIMAGE_PIPE_VERIFY)

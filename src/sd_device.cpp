@@ -459,7 +459,7 @@ void rope_half(float* x, int T, int heads, const float* cos, const float* sin) {
 
 void causal_attn(const float* q, const float* k, const float* v, int T, int H, int KVH, float* out) {
     void* a[] = {(void*)&q, (void*)&k, (void*)&v, (void*)&T, (void*)&H, (void*)&KVH, (void*)&out};
-    check(hipModuleLaunchKernel(f_zq_attn, (unsigned)T, (unsigned)H, 1, 128, 1, 1, 0, nullptr, a, nullptr), "causal attention");
+    check(hipModuleLaunchKernel(f_zq_attn, (unsigned)T, (unsigned)H, 1, 128, 1, 1, (unsigned)(sizeof(float) * (size_t)T), nullptr, a, nullptr), "causal attention");
     sync();
 }
 

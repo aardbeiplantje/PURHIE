@@ -329,10 +329,10 @@ zq_rope_half(float* x, int T, int heads, const float* cs, const float* sn, long 
     v[p + P] = b * c + a * s0;
 }
 // causal attention with grouped KV heads: out[t][h][d] = softmax_j<=t(q[t][h] . k[j][h / (H / KVH)] / sqrt(128)) v[j][kvh][d].
-// One block per (query t, head h); T <= 64 (the scores in shared memory).
+// One block per (query t, head h); the scores in dynamic shared memory (T floats: the launch passes 4 T bytes).
 extern "C" __global__ void __launch_bounds__(128)
 zq_causal_attn(const float* q, const float* k, const float* v, int T, int H, int KVH, float* out) {
-    __shared__ float sc[64];
+    extern __shared__ float sc[];
     const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     const int D = 128, kvh = h / (H / KVH);
     const float scale = rsqrtf((float)D);

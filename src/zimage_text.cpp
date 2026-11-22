@@ -55,7 +55,7 @@ void lin(const float* x, int T, const uint16_t* W, int in, int out, const float*
 
 bool dev_text_encode(const SafeTensors& st, const int* ids, int T, float* out) {
     if (!sddev::enabled()) { fprintf(stderr, "zimage text: no device\n"); return false; }
-    if (T < 1 || T > 64) { fprintf(stderr, "zimage text: %d tokens (1 to 64)\n", T); return false; }
+    if (T < 1 || T > 1024) { fprintf(stderr, "zimage text: %d tokens (1 to 1024)\n", T); return false; }
     const uint16_t* emb = nullptr;
     if (!bf16(st, "model.embed_tokens.weight", {151936, D_MODEL}, emb)) return false;
     /* the embedding rows (read in place from the mapping: the rows are the activations' input) */

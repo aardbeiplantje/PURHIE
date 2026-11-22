@@ -23,7 +23,6 @@ thread_local std::string g_error;
  * <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n  (the markers are special ids; the rest is encoded as text) */
 constexpr int kImStart = 151644;
 constexpr int kImEnd = 151645;
-constexpr int kMaxCaption = 32;  /* the DiT's caption length (padded to 32) */
 constexpr int kSteps = 8;
 constexpr float kShift = 3.0f;
 
@@ -88,8 +87,8 @@ void zi_close(zi_pipe_t* pipe) {
 
 const char* zi_last_error(void) { return g_error.c_str(); }
 
-/* the pipeline with the noise given (the latent [16][32][32]: the reference's noise in the checks) */
-static int run(zi_pipe_t* pipe, const char* prompt, const float* noise_in, unsigned char* rgb) {
+/* the pipeline with the noise given (the latent [16][H/8][W/8]: the reference's noise in the checks) */
+static int run(zi_pipe_t* pipe, const char* prompt, int height, int width, int steps, const float* noise_in, unsigned char* rgb) {
     try {
         /* the ids: <|im_start|> user\n + prompt + <|im_end|> \n <|im_start|> assistant\n (the markers as special ids) */
         std::vector<int> ids;
@@ -106,23 +105,23 @@ static int run(zi_pipe_t* pipe, const char* prompt, const float* noise_in, unsig
         ids.push_back(kImStart);
         enc("assistant\n");
         const int L = (int)ids.size();
-        if (L > kMaxCaption) throw std::runtime_error("the prompt is longer than 32 tokens");
 
         std::vector<float> cap((size_t)L * 2560);
         if (!zimage::dev_text_encode(pipe->te, ids.data(), L, cap.data())) throw std::runtime_error("the text encoder failed");
 
-        std::vector<float> lat(16 * 32 * 32), pix(3 * 256 * 256);
-        if (!zimage::dev_sample(pipe->dit, noise_in, cap.data(), L, kSteps, kShift, lat.data()))
+        const int gh = height / 16, gw = width / 16, LH = 2 * gh, LW = 2 * gw;
+        std::vector<float> lat((size_t)16 * LH * LW), pix((size_t)3 * height * width);
+        if (!zimage::dev_sample(pipe->dit, noise_in, cap.data(), L, steps, kShift, lat.data(), gh, gw))
             throw std::runtime_error("the sampler failed");
-        if (!zimage::dev_vae_decode(pipe->vae, lat.data(), pix.data())) throw std::runtime_error("the decoder failed");
+        if (!zimage::dev_vae_decode(pipe->vae, lat.data(), pix.data(), LH, LW)) throw std::runtime_error("the decoder failed");
 
         /* [-1, 1] floats (channel-major) to 8-bit HWC, rounded and clamped */
-        for (int y = 0; y < 256; ++y)
-            for (int x = 0; x < 256; ++x)
+        for (int y = 0; y < height; ++y)
+            for (int x = 0; x < width; ++x)
                 for (int c = 0; c < 3; ++c) {
-                    float v = (pix[((size_t)c * 256 + y) * 256 + x] + 1.0f) * 127.5f;
+                    float v = (pix[((size_t)c * height + y) * width + x] + 1.0f) * 127.5f;
                     int q = (int)std::lrint(v);
-                    rgb[((size_t)y * 256 + x) * 3 + c] = (unsigned char)(q < 0 ? 0 : q > 255 ? 255 : q);
+                    rgb[((size_t)y * width + x) * 3 + c] = (unsigned char)(q < 0 ? 0 : q > 255 ? 255 : q);
                 }
     } catch (const std::exception& e) {
         g_error = std::string("zimage: ") + e.what();
@@ -131,19 +130,32 @@ static int run(zi_pipe_t* pipe, const char* prompt, const float* noise_in, unsig
     return 0;
 }
 
-int zi_generate(zi_pipe_t* pipe, const char* prompt, int height, int width, unsigned long long seed, unsigned char* rgb) {
+int zi_generate_steps(zi_pipe_t* pipe, const char* prompt, int height, int width, int steps, unsigned long long seed, unsigned char* rgb) {
     g_error.clear();
     if (!pipe || !prompt || !rgb) { g_error = "zimage: a pipeline, a prompt and an output are needed"; return -1; }
-    if (height != 256 || width != 256) { g_error = "zimage: 256 x 256 only for now"; return -1; }
-    std::vector<float> noise(16 * 32 * 32);
+    if (height < 64 || width < 64 || height % 16 || width % 16) { g_error = "zimage: height and width: multiples of 16 from 64"; return -1; }
+    if (steps < 1 || steps > 50) { g_error = "zimage: steps 1 to 50"; return -1; }
+    std::vector<float> noise((size_t)16 * (height / 8) * (width / 8));
     noise_latent(seed, noise.data(), noise.size());
-    return run(pipe, prompt, noise.data(), rgb);
+    return run(pipe, prompt, height, width, steps, noise.data(), rgb);
+}
+
+int zi_generate_noise_steps(zi_pipe_t* pipe, const char* prompt, int height, int width, int steps, const float* noise, unsigned char* rgb) {
+    g_error.clear();
+    if (!pipe || !prompt || !noise || !rgb) { g_error = "zimage: a pipeline, a prompt, a noise and an output are needed"; return -1; }
+    if (height < 64 || width < 64 || height % 16 || width % 16) { g_error = "zimage: height and width: multiples of 16 from 64"; return -1; }
+    if (steps < 1 || steps > 50) { g_error = "zimage: steps 1 to 50"; return -1; }
+    return run(pipe, prompt, height, width, steps, noise, rgb);
+}
+
+int zi_generate(zi_pipe_t* pipe, const char* prompt, int height, int width, unsigned long long seed, unsigned char* rgb) {
+    return zi_generate_steps(pipe, prompt, height, width, kSteps, seed, rgb);
 }
 
 int zi_generate_with_noise(zi_pipe_t* pipe, const char* prompt, const float* noise, unsigned char* rgb) {
     g_error.clear();
     if (!pipe || !prompt || !noise || !rgb) { g_error = "zimage: a pipeline, a prompt, a noise and an output are needed"; return -1; }
-    return run(pipe, prompt, noise, rgb);
+    return run(pipe, prompt, 256, 256, kSteps, noise, rgb);
 }
 
 }  // extern "C"

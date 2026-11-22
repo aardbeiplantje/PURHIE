@@ -21,6 +21,19 @@ run alone on the machine.
 - **Tests:** `make regress` (quick tier) passes 47 of 47 on this host (2026-11-16). `make regress-full` has not been run.
 - **Image:** `/version` carries the rocm-hip commit. Last image build with nginx's `-t` check: 2026-11-16 19:42.
 
+## Status (saved before a reboot)
+
+Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching the ComfyUI workflow in comfy/workflows/zimage_mve.json):
+- Done: the DiT forward, sampler, output and VAE take the image grid (defaults keep 256 px unchanged); the causal text attention is
+  dynamic-shared and the text encoder takes any length (the example prompt is 101 tokens); the pipeline takes height, width and steps
+  (`zi_generate_steps`, `zi_generate_noise_steps`).
+- Not yet run: the 1024 engine output and its timing (tests/zimage_1024_verify.cpp, Makefile ZIMAGE_1024_VERIFY). The diffusers
+  reference (/data/zimage-ref/z1024/ref_1024.py, noise.f32, prompt.txt) was stopped twice: at 1024 it saturates the GPU and the desktop's
+  graphics ring times out (dmesg: ring gfx timeouts, recovered by resets). Run it only when the desktop is idle.
+- Next: run ref_1024.py 9 (idle GPU), then zimage_1024_verify 9 for the match and the time; then check the sampler against the
+  ComfyUI "simple" schedule; then the server parameters (steps, size) and the ComfyUI node.
+- Open: the 30 s target is unmeasured; the DiT uses BF16-rounded GEMMs (linear_bf16), which cost accuracy elsewhere (see the FP32 fixes).
+
 ## Open items, in order
 
 1. **Deployed service check (on the user's host).** `GET /rocm/v1/models`, one short chat through `/rocm/` (the fixup:

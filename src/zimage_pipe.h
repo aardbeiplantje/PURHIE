@@ -19,12 +19,17 @@ zi_pipe_t* zi_open(const char* dit_path, const char* vae_path, const char* te_pa
 void zi_close(zi_pipe_t* pipe);
 const char* zi_last_error(void);
 
-/* prompt -> rgb (height * width * 3 bytes, 8 bits). Only 256 x 256 for now (the DiT's latent grid is 32 x 32). The prompt's
- * chat-templated tokens must be at most 32 (the caption length of the DiT). The seed draws the initial noise (not torch's
- * sequence). Returns 0, or -1. */
+/* prompt -> rgb (height * width * 3 bytes, 8 bits), 8 sampler steps. height and width: multiples of 16 from 64. The seed draws the
+ * initial noise (not torch's sequence). Returns 0, or -1. */
 int zi_generate(zi_pipe_t* pipe, const char* prompt, int height, int width, unsigned long long seed, unsigned char* rgb);
 
-/* the same with the initial noise given: latent [16][32][32] floats (the reference's noise in the checks). Returns 0, or -1. */
+/* the same with the number of sampler steps (the DiT is called once per step); height and width: multiples of 16 from 64 */
+int zi_generate_steps(zi_pipe_t* pipe, const char* prompt, int height, int width, int steps, unsigned long long seed, unsigned char* rgb);
+
+/* the same with the noise given (latent [16][height/8][width/8] floats) and the steps; returns 0, or -1 */
+int zi_generate_noise_steps(zi_pipe_t* pipe, const char* prompt, int height, int width, int steps, const float* noise, unsigned char* rgb);
+
+/* the same with the initial noise given: 256 x 256 (latent [16][32][32] floats; the reference's noise in the checks). Returns 0, or -1. */
 int zi_generate_with_noise(zi_pipe_t* pipe, const char* prompt, const float* noise, unsigned char* rgb);
 
 #ifdef __cplusplus
