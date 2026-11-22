@@ -71,9 +71,18 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
   rounded to BF16) moves the image to PSNR 28.6 dB against ComfyUI (mean abs 2.78). A BF16-output hipBLASLt (the probe:
   40 / 40 / 22 TFLOPS against 32 / 32 / 18 with FP32 output) would save about 0.5 s a step, but it changes the precision policy
   (the project has kept FP32 activations since the BF16 errors of the Qwen and VAE paths). Not taken.
-- Next, in order: the VAE (about 3.6 s a decode: the fused BF16 lowering of the convolutions and the mid-block attention);
-  then the DiT's precision decision above, the sampler check against ComfyUI at 9 steps (done: the schedule), the server
-  parameters (steps, size) and the ComfyUI node.
+- VAE (2026-11-22, the Flux AE decoder, one 1024 decode, about 3.3 s now, was 3.7): the mid block's attention (one head of 512,
+  16384 tokens) runs its two products by hipBLASLt in FP32 (`blt::gemm_f32`; `SD_ATTN_KERNEL=scalar` keeps the old: 8.62 s
+  against 8.41 s a step); the group norm in three passes over 64 chunks per group (`zimage_gn_sum/_var/_apply`, fixed-order
+  reductions; 0.33 s -> 0.15 s a decode; the one-step output moves by at most one level). The convolutions stay on the
+  128 x 128 FP32 kernel: hipBLASLt in FP32 for them is slower on this decoder (8.65 s against 8.11 s a step; opt-in
+  `SD_CONV_KERNEL=blt`). `SD_VAE_BF16=1` (the BF16 convolutions) changes the image by 0.04 levels on average against the FP32
+  VAE, the PSNR against ComfyUI unchanged (27.74 dB): its precision is fine, but it is not faster yet (its im2col and
+  transpose passes, about 1.6 s, are the cost).
+- Next, in order: the convolutions (the FP32 kernel 1.75 s a decode, im2col 0.9 s): an im2col that writes BF16 straight into
+  the transposed layout (tiled, through LDS), then one hipBLASLt BF16 product per convolution (the output is the channel-major
+  layout as the column-major C with ld = HW: no transpose after). Then the DiT's decision above, the server parameters (steps,
+  size) and the ComfyUI node.
 - DiT linears, measured 2026-11-22 (`tests/sd_gemm_bench`, the three DiT shapes; `SD_BENCH_DEVICE=1` puts W, x, y in
   device memory): `sd_gemm_wmma256b` runs at about 19-20 TFLOPS on QKV and MLP-up and 9-13 on MLP-down (K 10240: a 20 KB row
   stride, half the rate of MLP-up at the same FLOPs). The DiT step's linears take about 2.7 s (the engine's own timing).

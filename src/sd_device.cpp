@@ -38,7 +38,7 @@ hipModule_t g_mod = nullptr;
 hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn_sum = nullptr, f_gn_sq = nullptr,
               f_gn_apply = nullptr, f_silu = nullptr, f_add = nullptr, f_upsample2 = nullptr, f_softmax = nullptr,
               f_layer_norm = nullptr, f_rms_norm = nullptr, f_zm_modulate = nullptr, f_zm_gate_add = nullptr, f_zm_swiglu = nullptr, f_zm_rope = nullptr, f_zm_ln_plain = nullptr, f_gn_f32 = nullptr, f_to_tok = nullptr, f_to_chw = nullptr, f_zq_rope = nullptr, f_zq_attn = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma256b = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
-              f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr, f_qi_linear_f8 = nullptr, f_qi_rms_f8 = nullptr, f_qi_affine = nullptr, f_qi_gelu = nullptr, f_qv_rms = nullptr, f_qv_patch = nullptr, f_qv_bias = nullptr, f_qv_upsample = nullptr, f_qi_hadamard = nullptr, f_qi_linear_i8 = nullptr, f_qi21_zc = nullptr, f_qi21_gather = nullptr, f_qi21_mul = nullptr, f_qi21_gated = nullptr, f_qi21_attn = nullptr, f_qi21_lbf = nullptr, f_qi21_dupup = nullptr, f_gemm_af128 = nullptr, f_transpose_bf16 = nullptr, f_bias_cm = nullptr, f_zm_rms_mod_bf16 = nullptr, f_zm_swiglu_bf16 = nullptr, f_bf16_to_f32 = nullptr, f_round_bf16 = nullptr;
+              f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr, f_qi_linear_f8 = nullptr, f_qi_rms_f8 = nullptr, f_qi_affine = nullptr, f_qi_gelu = nullptr, f_qv_rms = nullptr, f_qv_patch = nullptr, f_qv_bias = nullptr, f_qv_upsample = nullptr, f_qi_hadamard = nullptr, f_qi_linear_i8 = nullptr, f_qi21_zc = nullptr, f_qi21_gather = nullptr, f_qi21_mul = nullptr, f_qi21_gated = nullptr, f_qi21_attn = nullptr, f_qi21_lbf = nullptr, f_qi21_dupup = nullptr, f_gemm_af128 = nullptr, f_transpose_bf16 = nullptr, f_bias_cm = nullptr, f_zm_rms_mod_bf16 = nullptr, f_zm_swiglu_bf16 = nullptr, f_bf16_to_f32 = nullptr, f_round_bf16 = nullptr, f_gn_sum_part = nullptr, f_gn_var_part = nullptr, f_gn_apply_part = nullptr;
 
 constexpr int kThreads = 256;
 constexpr int kGroupSplit = 16;  // the group norm's partial sums per group
@@ -113,7 +113,7 @@ bool init() {
         const char* name;
     };
     const Entry entries[] = {
-        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"}, {&f_gemm_af128, "sd_gemm_af128"}, {&f_transpose_bf16, "sd_transpose_bf16"}, {&f_bias_cm, "sd_bias_cm"}, {&f_zm_rms_mod_bf16, "zimage_rms_mod_bf16"}, {&f_zm_swiglu_bf16, "zimage_swiglu_bf16"}, {&f_bf16_to_f32, "sd_bf16_to_f32"}, {&f_round_bf16, "sd_round_bf16"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_gemm_wmma256, "sd_gemm_wmma256"}, {&f_gemm_wmma256b, "sd_gemm_wmma256b"}, {&f_flash, "sd_flash_attn"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"}, {&f_qi_linear_f8, "qi_linear_f8"}, {&f_qi_rms_f8, "qi_rms_norm_f8"}, {&f_qi_affine, "qi_affine"}, {&f_qi_gelu, "qi_gelu_tanh"}, {&f_qv_rms, "qv_rms_tok"}, {&f_qv_patch, "qv_patch"}, {&f_qv_bias, "qv_bias_tok"}, {&f_qv_upsample, "qv_upsample2_tok"}, {&f_qi_hadamard, "qi_hadamard256"}, {&f_qi_linear_i8, "qi_linear_i8"}, {&f_qi21_zc, "qi21_zc_rms"}, {&f_qi21_gather, "qi21_gather_mod"}, {&f_qi21_mul, "qi21_mul_1p"}, {&f_qi21_gated, "qi21_gated_add"}, {&f_qi21_attn, "qi21_attn"}, {&f_qi21_lbf, "qi21_linear_bf16"}, {&f_qi21_dupup, "qi21_dupup"},
+        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"}, {&f_gemm_af128, "sd_gemm_af128"}, {&f_transpose_bf16, "sd_transpose_bf16"}, {&f_bias_cm, "sd_bias_cm"}, {&f_zm_rms_mod_bf16, "zimage_rms_mod_bf16"}, {&f_zm_swiglu_bf16, "zimage_swiglu_bf16"}, {&f_bf16_to_f32, "sd_bf16_to_f32"}, {&f_round_bf16, "sd_round_bf16"}, {&f_gn_sum_part, "zimage_gn_sum"}, {&f_gn_var_part, "zimage_gn_var"}, {&f_gn_apply_part, "zimage_gn_apply"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_gemm_wmma256, "sd_gemm_wmma256"}, {&f_gemm_wmma256b, "sd_gemm_wmma256b"}, {&f_flash, "sd_flash_attn"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"}, {&f_qi_linear_f8, "qi_linear_f8"}, {&f_qi_rms_f8, "qi_rms_norm_f8"}, {&f_qi_affine, "qi_affine"}, {&f_qi_gelu, "qi_gelu_tanh"}, {&f_qv_rms, "qv_rms_tok"}, {&f_qv_patch, "qv_patch"}, {&f_qv_bias, "qv_bias_tok"}, {&f_qv_upsample, "qv_upsample2_tok"}, {&f_qi_hadamard, "qi_hadamard256"}, {&f_qi_linear_i8, "qi_linear_i8"}, {&f_qi21_zc, "qi21_zc_rms"}, {&f_qi21_gather, "qi21_gather_mod"}, {&f_qi21_mul, "qi21_mul_1p"}, {&f_qi21_gated, "qi21_gated_add"}, {&f_qi21_attn, "qi21_attn"}, {&f_qi21_lbf, "qi21_linear_bf16"}, {&f_qi21_dupup, "qi21_dupup"},
         {&f_transpose_pad, "sd_transpose_pad"}, {&f_softmax_bf16, "sd_softmax_bf16"}, {&f_softmax_bf16w, "sd_softmax_bf16_w"},
         {&f_gn_sum, "sd_gn_sum"},       {&f_gn_sq, "sd_gn_sq"},         {&f_gn_apply, "sd_gn_apply"},
         {&f_silu, "sd_silu"},           {&f_add, "sd_add"},             {&f_upsample2, "sd_upsample2"},
@@ -340,6 +340,20 @@ void conv2d_bf16(const float* x, int cin, int H, int W, const float* w, int cout
     release(wb, sizeof(uint16_t) * (size_t)cout * K);
 }
 
+namespace blt {
+bool gemm_f32(int M, int N, int K, const float* A, long lda, const float* B, long sbk, long sbn, float* C, long cs_m, float alpha);
+}
+
+/* SD_CONV_KERNEL=blt: the FP32 convolutions by hipBLASLt (measured slower than the 128 x 128 kernel on the decoder: 8.65 s
+ * against 8.11 s a step); the default is the kernel */
+bool blt_conv_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("SD_CONV_KERNEL");
+        return e && std::strcmp(e, "blt") == 0;
+    }();
+    return on;
+}
+
 void conv2d_f32(const float* x, int cin, int H, int W, const float* w, int cout, const float* b, int k, int p, int st, float* y,
                 int Ho, int Wo) {
     const long HWo = (long)Ho * Wo;
@@ -361,7 +375,17 @@ void conv2d_f32(const float* x, int cin, int H, int W, const float* w, int cout,
         void* a1[] = {(void*)&x, (void*)&cin, (void*)&H, (void*)&W, (void*)&k, (void*)&p, (void*)&st, (void*)&Wo, (void*)&n0, (void*)&nc, (void*)&col};
         const dim3 g((unsigned)((nc + kThreads - 1) / kThreads), (unsigned)K, 1);
         launch(f_im2col, g, a1);
-        gemm_conv_f32(w, K, col, nc, 1, y + n0l, HWo, 1, 1.0f, 0.0f, cout, nc, K, b);
+        /* SD_CONV_KERNEL=blt: hipBLASLt in FP32 (the weights times the columns, then the bias as a pass) */
+        if (blt_conv_on() && blt::gemm_f32(cout, nc, K, w, K, col, nc, 1, y + n0l, HWo, 1.0f)) {
+            const long ne = (long)cout * nc;
+            const int ncc = nc, cc = cout;
+            const float* bb = b;
+            float* yy = y + n0l;
+            void* a2[] = {(void*)&yy, (void*)&HWo, (void*)&ncc, (void*)&cc, (void*)&bb};
+            launch(f_bias_cm, dim3(blocks((size_t)ne)), a2);
+        } else {
+            gemm_conv_f32(w, K, col, nc, 1, y + n0l, HWo, 1, 1.0f, 0.0f, cout, nc, K, b);
+        }
     }
     sync();
     release(col, sizeof(float) * (size_t)K * nc_max);
@@ -373,6 +397,7 @@ void linear_tok(const float* x, int T, const uint16_t* W, int in, int out, const
 }
 
 void linear_huge_xb(const uint16_t* xb, int T, const uint16_t* W, int in, int out, const float* b, float* y);
+
 
 void linear_bf16_xb(const uint16_t* xb, int T, const uint16_t* W, int in, int out, const float* b, float* y) {
     if (out <= 0 || T <= 0) return;
@@ -695,6 +720,102 @@ Plan* plan_for(int out, int T, int in, bool has_bias, const uint16_t* W, const u
 
 }  // namespace blt
 
+namespace blt {
+/* the FP32 product C[m][n] = alpha sum_k A[m][k] B(k, n) with the strides of gemm<float> (A rows contiguous in k: lda; B(k, n)
+ * at k sbk + n sbn; C at m cs_m + n, cs_n == 1), by hipBLASLt in FP32 (its algorithm tuned once per shape, as the BF16 plans).
+ * The attention's two products (sd_device attention_f32) take it. */
+struct PlanF32 {
+    hipblasLtMatmulDesc_t desc = nullptr;
+    hipblasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr;
+    hipblasLtMatmulPreference_t pref = nullptr;
+    hipblasLtMatmulAlgo_t algo{};
+    size_t ws = 0;
+    bool tuned = false, failed = false;
+};
+std::map<std::array<long, 7>, PlanF32> g_f32_plans;
+
+bool gemm_f32(int M, int N, int K, const float* A, long lda, const float* B, long sbk, long sbn, float* C, long cs_m, float alpha) {
+    if (M <= 0 || N <= 0 || K <= 0) return true;
+    if (!g_handle && hipblasLtCreate(&g_handle) != HIPBLAS_STATUS_SUCCESS) {
+        g_init_failed = true;
+        g_handle = nullptr;
+        return false;
+    }
+    /* B as the library reads it (column-major): B(k, n) at k + n ldb (op N: the stored matrix is n x k, ld = sbk; the
+     * transposed one: stored k x n with ld = sbn, when B's k is the contiguous one) */
+    const bool opN = (sbn == 1);
+    const long ldb = opN ? sbk : sbn;
+    const std::array<long, 7> key = {M, N, K, lda, ldb, opN ? 0L : 1L, cs_m};
+    auto it = g_f32_plans.find(key);
+    if (it == g_f32_plans.end()) {
+        PlanF32 p;
+        bool ok = hipblasLtMatmulDescCreate(&p.desc, HIPBLAS_COMPUTE_32F, HIP_R_32F) == HIPBLAS_STATUS_SUCCESS;
+        const hipblasOperation_t opA = opN ? HIPBLAS_OP_N : HIPBLAS_OP_T, opB = HIPBLAS_OP_N;
+        ok = ok && hipblasLtMatmulDescSetAttribute(p.desc, HIPBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)) == HIPBLAS_STATUS_SUCCESS;
+        ok = ok && hipblasLtMatmulDescSetAttribute(p.desc, HIPBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)) == HIPBLAS_STATUS_SUCCESS;
+        /* the stored B: n x k (opN, ld = sbk) or k x n (ld = sbn); A: k x m (ld = lda); C: n x m (ld = cs_m) */
+        ok = ok && hipblasLtMatrixLayoutCreate(&p.la, HIP_R_32F, opN ? N : K, opN ? K : N, ldb) == HIPBLAS_STATUS_SUCCESS;
+        ok = ok && hipblasLtMatrixLayoutCreate(&p.lb, HIP_R_32F, K, M, lda) == HIPBLAS_STATUS_SUCCESS;
+        ok = ok && hipblasLtMatrixLayoutCreate(&p.lc, HIP_R_32F, N, M, cs_m) == HIPBLAS_STATUS_SUCCESS;
+        ok = ok && hipblasLtMatmulPreferenceCreate(&p.pref) == HIPBLAS_STATUS_SUCCESS;
+        const uint64_t maxws = (uint64_t)512 << 20;
+        ok = ok && hipblasLtMatmulPreferenceSetAttribute(p.pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &maxws, sizeof(maxws)) ==
+                       HIPBLAS_STATUS_SUCCESS;
+        p.failed = !ok;
+        it = g_f32_plans.emplace(key, p).first;
+    }
+    PlanF32& p = it->second;
+    if (p.failed) return false;
+    const float beta = 0.0f;
+    auto run = [&](const hipblasLtMatmulAlgo_t& algo, size_t wsz) {
+        return hipblasLtMatmul(g_handle, p.desc, &alpha, B, p.la, A, p.lb, &beta, C, p.lc, C, p.lc, &algo, g_ws, wsz, nullptr) ==
+               HIPBLAS_STATUS_SUCCESS;
+    };
+    if (!p.tuned) {
+        hipblasLtMatmulHeuristicResult_t heur[16];
+        int n = 0;
+        if (hipblasLtMatmulAlgoGetHeuristic(g_handle, p.desc, p.la, p.lb, p.lc, p.lc, p.pref, 16, heur, &n) != HIPBLAS_STATUS_SUCCESS ||
+            n < 1) {
+            p.failed = true;
+            return false;
+        }
+        size_t maxws = 0;
+        for (int i = 0; i < n; ++i) maxws = std::max(maxws, (size_t)heur[i].workspaceSize);
+        if (!ensure_workspace(std::max<size_t>(maxws, 1))) {
+            p.failed = true;
+            return false;
+        }
+        double best = 1e30;
+        int best_i = -1;
+        for (int i = 0; i < n; ++i) {
+            if (!run(heur[i].algo, heur[i].workspaceSize)) continue;
+            hipDeviceSynchronize();
+            const auto t0 = std::chrono::steady_clock::now();
+            run(heur[i].algo, heur[i].workspaceSize);
+            hipDeviceSynchronize();
+            const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (t < best) {
+                best = t;
+                best_i = i;
+            }
+        }
+        if (best_i < 0) {
+            p.failed = true;
+            return false;
+        }
+        p.algo = heur[best_i].algo;
+        p.ws = heur[best_i].workspaceSize;
+        p.tuned = true;
+    }
+    if (!ensure_workspace(std::max<size_t>(p.ws, 1))) return false;
+    if (!run(p.algo, p.ws)) {
+        p.failed = true;
+        return false;
+    }
+    return true;
+}
+}  // namespace blt
+
 /* the large linear with its input in BF16 (xb: T x in, row-major): hipBLASLt, or the 256 x 128 WMMA kernel when hipBLASLt is off
  * or has no plan for the shape. The callers check the shape (out >= 256, T >= 1024, in % 64 == 0). */
 void linear_huge_xb(const uint16_t* xb, int T, const uint16_t* W, int in, int out, const float* b, float* y) {
@@ -874,9 +995,28 @@ void to_chw(const float* x, int C, int HW, float* y) {
 }
 
 void group_norm_f32(const float* x, int C, int HW, int groups, const float* gamma, const float* beta, float eps, float* y) {
-    void* a[] = {(void*)&x, (void*)&C, (void*)&HW, (void*)&groups, (void*)&gamma, (void*)&beta, (void*)&eps, (void*)&y};
-    launch(f_gn_f32, dim3((unsigned)groups, 1, 1), a);
+    /* the three passes over 64 chunks per group (zimage_gn_sum / _var / _apply); the one-block version when the groups are odd */
+    const int S = 64;
+    const int per = C / groups;
+    if (groups <= 0 || C % groups != 0 || !f_gn_sum_part) {
+        void* a[] = {(void*)&x, (void*)&C, (void*)&HW, (void*)&groups, (void*)&gamma, (void*)&beta, (void*)&eps, (void*)&y};
+        launch(f_gn_f32, dim3((unsigned)groups, 1, 1), a);
+        sync();
+        return;
+    }
+    float* part_sum = static_cast<float*>(alloc(sizeof(float) * (size_t)groups * S, false));
+    float* part_q = static_cast<float*>(alloc(sizeof(float) * (size_t)groups * S, false));
+    const int Sv = S;
+    void* a1[] = {(void*)&x, (void*)&HW, (void*)&per, (void*)&Sv, (void*)&part_sum};
+    launch(f_gn_sum_part, dim3((unsigned)S, (unsigned)groups, 1), a1);
+    void* a2[] = {(void*)&x, (void*)&HW, (void*)&per, (void*)&Sv, (void*)&part_sum, (void*)&part_q};
+    launch(f_gn_var_part, dim3((unsigned)S, (unsigned)groups, 1), a2);
+    void* a3[] = {(void*)&x, (void*)&C, (void*)&HW, (void*)&groups, (void*)&Sv, (void*)&part_sum, (void*)&part_q, (void*)&gamma,
+                  (void*)&beta, (void*)&eps, (void*)&y};
+    launch(f_gn_apply_part, dim3((unsigned)S, (unsigned)groups, 1), a3);
     sync();
+    release(part_sum, sizeof(float) * (size_t)groups * S);
+    release(part_q, sizeof(float) * (size_t)groups * S);
 }
 
 void layer_norm_plain(const float* x, int T, int C, float eps, float* y) {
@@ -945,6 +1085,15 @@ void geglu(const float* pj, long rows, int ff, float* g) {
     sync();
 }
 
+/* SD_ATTN_KERNEL=scalar keeps the scalar FP32 products of attention_f32 */
+bool blt_attn_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("SD_ATTN_KERNEL");
+        return !(e && std::strcmp(e, "scalar") == 0);
+    }();
+    return on;
+}
+
 void attention_f32(const float* q, int Tq, const float* k, const float* v, int Tk, int C, int heads, float* out) {
     const int D = C / heads;
     const float scale = 1.0f / std::sqrt((float)D);
@@ -955,11 +1104,13 @@ void attention_f32(const float* q, int Tq, const float* k, const float* v, int T
         for (int r0 = 0; r0 < Tq; r0 += R) {
             const int Rc = std::min(R, Tq - r0);
             // scores = scale * Q K^T for the chunk's rows, softmaxed, then the weighted values into the head's columns
-            gemm<float>(f_gemm_af, q + (size_t)r0 * C + hd * D, C, k + hd * D, 1, C, S, Tk, 1, nullptr, scale, 0.0f, Rc, Tk, D);
+            const bool blt_ok = blt_attn_on() && blt::gemm_f32(Rc, Tk, D, q + (size_t)r0 * C + hd * D, C, k + hd * D, 1, C, S, Tk, scale);
+            if (!blt_ok) gemm<float>(f_gemm_af, q + (size_t)r0 * C + hd * D, C, k + hd * D, 1, C, S, Tk, 1, nullptr, scale, 0.0f, Rc, Tk, D);
             int N = Tk;
             void* sm[] = {(void*)&S, (void*)&N};
             launch(f_softmax, dim3((unsigned)Rc, 1, 1), sm);
-            gemm<float>(f_gemm_af, S, Tk, v + hd * D, C, 1, out + (size_t)r0 * C + hd * D, C, 1, nullptr, 1.0f, 0.0f, Rc, D, Tk);
+            const bool blt_pv = blt_attn_on() && blt::gemm_f32(Rc, D, Tk, S, Tk, v + hd * D, C, 1, out + (size_t)r0 * C + hd * D, C, 1.0f);
+            if (!blt_pv) gemm<float>(f_gemm_af, S, Tk, v + hd * D, C, 1, out + (size_t)r0 * C + hd * D, C, 1, nullptr, 1.0f, 0.0f, Rc, D, Tk);
         }
     sync();
     release(S, sizeof(float) * (size_t)R * Tk);

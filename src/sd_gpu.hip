@@ -352,6 +352,66 @@ zimage_group_norm_f32(const float* x, int C, int HW, int groups, const float* g,
     }
 }
 
+// GroupNorm in three passes over S chunks per group (grid (S, groups)): the one-block-per-group kernel above left 32 blocks
+// for the GPU's 40 CUs. The partial sums are reduced in a fixed order (every block sums the group's S partials the same way),
+// so the result does not depend on the scheduling: the same two-pass statistics (mean, then the squared deviations).
+extern "C" __global__ void __launch_bounds__(SD_THREADS)
+zimage_gn_sum(const float* x, int HW, int per, int S, float* part) {
+    __shared__ float red[SD_THREADS];
+    const int sc = blockIdx.x, grp = blockIdx.y;
+    const long n = (long)per * HW;
+    const long len = (n + S - 1) / S;
+    const long i0 = (long)sc * len, i1 = i0 + len < n ? i0 + len : n;
+    const float* xg = x + (long)grp * n;
+    float s = 0.0f;
+    for (long i = i0 + threadIdx.x; i < i1; i += SD_THREADS) s += xg[i];
+    const float tot = block_sum(s, red);
+    if (threadIdx.x == 0) part[(long)grp * S + sc] = tot;
+}
+
+extern "C" __global__ void __launch_bounds__(SD_THREADS)
+zimage_gn_var(const float* x, int HW, int per, int S, const float* part_sum, float* part_q) {
+    __shared__ float red[SD_THREADS];
+    const int sc = blockIdx.x, grp = blockIdx.y;
+    const long n = (long)per * HW;
+    const long len = (n + S - 1) / S;
+    const long i0 = (long)sc * len, i1 = i0 + len < n ? i0 + len : n;
+    float tot = 0.0f;
+    for (int k = 0; k < S; ++k) tot += part_sum[(long)grp * S + k];
+    const float mean = tot / (float)n;
+    const float* xg = x + (long)grp * n;
+    float q = 0.0f;
+    for (long i = i0 + threadIdx.x; i < i1; i += SD_THREADS) {
+        const float d = xg[i] - mean;
+        q += d * d;
+    }
+    const float qt = block_sum(q, red);
+    if (threadIdx.x == 0) part_q[(long)grp * S + sc] = qt;
+}
+
+extern "C" __global__ void __launch_bounds__(SD_THREADS)
+zimage_gn_apply(const float* x, int C, int HW, int groups, int S, const float* part_sum, const float* part_q, const float* g,
+                const float* bt, float eps, float* y) {
+    const int sc = blockIdx.x, grp = blockIdx.y;
+    const int per = C / groups;
+    const long n = (long)per * HW;
+    const long len = (n + S - 1) / S;
+    const long i0 = (long)sc * len, i1 = i0 + len < n ? i0 + len : n;
+    float tot = 0.0f, totq = 0.0f;
+    for (int k = 0; k < S; ++k) {
+        tot += part_sum[(long)grp * S + k];
+        totq += part_q[(long)grp * S + k];
+    }
+    const float mean = tot / (float)n;
+    const float inv = rsqrtf(totq / (float)n + eps);
+    const float* xg = x + (long)grp * n;
+    float* yg = y + (long)grp * n;
+    for (long i = i0 + threadIdx.x; i < i1; i += SD_THREADS) {
+        const int c = grp * per + (int)(i / HW);
+        yg[i] = (xg[i] - mean) * inv * g[c] + bt[c];
+    }
+}
+
 // [C][HW] -> [HW][C] and back (the decoder's attention works on tokens)
 extern "C" __global__ void __launch_bounds__(SD_THREADS) zimage_to_tokens(const float* x, int C, int HW, float* y) {
     const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
