@@ -743,6 +743,12 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) zimage_swiglu_bf16_in(c
     }
 }
 
+// The number of 32-bit words that differ (the tuner's check that two algorithms give the same bits): count += 1 per word
+extern "C" __global__ void __launch_bounds__(SD_THREADS) sd_count_diff(const uint32_t* a, const uint32_t* b, long n, unsigned* count) {
+    for (long i = (long)blockIdx.x * SD_THREADS + threadIdx.x; i < n; i += (long)gridDim.x * SD_THREADS)
+        if (a[i] != b[i]) atomicAdd(count, 1u);
+}
+
 // y[i] = BF16(y[i]) as FP32 (in place): a linear's output rounded to BF16 (the precision experiment: SD_ROUND_OUT)
 extern "C" __global__ void __launch_bounds__(SD_THREADS) sd_round_bf16(float* y, long n) {
     const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;

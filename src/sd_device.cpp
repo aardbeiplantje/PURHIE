@@ -38,7 +38,7 @@ hipModule_t g_mod = nullptr;
 hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn_sum = nullptr, f_gn_sq = nullptr,
               f_gn_apply = nullptr, f_silu = nullptr, f_add = nullptr, f_upsample2 = nullptr, f_softmax = nullptr,
               f_layer_norm = nullptr, f_rms_norm = nullptr, f_zm_modulate = nullptr, f_zm_gate_add = nullptr, f_zm_swiglu = nullptr, f_zm_rope = nullptr, f_zm_ln_plain = nullptr, f_gn_f32 = nullptr, f_to_tok = nullptr, f_to_chw = nullptr, f_zq_rope = nullptr, f_zq_attn = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma256b = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
-              f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr, f_qi_linear_f8 = nullptr, f_qi_rms_f8 = nullptr, f_qi_affine = nullptr, f_qi_gelu = nullptr, f_qv_rms = nullptr, f_qv_patch = nullptr, f_qv_bias = nullptr, f_qv_upsample = nullptr, f_qi_hadamard = nullptr, f_qi_linear_i8 = nullptr, f_qi21_zc = nullptr, f_qi21_gather = nullptr, f_qi21_mul = nullptr, f_qi21_gated = nullptr, f_qi21_attn = nullptr, f_qi21_lbf = nullptr, f_qi21_dupup = nullptr, f_gemm_af128 = nullptr, f_transpose_bf16 = nullptr, f_bias_cm = nullptr, f_zm_rms_mod_bf16 = nullptr, f_zm_swiglu_bf16 = nullptr, f_bf16_to_f32 = nullptr, f_round_bf16 = nullptr, f_gn_sum_part = nullptr, f_gn_var_part = nullptr, f_gn_apply_part = nullptr, f_im2col_bf16_tile = nullptr, f_hnr16 = nullptr, f_tp16 = nullptr, f_rga16 = nullptr, f_sw16 = nullptr;
+              f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr, f_qi_linear_f8 = nullptr, f_qi_rms_f8 = nullptr, f_qi_affine = nullptr, f_qi_gelu = nullptr, f_qv_rms = nullptr, f_qv_patch = nullptr, f_qv_bias = nullptr, f_qv_upsample = nullptr, f_qi_hadamard = nullptr, f_qi_linear_i8 = nullptr, f_qi21_zc = nullptr, f_qi21_gather = nullptr, f_qi21_mul = nullptr, f_qi21_gated = nullptr, f_qi21_attn = nullptr, f_qi21_lbf = nullptr, f_qi21_dupup = nullptr, f_gemm_af128 = nullptr, f_transpose_bf16 = nullptr, f_bias_cm = nullptr, f_zm_rms_mod_bf16 = nullptr, f_zm_swiglu_bf16 = nullptr, f_bf16_to_f32 = nullptr, f_round_bf16 = nullptr, f_gn_sum_part = nullptr, f_gn_var_part = nullptr, f_gn_apply_part = nullptr, f_im2col_bf16_tile = nullptr, f_hnr16 = nullptr, f_count_diff = nullptr, f_tp16 = nullptr, f_rga16 = nullptr, f_sw16 = nullptr;
 
 constexpr int kThreads = 256;
 constexpr int kGroupSplit = 16;  // the group norm's partial sums per group
@@ -113,7 +113,7 @@ bool init() {
         const char* name;
     };
     const Entry entries[] = {
-        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"}, {&f_gemm_af128, "sd_gemm_af128"}, {&f_transpose_bf16, "sd_transpose_bf16"}, {&f_bias_cm, "sd_bias_cm"}, {&f_zm_rms_mod_bf16, "zimage_rms_mod_bf16"}, {&f_zm_swiglu_bf16, "zimage_swiglu_bf16"}, {&f_bf16_to_f32, "sd_bf16_to_f32"}, {&f_round_bf16, "sd_round_bf16"}, {&f_gn_sum_part, "zimage_gn_sum"}, {&f_gn_var_part, "zimage_gn_var"}, {&f_gn_apply_part, "zimage_gn_apply"}, {&f_im2col_bf16_tile, "sd_im2col_bf16_tile"}, {&f_hnr16, "zimage_head_norm_rope_bf16"}, {&f_tp16, "zimage_transpose_pad_bf16_in"}, {&f_rga16, "zimage_rms_gate_add_bf16"}, {&f_sw16, "zimage_swiglu_bf16_in"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_gemm_wmma256, "sd_gemm_wmma256"}, {&f_gemm_wmma256b, "sd_gemm_wmma256b"}, {&f_flash, "sd_flash_attn"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"}, {&f_qi_linear_f8, "qi_linear_f8"}, {&f_qi_rms_f8, "qi_rms_norm_f8"}, {&f_qi_affine, "qi_affine"}, {&f_qi_gelu, "qi_gelu_tanh"}, {&f_qv_rms, "qv_rms_tok"}, {&f_qv_patch, "qv_patch"}, {&f_qv_bias, "qv_bias_tok"}, {&f_qv_upsample, "qv_upsample2_tok"}, {&f_qi_hadamard, "qi_hadamard256"}, {&f_qi_linear_i8, "qi_linear_i8"}, {&f_qi21_zc, "qi21_zc_rms"}, {&f_qi21_gather, "qi21_gather_mod"}, {&f_qi21_mul, "qi21_mul_1p"}, {&f_qi21_gated, "qi21_gated_add"}, {&f_qi21_attn, "qi21_attn"}, {&f_qi21_lbf, "qi21_linear_bf16"}, {&f_qi21_dupup, "qi21_dupup"},
+        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"}, {&f_gemm_af128, "sd_gemm_af128"}, {&f_transpose_bf16, "sd_transpose_bf16"}, {&f_bias_cm, "sd_bias_cm"}, {&f_zm_rms_mod_bf16, "zimage_rms_mod_bf16"}, {&f_zm_swiglu_bf16, "zimage_swiglu_bf16"}, {&f_bf16_to_f32, "sd_bf16_to_f32"}, {&f_round_bf16, "sd_round_bf16"}, {&f_gn_sum_part, "zimage_gn_sum"}, {&f_gn_var_part, "zimage_gn_var"}, {&f_gn_apply_part, "zimage_gn_apply"}, {&f_im2col_bf16_tile, "sd_im2col_bf16_tile"}, {&f_hnr16, "zimage_head_norm_rope_bf16"}, {&f_count_diff, "sd_count_diff"}, {&f_tp16, "zimage_transpose_pad_bf16_in"}, {&f_rga16, "zimage_rms_gate_add_bf16"}, {&f_sw16, "zimage_swiglu_bf16_in"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_gemm_wmma256, "sd_gemm_wmma256"}, {&f_gemm_wmma256b, "sd_gemm_wmma256b"}, {&f_flash, "sd_flash_attn"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"}, {&f_qi_linear_f8, "qi_linear_f8"}, {&f_qi_rms_f8, "qi_rms_norm_f8"}, {&f_qi_affine, "qi_affine"}, {&f_qi_gelu, "qi_gelu_tanh"}, {&f_qv_rms, "qv_rms_tok"}, {&f_qv_patch, "qv_patch"}, {&f_qv_bias, "qv_bias_tok"}, {&f_qv_upsample, "qv_upsample2_tok"}, {&f_qi_hadamard, "qi_hadamard256"}, {&f_qi_linear_i8, "qi_linear_i8"}, {&f_qi21_zc, "qi21_zc_rms"}, {&f_qi21_gather, "qi21_gather_mod"}, {&f_qi21_mul, "qi21_mul_1p"}, {&f_qi21_gated, "qi21_gated_add"}, {&f_qi21_attn, "qi21_attn"}, {&f_qi21_lbf, "qi21_linear_bf16"}, {&f_qi21_dupup, "qi21_dupup"},
         {&f_transpose_pad, "sd_transpose_pad"}, {&f_softmax_bf16, "sd_softmax_bf16"}, {&f_softmax_bf16w, "sd_softmax_bf16_w"},
         {&f_gn_sum, "sd_gn_sum"},       {&f_gn_sq, "sd_gn_sq"},         {&f_gn_apply, "sd_gn_apply"},
         {&f_silu, "sd_silu"},           {&f_add, "sd_add"},             {&f_upsample2, "sd_upsample2"},
@@ -649,6 +649,22 @@ bool ensure_workspace(size_t bytes) {
     return true;
 }
 
+/* the number of differing 32-bit words of two device buffers (bytes a multiple of 4): 0 when the two algorithms gave the same bits */
+unsigned diff_words(const void* a, const void* b, size_t bytes) {
+    unsigned* cnt = static_cast<unsigned*>(dalloc(sizeof(unsigned)));
+    unsigned zero = 0;
+    hipMemcpy(cnt, &zero, sizeof(unsigned), hipMemcpyHostToDevice);
+    const long n = (long)(bytes / 4);
+    const void* ap = a;
+    const void* bp = b;
+    void* args[] = {(void*)&ap, (void*)&bp, (void*)&n, (void*)&cnt};
+    launch(f_count_diff, dim3((unsigned)((n + kThreads - 1) / kThreads), 1, 1), args);
+    unsigned host = 0;
+    hipMemcpy(&host, cnt, sizeof(unsigned), hipMemcpyDeviceToHost);
+    drelease(cnt, sizeof(unsigned));
+    return host;
+}
+
 bool enabled() {
     static const bool on = [] {
         const char* e = std::getenv("SD_LINEAR_KERNEL");
@@ -724,6 +740,11 @@ Plan* plan_for(int out, int T, int in, bool has_bias, bool out16, const uint16_t
         return nullptr;
     }
     const void* bias_ptr = b;
+    /* the candidates' outputs: the first candidate's is the reference, and a candidate whose bits differ is never chosen (the
+     * algorithms differ in their numerics; the choice must not depend on the timing) */
+    const size_t nbytes = (size_t)out * T * (out16 ? 2 : 4);
+    void* ref = dalloc(nbytes);
+    bool have_ref = false;
     double best = 1e30;
     int best_i = -1;
     for (int i = 0; i < n; ++i) {
@@ -734,6 +755,15 @@ Plan* plan_for(int out, int T, int in, bool has_bias, bool out16, const uint16_t
         if (!run_once(p, heur[i].algo, W, xb, y, bias_ptr, has_bias)) continue;
         hipDeviceSynchronize();
         double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
+        if (!have_ref) {
+            hipMemcpy(ref, y, nbytes, hipMemcpyDeviceToDevice);
+            have_ref = true;
+        } else if (diff_words(y, ref, nbytes) != 0) {
+            if (std::getenv("SD_BLT_LOG"))
+                std::fprintf(stderr, "blt: out %d T %d in %d bias %d out16 %d candidate %d: other numerics, not chosen\n", out, T, in,
+                             has_bias ? 1 : 0, out16 ? 1 : 0, i);
+            continue;
+        }
         if (best < 1e30 && t > 2.5 * best) {
             if (std::getenv("SD_BLT_LOG"))
                 std::fprintf(stderr, "blt: out %d T %d in %d bias %d candidate %d: %.2f ms (warm-up only)\n", out, T, in,
@@ -747,13 +777,14 @@ Plan* plan_for(int out, int T, int in, bool has_bias, bool out16, const uint16_t
             t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         }
         if (std::getenv("SD_BLT_LOG"))
-            std::fprintf(stderr, "blt: out %d T %d in %d bias %d candidate %d: %.2f ms (workspace %zu)\n", out, T, in, has_bias ? 1 : 0,
-                         i, t * 1e3, (size_t)heur[i].workspaceSize);
+            std::fprintf(stderr, "blt: out %d T %d in %d bias %d out16 %d candidate %d: %.2f ms (workspace %zu)\n", out, T, in,
+                         has_bias ? 1 : 0, out16 ? 1 : 0, i, t * 1e3, (size_t)heur[i].workspaceSize);
         if (t < best) {
             best = t;
             best_i = i;
         }
     }
+    drelease(ref, nbytes);
     if (best_i < 0) {
         p.failed = true;
         return nullptr;
@@ -832,20 +863,35 @@ bool gemm_impl(bool bf16, int M, int N, int K, const void* A, long lda, const vo
             p.failed = true;
             return false;
         }
+        /* the candidates' outputs: the first candidate's is the reference; a candidate whose bits differ is never chosen (the
+         * choice must not depend on the timing). The span: the rows M of cs_m words */
+        const size_t span = (size_t)M * (size_t)cs_m * sizeof(float);
+        void* ref = dalloc(span);
+        bool have_ref = false;
         double best = 1e30;
         int best_i = -1;
         for (int i = 0; i < n; ++i) {
             if (!run(heur[i].algo, heur[i].workspaceSize)) continue;
             hipDeviceSynchronize();
+            if (!have_ref) {
+                hipMemcpy(ref, C, span, hipMemcpyDeviceToDevice);
+                have_ref = true;
+            } else if (diff_words(C, ref, span) != 0) {
+                continue;
+            }
             const auto t0 = std::chrono::steady_clock::now();
             run(heur[i].algo, heur[i].workspaceSize);
             hipDeviceSynchronize();
             const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (std::getenv("SD_BLT_LOG"))
+                std::fprintf(stderr, "blt product: M %d N %d K %d lda %ld ldb %ld cs_m %ld bf16 %d candidate %d: %.3f ms\n", M, N, K, lda,
+                             ldb, cs_m, bf16 ? 1 : 0, i, t * 1e3);
             if (t < best) {
                 best = t;
                 best_i = i;
             }
         }
+        drelease(ref, span);
         if (best_i < 0) {
             p.failed = true;
             return false;

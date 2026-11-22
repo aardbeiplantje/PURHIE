@@ -89,9 +89,17 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
   single-tap kernel's on all 48 convolutions of the 256 run. The gate moved by 0.8 points between two versions of the
   column kernel with identical columns: the product's algorithm is chosen by timing, so it may differ between runs; this is
   not yet proved, and it is the same kind of effect as the DiT's tuning.
+- hipBLASLt's algorithm choice (2026-11-22): the candidates' numerics differ. Identical code in three processes gave outputs that
+  differed on 42% of the bytes (mean 0.8 levels, max 65): the timing picked different algorithms. Each algorithm's own output is
+  reproducible (the same hash in every process). The tuner now times only the candidates whose output equals the first
+  candidate's bit for bit (`diff_words`, on the device; the generic product's span of rows the same way), and picks the fastest
+  of those. Three processes now give identical outputs (md5 equal). The cost: for the VAE's convolutions the first candidate is
+  about 2x slower than the fastest (for example 56 against 27 ms at 128 x 1048576 x 1152), once per image: about 1.3 s
+  (9 steps: 25.5 s, was 24.2 s with the timing choice). A calibrated table (the best index per shape, measured once) would
+  recover it; not done. The nine-step image: PSNR 27.45 dB (as before).
 - Next, in order: the chain's remaining cost (the flash attention 0.43 s a step, the attention's FP32 output converted to BF16,
-  the modulation); the tuner's algorithm choice (fix it per shape, to make the results reproducible across runs); the server
-  parameters (steps, size) and the ComfyUI node.
+  the modulation); the calibrated table for the convolutions' algorithms (about 1.3 s a generation); the server parameters
+  (steps, size) and the ComfyUI node.
 - DiT linears, measured 2026-11-22 (`tests/sd_gemm_bench`, the three DiT shapes; `SD_BENCH_DEVICE=1` puts W, x, y in
   device memory): `sd_gemm_wmma256b` runs at about 19-20 TFLOPS on QKV and MLP-up and 9-13 on MLP-down (K 10240: a 20 KB row
   stride, half the rate of MLP-up at the same FLOPs). The DiT step's linears take about 2.7 s (the engine's own timing).
