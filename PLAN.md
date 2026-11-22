@@ -346,6 +346,10 @@ Quality and correctness:
   itself matches the exact quantised layer to 1.7e-6. Found and fixed: the BF16 linears rounded their activations (2 % error in one
   block), so they now use an FP32-activation kernel (`qi21_linear_bf16`). Not yet: the Qwen3-VL 8B text encoder, the 2.1 VAE, the sampler
   (25 steps, `simple`, CFG 1 in the ComfyUI workflow), the server path.
+  Qwen3-VL 8B text encoder for 2.1 (`src/qwenimage21_text.cpp`, ComfyUI int8 ConvRot file): the 36-layer language model, last layer
+  output before the final norm, system tokens dropped; matches the exact dequantised FP32 oracle (`/data/zimage-ref/qwen3vl`,
+  ref_te21_fp32.py) at min row cosine 1.000000, 1.6e-4 relative. Its embedding table is ConvRot too (rotated along the hidden dim).
+  Still to do for 2.1: the 2.1 VAE, the sampler (25 steps, `simple`, CFG 1), the server path.
   (`ref_pipeline.py`) differs from these by 6 to 15 % over 8 steps: it is not the reference for the engine. Not yet: the server path
   (`/v1/images/generations`) and the CFG (the default pipeline run has no negative prompt; true CFG 4 is for the negative case).
 - **Flux.2 dev** (`diffusion_models/flux2_dev_fp8mixed`: BF16 and FP8 layers with scales and a quantization table; double and
