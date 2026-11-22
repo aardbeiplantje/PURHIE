@@ -1672,19 +1672,20 @@ _zi_close(h)
     zi_close(INT2PTR(zi_pipe_t*, h));
 
 SV*
-_zi_generate_png(h, prompt, seed, width, height)
+_zi_generate_png(h, prompt, seed, width, height, steps)
     IV h
     SV* prompt
     UV seed
     int width
     int height
+    int steps
   CODE:
-    /* one image of the Z-Image-Turbo pipeline, as PNG bytes */
+    /* one image of the Z-Image-Turbo pipeline, as PNG bytes (steps: the sampler's steps, 9 for the workflow the MVE matches) */
     unsigned char* rgb = (unsigned char*)malloc((size_t)3 * width * height);
     uint8_t* png = NULL;
     size_t n = 0;
     if (!rgb) croak("ROCm::Inference: out of memory");
-    if (zi_generate(INT2PTR(zi_pipe_t*, h), SvPV_nolen(prompt), height, width, (unsigned long long)seed, rgb) != 0) {
+    if (zi_generate_steps(INT2PTR(zi_pipe_t*, h), SvPV_nolen(prompt), height, width, steps, (unsigned long long)seed, rgb) != 0) {
         free(rgb);
         croak("ROCm::Inference: zi_generate: %s", zi_last_error());
     }

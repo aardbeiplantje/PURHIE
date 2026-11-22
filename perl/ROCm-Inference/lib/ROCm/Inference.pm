@@ -871,15 +871,20 @@ sub _tokenizer {
     return (\@vocab, \@merges);
 }
 
-# $img->generate($prompt, size => 'WIDTHxHEIGHT', seed => N): PNG bytes (256 x 256 only)
+# $img->generate($prompt, size => 'WIDTHxHEIGHT', seed => N, steps => N): PNG bytes. The size: multiples of 16 from 64 to 1024
+# (1024 x 1024 by default); the steps: 1 to 50 (9 by default: the ComfyUI workflow the engine matches). The seed: torch's
+# randn for the seed (ComfyUI's noise).
 sub generate {
     my ($img, $prompt, %o) = @_;
-    my ($w, $h) = (256, 256);
+    my ($w, $h) = (1024, 1024);
     if (defined $o{size}) {
         ($w, $h) = $o{size} =~ /\A(\d+)x(\d+)\z/ or die "size: WIDTHxHEIGHT, not '$o{size}'\n";
     }
-    die "size: 256x256 only for now\n" unless $w == 256 && $h == 256;
-    return ROCm::Inference::_zi_generate_png($img->{h}, $prompt, $o{seed} // 0, $w, $h);
+    die "size: multiples of 16 from 64 to 1024, not ${w}x$h\n"
+        unless $w >= 64 && $h >= 64 && $w <= 1024 && $h <= 1024 && $w % 16 == 0 && $h % 16 == 0;
+    my $steps = $o{steps} // 9;
+    die "steps: 1 to 50, not '$steps'\n" unless $steps =~ /\A\d+\z/ && $steps >= 1 && $steps <= 50;
+    return ROCm::Inference::_zi_generate_png($img->{h}, $prompt, $o{seed} // 0, $w, $h, $steps);
 }
 
 sub DESTROY {

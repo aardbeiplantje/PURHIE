@@ -1380,7 +1380,7 @@ route::get '/v1/audio/voices' => sub {
 };
 
 # OpenAI's image generation: a JSON body with the prompt, the size (WIDTHxHEIGHT, multiples of 8 from 64 to 1024; 512x512 by
-# default), n (1: one image per request) and response_format (b64_json: the PNG in base64 in data[0].b64_json; or png: the
+# default; z-image-turbo: multiples of 16, 1024x1024 by default), steps (z-image-turbo: 9 by default), n (1: one image per request) and response_format (b64_json: the PNG in base64 in data[0].b64_json; or png: the
 # PNG bytes as image/png), the optional seed (the latents; 0 by default). One image at a time, on the host (about half a
 # minute at 512 x 512 with sd-turbo's one step).
 route::post '/v1/images/generations' => sub {
@@ -1403,7 +1403,7 @@ route::post '/v1/images/generations' => sub {
     error(400, 'prompt: at most 1000 characters') if length $prompt > 1000;
     my $n = $p->{n} // 1;
     error(400, 'n: 1 (one image per request)') unless $n =~ /\A1\z/;
-    my $size = $p->{size} // ($model eq 'minimax-h3-image' ? '1024x1024' : $model eq 'z-image-turbo' ? '256x256' : '512x512');
+    my $size = $p->{size} // ($model eq 'minimax-h3-image' ? '1024x1024' : $model eq 'z-image-turbo' ? '1024x1024' : '512x512');
     error(400, "size: WIDTHxHEIGHT, not '$size'") unless $size =~ /\A\d+x\d+\z/;
     my $fmt = $p->{response_format} // 'b64_json';
     error(400, "response_format: b64_json or png, not '$fmt'") unless $fmt =~ /\A(?:b64_json|png)\z/;
@@ -1411,7 +1411,11 @@ route::post '/v1/images/generations' => sub {
     error(400, 'seed: a whole number') unless $seed =~ /\A\d+\z/;
     # one image at a time: the loop is busy while it is generated, so other requests wait in the socket queue (no 503)
     my $t0 = Time::HiRes::time();
-    my $png = eval { $backend->generate($prompt, size => $size, seed => $seed) };
+    # steps: Z-Image-Turbo's (9 by default, as the ComfyUI workflow; the sd-turbo file takes its own one step)
+    my $steps = $p->{steps};
+    error(400, 'steps: a whole number from 1 to 50') if defined $steps && !($steps =~ /\A\d+\z/ && $steps >= 1 && $steps <= 50);
+    my $png = eval { $backend == $ZIMAGE ? $backend->generate($prompt, size => $size, seed => $seed, steps => $steps)
+                                         : $backend->generate($prompt, size => $size, seed => $seed) };
     error(400, $@ =~ s/ at \S+ line \d+\.?\n?\z//r) if $@;
     my $secs = Time::HiRes::time() - $t0;
     my $canvas = '';

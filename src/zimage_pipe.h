@@ -20,7 +20,8 @@ void zi_close(zi_pipe_t* pipe);
 const char* zi_last_error(void);
 
 /* prompt -> rgb (height * width * 3 bytes, 8 bits), 8 sampler steps. height and width: multiples of 16 from 64. The seed draws the
- * initial noise (not torch's sequence). Returns 0, or -1. */
+ * initial noise: torch.randn after manual_seed(seed) (the CPU generator: ComfyUI draws the same latent for the seed). Returns 0,
+ * or -1. */
 int zi_generate(zi_pipe_t* pipe, const char* prompt, int height, int width, unsigned long long seed, unsigned char* rgb);
 
 /* the same with the number of sampler steps (the DiT is called once per step); height and width: multiples of 16 from 64 */

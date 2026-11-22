@@ -2,6 +2,8 @@
  * host work besides the noise), then the device path: the text encoder, the 8-step sampler, the VAE decoder. */
 #include "zimage_pipe.h"
 
+#include "torch_randn.h"
+
 #include "tokenizer.h"
 #include "zimage_dit.h"
 #include "zimage_text.h"
@@ -25,26 +27,6 @@ constexpr int kImStart = 151644;
 constexpr int kImEnd = 151645;
 constexpr int kSteps = 8;
 constexpr float kShift = 3.0f;
-
-/* splitmix64: the noise's uniform draws (deterministic from the seed) */
-uint64_t next_u64(uint64_t& s) {
-    uint64_t z = (s += 0x9E3779B97F4A7C15ull);
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-    return z ^ (z >> 31);
-}
-
-/* the standard normal values (Box-Muller) of the latent [16][32][32] */
-void noise_latent(unsigned long long seed, float* out, size_t n) {
-    uint64_t s = seed;
-    for (size_t i = 0; i < n; i += 2) {
-        double u1 = ((next_u64(s) >> 11) + 1.0) * (1.0 / 9007199254740993.0);
-        double u2 = (next_u64(s) >> 11) * (1.0 / 9007199254740992.0);
-        double r = std::sqrt(-2.0 * std::log(u1)), a = 6.283185307179586 * u2;
-        out[i] = (float)(r * std::cos(a));
-        if (i + 1 < n) out[i + 1] = (float)(r * std::sin(a));
-    }
-}
 
 }  // namespace
 
@@ -136,7 +118,7 @@ int zi_generate_steps(zi_pipe_t* pipe, const char* prompt, int height, int width
     if (height < 64 || width < 64 || height % 16 || width % 16) { g_error = "zimage: height and width: multiples of 16 from 64"; return -1; }
     if (steps < 1 || steps > 50) { g_error = "zimage: steps 1 to 50"; return -1; }
     std::vector<float> noise((size_t)16 * (height / 8) * (width / 8));
-    noise_latent(seed, noise.data(), noise.size());
+    torch_randn(seed, noise.data(), noise.size());  /* torch.randn after manual_seed(seed): ComfyUI's noise for the seed */
     return run(pipe, prompt, height, width, steps, noise.data(), rgb);
 }
 
