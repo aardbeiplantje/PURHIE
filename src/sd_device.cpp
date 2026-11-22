@@ -38,7 +38,7 @@ hipModule_t g_mod = nullptr;
 hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn_sum = nullptr, f_gn_sq = nullptr,
               f_gn_apply = nullptr, f_silu = nullptr, f_add = nullptr, f_upsample2 = nullptr, f_softmax = nullptr,
               f_layer_norm = nullptr, f_rms_norm = nullptr, f_zm_modulate = nullptr, f_zm_gate_add = nullptr, f_zm_swiglu = nullptr, f_zm_rope = nullptr, f_zm_ln_plain = nullptr, f_gn_f32 = nullptr, f_to_tok = nullptr, f_to_chw = nullptr, f_zq_rope = nullptr, f_zq_attn = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma256b = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
-              f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr, f_qi_linear_f8 = nullptr, f_qi_rms_f8 = nullptr, f_qi_affine = nullptr, f_qi_gelu = nullptr, f_qv_rms = nullptr, f_qv_patch = nullptr, f_qv_bias = nullptr, f_qv_upsample = nullptr, f_qi_hadamard = nullptr, f_qi_linear_i8 = nullptr, f_qi21_zc = nullptr, f_qi21_gather = nullptr, f_qi21_mul = nullptr, f_qi21_gated = nullptr, f_qi21_attn = nullptr, f_qi21_lbf = nullptr, f_qi21_dupup = nullptr, f_gemm_af128 = nullptr, f_transpose_bf16 = nullptr, f_bias_cm = nullptr, f_zm_rms_mod_bf16 = nullptr, f_zm_swiglu_bf16 = nullptr, f_bf16_to_f32 = nullptr, f_round_bf16 = nullptr, f_gn_sum_part = nullptr, f_gn_var_part = nullptr, f_gn_apply_part = nullptr;
+              f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr, f_qi_linear_f8 = nullptr, f_qi_rms_f8 = nullptr, f_qi_affine = nullptr, f_qi_gelu = nullptr, f_qv_rms = nullptr, f_qv_patch = nullptr, f_qv_bias = nullptr, f_qv_upsample = nullptr, f_qi_hadamard = nullptr, f_qi_linear_i8 = nullptr, f_qi21_zc = nullptr, f_qi21_gather = nullptr, f_qi21_mul = nullptr, f_qi21_gated = nullptr, f_qi21_attn = nullptr, f_qi21_lbf = nullptr, f_qi21_dupup = nullptr, f_gemm_af128 = nullptr, f_transpose_bf16 = nullptr, f_bias_cm = nullptr, f_zm_rms_mod_bf16 = nullptr, f_zm_swiglu_bf16 = nullptr, f_bf16_to_f32 = nullptr, f_round_bf16 = nullptr, f_gn_sum_part = nullptr, f_gn_var_part = nullptr, f_gn_apply_part = nullptr, f_im2col_bf16_tile = nullptr;
 
 constexpr int kThreads = 256;
 constexpr int kGroupSplit = 16;  // the group norm's partial sums per group
@@ -113,7 +113,7 @@ bool init() {
         const char* name;
     };
     const Entry entries[] = {
-        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"}, {&f_gemm_af128, "sd_gemm_af128"}, {&f_transpose_bf16, "sd_transpose_bf16"}, {&f_bias_cm, "sd_bias_cm"}, {&f_zm_rms_mod_bf16, "zimage_rms_mod_bf16"}, {&f_zm_swiglu_bf16, "zimage_swiglu_bf16"}, {&f_bf16_to_f32, "sd_bf16_to_f32"}, {&f_round_bf16, "sd_round_bf16"}, {&f_gn_sum_part, "zimage_gn_sum"}, {&f_gn_var_part, "zimage_gn_var"}, {&f_gn_apply_part, "zimage_gn_apply"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_gemm_wmma256, "sd_gemm_wmma256"}, {&f_gemm_wmma256b, "sd_gemm_wmma256b"}, {&f_flash, "sd_flash_attn"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"}, {&f_qi_linear_f8, "qi_linear_f8"}, {&f_qi_rms_f8, "qi_rms_norm_f8"}, {&f_qi_affine, "qi_affine"}, {&f_qi_gelu, "qi_gelu_tanh"}, {&f_qv_rms, "qv_rms_tok"}, {&f_qv_patch, "qv_patch"}, {&f_qv_bias, "qv_bias_tok"}, {&f_qv_upsample, "qv_upsample2_tok"}, {&f_qi_hadamard, "qi_hadamard256"}, {&f_qi_linear_i8, "qi_linear_i8"}, {&f_qi21_zc, "qi21_zc_rms"}, {&f_qi21_gather, "qi21_gather_mod"}, {&f_qi21_mul, "qi21_mul_1p"}, {&f_qi21_gated, "qi21_gated_add"}, {&f_qi21_attn, "qi21_attn"}, {&f_qi21_lbf, "qi21_linear_bf16"}, {&f_qi21_dupup, "qi21_dupup"},
+        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"}, {&f_gemm_af128, "sd_gemm_af128"}, {&f_transpose_bf16, "sd_transpose_bf16"}, {&f_bias_cm, "sd_bias_cm"}, {&f_zm_rms_mod_bf16, "zimage_rms_mod_bf16"}, {&f_zm_swiglu_bf16, "zimage_swiglu_bf16"}, {&f_bf16_to_f32, "sd_bf16_to_f32"}, {&f_round_bf16, "sd_round_bf16"}, {&f_gn_sum_part, "zimage_gn_sum"}, {&f_gn_var_part, "zimage_gn_var"}, {&f_gn_apply_part, "zimage_gn_apply"}, {&f_im2col_bf16_tile, "sd_im2col_bf16_tile"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_gemm_wmma256, "sd_gemm_wmma256"}, {&f_gemm_wmma256b, "sd_gemm_wmma256b"}, {&f_flash, "sd_flash_attn"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"}, {&f_qi_linear_f8, "qi_linear_f8"}, {&f_qi_rms_f8, "qi_rms_norm_f8"}, {&f_qi_affine, "qi_affine"}, {&f_qi_gelu, "qi_gelu_tanh"}, {&f_qv_rms, "qv_rms_tok"}, {&f_qv_patch, "qv_patch"}, {&f_qv_bias, "qv_bias_tok"}, {&f_qv_upsample, "qv_upsample2_tok"}, {&f_qi_hadamard, "qi_hadamard256"}, {&f_qi_linear_i8, "qi_linear_i8"}, {&f_qi21_zc, "qi21_zc_rms"}, {&f_qi21_gather, "qi21_gather_mod"}, {&f_qi21_mul, "qi21_mul_1p"}, {&f_qi21_gated, "qi21_gated_add"}, {&f_qi21_attn, "qi21_attn"}, {&f_qi21_lbf, "qi21_linear_bf16"}, {&f_qi21_dupup, "qi21_dupup"},
         {&f_transpose_pad, "sd_transpose_pad"}, {&f_softmax_bf16, "sd_softmax_bf16"}, {&f_softmax_bf16w, "sd_softmax_bf16_w"},
         {&f_gn_sum, "sd_gn_sum"},       {&f_gn_sq, "sd_gn_sq"},         {&f_gn_apply, "sd_gn_apply"},
         {&f_silu, "sd_silu"},           {&f_add, "sd_add"},             {&f_upsample2, "sd_upsample2"},
@@ -342,6 +342,47 @@ void conv2d_bf16(const float* x, int cin, int H, int W, const float* w, int cout
 
 namespace blt {
 bool gemm_f32(int M, int N, int K, const float* A, long lda, const float* B, long sbk, long sbn, float* C, long cs_m, float alpha);
+bool gemm_bf16(int M, int N, int K, const uint16_t* A, long lda, const uint16_t* B, long sbk, long sbn, float* C, long cs_m, float alpha);
+}
+
+/* The convolution in BF16 by hipBLASLt (the default of the VAE's convolutions; SD_VAE_CONV=fp32 keeps the FP32 kernel): the
+ * im2col written as BF16 token-major in one pass, the weights as BF16, one product per convolution (no
+ * chunks: one plan per shape) with the FP32 output channel-major (C[c][p] at c HW + p: the product's rows are the pixels, the
+ * output's row stride is 1), the bias as a pass. Returns false when the device path does not take it. */
+bool conv2d_blt_bf16(const float* x, int cin, int H, int W, const float* w, int cout, const float* b, int k, int p, int st, float* y,
+                     int Ho, int Wo) {
+    const long HWo = (long)Ho * Wo;
+    const int K = cin * k * k;
+    if (HWo <= 0 || K <= 0 || !f_im2col_bf16_tile || !f_bias_cm || !f_to_bf16) return false;
+    /* the tile kernel: stride 1, k <= 3, whole 64-pixel row segments, 8-channel blocks */
+    if (st != 1 || k > 3 || k < 1 || Wo % 64 != 0 || cin % 8 != 0 || Ho != H) return false;
+    uint16_t* wb = static_cast<uint16_t*>(dalloc(sizeof(uint16_t) * (size_t)cout * K));
+    uint16_t* col = static_cast<uint16_t*>(dalloc(sizeof(uint16_t) * (size_t)HWo * K));
+    {
+        const long nw = (long)cout * K;
+        const float* wf = w;
+        void* a[] = {(void*)&wf, (void*)&wb, (void*)&nw};
+        launch(f_to_bf16, dim3(blocks((size_t)nw)), a);
+    }
+    {
+        const float* xs = x;
+        const int Kc = K;
+        void* a[] = {(void*)&xs, (void*)&cin, (void*)&H, (void*)&W, (void*)&k, (void*)&p, (void*)&Wo, (void*)&Kc, (void*)&col};
+        launch(f_im2col_bf16_tile, dim3((unsigned)(Ho * (Wo / 64)), (unsigned)(cin / 8), 1), a);
+    }
+    const bool ok = blt::gemm_bf16(cout, (int)HWo, K, wb, K, col, 1, K, y, HWo, 1.0f);
+    if (ok) {
+        const long ne = (long)cout * HWo;
+        const int ncc = (int)HWo, cc = cout;
+        const long hw = HWo;
+        const float* bb = b;
+        void* a[] = {(void*)&y, (void*)&hw, (void*)&ncc, (void*)&cc, (void*)&bb};
+        launch(f_bias_cm, dim3(blocks((size_t)ne)), a);
+    }
+    sync();
+    drelease(col, sizeof(uint16_t) * (size_t)HWo * K);
+    drelease(wb, sizeof(uint16_t) * (size_t)cout * K);
+    return ok;
 }
 
 /* SD_CONV_KERNEL=blt: the FP32 convolutions by hipBLASLt (measured slower than the 128 x 128 kernel on the decoder: 8.65 s
@@ -359,6 +400,11 @@ void conv2d_f32(const float* x, int cin, int H, int W, const float* w, int cout,
     const long HWo = (long)Ho * Wo;
     const int K = cin * k * k;
     if (HWo <= 0 || K <= 0) return;
+    static const bool conv_fp32 = [] {
+        const char* e = std::getenv("SD_VAE_CONV");
+        return e && std::strcmp(e, "fp32") == 0;
+    }();
+    if (!conv_fp32 && (K % 8) == 0 && conv2d_blt_bf16(x, cin, H, W, w, cout, b, k, p, st, y, Ho, Wo)) return;
     static const bool bf16_conv = [] {
         const char* e = std::getenv("SD_VAE_BF16");
         return e && std::atoi(e) != 0;
@@ -732,9 +778,9 @@ struct PlanF32 {
     size_t ws = 0;
     bool tuned = false, failed = false;
 };
-std::map<std::array<long, 7>, PlanF32> g_f32_plans;
+std::map<std::array<long, 8>, PlanF32> g_f32_plans;
 
-bool gemm_f32(int M, int N, int K, const float* A, long lda, const float* B, long sbk, long sbn, float* C, long cs_m, float alpha) {
+bool gemm_impl(bool bf16, int M, int N, int K, const void* A, long lda, const void* B, long sbk, long sbn, float* C, long cs_m, float alpha) {
     if (M <= 0 || N <= 0 || K <= 0) return true;
     if (!g_handle && hipblasLtCreate(&g_handle) != HIPBLAS_STATUS_SUCCESS) {
         g_init_failed = true;
@@ -743,9 +789,10 @@ bool gemm_f32(int M, int N, int K, const float* A, long lda, const float* B, lon
     }
     /* B as the library reads it (column-major): B(k, n) at k + n ldb (op N: the stored matrix is n x k, ld = sbk; the
      * transposed one: stored k x n with ld = sbn, when B's k is the contiguous one) */
+    const hipDataType dt = bf16 ? HIP_R_16BF : HIP_R_32F;
     const bool opN = (sbn == 1);
     const long ldb = opN ? sbk : sbn;
-    const std::array<long, 7> key = {M, N, K, lda, ldb, opN ? 0L : 1L, cs_m};
+    const std::array<long, 8> key = {M, N, K, lda, ldb, opN ? 0L : 1L, cs_m, bf16 ? 1L : 0L};
     auto it = g_f32_plans.find(key);
     if (it == g_f32_plans.end()) {
         PlanF32 p;
@@ -754,8 +801,8 @@ bool gemm_f32(int M, int N, int K, const float* A, long lda, const float* B, lon
         ok = ok && hipblasLtMatmulDescSetAttribute(p.desc, HIPBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)) == HIPBLAS_STATUS_SUCCESS;
         ok = ok && hipblasLtMatmulDescSetAttribute(p.desc, HIPBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)) == HIPBLAS_STATUS_SUCCESS;
         /* the stored B: n x k (opN, ld = sbk) or k x n (ld = sbn); A: k x m (ld = lda); C: n x m (ld = cs_m) */
-        ok = ok && hipblasLtMatrixLayoutCreate(&p.la, HIP_R_32F, opN ? N : K, opN ? K : N, ldb) == HIPBLAS_STATUS_SUCCESS;
-        ok = ok && hipblasLtMatrixLayoutCreate(&p.lb, HIP_R_32F, K, M, lda) == HIPBLAS_STATUS_SUCCESS;
+        ok = ok && hipblasLtMatrixLayoutCreate(&p.la, dt, opN ? N : K, opN ? K : N, ldb) == HIPBLAS_STATUS_SUCCESS;
+        ok = ok && hipblasLtMatrixLayoutCreate(&p.lb, dt, K, M, lda) == HIPBLAS_STATUS_SUCCESS;
         ok = ok && hipblasLtMatrixLayoutCreate(&p.lc, HIP_R_32F, N, M, cs_m) == HIPBLAS_STATUS_SUCCESS;
         ok = ok && hipblasLtMatmulPreferenceCreate(&p.pref) == HIPBLAS_STATUS_SUCCESS;
         const uint64_t maxws = (uint64_t)512 << 20;
@@ -813,6 +860,14 @@ bool gemm_f32(int M, int N, int K, const float* A, long lda, const float* B, lon
         return false;
     }
     return true;
+}
+
+bool gemm_f32(int M, int N, int K, const float* A, long lda, const float* B, long sbk, long sbn, float* C, long cs_m, float alpha) {
+    return gemm_impl(false, M, N, K, A, lda, B, sbk, sbn, C, cs_m, alpha);
+}
+
+bool gemm_bf16(int M, int N, int K, const uint16_t* A, long lda, const uint16_t* B, long sbk, long sbn, float* C, long cs_m, float alpha) {
+    return gemm_impl(true, M, N, K, A, lda, B, sbk, sbn, C, cs_m, alpha);
 }
 }  // namespace blt
 

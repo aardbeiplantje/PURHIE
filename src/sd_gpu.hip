@@ -642,6 +642,37 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) zimage_swiglu_bf16(cons
     if (i < n) g[i] = f2bf(a[i] / (1.0f + expf(-a[i])) * b[i]);
 }
 
+// The im2col in BF16 through shared memory (stride 1, k <= 3, the output width a multiple of 64, the channels a multiple of
+// 8: the VAE's convolutions). A block is 64 consecutive output pixels of one row (blockIdx.x) and 8 input channels
+// (blockIdx.y): the input patch (8 channels x 3 rows x 66 columns) is read once and the block writes its 72 taps (8 x 9) of
+// each pixel as one contiguous run of colT (token-major: colT[n][r], n = y Wo + x, r = c k k + ky k + kx).
+#define IM2COL_CB 8
+extern "C" __global__ void __launch_bounds__(SD_THREADS)
+sd_im2col_bf16_tile(const float* x, int cin, int H, int W, int k, int p, int Wo, int K, uint16_t* colT) {
+    __shared__ float patch[IM2COL_CB][3][66];
+    const int tiles_x = Wo / 64;
+    const int yy = (int)blockIdx.x / tiles_x;
+    const int xseg = ((int)blockIdx.x % tiles_x) * 64;
+    const int cb = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int kk = k * k;
+    for (int idx = tid; idx < IM2COL_CB * 3 * 66; idx += SD_THREADS) {
+        const int cl = idx / (3 * 66), rem = idx % (3 * 66), ry = rem / 66, cx = rem % 66;
+        const int c = cb * IM2COL_CB + cl, gy = yy - p + ry, gx = xseg - p + cx;
+        float v = 0.0f;
+        if (c < cin && gy >= 0 && gy < H && gx >= 0 && gx < W) v = x[((long)c * H + gy) * W + gx];
+        patch[cl][ry][cx] = v;
+    }
+    __syncthreads();
+    const int taps = IM2COL_CB * kk;
+    for (int idx = tid; idx < 64 * taps; idx += SD_THREADS) {
+        const int j = idx / taps, rr = idx % taps;
+        const int cl = rr / kk, rem = rr % kk, ky = rem / k, kx = rem % k;
+        const long n = (long)yy * Wo + xseg + j;
+        colT[n * K + cb * taps + rr] = f2bf(patch[cl][ky][j + kx]);
+    }
+}
+
 // y[i] = BF16(y[i]) as FP32 (in place): a linear's output rounded to BF16 (the precision experiment: SD_ROUND_OUT)
 extern "C" __global__ void __launch_bounds__(SD_THREADS) sd_round_bf16(float* y, long n) {
     const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;

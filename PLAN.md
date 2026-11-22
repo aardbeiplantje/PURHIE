@@ -79,9 +79,16 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
   `SD_CONV_KERNEL=blt`). `SD_VAE_BF16=1` (the BF16 convolutions) changes the image by 0.04 levels on average against the FP32
   VAE, the PSNR against ComfyUI unchanged (27.74 dB): its precision is fine, but it is not faster yet (its im2col and
   transpose passes, about 1.6 s, are the cost).
-- Next, in order: the convolutions (the FP32 kernel 1.75 s a decode, im2col 0.9 s): an im2col that writes BF16 straight into
-  the transposed layout (tiled, through LDS), then one hipBLASLt BF16 product per convolution (the output is the channel-major
-  layout as the column-major C with ld = HW: no transpose after). Then the DiT's decision above, the server parameters (steps,
+- VAE convolutions, BF16 by default (2026-11-22; `SD_VAE_CONV=fp32` keeps the FP32 kernel): the im2col written as BF16 in
+  one pass through shared memory (`sd_im2col_bf16_tile`: a block is 64 consecutive pixels of one row and 8 channels; stride
+  1, k <= 3, Wo a multiple of 64, cin a multiple of 8), the weights as BF16, one hipBLASLt BF16 product per convolution with
+  the FP32 output channel-major (the product's rows are the pixels, the output row stride 1), the bias as a pass. One step:
+  7.15 s against 8.15 s (FP32). Against ComfyUI at nine steps: PSNR 27.74 dB, as before (mean abs 3.17). The 256 check:
+  exact 23.89%, within one level 78.87%, mean abs 1.014 (FP32: 22.54 / 79.36 / 1.022). The column matrix matches the
+  single-tap kernel's on all 48 convolutions of the 256 run. The gate moved by 0.8 points between two versions of the
+  column kernel with identical columns: the product's algorithm is chosen by timing, so it may differ between runs; this is
+  not yet proved, and it is the same kind of effect as the DiT's tuning.
+- Next, in order: the DiT's BF16 outputs for the large linears (the decision above: 1), then the server parameters (steps,
   size) and the ComfyUI node.
 - DiT linears, measured 2026-11-22 (`tests/sd_gemm_bench`, the three DiT shapes; `SD_BENCH_DEVICE=1` puts W, x, y in
   device memory): `sd_gemm_wmma256b` runs at about 19-20 TFLOPS on QKV and MLP-up and 9-13 on MLP-down (K 10240: a 20 KB row
