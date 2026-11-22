@@ -31,7 +31,7 @@ hipModule_t g_mod = nullptr;
 hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn_sum = nullptr, f_gn_sq = nullptr,
               f_gn_apply = nullptr, f_silu = nullptr, f_add = nullptr, f_upsample2 = nullptr, f_softmax = nullptr,
               f_layer_norm = nullptr, f_rms_norm = nullptr, f_zm_modulate = nullptr, f_zm_gate_add = nullptr, f_zm_swiglu = nullptr, f_zm_rope = nullptr, f_zm_ln_plain = nullptr, f_gn_f32 = nullptr, f_to_tok = nullptr, f_to_chw = nullptr, f_zq_rope = nullptr, f_zq_attn = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma256b = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
-              f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr;
+              f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr, f_qi_linear_f8 = nullptr, f_qi_rms_f8 = nullptr, f_qi_affine = nullptr, f_qi_gelu = nullptr, f_qv_rms = nullptr, f_qv_patch = nullptr, f_qv_bias = nullptr, f_qv_upsample = nullptr;
 
 constexpr int kThreads = 256;
 constexpr int kGroupSplit = 16;  // the group norm's partial sums per group
@@ -56,7 +56,7 @@ bool init() {
         const char* name;
     };
     const Entry entries[] = {
-        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_gemm_wmma256, "sd_gemm_wmma256"}, {&f_gemm_wmma256b, "sd_gemm_wmma256b"}, {&f_flash, "sd_flash_attn"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"},
+        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_gemm_wmma256, "sd_gemm_wmma256"}, {&f_gemm_wmma256b, "sd_gemm_wmma256b"}, {&f_flash, "sd_flash_attn"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"}, {&f_qi_linear_f8, "qi_linear_f8"}, {&f_qi_rms_f8, "qi_rms_norm_f8"}, {&f_qi_affine, "qi_affine"}, {&f_qi_gelu, "qi_gelu_tanh"}, {&f_qv_rms, "qv_rms_tok"}, {&f_qv_patch, "qv_patch"}, {&f_qv_bias, "qv_bias_tok"}, {&f_qv_upsample, "qv_upsample2_tok"},
         {&f_transpose_pad, "sd_transpose_pad"}, {&f_softmax_bf16, "sd_softmax_bf16"}, {&f_softmax_bf16w, "sd_softmax_bf16_w"},
         {&f_gn_sum, "sd_gn_sum"},       {&f_gn_sq, "sd_gn_sq"},         {&f_gn_apply, "sd_gn_apply"},
         {&f_silu, "sd_silu"},           {&f_add, "sd_add"},             {&f_upsample2, "sd_upsample2"},
@@ -192,6 +192,70 @@ void linear_tok(const float* x, int T, const uint16_t* W, int in, int out, const
 
 void linear_f32(const float* x, int T, const float* W, int in, int out, const float* b, float* y) {
     gemm<float>(f_gemm_af, W, in, x, 1, in, y, 1, out, nullptr, 1.0f, 0.0f, out, T, in, b);
+    sync();
+}
+
+// Qwen-Image's FP8 linear (sd_gpu.hip qi_linear_f8): the weights (E4M3 bytes, read in place) times wscale, plus the bias
+// (bias_kind: 0 none, 1 E4M3, 2 BF16 bits, 3 F32)
+void linear_f8(const float* x, int T, const uint8_t* W, float wscale, int in, int out, const void* b, int bias_kind, float* y) {
+    if (out <= 0 || T <= 0) return;
+    if (in % 16 != 0) throw std::runtime_error("linear_f8: the input width must be a multiple of 16");
+    void* a[] = {(void*)&x, (void*)&T, (void*)&W, (void*)&wscale, (void*)&in, (void*)&out, (void*)&b, (void*)&bias_kind, (void*)&y};
+    check(hipModuleLaunchKernel(f_qi_linear_f8, (unsigned)((out + 63) / 64), (unsigned)((T + 63) / 64), 1, 256, 1, 1, 0, nullptr, a,
+                                nullptr),
+          "qi_linear_f8");
+    sync();
+}
+
+// Qwen-Image's RMS norm with E4M3 weights (no scale): y = x rsqrt(mean(x^2) + eps) w, one row of C per token
+void rms_norm_f8(const float* x, int T, int C, const uint8_t* w, float eps, float* y) {
+    void* a[] = {(void*)&x, (void*)&C, (void*)&w, (void*)&eps, (void*)&y};
+    launch(f_qi_rms_f8, dim3((unsigned)T, 1, 1), a);
+    sync();
+}
+
+// x[t][c] = x[t][c] (1 + s[c]) + b[c], in place
+void affine(float* x, int T, int C, const float* s, const float* b) {
+    long n = (long)T * C;
+    void* a[] = {(void*)&x, (void*)&s, (void*)&b, (void*)&C, (void*)&n};
+    launch(f_qi_affine, dim3((unsigned)((n + kThreads - 1) / kThreads)), a);
+    sync();
+}
+
+// GELU (tanh approximation), in place
+void gelu_tanh(float* x, size_t n) {
+    long nn = (long)n;
+    void* a[] = {(void*)&x, (void*)&nn};
+    launch(f_qi_gelu, dim3((unsigned)((nn + kThreads - 1) / kThreads)), a);
+    sync();
+}
+
+// Qwen-Image's VAE decoder ops (token-major x[h][w][c]): the channel RMS norm (gamma BF16); the convolution patches (mode 1: 2D 3 x 3,
+// mode 3: causal 3 x 3 x 3 on one frame) for the GEMM; a BF16 bias added to rows of C; the nearest 2x upsampling
+void rms_tok(const float* x, int HW, int C, const uint16_t* g, float* y) {
+    void* a[] = {(void*)&x, (void*)&C, (void*)&g, (void*)&y};
+    launch(f_qv_rms, dim3((unsigned)HW, 1, 1), a);
+    sync();
+}
+
+void patches(const float* x, int H, int W, int C, int mode, int p0, int n, float* P) {
+    long total = (long)n * (mode == 3 ? 27 : 9) * C;
+    void* a[] = {(void*)&x, (void*)&H, (void*)&W, (void*)&C, (void*)&mode, (void*)&p0, (void*)&n, (void*)&P};
+    launch(f_qv_patch, dim3((unsigned)((total + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void bias_tok(float* y, long rows, int C, const uint16_t* b) {
+    long n = rows * C;
+    void* a[] = {(void*)&y, (void*)&b, (void*)&C, (void*)&n};
+    launch(f_qv_bias, dim3((unsigned)((n + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void upsample2_tok(const float* x, int H, int W, int C, float* y) {
+    long n = 4L * H * W * C;
+    void* a[] = {(void*)&x, (void*)&H, (void*)&W, (void*)&C, (void*)&y};
+    launch(f_qv_upsample, dim3((unsigned)((n + kThreads - 1) / kThreads), 1, 1), a);
     sync();
 }
 

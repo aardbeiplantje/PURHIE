@@ -327,6 +327,15 @@ Quality and correctness:
 - **Qwen-Image** (`diffusion_models/qwen_image_fp8_e4m3fn`, MMDiT, 60 blocks, dim 3072, plain E4M3 without scales; the edit
   variant `qwen_image_edit_2509_fp8`); text `text_encoders/qwen_2.5_vl_7b_fp8_scaled`; VAE `vae/qwen_image_vae` (3D causal,
   single images); LoRAs Lightning 4 and 8 steps, Edit Lightning.
+  Status (2026-11-22): the reference oracle is done (`/data/zimage-ref/qwenimage/ref_stages.py`, diffusers 0.43.0, the ComfyUI
+  files; configs from Hugging Face Qwen/Qwen-Image and Qwen/Qwen2.5-VL-7B-Instruct, the tokenizer in `tokenizer/`). The DiT is
+  F8_E4M3 with no scales (loaded as BF16 on the GPU, 1933 of 1933 tensors); the text encoder's FP8 linears are dequantised as
+  weight x scale_weight (scale_input is not used); the VAE's Wan key names go through diffusers' `convert_wan_vae_to_diffusers`
+  (194 of 194, strict). Stage files in `out/`: te_ids (46 ids; 12 kept after the 34-token drop), te_embeds [12][3584], dit_lat and
+  dit_out [256][64] (seed 0, t 500/1000), vae_lat [16][32][32] and vae_dec [3][256][256]. Not yet: the engine's port of any stage.
+  Recorded facts: true CFG 4 by default (two DiT passes); the sigmas linspace(1, 1/n, n) with the exponential dynamic shift
+  (base 256 -> 0.5, max 8192 -> 0.9, shift_terminal 0.02); RoPE axes (16, 56, 56), theta 10000, scale_rope on (the text
+  positions start at max(h/2, w/2)); the timestep is t/1000 with a 1000x sinusoid.
 - **Flux.2 dev** (`diffusion_models/flux2_dev_fp8mixed`: BF16 and FP8 layers with scales and a quantization table; double and
   single blocks, dim 6144); text `text_encoders/mistral_3_small_flux2_bf16`; VAE `vae/flux2-vae` (32 channels); LoRA
   `Flux_2-Turbo-LoRA`.

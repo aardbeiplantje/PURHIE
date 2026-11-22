@@ -1034,3 +1034,156 @@ sd_gemm_wmma256b(const uint16_t* __restrict__ A0, long lda, const uint16_t* __re
     __syncthreads();  // the last k-tile's reads of the staging memory (the LDS below is reused for the output)
     gemm256_store(acc, reinterpret_cast<float*>(&As[0][0]), w, l, wm, wn, bm, bn, C, cs_m, cs_n, biasf, alpha, beta, M, N);
 }
+
+// Qwen-Image's linear layers (FP8 E4M3 weights read in place, F32 activations, F32 accumulation): y[t][o] = wscale * sum_i x[t][i]
+// W[o][i] + bias[o], the weights decoded in the load (no conversion copy). A block is 256 threads in a line; the tile is 64 tokens by 64
+// outputs with a k-step of 16, each thread 4 x 4 outputs. bias_kind: 0 none, 1 FP8 E4M3, 2 BF16 bits, 3 F32. in % 16 == 0.
+__device__ __forceinline__ float qi_e4m3(uint8_t v) {
+    const uint32_t s = (uint32_t)(v & 0x80) << 24;
+    const int e = (v >> 3) & 0xF;
+    const int m = v & 0x7;
+    if (e == 0) {  // subnormal: m * 2^-9
+        const float mag = (float)m * (1.0f / 512.0f);
+        return (v & 0x80) ? -mag : mag;
+    }
+    if (e == 15 && m == 7) return __uint_as_float(0x7fc00000u);  // NaN (E4M3fn has no infinity)
+    return __uint_as_float(s | ((uint32_t)(e - 7 + 127) << 23) | ((uint32_t)m << 20));
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+qi_linear_f8(const float* __restrict__ x, int T, const uint8_t* __restrict__ W, float wscale, int in, int out,
+             const void* __restrict__ bias, int bias_kind, float* __restrict__ y) {
+    __shared__ float As[16][64 + 1];
+    __shared__ float Bs[16][64 + 1];
+    const int tid = threadIdx.x;
+    const int tx = tid & 15, ty = tid >> 4;
+    const int t0 = blockIdx.y * 64, o0 = blockIdx.x * 64;
+    float acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+    for (int k0 = 0; k0 < in; k0 += 16) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int e = tid + j * 256;      // 1024 elements per tile: 64 rows x 16 k
+            const int r = e >> 4, k = e & 15;
+            const int t = t0 + r, o = o0 + r;
+            As[k][r] = (t < T) ? x[(size_t)t * in + k0 + k] : 0.0f;
+            Bs[k][r] = (o < out) ? qi_e4m3(W[(size_t)o * in + k0 + k]) : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            float a[4], b[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) a[i] = As[k][ty * 4 + i];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) b[j] = Bs[k][tx * 4 + j];
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int o = o0 + tx * 4 + j;
+        if (o >= out) continue;
+        float bv = 0.0f;
+        if (bias_kind == 1) bv = qi_e4m3(static_cast<const uint8_t*>(bias)[o]);
+        else if (bias_kind == 2) bv = __uint_as_float((uint32_t)static_cast<const uint16_t*>(bias)[o] << 16);
+        else if (bias_kind == 3) bv = static_cast<const float*>(bias)[o];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int t = t0 + ty * 4 + i;
+            if (t < T) y[(size_t)t * out + o] = wscale * acc[i][j] + bv;
+        }
+    }
+}
+
+// Qwen-Image's RMS norm with E4M3 weights (the q/k norms of 128, the text norm of 3584; no scale): one block per row of x [T][C]
+extern "C" __global__ void __launch_bounds__(SD_THREADS) qi_rms_norm_f8(const float* x, int C, const uint8_t* w, float eps, float* y) {
+    __shared__ float red[SD_THREADS];
+    const float* xr = x + (long)blockIdx.x * C;
+    float* yr = y + (long)blockIdx.x * C;
+    float q = 0.0f;
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) q += xr[i] * xr[i];
+    const float inv = rsqrtf(block_sum(q, red) / (float)C + eps);
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) yr[i] = xr[i] * inv * qi_e4m3(w[i]);
+}
+
+// x[t][c] = x[t][c] (1 + s[c]) + b[c] in place (the adaLN modulation: scale and shift per channel); n = T * C
+extern "C" __global__ void __launch_bounds__(SD_THREADS) qi_affine(float* x, const float* s, const float* b, int C, long n) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= n) return;
+    const int c = (int)(i % C);
+    x[i] = x[i] * (1.0f + s[c]) + b[c];
+}
+
+// GELU with the tanh approximation, in place: x = 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))
+extern "C" __global__ void __launch_bounds__(SD_THREADS) qi_gelu_tanh(float* x, long n) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= n) return;
+    const float v = x[i];
+    x[i] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v)));
+}
+
+// Qwen-Image's VAE decoder (token-major activations x[h][w][c]). The RMS norm over the channels of each pixel: y = x / max(|x|, 1e-12)
+// sqrt(C) gamma (one block per pixel row of C).
+extern "C" __global__ void __launch_bounds__(SD_THREADS) qv_rms_tok(const float* x, int C, const uint16_t* g, float* y) {
+    __shared__ float red[SD_THREADS];
+    const float* xr = x + (long)blockIdx.x * C;
+    float* yr = y + (long)blockIdx.x * C;
+    float q = 0.0f;
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) q += xr[i] * xr[i];
+    const float nrm = sqrtf(block_sum(q, red));
+    const float s = sqrtf((float)C) / fmaxf(nrm, 1e-12f);
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) yr[i] = xr[i] * s * bf2f(g[i]);
+}
+
+// The patches of the convolution as a matrix, one row per output pixel p = p0 + r of the H x W grid (zero outside the image):
+// mode 1 (a 2D 3 x 3 kernel): K = 9 C, index c * 9 + kh * 3 + kw; mode 3 (a causal 3 x 3 x 3 kernel on one frame: the history is
+// zero, so only the current frame's tap kt = 2 contributes): K = 27 C, index c * 27 + kt * 9 + kh * 3 + kw with kt != 2 zero.
+// The weights of the file ([cout][cin][kt][kh][kw]) are read as they are (no repacking).
+extern "C" __global__ void __launch_bounds__(SD_THREADS)
+qv_patch(const float* x, int H, int W, int C, int mode, int p0, int n, float* P) {
+    const int K = (mode == 3 ? 27 : 9) * C;
+    const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (e >= (long)n * K) return;
+    const int r = (int)(e / K), j = (int)(e % K);
+    const int p = p0 + r, h = p / W, w = p % W;
+    const int c = mode == 3 ? j / 27 : j / 9;
+    const int rem = mode == 3 ? j % 27 : j % 9;
+    float v = 0.0f;
+    if (mode == 3) {
+        const int kt = rem / 9;
+        if (kt == 2) {
+            const int rr = rem % 9, ih = h + rr / 3 - 1, iw = w + rr % 3 - 1;
+            if (ih >= 0 && ih < H && iw >= 0 && iw < W) v = x[((long)ih * W + iw) * C + c];
+        }
+    } else {
+        const int ih = h + rem / 3 - 1, iw = w + rem % 3 - 1;
+        if (ih >= 0 && ih < H && iw >= 0 && iw < W) v = x[((long)ih * W + iw) * C + c];
+    }
+    P[e] = v;
+}
+
+// y[r][c] += b[c] (BF16 bias), rows x C
+extern "C" __global__ void __launch_bounds__(SD_THREADS) qv_bias_tok(float* y, const uint16_t* b, int C, long n) {
+    const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (e >= n) return;
+    y[e] += bf2f(b[e % C]);
+}
+
+// nearest-exact 2x upsampling of x[h][w][c] to y[2h + a][2w + b][c]
+extern "C" __global__ void __launch_bounds__(SD_THREADS) qv_upsample2_tok(const float* x, int H, int W, int C, float* y) {
+    const long n = 4L * H * W * C;
+    const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (e >= n) return;
+    const int c = (int)(e % C);
+    const long pix = e / C;
+    const int ox = (int)(pix % (2 * W)), oy = (int)(pix / (2 * W));
+    y[e] = x[((long)(oy / 2) * W + ox / 2) * C + c];
+}

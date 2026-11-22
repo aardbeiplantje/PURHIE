@@ -91,6 +91,21 @@ void linear_cm(const float* x, int T, const uint16_t* W, int in, int out, const 
 void linear_f32(const float* x, int T, const float* W, int in, int out, const float* b, float* y);
 // conv2d with F32 weights [cout][cin][k][k] (read in place) and F32 bias; the same im2col + GEMM as conv2d
 void conv2d_f32(const float* x, int cin, int H, int W, const float* w, int cout, const float* b, int k, int p, int st, float* y, int Ho, int Wo);
+// Qwen-Image's FP8 E4M3 linear (sd_gpu.hip qi_linear_f8): W [out][in] raw bytes read in place, times wscale; the bias is
+// bias_kind 0 none, 1 E4M3, 2 BF16 bits, 3 F32. y[t][o] = wscale sum_i x[t][i] W[o][i] + b[o]
+void linear_f8(const float* x, int T, const uint8_t* W, float wscale, int in, int out, const void* b, int bias_kind, float* y);
+// Qwen-Image's norms and elementwise ops (sd_gpu.hip): the RMS norm with E4M3 weights; x[t][c] = x[t][c] (1 + s[c]) + b[c] in
+// place; GELU (tanh approximation) in place
+void rms_norm_f8(const float* x, int T, int C, const uint8_t* w, float eps, float* y);
+void affine(float* x, int T, int C, const float* s, const float* b);
+void gelu_tanh(float* x, size_t n);
+// Qwen-Image's VAE decoder ops (sd_gpu.hip), token-major x[h][w][c] (H x W pixels, C channels): the channel RMS norm (gamma
+// BF16); the convolution patches for the GEMM (mode 1: 2D 3 x 3, K = 9C; mode 3: causal 3 x 3 x 3 on one frame, K = 27C) of the
+// pixel rows p0..p0+n-1 into P [n][K]; a BF16 bias added to rows of C; the nearest 2x upsampling
+void rms_tok(const float* x, int HW, int C, const uint16_t* g, float* y);
+void patches(const float* x, int H, int W, int C, int mode, int p0, int n, float* P);
+void bias_tok(float* y, long rows, int C, const uint16_t* b);
+void upsample2_tok(const float* x, int H, int W, int C, float* y);
 // The same with bfloat16 weights (the checkpoint's BF16, raw bits): y[t][o] = b[o] + sum_i x[t][i] W[o][i]
 void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, const float* b, float* y);
 void linear_to_cm(const float* x, int T, const uint16_t* W, int in, int out, const uint16_t* b, float* y, bool accumulate);
