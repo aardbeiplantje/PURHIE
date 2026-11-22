@@ -116,6 +116,7 @@ void gather_mod(const float* mod, const float* sel, int J, int C, float* out);
 void mul_1p(float* x, const float* s, size_t n);
 void gated_add(float* h, const float* g, const float* y, size_t n);
 void linear_bf16_f32(const float* x, int T, const uint16_t* W, int in, int out, float* y);
+void dupup(const float* x, int H, int W, int in, int out, int factor_t, float* y);
 void attn21_text(const float* q, const float* k, const float* v, int J, int L, int heads, float* out);
 // The same with bfloat16 weights (the checkpoint's BF16, raw bits): y[t][o] = b[o] + sum_i x[t][i] W[o][i]
 void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, const float* b, float* y);

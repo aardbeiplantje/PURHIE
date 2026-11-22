@@ -9,6 +9,7 @@
 #include "qwenimage_text.h"
 #include "qwenimage21_dit.h"
 #include "qwenimage21_text.h"
+#include "qwenimage21_vae.h"
 #include "qwenimage_pipe.h"
 #include "qwenimage_vae.h"
 #include "sd_device.h"
@@ -26,6 +27,7 @@ static const char* kTePath = "/comfyui/text_encoders/qwen_2.5_vl_7b_fp8_scaled.s
 static const char* kDit21Int8 = "/comfyui/diffusion_models/qwen_image_2.1_int8_convrot.safetensors";
 static const char* kDit21Bf16 = "/comfyui/diffusion_models/qwen_image_2.1_bf16.safetensors";
 static const char* kQwen3vl21 = "/comfyui/text_encoders/qwen3vl_8b_int8_convrot.safetensors";
+static const char* kVae21Path = "/comfyui/vae/qwen_image_2.1_vae_bf16.safetensors";
 static const char* kVaePath = "/comfyui/vae/qwen_image_vae.safetensors";
 static const std::string kOut = "/data/zimage-ref/qwenimage/out/";
 
@@ -77,6 +79,13 @@ static zimage::SafeTensors& qwen3vl21_file() {
     static const bool reg = t.ok() && t.register_device();
     if (!reg) fprintf(stderr, "the Qwen3-VL 2.1 text mapping did not register\n");
     return t;
+}
+
+static zimage::SafeTensors& vae21_file() {
+    static zimage::SafeTensors v(kVae21Path);
+    static const bool reg = v.ok() && v.register_device();
+    if (!reg) fprintf(stderr, "the 2.1 VAE mapping did not register\n");
+    return v;
 }
 
 static zimage::SafeTensors& vae_file() {
@@ -280,6 +289,26 @@ int main(int argc, char** argv) {
         ok = ok && pass;
         printf("%s ConvRot linear (2.1 %s, 64 x 4096 -> 4096): against the exact quantized layer %.3g relative; against the BF16 original %.3g relative (min row cosine %.6f)\n",
                pass ? "[PASS]" : "[FAIL]", L, mq.max_rel, mb.max_rel, mb.min_cos);
+    }
+
+    /* Qwen-Image 2.1's VAE decoder on the FP32 oracle's latent (ref_vae21_fp32.py: [64][16][16], the normalised latent; decoded to 4 x 256
+     * x 256) */
+    if (want("vae21")) {
+        std::vector<float> lat(64 * 16 * 16), ref(4 * 256 * 256), out(4 * 256 * 256);
+        if (!read_file_path("/data/zimage-ref/qwenimage2/out/vae21_lat.f32", lat.data(), lat.size() * 4) ||
+            !read_file_path("/data/zimage-ref/qwenimage2/out/vae21_dec.f32", ref.data(), ref.size() * 4)) {
+            printf("[FAIL] the 2.1 VAE oracle files (run ref_vae21_fp32.py)\n");
+            return 1;
+        }
+        if (!vae21_file().ok() || !qwenimage21::dev_vae21_decode(vae21_file(), lat.data(), out.data())) {
+            printf("[FAIL] dev_vae21_decode\n");
+            return 1;
+        }
+        const Metrics m = compare_rows(out.data(), ref.data(), 4, 256 * 256);
+        const bool pass = m.min_cos >= 0.999 && m.max_rel <= 0.02;
+        ok = ok && pass;
+        printf("%s Qwen-Image 2.1 VAE decode (64 x 16 x 16 -> 4 x 256 x 256, residual up blocks): min channel cosine %.6f, max error %.3g relative\n",
+               pass ? "[PASS]" : "[FAIL]", m.min_cos, m.max_rel);
     }
 
     /* Qwen-Image 2.1's text encoder (Qwen3-VL 8B, int8 ConvRot) on the oracle's tokens (ref_te21_fp32.py): the kept rows (the system

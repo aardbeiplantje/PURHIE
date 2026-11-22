@@ -1370,3 +1370,21 @@ qi21_linear_bf16(const float* __restrict__ x, int T, const uint16_t* __restrict_
         }
     }
 }
+
+// Qwen-Image 2.1's residual up block shortcut (DupUp3D, one frame, the first_chunk slice): y[oy][ox][o] = x[h][w][c] with h = oy / 2,
+// w = ox / 2, the channel c = (o * factor + ft * 4 + (oy & 1) * 2 + (ox & 1)) / repeats, factor = factor_t * 4, repeats = out * factor /
+// in, ft = factor_t - 1 (the time slot kept). Token-major [H][W][in] -> [2H][2W][out].
+extern "C" __global__ void __launch_bounds__(SD_THREADS)
+qi21_dupup(const float* x, int H, int W, int in, int out, int factor_t, float* y) {
+    const long n = 4L * H * W * out;
+    const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (e >= n) return;
+    const int o = (int)(e % out);
+    const long pix = e / out;
+    const int ox = (int)(pix % (2 * W)), oy = (int)(pix / (2 * W));
+    const int factor = factor_t * 4, repeats = out * factor / in;
+    const int ft = factor_t - 1;
+    const int k = o * factor + ft * 4 + (oy & 1) * 2 + (ox & 1);
+    const int c = k / repeats;
+    y[e] = x[((long)(oy >> 1) * W + (ox >> 1)) * in + c];
+}

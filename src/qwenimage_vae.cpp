@@ -82,7 +82,7 @@ bool load_conv(const zimage::SafeTensors& st, const std::string& prefix, int cin
 void conv(const float* x, int H, int W, const Conv& c, const DevBuf& zeros, float* y) {
     const int HW = H * W;
     if (c.mode == 0) {
-        sddev::linear_bf16(x, HW, c.W, c.cin, c.cout, zeros.get(), y);
+        sddev::linear_bf16_f32(x, HW, c.W, c.cin, c.cout, y);
     } else {
         const int K = (c.mode == 3 ? 27 : 9) * c.cin;
         const int chunk = (int)std::max<size_t>(1, kChunkFloats / (size_t)K);
@@ -90,7 +90,7 @@ void conv(const float* x, int H, int W, const Conv& c, const DevBuf& zeros, floa
         for (int p0 = 0; p0 < HW; p0 += chunk) {
             const int n = std::min(chunk, HW - p0);
             sddev::patches(x, H, W, c.cin, c.mode, p0, n, P.get());
-            sddev::linear_bf16(P.get(), n, c.W, K, c.cout, zeros.get(), y + (size_t)p0 * c.cout);
+            sddev::linear_bf16_f32(P.get(), n, c.W, K, c.cout, y + (size_t)p0 * c.cout);
         }
     }
     sddev::bias_tok(y, HW, c.cout, c.b);
@@ -142,11 +142,11 @@ bool attention_block(const zimage::SafeTensors& st, const std::string& p, const 
     sddev::rms_tok(x, HW, C, g, n.get());
     DevBuf q((size_t)HW * C), k((size_t)HW * C), v((size_t)HW * C);
     /* the qkv rows of to_qkv: q [0, C), k [C, 2C), v [2C, 3C) (contiguous slices of the weight and the bias) */
-    sddev::linear_bf16(n.get(), HW, wq, C, C, zeros.get(), q.get());
+    sddev::linear_bf16_f32(n.get(), HW, wq, C, C, q.get());
     sddev::bias_tok(q.get(), HW, C, bq);
-    sddev::linear_bf16(n.get(), HW, wq + (size_t)C * C, C, C, zeros.get(), k.get());
+    sddev::linear_bf16_f32(n.get(), HW, wq + (size_t)C * C, C, C, k.get());
     sddev::bias_tok(k.get(), HW, C, bq + C);
-    sddev::linear_bf16(n.get(), HW, wq + (size_t)2 * C * C, C, C, zeros.get(), v.get());
+    sddev::linear_bf16_f32(n.get(), HW, wq + (size_t)2 * C * C, C, C, v.get());
     sddev::bias_tok(v.get(), HW, C, bq + 2 * C);
     DevBuf o((size_t)HW * C);
     sddev::attention(q.get(), HW, k.get(), v.get(), HW, C, 1, o.get());

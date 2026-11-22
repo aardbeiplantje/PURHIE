@@ -349,7 +349,10 @@ Quality and correctness:
   Qwen3-VL 8B text encoder for 2.1 (`src/qwenimage21_text.cpp`, ComfyUI int8 ConvRot file): the 36-layer language model, last layer
   output before the final norm, system tokens dropped; matches the exact dequantised FP32 oracle (`/data/zimage-ref/qwen3vl`,
   ref_te21_fp32.py) at min row cosine 1.000000, 1.6e-4 relative. Its embedding table is ConvRot too (rotated along the hidden dim).
-  Still to do for 2.1: the 2.1 VAE, the sampler (25 steps, `simple`, CFG 1), the server path.
+  The 2.1 VAE decoder (`src/qwenimage21_vae.cpp`, the residual variant, 64 latent channels, 16 x 16 latent tokens for 256 px, 4 output
+  channels): matches the diffusers oracle (`/data/zimage-ref/qwenimage2/ref_vae21_fp32.py`, the file's names mapped onto the class) at
+  0.13 % (channel cosine 1.000000). The Qwen-Image 1 VAE now also uses the FP32-activation linears: 5e-6 (it was 1.2 %).
+  Still to do for 2.1: the sampler (the ComfyUI workflow: 25 steps, `simple`, CFG 1, no shift node: the shift to use is open), the server path.
   (`ref_pipeline.py`) differs from these by 6 to 15 % over 8 steps: it is not the reference for the engine. Not yet: the server path
   (`/v1/images/generations`) and the CFG (the default pipeline run has no negative prompt; true CFG 4 is for the negative case).
 - **Flux.2 dev** (`diffusion_models/flux2_dev_fp8mixed`: BF16 and FP8 layers with scales and a quantization table; double and
