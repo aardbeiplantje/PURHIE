@@ -39,6 +39,12 @@ All binaries use the same zero-copy approach:
   from one process, with per-model settings (`NAME.json`, host rules) and least-recently-used eviction under the memory
   check (`make_room`). New model kinds join that policy; they do not get their own process.
 
+## Where Files Go (read this first)
+
+The agent runs in a Docker container. `/home/agent` is inside the container: the user cannot reach it from the host,
+and it is not safe to keep anything there. Put every deliverable, script, and note the user should use in the
+repository (`/work/rocm-hip`, the mounted checkout), e.g. `tools/` for host helpers. Scratch files go in `/tmp`, as below.
+
 ## Temp Snippets and Debugging
 
 For temporary code snippets, test scripts, and debugging runs, use files in `/tmp/`. On error or syntax issues, update the temp file using the **Edit tool** rather than rewriting it via `cat`, `echo`, or `bash` heredocs. File edit tools are preferred over inline command-line scripts because:

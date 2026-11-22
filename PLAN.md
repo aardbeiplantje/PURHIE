@@ -27,12 +27,24 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
 - Done: the DiT forward, sampler, output and VAE take the image grid (defaults keep 256 px unchanged); the causal text attention is
   dynamic-shared and the text encoder takes any length (the example prompt is 101 tokens); the pipeline takes height, width and steps
   (`zi_generate_steps`, `zi_generate_noise_steps`).
-- Not yet run: the 1024 engine output and its timing (tests/zimage_1024_verify.cpp, Makefile ZIMAGE_1024_VERIFY). The diffusers
-  reference (/data/zimage-ref/z1024/ref_1024.py, noise.f32, prompt.txt) was stopped twice: at 1024 it saturates the GPU and the desktop's
-  graphics ring times out (dmesg: ring gfx timeouts, recovered by resets). Run it only when the desktop is idle.
-- Next: run ref_1024.py 9 (idle GPU), then zimage_1024_verify 9 for the match and the time; then check the sampler against the
-  ComfyUI "simple" schedule; then the server parameters (steps, size) and the ComfyUI node.
-- Open: the 30 s target is unmeasured; the DiT uses BF16-rounded GEMMs (linear_bf16), which cost accuracy elsewhere (see the FP32 fixes).
+- Timed (2026-11-22, `SD_TIME=1 SD_TIME_MS=50 zimage_1024_verify 1`, one DiT step at 1024 and the VAE decode): the DiT is
+  about 3.8 s a step (the WMMA linears 2.7 s, flash attention 0.4 s, the bf16 and norm kernels the rest); the FP32 VAE decode
+  is about 3.6 s. Nine steps plus the decode come to about 39 s against the 30 s target. The largest single launch is 50 ms;
+  no ring timeouts.
+- VAE: `sd_gemm_af128` (128 x 128 FP32 tiles) and 128 MB im2col chunks (the default, FP32). Opt-in `SD_VAE_BF16=1`: the
+  convolutions with cout >= 128 and K % 64 == 0 run on the 256-row WMMA (`sd_gemm_wmma256b`) with BF16 activations and weights
+  (FP32 im2col, then `sd_transpose_bf16`, then `sd_bias_cm`). The 256 check passes both ways: FP32 exact 22.54%, within one
+  level 79.36%, mean abs 1.022; BF16 exact 23.28%, 78.53%, 1.024. One step: 8.7 s BF16, 9.5 s FP32 (run-to-run noise about 0.4 s).
+  Not default until the lowering is fused (below). `sd_gemm_wmma128` faults on the conv shape (K 1152, cs_m 1, cs_n = HW): not
+  used, not investigated.
+- Not yet checked: the 1024 engine output against the diffusers reference (9 steps). The reference's VAE decode stalled the
+  desktop's graphics ring at 1024 (dmesg: ring gfx timeouts); run it only when the desktop is idle.
+- Next, in order: (1) fuse the BF16 conv's im2col and transpose into one kernel (about 0.8 s a decode); (2) the VAE's mid-block
+  attention, FP32 scalar over 16384 tokens (about 0.55 s); (3) the DiT's linears and attention, the bigger block (about 3.8 s a
+  step); then the 9-step match against the reference on an idle desktop, the sampler against ComfyUI's "simple" schedule, the
+  server parameters (steps, size) and the ComfyUI node.
+- Open: the 30 s target is unmeasured end to end; the DiT uses BF16-rounded GEMMs (linear_bf16), which cost accuracy elsewhere
+  (see the FP32 fixes).
 
 ## Open items, in order
 

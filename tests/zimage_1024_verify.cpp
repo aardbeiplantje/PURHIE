@@ -46,9 +46,10 @@ int main(int argc, char** argv) {
     }
     std::vector<float> noise(16 * 128 * 128);
     std::vector<unsigned char> ref(1024 * 1024 * 3), rgb(1024 * 1024 * 3);
-    if (!read_bytes(dir + "noise.f32", noise.data(), noise.size() * 4) ||
-        !read_bytes(dir + "image_" + std::to_string(steps) + ".u8", ref.data(), ref.size())) {
-        printf("[FAIL] the noise or the reference image (run ref_1024.py %d)\n", steps);
+    /* the reference image is optional: without it the run only times the engine */
+    const bool have_ref = read_bytes(dir + "image_" + std::to_string(steps) + ".u8", ref.data(), ref.size());
+    if (!read_bytes(dir + "noise.f32", noise.data(), noise.size() * 4)) {
+        printf("[FAIL] the noise (%snoise.f32)\n", dir.c_str());
         zi_close(p);
         return 1;
     }
@@ -66,6 +67,12 @@ int main(int argc, char** argv) {
         zi_close(p);
         return 1;
     }
+    printf("  %d steps, 1024 x 1024: %.2f s\n", steps, secs);
+    if (!have_ref) {
+        printf("  no reference image for %d steps (run ref_1024.py %d to compare)\n", steps, steps);
+        zi_close(p);
+        return 0;
+    }
     long exact = 0, within1 = 0;
     double sumd = 0;
     for (size_t i = 0; i < rgb.size(); ++i) {
@@ -75,7 +82,6 @@ int main(int argc, char** argv) {
         sumd += std::abs(d);
     }
     const double n = (double)rgb.size();
-    printf("  %d steps, 1024 x 1024: %.2f s\n", steps, secs);
     printf("  vs diffusers: exact %.2f%%, within 1 level %.2f%%, mean abs %.3f levels\n", 100.0 * exact / n, 100.0 * within1 / n,
            sumd / n);
     zi_close(p);

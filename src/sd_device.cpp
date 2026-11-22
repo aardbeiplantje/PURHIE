@@ -9,10 +9,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sddev {
@@ -31,15 +35,65 @@ hipModule_t g_mod = nullptr;
 hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn_sum = nullptr, f_gn_sq = nullptr,
               f_gn_apply = nullptr, f_silu = nullptr, f_add = nullptr, f_upsample2 = nullptr, f_softmax = nullptr,
               f_layer_norm = nullptr, f_rms_norm = nullptr, f_zm_modulate = nullptr, f_zm_gate_add = nullptr, f_zm_swiglu = nullptr, f_zm_rope = nullptr, f_zm_ln_plain = nullptr, f_gn_f32 = nullptr, f_to_tok = nullptr, f_to_chw = nullptr, f_zq_rope = nullptr, f_zq_attn = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma256b = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
-              f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr, f_qi_linear_f8 = nullptr, f_qi_rms_f8 = nullptr, f_qi_affine = nullptr, f_qi_gelu = nullptr, f_qv_rms = nullptr, f_qv_patch = nullptr, f_qv_bias = nullptr, f_qv_upsample = nullptr, f_qi_hadamard = nullptr, f_qi_linear_i8 = nullptr, f_qi21_zc = nullptr, f_qi21_gather = nullptr, f_qi21_mul = nullptr, f_qi21_gated = nullptr, f_qi21_attn = nullptr, f_qi21_lbf = nullptr, f_qi21_dupup = nullptr;
+              f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr, f_qi_linear_f8 = nullptr, f_qi_rms_f8 = nullptr, f_qi_affine = nullptr, f_qi_gelu = nullptr, f_qv_rms = nullptr, f_qv_patch = nullptr, f_qv_bias = nullptr, f_qv_upsample = nullptr, f_qi_hadamard = nullptr, f_qi_linear_i8 = nullptr, f_qi21_zc = nullptr, f_qi21_gather = nullptr, f_qi21_mul = nullptr, f_qi21_gated = nullptr, f_qi21_attn = nullptr, f_qi21_lbf = nullptr, f_qi21_dupup = nullptr, f_gemm_af128 = nullptr, f_transpose_bf16 = nullptr, f_bias_cm = nullptr;
 
 constexpr int kThreads = 256;
 constexpr int kGroupSplit = 16;  // the group norm's partial sums per group
-constexpr size_t kColFloats = (size_t)1 << 23;  // the im2col chunk: at most 32 MB
+constexpr size_t kColFloats = (size_t)1 << 25;  // the im2col chunk: at most 128 MB (a launch covers enough tiles to fill the GPU)
 constexpr size_t kScoreFloats = (size_t)1 << 22;  // the attention's score chunk: at most 16 MB
 
 void check(hipError_t e, const char* what) {
     if (e != hipSuccess) throw std::runtime_error(std::string("sd device: ") + what + ": " + hipGetErrorString(e));
+}
+
+// SD_TIME=1: every launch is timed (events around it, synchronous: the results do not change) and the totals per kernel are
+// printed at exit; SD_TIME_MS=n also prints each launch that takes longer than n ms (default 100)
+struct TimeStat {
+    long count = 0;
+    double total = 0, max = 0;
+};
+bool g_time_on = false;
+double g_time_slow_ms = 100;
+hipEvent_t g_ev0 = nullptr, g_ev1 = nullptr;
+std::mutex g_time_mu;
+std::map<std::string, TimeStat> g_time_stats;
+std::vector<std::pair<hipFunction_t, const char*>> g_names;
+
+const char* kernel_name(hipFunction_t f) {
+    for (const auto& p : g_names)
+        if (p.first == f) return p.second;
+    return "?";
+}
+
+void print_timing() {
+    std::lock_guard<std::mutex> lk(g_time_mu);
+    std::fprintf(stderr, "sd timing (ms): kernel, launches, total, max\n");
+    for (const auto& kv : g_time_stats)
+        std::fprintf(stderr, "  %-24s %8ld %12.2f %10.2f\n", kv.first.c_str(), kv.second.count, kv.second.total, kv.second.max);
+}
+
+// hipModuleLaunchKernel, timed when SD_TIME is set
+hipError_t hip_launch(hipFunction_t f, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, unsigned sh,
+                      hipStream_t stream, void** args, void** extra) {
+    if (!g_time_on) return hipModuleLaunchKernel(f, gx, gy, gz, bx, by, bz, sh, stream, args, extra);
+    check(hipEventRecord(g_ev0, stream), "event");
+    const hipError_t e = hipModuleLaunchKernel(f, gx, gy, gz, bx, by, bz, sh, stream, args, extra);
+    if (e != hipSuccess) return e;
+    check(hipEventRecord(g_ev1, stream), "event");
+    check(hipEventSynchronize(g_ev1), "event");
+    float ms = 0;
+    check(hipEventElapsedTime(&ms, g_ev0, g_ev1), "event");
+    const char* name = kernel_name(f);
+    {
+        std::lock_guard<std::mutex> lk(g_time_mu);
+        TimeStat& s = g_time_stats[name];
+        s.count += 1;
+        s.total += ms;
+        s.max = std::max(s.max, (double)ms);
+    }
+    if (ms > g_time_slow_ms)
+        std::fprintf(stderr, "sd timing: %s grid %u x %u x %u block %u took %.1f ms\n", name, gx, gy, gz, bx, ms);
+    return hipSuccess;
 }
 
 bool init() {
@@ -56,7 +110,7 @@ bool init() {
         const char* name;
     };
     const Entry entries[] = {
-        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_gemm_wmma256, "sd_gemm_wmma256"}, {&f_gemm_wmma256b, "sd_gemm_wmma256b"}, {&f_flash, "sd_flash_attn"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"}, {&f_qi_linear_f8, "qi_linear_f8"}, {&f_qi_rms_f8, "qi_rms_norm_f8"}, {&f_qi_affine, "qi_affine"}, {&f_qi_gelu, "qi_gelu_tanh"}, {&f_qv_rms, "qv_rms_tok"}, {&f_qv_patch, "qv_patch"}, {&f_qv_bias, "qv_bias_tok"}, {&f_qv_upsample, "qv_upsample2_tok"}, {&f_qi_hadamard, "qi_hadamard256"}, {&f_qi_linear_i8, "qi_linear_i8"}, {&f_qi21_zc, "qi21_zc_rms"}, {&f_qi21_gather, "qi21_gather_mod"}, {&f_qi21_mul, "qi21_mul_1p"}, {&f_qi21_gated, "qi21_gated_add"}, {&f_qi21_attn, "qi21_attn"}, {&f_qi21_lbf, "qi21_linear_bf16"}, {&f_qi21_dupup, "qi21_dupup"},
+        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"}, {&f_gemm_af128, "sd_gemm_af128"}, {&f_transpose_bf16, "sd_transpose_bf16"}, {&f_bias_cm, "sd_bias_cm"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_gemm_wmma256, "sd_gemm_wmma256"}, {&f_gemm_wmma256b, "sd_gemm_wmma256b"}, {&f_flash, "sd_flash_attn"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"}, {&f_qi_linear_f8, "qi_linear_f8"}, {&f_qi_rms_f8, "qi_rms_norm_f8"}, {&f_qi_affine, "qi_affine"}, {&f_qi_gelu, "qi_gelu_tanh"}, {&f_qv_rms, "qv_rms_tok"}, {&f_qv_patch, "qv_patch"}, {&f_qv_bias, "qv_bias_tok"}, {&f_qv_upsample, "qv_upsample2_tok"}, {&f_qi_hadamard, "qi_hadamard256"}, {&f_qi_linear_i8, "qi_linear_i8"}, {&f_qi21_zc, "qi21_zc_rms"}, {&f_qi21_gather, "qi21_gather_mod"}, {&f_qi21_mul, "qi21_mul_1p"}, {&f_qi21_gated, "qi21_gated_add"}, {&f_qi21_attn, "qi21_attn"}, {&f_qi21_lbf, "qi21_linear_bf16"}, {&f_qi21_dupup, "qi21_dupup"},
         {&f_transpose_pad, "sd_transpose_pad"}, {&f_softmax_bf16, "sd_softmax_bf16"}, {&f_softmax_bf16w, "sd_softmax_bf16_w"},
         {&f_gn_sum, "sd_gn_sum"},       {&f_gn_sq, "sd_gn_sq"},         {&f_gn_apply, "sd_gn_apply"},
         {&f_silu, "sd_silu"},           {&f_add, "sd_add"},             {&f_upsample2, "sd_upsample2"},
@@ -64,12 +118,20 @@ bool init() {
     };
     for (const Entry& e : entries)
         if (hipModuleGetFunction(e.f, g_mod, e.name) != hipSuccess) return false;
+    for (const Entry& e : entries) g_names.push_back({*e.f, e.name});
+    if (const char* t = std::getenv("SD_TIME"); t && std::atoi(t) != 0) {
+        g_time_on = true;
+        if (const char* m = std::getenv("SD_TIME_MS")) g_time_slow_ms = std::atof(m);
+        check(hipEventCreate(&g_ev0), "event");
+        check(hipEventCreate(&g_ev1), "event");
+        std::atexit(print_timing);
+    }
     g_state = 1;
     return true;
 }
 
 void launch(hipFunction_t f, dim3 grid, void** args) {
-    check(hipModuleLaunchKernel(f, grid.x, grid.y, grid.z, kThreads, 1, 1, 0, nullptr, args, nullptr), "launch");
+    check(hip_launch(f, grid.x, grid.y, grid.z, kThreads, 1, 1, 0, nullptr, args, nullptr), "launch");
 }
 
 void sync() { check(hipStreamSynchronize(nullptr), "stream"); }
@@ -166,11 +228,93 @@ void conv2d(const float* x, int cin, int H, int W, const uint16_t* w, int cout, 
     release(col, sizeof(float) * (size_t)K * nc_max);
 }
 
+// the convolutions' FP32 GEMM with 128 x 128 tiles (sd_gemm_af128), the same arguments as gemm<float>
+void gemm_conv_f32(const float* A, long lda, const float* B, long sbk, long sbn, float* C, long cs_m, long cs_n, float alpha,
+                   float beta, int M, int N, int K, const float* biasf) {
+    if (M <= 0 || N <= 0) return;
+    const float* a = A;
+    const float* b = B;
+    float* c = C;
+    const uint16_t* bi = nullptr;
+    const float* bf = biasf;
+    void* args[] = {(void*)&a, (void*)&lda, (void*)&b, (void*)&sbk, (void*)&sbn, (void*)&c, (void*)&cs_m, (void*)&cs_n,
+                    (void*)&bi, (void*)&bf, (void*)&alpha, (void*)&beta, (void*)&M, (void*)&N, (void*)&K};
+    launch(f_gemm_af128, dim3((unsigned)((N + 127) / 128), (unsigned)((M + 127) / 128), 1), args);
+}
+
+// The convolution on the tensor cores (SD_VAE_BF16=1): the weights and the im2col activations rounded to BF16 (the products
+// and the sums stay FP32 in the WMMA), the output FP32 and channel-major. The GEMM's rows are the output pixels (the tile
+// stores 8 consecutive rows at once, so the output's stride along the rows is 1); the bias is added in a pass after it.
+void conv2d_bf16(const float* x, int cin, int H, int W, const float* w, int cout, const float* b, int k, int p, int st, float* y,
+                 int Ho, int Wo) {
+    const long HWo = (long)Ho * Wo;
+    const int K = cin * k * k;
+    const long nc_max = std::max<long>(1, std::min<long>(HWo, (long)(kColFloats / (size_t)K)));
+    uint16_t* wb = static_cast<uint16_t*>(alloc(sizeof(uint16_t) * (size_t)cout * K, false));
+    {
+        const long nw = (long)cout * K;
+        const float* wf = w;
+        void* a[] = {(void*)&wf, (void*)&wb, (void*)&nw};
+        launch(f_to_bf16, dim3(blocks((size_t)nw)), a);
+    }
+    float* colf = static_cast<float*>(alloc(sizeof(float) * (size_t)K * nc_max, false));
+    uint16_t* col = static_cast<uint16_t*>(alloc(sizeof(uint16_t) * (size_t)K * nc_max, false));
+    const long bs0 = 0;
+    for (long n0l = 0; n0l < HWo; n0l += nc_max) {
+        const int n0 = (int)n0l;
+        const int nc = (int)std::min<long>(nc_max, HWo - n0l);
+        {
+            void* a1[] = {(void*)&x, (void*)&cin, (void*)&H, (void*)&W, (void*)&k, (void*)&p, (void*)&st, (void*)&Wo, (void*)&n0,
+                          (void*)&nc, (void*)&colf};
+            launch(f_im2col, dim3((unsigned)((nc + kThreads - 1) / kThreads), (unsigned)K, 1), a1);
+            const int Kc = K, ncc = nc;
+            void* a2[] = {(void*)&colf, (void*)&Kc, (void*)&ncc, (void*)&col};
+            check(hip_launch(f_transpose_bf16, (unsigned)((nc + 31) / 32), (unsigned)((K + 31) / 32), 1, 32, 8, 1, 0, nullptr,
+                             a2, nullptr),
+                  "transpose bf16");
+        }
+        // C[pixel][channel] = sum_k col[pixel][k] wb[channel][k]: M = the chunk's pixels, N = the output channels
+        const uint16_t* A = col;
+        const uint16_t* B = wb;
+        float* C = y + n0l;
+        const long lda = K, sbn = K, cs_m = 1, cs_n = HWo;
+        const float alpha = 1.0f, beta = 0.0f;
+        const int M = nc, N = cout, KK = K;
+        const float* bf = nullptr;
+        void* args[] = {(void*)&A, (void*)&lda, (void*)&B, (void*)&sbn, (void*)&C, (void*)&cs_m, (void*)&cs_n,
+                        (void*)&bf, (void*)&alpha, (void*)&beta, (void*)&M, (void*)&N, (void*)&KK, (void*)&bs0, (void*)&bs0,
+                        (void*)&bs0};
+        check(hip_launch(f_gemm_wmma256b, (unsigned)((N + 127) / 128), (unsigned)((M + 255) / 256), 1, 256, 1, 1, 0, nullptr,
+                         args, nullptr),
+              "wmma conv");
+        {
+            const long ne = (long)cout * nc;
+            const int ncc = nc, cc = cout;
+            const float* bb = b;
+            float* yy = y + n0l;
+            void* a2[] = {(void*)&yy, (void*)&HWo, (void*)&ncc, (void*)&cc, (void*)&bb};
+            launch(f_bias_cm, dim3(blocks((size_t)ne)), a2);
+        }
+    }
+    sync();
+    release(colf, sizeof(float) * (size_t)K * nc_max);
+    release(col, sizeof(uint16_t) * (size_t)K * nc_max);
+    release(wb, sizeof(uint16_t) * (size_t)cout * K);
+}
+
 void conv2d_f32(const float* x, int cin, int H, int W, const float* w, int cout, const float* b, int k, int p, int st, float* y,
                 int Ho, int Wo) {
     const long HWo = (long)Ho * Wo;
     const int K = cin * k * k;
     if (HWo <= 0 || K <= 0) return;
+    static const bool bf16_conv = [] {
+        const char* e = std::getenv("SD_VAE_BF16");
+        return e && std::atoi(e) != 0;
+    }();
+    if (bf16_conv && cout >= 128 && K % 64 == 0 && f_im2col && f_transpose_bf16 && f_bias_cm && f_gemm_wmma256b) {
+        conv2d_bf16(x, cin, H, W, w, cout, b, k, p, st, y, Ho, Wo);
+        return;
+    }
     const long nc_max = std::max<long>(1, std::min<long>(HWo, (long)(kColFloats / (size_t)K)));
     float* col = static_cast<float*>(alloc(sizeof(float) * (size_t)K * nc_max));
     for (long n0l = 0; n0l < HWo; n0l += nc_max) {
@@ -179,7 +323,7 @@ void conv2d_f32(const float* x, int cin, int H, int W, const float* w, int cout,
         void* a1[] = {(void*)&x, (void*)&cin, (void*)&H, (void*)&W, (void*)&k, (void*)&p, (void*)&st, (void*)&Wo, (void*)&n0, (void*)&nc, (void*)&col};
         const dim3 g((unsigned)((nc + kThreads - 1) / kThreads), (unsigned)K, 1);
         launch(f_im2col, g, a1);
-        gemm<float>(f_gemm_af, w, K, col, nc, 1, y + n0l, HWo, 1, nullptr, 1.0f, 0.0f, cout, nc, K, b);
+        gemm_conv_f32(w, K, col, nc, 1, y + n0l, HWo, 1, 1.0f, 0.0f, cout, nc, K, b);
     }
     sync();
     release(col, sizeof(float) * (size_t)K * nc_max);
@@ -201,7 +345,7 @@ void linear_f8(const float* x, int T, const uint8_t* W, float wscale, int in, in
     if (out <= 0 || T <= 0) return;
     if (in % 16 != 0) throw std::runtime_error("linear_f8: the input width must be a multiple of 16");
     void* a[] = {(void*)&x, (void*)&T, (void*)&W, (void*)&wscale, (void*)&in, (void*)&out, (void*)&b, (void*)&bias_kind, (void*)&y};
-    check(hipModuleLaunchKernel(f_qi_linear_f8, (unsigned)((out + 63) / 64), (unsigned)((T + 63) / 64), 1, 256, 1, 1, 0, nullptr, a,
+    check(hip_launch(f_qi_linear_f8, (unsigned)((out + 63) / 64), (unsigned)((T + 63) / 64), 1, 256, 1, 1, 0, nullptr, a,
                                 nullptr),
           "qi_linear_f8");
     sync();
@@ -266,9 +410,9 @@ void linear_convrot(const float* x, int T, const int8_t* W, const float* wscale,
     if (out <= 0 || T <= 0) return;
     if (in % 256 != 0) throw std::runtime_error("linear_convrot: the input width must be a multiple of 256");
     void* ha[] = {(void*)&x, (void*)&T, (void*)&in, (void*)&H, (void*)&xr};
-    check(hipModuleLaunchKernel(f_qi_hadamard, (unsigned)(in / 256), (unsigned)T, 1, 256, 1, 1, 0, nullptr, ha, nullptr), "qi_hadamard256");
+    check(hip_launch(f_qi_hadamard, (unsigned)(in / 256), (unsigned)T, 1, 256, 1, 1, 0, nullptr, ha, nullptr), "qi_hadamard256");
     void* la[] = {(void*)&xr, (void*)&T, (void*)&W, (void*)&wscale, (void*)&in, (void*)&out, (void*)&y};
-    check(hipModuleLaunchKernel(f_qi_linear_i8, (unsigned)((out + 63) / 64), (unsigned)((T + 63) / 64), 1, 256, 1, 1, 0, nullptr, la,
+    check(hip_launch(f_qi_linear_i8, (unsigned)((out + 63) / 64), (unsigned)((T + 63) / 64), 1, 256, 1, 1, 0, nullptr, la,
                                 nullptr),
           "qi_linear_i8");
     sync();
@@ -308,7 +452,7 @@ void linear_bf16_f32(const float* x, int T, const uint16_t* W, int in, int out, 
     if (out <= 0 || T <= 0) return;
     if (in % 16 != 0) throw std::runtime_error("linear_bf16_f32: the input width must be a multiple of 16");
     void* a[] = {(void*)&x, (void*)&T, (void*)&W, (void*)&in, (void*)&out, (void*)&y};
-    check(hipModuleLaunchKernel(f_qi21_lbf, (unsigned)((out + 63) / 64), (unsigned)((T + 63) / 64), 1, 256, 1, 1, 0, nullptr, a, nullptr),
+    check(hip_launch(f_qi21_lbf, (unsigned)((out + 63) / 64), (unsigned)((T + 63) / 64), 1, 256, 1, 1, 0, nullptr, a, nullptr),
           "qi21_linear_bf16");
     sync();
 }
@@ -354,7 +498,7 @@ void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, cons
             void* args[] = {(void*)&A, (void*)&lda, (void*)&B, (void*)&sbn, (void*)&C, (void*)&cs_m, (void*)&cs_n,
                             (void*)&bf, (void*)&alpha, (void*)&beta, (void*)&M, (void*)&N, (void*)&K, (void*)&bs0, (void*)&bs0,
                             (void*)&bs0};
-            check(hipModuleLaunchKernel(f_gemm_wmma256b, (unsigned)((N + 127) / 128), (unsigned)((M + 255) / 256), 1, 256, 1, 1, 0,
+            check(hip_launch(f_gemm_wmma256b, (unsigned)((N + 127) / 128), (unsigned)((M + 255) / 256), 1, 256, 1, 1, 0,
                                         nullptr, args, nullptr),
                   "wmma gemm 256b");
             sync();
@@ -370,11 +514,11 @@ void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, cons
                         (void*)&bf, (void*)&alpha, (void*)&beta, (void*)&M, (void*)&N, (void*)&K, (void*)&bs0, (void*)&bs0,
                         (void*)&bs0};
         if (huge)
-            check(hipModuleLaunchKernel(f_gemm_wmma256, (unsigned)((N + 127) / 128), (unsigned)((M + 255) / 256), 1, 256, 1, 1, 0,
+            check(hip_launch(f_gemm_wmma256, (unsigned)((N + 127) / 128), (unsigned)((M + 255) / 256), 1, 256, 1, 1, 0,
                                         nullptr, args, nullptr),
                   "wmma gemm 256");
         else
-            check(hipModuleLaunchKernel(big ? f_gemm_wmma128 : f_gemm_wmma, (unsigned)((N + (big ? 127 : 63)) / (big ? 128 : 64)),
+            check(hip_launch(big ? f_gemm_wmma128 : f_gemm_wmma, (unsigned)((N + (big ? 127 : 63)) / (big ? 128 : 64)),
                                         (unsigned)((M + (big ? 127 : 63)) / (big ? 128 : 64)), 1, big ? 256 : 128, 1, 1, 0, nullptr,
                                         args, nullptr),
                   "wmma gemm");
@@ -459,7 +603,7 @@ void rope_half(float* x, int T, int heads, const float* cos, const float* sin) {
 
 void causal_attn(const float* q, const float* k, const float* v, int T, int H, int KVH, float* out) {
     void* a[] = {(void*)&q, (void*)&k, (void*)&v, (void*)&T, (void*)&H, (void*)&KVH, (void*)&out};
-    check(hipModuleLaunchKernel(f_zq_attn, (unsigned)T, (unsigned)H, 1, 128, 1, 1, (unsigned)(sizeof(float) * (size_t)T), nullptr, a, nullptr), "causal attention");
+    check(hip_launch(f_zq_attn, (unsigned)T, (unsigned)H, 1, 128, 1, 1, (unsigned)(sizeof(float) * (size_t)T), nullptr, a, nullptr), "causal attention");
     sync();
 }
 
@@ -568,7 +712,7 @@ void wmma_batched(const uint16_t* A, long lda, long bsA, const float* B, long sb
     void* args[] = {(void*)&a, (void*)&lda, (void*)&b, (void*)&sbn, (void*)&c, (void*)&cs_m, (void*)&cs_n, (void*)&bi,
                     (void*)&alpha, (void*)&beta, (void*)&M, (void*)&N, (void*)&K, (void*)&bsA, (void*)&bsB, (void*)&bsC};
     const bool big = M >= 128;
-    check(hipModuleLaunchKernel(big ? f_gemm_wmma128 : f_gemm_wmma, (unsigned)((N + (big ? 127 : 63)) / (big ? 128 : 64)),
+    check(hip_launch(big ? f_gemm_wmma128 : f_gemm_wmma, (unsigned)((N + (big ? 127 : 63)) / (big ? 128 : 64)),
                                 (unsigned)((M + (big ? 127 : 63)) / (big ? 128 : 64)), (unsigned)batches, big ? 256 : 128, 1, 1, 0,
                                 nullptr, args, nullptr),
           "wmma batched");
@@ -606,7 +750,7 @@ void attention_tc(const float* q, int Tq, const float* k, const float* v, int Tk
         void* a3[] = {(void*)&sp, (void*)&pp, (void*)&tq, (void*)&tk, (void*)&tkp};
         const long rows = (long)heads * Tq;
         void* a3w[] = {(void*)&sp, (void*)&pp, (void*)&tq, (void*)&tk, (void*)&tkp, (void*)&rows};
-        check(hipModuleLaunchKernel(f_softmax_bf16w, (unsigned)((rows + 7) / 8), 1, 1, 256, 1, 1, 0, nullptr, a3w, nullptr),
+        check(hip_launch(f_softmax_bf16w, (unsigned)((rows + 7) / 8), 1, 1, 256, 1, 1, 0, nullptr, a3w, nullptr),
               "softmax_bf16_w");
         (void)a3;
     }
@@ -646,7 +790,7 @@ void attention_flash(const float* q, int Tq, const float* k, const float* v, int
         const float scale = 1.0f / std::sqrt((float)(C / heads));
         int tq = Tq, tk = Tk, tkp = Tkp, c = C;
         void* a4[] = {(void*)&qb, (void*)&kb, (void*)&vt, (void*)&out, (void*)&tq, (void*)&tk, (void*)&tkp, (void*)&c, (void*)&scale};
-        check(hipModuleLaunchKernel(f_flash, (unsigned)((Tq + 127) / 128), (unsigned)heads, 1, 256, 1, 1, 0, nullptr, a4, nullptr),
+        check(hip_launch(f_flash, (unsigned)((Tq + 127) / 128), (unsigned)heads, 1, 256, 1, 1, 0, nullptr, a4, nullptr),
               "flash attention");
     }
     check(hipStreamSynchronize(nullptr), "stream");

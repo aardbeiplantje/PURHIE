@@ -111,6 +111,60 @@ sd_gemm_af(const float* A, long lda, const float* B, long sbk, long sbn, float* 
     gemm_body<float, 0>(A, lda, B, sbk, sbn, C, cs_m, cs_n, bias, biasf, alpha, beta, M, N, K, As, Bs);
 }
 
+// The FP32 GEMM for the convolutions: 128 x 128 tiles, 8 x 8 outputs per thread (the 64 x 64 body above does 4 x 4), so each
+// loaded value feeds twice the products. Same epilogue and FP32 arithmetic; only the summation order differs.
+extern "C" __global__ void __launch_bounds__(SD_THREADS)
+sd_gemm_af128(const float* __restrict__ A, long lda, const float* __restrict__ B, long sbk, long sbn, float* __restrict__ C,
+              long cs_m, long cs_n, const uint16_t* __restrict__ bias, const float* __restrict__ biasf, float alpha, float beta,
+              int M, int N, int K) {
+    __shared__ float As[16][132];
+    __shared__ float Bs[16][132];
+    const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
+    const int bm = blockIdx.y * 128, bn = blockIdx.x * 128;
+    float acc[8][8] = {};
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        for (int e = tid; e < 128 * 16; e += SD_THREADS) {  // A: m = e / 16 (rows of A are contiguous in k)
+            const int m = e >> 4, k = e & 15;
+            const int gm = bm + m, gk = k0 + k;
+            As[k][m] = (gm < M && gk < K) ? A[(long)gm * lda + gk] : 0.0f;
+        }
+        for (int e = tid; e < 16 * 128; e += SD_THREADS) {  // B: k = e / 128, n = e % 128
+            const int k = e >> 7, n = e & 127;
+            const int gk = k0 + k, gn = bn + n;
+            Bs[k][n] = (gk < K && gn < N) ? B[(long)gk * sbk + (long)gn * sbn] : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < 16; ++kk) {
+            float a[8], b[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                a[i] = As[kk][ty * 8 + i];
+                b[i] = Bs[kk][tx * 8 + i];
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int j = 0; j < 8; ++j) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int m = bm + ty * 8 + i, n = bn + tx * 8 + j;
+            if (m < M && n < N) {
+                float v = alpha * acc[i][j];
+                if (bias) v += h2f(bias[m]);
+                if (biasf) v += biasf[m];
+                const long off = (long)m * cs_m + (long)n * cs_n;
+                if (beta != 0.0f) v += beta * C[off];
+                C[off] = v;
+            }
+        }
+}
+
 // col[r][j] (r < cin k k, j < nc): the input under kernel tap r at output position n0 + j (zero outside the input)
 extern "C" __global__ void __launch_bounds__(SD_THREADS)
 sd_im2col(const float* x, int cin, int H, int W, int k, int p, int st, int Wo, int n0, int nc, float* col) {
@@ -506,6 +560,32 @@ sd_gemm_wmma(const uint16_t* __restrict__ A0, long lda, const float* __restrict_
 extern "C" __global__ void __launch_bounds__(256) sd_to_bf16(const float* x, uint16_t* y, long n) {
     const long i = (long)blockIdx.x * 256 + threadIdx.x;
     if (i < n) y[i] = f2bf(x[i]);
+}
+
+// colT[j][r] = BF16(col[r][j]) for col [K][nc] (sd_im2col's columns): a 32 x 32 tile through LDS, so the reads run along
+// the columns and the writes along the rows (block 32 x 8)
+extern "C" __global__ void __launch_bounds__(256) sd_transpose_bf16(const float* col, int K, int nc, uint16_t* colT) {
+    __shared__ float tile[32][33];
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int j0 = blockIdx.x * 32, r0 = blockIdx.y * 32;
+    for (int i = 0; i < 32; i += 8) {
+        const int r = r0 + ty + i, j = j0 + tx;
+        if (r < K && j < nc) tile[ty + i][tx] = col[(long)r * nc + j];
+    }
+    __syncthreads();
+    for (int i = 0; i < 32; i += 8) {
+        const int j = j0 + ty + i, r = r0 + tx;
+        if (j < nc && r < K) colT[(long)j * K + r] = f2bf(tile[tx][ty + i]);
+    }
+}
+
+// y[c * HW + p] += b[c] for p < nc, c < C: the convolution's bias on the channel-major output (the chunk at its column)
+extern "C" __global__ void __launch_bounds__(SD_THREADS)
+sd_bias_cm(float* y, long HW, int nc, int C, const float* b) {
+    const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (e >= (long)C * nc) return;
+    const int c = (int)(e / nc), p = (int)(e % nc);
+    y[(long)c * HW + p] += b[c];
 }
 
 // Vt[c * Tkp + j] = V[j * C + c] for j < Tk, zero for Tk <= j < Tkp (the attention's values, transposed and padded)
