@@ -306,7 +306,7 @@ $(INFERENCE_LIB): $(SRCDIR)/inference.cpp $(SRCDIR)/inference.h $(SRCDIR)/gguf_m
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/sha256.cpp -o $(OBJDIR)/sha256.o
 	$(CLANG) $(CXXFLAGS) -I. -fPIC -c $(SRCDIR)/model_stage.cpp -o $(OBJDIR)/model_stage.o
 	rm -f $@
-	ar rcs $@ $(OBJDIR)/inference.o $(OBJDIR)/gguf_mmap.o $(OBJDIR)/quant_types.o $(OBJDIR)/quantize.o $(OBJDIR)/quantize_iq.o $(OBJDIR)/kv_cache.o $(OBJDIR)/tokenizer.o $(OBJDIR)/sampler.o $(OBJDIR)/sha256.o $(OBJDIR)/model_stage.o $(OBJDIR)/expert_pager.o $(OBJDIR)/zimage_dit.o $(OBJDIR)/zimage_vae.o $(OBJDIR)/zimage_text.o $(OBJDIR)/zimage_pipe.o
+	ar rcs $@ $(OBJDIR)/inference.o $(OBJDIR)/gguf_mmap.o $(OBJDIR)/quant_types.o $(OBJDIR)/quantize.o $(OBJDIR)/quantize_iq.o $(OBJDIR)/kv_cache.o $(OBJDIR)/tokenizer.o $(OBJDIR)/sampler.o $(OBJDIR)/sha256.o $(OBJDIR)/model_stage.o $(OBJDIR)/expert_pager.o
 
 # Inference engine shared library (versioned): the whole engine (both archives, kernels embedded), exporting only
 # the public C API (src/libinference.map: inference_*, tokenizer_*, sampler_*)
