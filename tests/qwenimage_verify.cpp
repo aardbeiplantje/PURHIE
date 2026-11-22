@@ -7,6 +7,7 @@
  * old registration: hipErrorHostMemoryAlreadyRegistered). Run from build/co (the kernels). */
 #include "qwenimage_dit.h"
 #include "qwenimage_text.h"
+#include "qwenimage21_dit.h"
 #include "qwenimage_pipe.h"
 #include "qwenimage_vae.h"
 #include "sd_device.h"
@@ -83,6 +84,14 @@ static float e4m3_host(uint8_t v) {
     else if (e == 15 && m == 7) return NAN;
     else mag = std::ldexp(1.0f + m / 8.0f, e - 7);
     return s ? -mag : mag;
+}
+
+static bool read_file_path(const char* path, void* dst, size_t bytes) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    const size_t n = fread(dst, 1, bytes, f);
+    fclose(f);
+    return n == bytes;
 }
 
 static bool read_file(const char* name, void* dst, size_t bytes) {
@@ -262,6 +271,34 @@ int main(int argc, char** argv) {
         ok = ok && pass;
         printf("%s ConvRot linear (2.1 %s, 64 x 4096 -> 4096): against the exact quantized layer %.3g relative; against the BF16 original %.3g relative (min row cosine %.6f)\n",
                pass ? "[PASS]" : "[FAIL]", L, mq.max_rel, mb.max_rel, mb.min_cos);
+    }
+
+    /* Qwen-Image 2.1's DiT (int8 ConvRot, the whole 32-block forward) on the FP32 oracle's inputs (ref_dit21_fp32.py): the packed
+     * latent, the text embeddings, t = 0.5; the oracle dequantises the int8 weights exactly, so the reference is the exact layer math */
+    if (want("dit21")) {
+        std::vector<float> x(256 * 64), emb(12 * 4096), ref_joint(268 * 64), out(256 * 64);
+        if (!read_file_path("/data/zimage-ref/qwenimage2/out/dit21_x.f32", x.data(), x.size() * 4) ||
+            !read_file_path("/data/zimage-ref/qwenimage2/out/dit21_emb.f32", emb.data(), emb.size() * 4) ||
+            !read_file_path("/data/zimage-ref/qwenimage2/out/dit21_out.f32", ref_joint.data(), ref_joint.size() * 4)) {
+            printf("[FAIL] the 2.1 DiT oracle files (run ref_dit21_fp32.py)\n");
+            return 1;
+        }
+        zimage::SafeTensors& q21 = dit21_int8();
+        if (!q21.ok()) {
+            printf("[FAIL] the 2.1 file: %s\n", q21.error().c_str());
+            return 1;
+        }
+        if (!qwenimage21::dev_dit21_forward(q21, x.data(), 16, 16, emb.data(), 12, 0.5f, out.data())) {
+            printf("[FAIL] dev_dit21_forward\n");
+            return 1;
+        }
+        /* the oracle's output is the whole joint sequence: 12 text rows, then the 256 image rows */
+        const std::vector<float> ref(ref_joint.begin() + 12 * 64, ref_joint.end());
+        const Metrics m = compare_rows(out.data(), ref.data(), 256, 64);
+        const bool pass = m.min_cos >= 0.9999 && m.max_rel <= 0.01;
+        ok = ok && pass;
+        printf("%s Qwen-Image 2.1 DiT (32 blocks, int8 ConvRot, t 0.5, text 12 + 256 image tokens): min row cosine %.6f, max error %.3g relative\n",
+               pass ? "[PASS]" : "[FAIL]", m.min_cos, m.max_rel);
     }
 
     /* the oracle's template tokens and embeddings (the pipeline keeps the last 12 rows: the first 34 template tokens are dropped) */

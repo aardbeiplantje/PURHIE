@@ -341,6 +341,11 @@ Quality and correctness:
   streamed block by block: 6e-5 relative, cosine 1.0; the engine\'s joint attention runs in FP32 — the BF16 flash path was 1 % off);
   the VAE decode (0.999999 cosine, 1.2 % relative: its convolutions are BF16 GEMMs that round the activations to BF16); the sampler
   with exact timesteps (against the FP32 sampler reference, `ref_sampler_fp32_stream.py`: 1.2e-4 relative). The BF16 pipeline itself
+  Qwen-Image 2.1 (ComfyUI int8 ConvRot files in /comfyui; `src/qwenimage21_dit.cpp`): the DiT forward (32 blocks) against the exact
+  dequantised FP32 oracle (`/data/zimage-ref/qwenimage2/ref_dit21_fp32.py`): min row cosine 0.99997, 0.5 % max error; the ConvRot linear
+  itself matches the exact quantised layer to 1.7e-6. Found and fixed: the BF16 linears rounded their activations (2 % error in one
+  block), so they now use an FP32-activation kernel (`qi21_linear_bf16`). Not yet: the Qwen3-VL 8B text encoder, the 2.1 VAE, the sampler
+  (25 steps, `simple`, CFG 1 in the ComfyUI workflow), the server path.
   (`ref_pipeline.py`) differs from these by 6 to 15 % over 8 steps: it is not the reference for the engine. Not yet: the server path
   (`/v1/images/generations`) and the CFG (the default pipeline run has no negative prompt; true CFG 4 is for the negative case).
 - **Flux.2 dev** (`diffusion_models/flux2_dev_fp8mixed`: BF16 and FP8 layers with scales and a quantization table; double and

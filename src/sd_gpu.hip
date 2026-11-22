@@ -1252,3 +1252,121 @@ qi_linear_i8(const float* __restrict__ x, int T, const int8_t* __restrict__ W, c
         }
     }
 }
+
+// Qwen-Image 2.1: the zero-centred RMS norm of the text projection (y = x rsqrt(mean(x^2) + eps) (w + 1), w BF16); one block per row
+extern "C" __global__ void __launch_bounds__(SD_THREADS) qi21_zc_rms(const float* x, int C, const uint16_t* w, float eps, float* y) {
+    __shared__ float red[SD_THREADS];
+    const float* xr = x + (long)blockIdx.x * C;
+    float* yr = y + (long)blockIdx.x * C;
+    float q = 0.0f;
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) q += xr[i] * xr[i];
+    const float inv = rsqrtf(block_sum(q, red) / (float)C + eps);
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) yr[i] = xr[i] * inv * (bf2f(w[i]) + 1.0f);
+}
+
+// mod_tok[j][c] = mod[sel[j]][c] with sel[j] = 0 (the sampled timestep's row) or 1 (t = 0's row); mod is [2][C]
+extern "C" __global__ void __launch_bounds__(SD_THREADS) qi21_gather_mod(const float* mod, const float* sel, int C, long n, float* out) {
+    const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (e >= n) return;
+    const long j = e / C;
+    const int c = (int)(e % C);
+    out[e] = mod[(sel[j] > 0.5f ? C : 0) + c];
+}
+
+// x[e] *= (1 + s[e]) elementwise (the adaLN scale; the 2.1 variant has no shift)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) qi21_mul_1p(float* x, const float* s, long n) {
+    const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (e >= n) return;
+    x[e] *= (1.0f + s[e]);
+}
+
+// h[e] += tanh(g[e]) * y[e]
+extern "C" __global__ void __launch_bounds__(SD_THREADS) qi21_gated_add(float* h, const float* g, const float* y, long n) {
+    const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (e >= n) return;
+    h[e] += tanhf(g[e]) * y[e];
+}
+
+// The text queries of Qwen-Image 2.1's attention: query i (i < L) sees the keys 0..i (causal among the text). q, k, v, out: [J][heads][128]
+// (only the first L rows are read and written). One thread per (query, head): L * heads threads, a few keys each.
+extern "C" __global__ void __launch_bounds__(SD_THREADS)
+qi21_attn(const float* q, const float* k, const float* v, int J, int L, int heads, float* out) {
+    const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (e >= (long)L * heads) return;
+    const int i = (int)(e / heads), h = (int)(e % heads);
+    const int D = 128;
+    const float scale = rsqrtf((float)D);
+    const int kmax = i + 1;
+    const float* qi = q + ((long)i * heads + h) * D;
+    float m = -3.0e38f;
+    for (int j = 0; j < kmax; ++j) {
+        const float* kj = k + ((long)j * heads + h) * D;
+        float s = 0.0f;
+        for (int d = 0; d < D; ++d) s += qi[d] * kj[d];
+        m = fmaxf(m, s * scale);
+    }
+    float denom = 0.0f;
+    float acc[128];
+    for (int d = 0; d < D; ++d) acc[d] = 0.0f;
+    for (int j = 0; j < kmax; ++j) {
+        const float* kj = k + ((long)j * heads + h) * D;
+        const float* vj = v + ((long)j * heads + h) * D;
+        float s = 0.0f;
+        for (int d = 0; d < D; ++d) s += qi[d] * kj[d];
+        const float p = expf(s * scale - m);
+        denom += p;
+        for (int d = 0; d < D; ++d) acc[d] += p * vj[d];
+    }
+    float* oi = out + ((long)i * heads + h) * D;
+    for (int d = 0; d < D; ++d) oi[d] = acc[d] / denom;
+}
+
+// Qwen-Image 2.1's BF16 linears with FP32 activations (the weights BF16 bits read in place, decoded in the load; no rounding of the
+// activations): y[t][o] = sum_i x[t][i] W[o][i]. The qi_linear_f8 tile with a BF16 decode. in % 16 == 0. Block: 256 threads in a line.
+extern "C" __global__ void __launch_bounds__(256)
+qi21_linear_bf16(const float* __restrict__ x, int T, const uint16_t* __restrict__ W, int in, int out, float* __restrict__ y) {
+    __shared__ float As[16][64 + 1];
+    __shared__ float Bs[16][64 + 1];
+    const int tid = threadIdx.x;
+    const int tx = tid & 15, ty = tid >> 4;
+    const int t0 = blockIdx.y * 64, o0 = blockIdx.x * 64;
+    float acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+    for (int k0 = 0; k0 < in; k0 += 16) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int e = tid + j * 256;
+            const int r = e >> 4, k = e & 15;
+            const int t = t0 + r, o = o0 + r;
+            As[k][r] = (t < T) ? x[(size_t)t * in + k0 + k] : 0.0f;
+            Bs[k][r] = (o < out) ? __uint_as_float((uint32_t)W[(size_t)o * in + k0 + k] << 16) : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            float a[4], b[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) a[i] = As[k][ty * 4 + i];
+#pragma unroll
+            for (int jj = 0; jj < 4; ++jj) b[jj] = Bs[k][tx * 4 + jj];
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int jj = 0; jj < 4; ++jj) acc[i][jj] += a[i] * b[jj];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int o = o0 + tx * 4 + j;
+        if (o >= out) continue;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int t = t0 + ty * 4 + i;
+            if (t < T) y[(size_t)t * out + o] = acc[i][j];
+        }
+    }
+}
