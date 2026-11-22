@@ -25,8 +25,9 @@ class RocmInferenceImage:
             "required": {
                 "prompt": ("STRING", {"multiline": True, "default": "a red square on a blue background"}),
                 "model": ("STRING", {"default": "z-image-turbo"}),
-                "size": ("STRING", {"default": "256x256"}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 2**53 - 1}),
+                "size": ("STRING", {"default": "1024x1024"}),
+                "steps": ("INT", {"default": 9, "min": 1, "max": 50}),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 2**53 - 1}),
             },
             "optional": {
                 "server": ("STRING", {"default": ""}),
@@ -37,12 +38,13 @@ class RocmInferenceImage:
     FUNCTION = "generate"
     CATEGORY = "rocm-inference"
 
-    def generate(self, prompt, model, size, seed, server=""):
+    def generate(self, prompt, model, size, steps, seed, server=""):
         base = (server or DEFAULT_SERVER).rstrip("/")
         body = json.dumps({
             "model": model,
             "prompt": prompt,
             "size": size,
+            "steps": int(steps),  # z-image-turbo: the sampler's steps (9 is the ComfyUI workflow's)
             "seed": int(seed),
             "response_format": "b64_json",
         }).encode("utf-8")

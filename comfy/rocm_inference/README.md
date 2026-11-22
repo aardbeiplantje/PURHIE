@@ -6,6 +6,6 @@ The nodes call the rocm-inference HTTP service (`rocm-inference-server`, `/v1/im
 The server address: the node's `server` input, or the `ROCM_INFERENCE_URL` environment variable (default `http://rocm-inference:8080`).
 
 Nodes:
-- `ROCm Inference: Image`: prompt, model name (as the service lists it), size WIDTHxHEIGHT, seed -> IMAGE.
+- `ROCm Inference: Image`: prompt, model name (as the service lists it), size WIDTHxHEIGHT (z-image-turbo: 1024x1024 by default), steps (z-image-turbo: 9, the ComfyUI workflow's), seed (42 matches the workflow's image: torch's noise for the seed) -> IMAGE.
 
 Not yet: the stage endpoints (encode, sample, decode) that would let a workflow use the engine's pieces separately.

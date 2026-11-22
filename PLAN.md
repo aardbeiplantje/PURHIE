@@ -103,7 +103,8 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
   (multiples of 16 from 64 to 1024; 1024 x 1024 by default); the Perl XS `_zi_generate_png` passes the steps to
   `zi_generate_steps`. End to end through the Perl module, seed 42, 9 steps, 1024 x 1024: 27.44 dB against ComfyUI's PNG, 41 s
   with the model's load.
-- Next, in order: the ComfyUI node (the Z-Image workflow through the server's steps and size), the chain's remaining cost
+- The ComfyUI node (2026-11-22): `steps` (9) and the size (1024 x 1024) are inputs now; the request carries the steps.
+- Next, in order: the chain's remaining cost
   (flash attention 0.43 s a step, the attention's FP32 output converted to BF16, the modulation), and the calibrated table
   for the convolutions' algorithms (about 1.3 s a generation).
 - DiT linears, measured 2026-11-22 (`tests/sd_gemm_bench`, the three DiT shapes; `SD_BENCH_DEVICE=1` puts W, x, y in
