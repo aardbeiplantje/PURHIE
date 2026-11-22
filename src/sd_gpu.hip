@@ -1187,3 +1187,68 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) qv_upsample2_tok(const 
     const int ox = (int)(pix % (2 * W)), oy = (int)(pix / (2 * W));
     y[e] = x[((long)(oy / 2) * W + ox / 2) * C + c];
 }
+
+// Qwen-Image 2.1's ConvRot layers (int8 weights in place, symmetric per output row: W = q s[o], q in [-127, 127]). The activations
+// are rotated first by the same orthonormal regular Hadamard of 256 in blocks of the input dimension (qi_hadamard256). Y = X R Q^T:
+// the GEMM is the qi_linear_f8 tile with the int8 weights and the row scale applied to the accumulator.
+extern "C" __global__ void __launch_bounds__(256)
+qi_hadamard256(const float* __restrict__ x, int T, int K, const float* __restrict__ H, float* __restrict__ y) {
+    const int t = blockIdx.y;
+    const int k = blockIdx.x * 256 + threadIdx.x;  /* the output column; grid.x = K / 256 blocks of 256 threads */
+    if (t >= T || k >= K) return;
+    const int b0 = (k / 256) * 256, c = k - b0;
+    const float* xr = x + (size_t)t * K + b0;
+    float acc = 0.0f;
+    for (int j = 0; j < 256; ++j) acc += xr[j] * H[j * 256 + c];
+    y[(size_t)t * K + k] = acc;
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+qi_linear_i8(const float* __restrict__ x, int T, const int8_t* __restrict__ W, const float* __restrict__ wscale, int in, int out,
+             float* __restrict__ y) {
+    __shared__ float As[16][64 + 1];
+    __shared__ float Bs[16][64 + 1];
+    const int tid = threadIdx.x;
+    const int tx = tid & 15, ty = tid >> 4;
+    const int t0 = blockIdx.y * 64, o0 = blockIdx.x * 64;
+    float acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+    for (int k0 = 0; k0 < in; k0 += 16) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int e = tid + j * 256;
+            const int r = e >> 4, k = e & 15;
+            const int t = t0 + r, o = o0 + r;
+            As[k][r] = (t < T) ? x[(size_t)t * in + k0 + k] : 0.0f;
+            Bs[k][r] = (o < out) ? (float)W[(size_t)o * in + k0 + k] : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            float a[4], b[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) a[i] = As[k][ty * 4 + i];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) b[j] = Bs[k][tx * 4 + j];
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int o = o0 + tx * 4 + j;
+        if (o >= out) continue;
+        const float s = wscale[o];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int t = t0 + ty * 4 + i;
+            if (t < T) y[(size_t)t * out + o] = s * acc[i][j];
+        }
+    }
+}

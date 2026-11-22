@@ -21,6 +21,8 @@
 
 static const char* kDitPath = "/comfyui/diffusion_models/qwen_image_fp8_e4m3fn.safetensors";
 static const char* kTePath = "/comfyui/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors";
+static const char* kDit21Int8 = "/comfyui/diffusion_models/qwen_image_2.1_int8_convrot.safetensors";
+static const char* kDit21Bf16 = "/comfyui/diffusion_models/qwen_image_2.1_bf16.safetensors";
 static const char* kVaePath = "/comfyui/vae/qwen_image_vae.safetensors";
 static const std::string kOut = "/data/zimage-ref/qwenimage/out/";
 
@@ -37,6 +39,35 @@ static zimage::SafeTensors& te_file() {
     if (!reg) fprintf(stderr, "the text encoder mapping did not register\n");
     return t;
 }
+
+static zimage::SafeTensors& dit21_int8() {
+    static zimage::SafeTensors d(kDit21Int8);
+    static const bool reg = d.ok() && d.register_device();
+    if (!reg) fprintf(stderr, "the 2.1 int8 mapping did not register\n");
+    return d;
+}
+static zimage::SafeTensors& dit21_bf16() {
+    static zimage::SafeTensors d(kDit21Bf16);
+    static const bool reg = d.ok() && d.register_device();
+    if (!reg) fprintf(stderr, "the 2.1 bf16 mapping did not register\n");
+    return d;
+}
+
+/* the regular Hadamard of 256 (H4 Kronecker powers, normalised by 1/16) and the block rotation of x [rows][K] by it */
+static std::vector<double> regular_h256() {
+    static const double H4[4][4] = {{1, 1, 1, -1}, {1, 1, -1, 1}, {1, -1, 1, 1}, {-1, 1, 1, 1}};
+    std::vector<double> H = {1.0}; int n = 1;
+    while (n < 256) {
+        std::vector<double> K((size_t)n * 4 * n * 4);
+        for (int a = 0; a < n; ++a) for (int b = 0; b < n; ++b) for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j)
+            K[(size_t)(a * 4 + i) * (n * 4) + (b * 4 + j)] = H[(size_t)a * n + b] * H4[i][j];
+        H.swap(K); n *= 4;
+    }
+    for (double& v : H) v /= 16.0;
+    return H;
+}
+
+static float e4m3_host(uint8_t v);
 
 static zimage::SafeTensors& vae_file() {
     static zimage::SafeTensors v(kVaePath);
@@ -170,6 +201,67 @@ int main(int argc, char** argv) {
         ok = ok && pass;
         printf("%s text q_proj (12 x 3584 -> 3584, E4M3 weights x scale %.4g, BF16 bias): min row cosine %.7f, max error %.3g relative\n",
                pass ? "[PASS]" : "[FAIL]", wscale, m.min_cos, m.max_rel);
+    }
+
+    /* Qwen-Image 2.1's ConvRot linear (int8, rotated) on one real layer: against the exact host computation of the same quantized
+     * layer (rotate x, dequantise q s, multiply in double), and against the BF16 original (the quantization error only) */
+    if (want("convrot")) {
+        zimage::SafeTensors& q = dit21_int8();
+        zimage::SafeTensors& b16 = dit21_bf16();
+        const char* L = "transformer_blocks.0.attn.to_q";
+        const int8_t* Wq = nullptr;
+        const float* sc = nullptr;
+        const uint16_t* Wb = nullptr;
+        std::vector<size_t> sw, ss, sb;
+        if (!q.ok() || !b16.ok() || !q.i8_in_place(std::string(L) + ".weight", Wq, sw) ||
+            !q.f32_in_place(std::string(L) + ".weight_scale", sc, ss) || !b16.bf16_in_place(std::string(L) + ".weight", Wb, sb) ||
+            sw.size() != 2 || sw[0] != 4096 || sw[1] != 4096) {
+            printf("[FAIL] the 2.1 layer tensors (%s)\n", q.error().c_str());
+            return 1;
+        }
+        const int T = 64, K = 4096, N = 4096;
+        std::vector<float> x((size_t)T * K);
+        srand(11);
+        for (float& v : x) v = (float)(rand() % 2001 - 1000) / 1000.0f;
+        std::vector<double> H = regular_h256();
+        /* the rotation of the activations on the host (exact), then the device */
+        std::vector<double> xr((size_t)T * K);
+        for (int t = 0; t < T; ++t)
+            for (int blk = 0; blk < K / 256; ++blk)
+                for (int c = 0; c < 256; ++c) {
+                    double acc = 0;
+                    for (int j = 0; j < 256; ++j) acc += (double)x[(size_t)t * K + blk * 256 + j] * H[(size_t)j * 256 + c];
+                    xr[(size_t)t * K + blk * 256 + c] = acc;
+                }
+        std::vector<double> ref_q((size_t)T * N), ref_bf((size_t)T * N);
+        for (int t = 0; t < T; ++t)
+            for (int o = 0; o < N; ++o) {
+                double a = 0, bsum = 0;
+                const double so = sc[o];
+                for (int i = 0; i < K; ++i) {
+                    a += xr[(size_t)t * K + i] * (double)Wq[(size_t)o * K + i] * so;
+                    const uint32_t bits = (uint32_t)Wb[(size_t)o * K + i] << 16;
+                    float wf;
+                    std::memcpy(&wf, &bits, 4);
+                    bsum += (double)x[(size_t)t * K + i] * wf;
+                }
+                ref_q[(size_t)t * N + o] = a;
+                ref_bf[(size_t)t * N + o] = bsum;
+            }
+        sddev::Floats xd((size_t)T * K), xrd((size_t)T * K), yd((size_t)T * N), Hd(256 * 256);
+        std::memcpy(xd.data(), x.data(), x.size() * 4);
+        std::vector<float> Hf(256 * 256);
+        for (size_t i = 0; i < Hf.size(); ++i) Hf[i] = (float)H[i];
+        std::memcpy(Hd.data(), Hf.data(), Hf.size() * 4);
+        sddev::linear_convrot(xd.data(), T, Wq, sc, Hd.data(), K, N, xrd.data(), yd.data());
+        std::vector<float> yv(yd.data(), yd.data() + (size_t)T * N);
+        std::vector<float> rq(ref_q.begin(), ref_q.end()), rb(ref_bf.begin(), ref_bf.end());
+        const Metrics mq = compare_rows(yv.data(), rq.data(), T, N);
+        const Metrics mb = compare_rows(yv.data(), rb.data(), T, N);
+        const bool pass = mq.max_rel <= 1e-4 && mb.max_rel <= 0.03;
+        ok = ok && pass;
+        printf("%s ConvRot linear (2.1 %s, 64 x 4096 -> 4096): against the exact quantized layer %.3g relative; against the BF16 original %.3g relative (min row cosine %.6f)\n",
+               pass ? "[PASS]" : "[FAIL]", L, mq.max_rel, mb.max_rel, mb.min_cos);
     }
 
     /* the oracle's template tokens and embeddings (the pipeline keeps the last 12 rows: the first 34 template tokens are dropped) */

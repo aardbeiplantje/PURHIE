@@ -106,6 +106,9 @@ void rms_tok(const float* x, int HW, int C, const uint16_t* g, float* y);
 void patches(const float* x, int H, int W, int C, int mode, int p0, int n, float* P);
 void bias_tok(float* y, long rows, int C, const uint16_t* b);
 void upsample2_tok(const float* x, int H, int W, int C, float* y);
+// Qwen-Image 2.1's ConvRot linear (sd_gpu.hip qi_hadamard256 and qi_linear_i8): int8 weights W [out][in] in place with per-row
+// scales, the input rotated by H (the regular Hadamard of 256, normalised) per block; xr: T * in floats of scratch (sddev::alloc)
+void linear_convrot(const float* x, int T, const int8_t* W, const float* wscale, const float* H, int in, int out, float* xr, float* y);
 // The same with bfloat16 weights (the checkpoint's BF16, raw bits): y[t][o] = b[o] + sum_i x[t][i] W[o][i]
 void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, const float* b, float* y);
 void linear_to_cm(const float* x, int T, const uint16_t* W, int in, int out, const uint16_t* b, float* y, bool accumulate);
