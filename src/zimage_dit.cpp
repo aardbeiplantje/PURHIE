@@ -456,38 +456,36 @@ bool dev_refiner_block(const SafeTensors& st, const std::string& pre, float* x, 
     }
     DevBuf zeros(3 * dim, true);  /* zeros: the biases of the GEMMs without one (11520 >= every output here) */
     const float eps = 1e-5f;
-    /* attention */
-    /* the norm and the AdaLN scale in one pass, written in BF16: the input of the three projections (no conversion copy) */
+    /* attention: the projections' outputs in BF16 (hipBLASLt's BF16 output); the QK norms and RoPE on BF16 rows; the attention on
+     * BF16 q, k, v. The residual x stays FP32 */
     DevHalf h(static_cast<size_t>(N) * dim);
     sddev::rms_mod_bf16(x, N, dim, wn1, eps, sc_msa.p, h.p);
     const size_t sq = (size_t)dim * dim;
-    DevBuf q(static_cast<size_t>(N) * dim), k(static_cast<size_t>(N) * dim), v(static_cast<size_t>(N) * dim);
-    sddev::linear_bf16_xb(h.p, N, wqkv, dim, dim, zeros.p, q.p);
-    sddev::linear_bf16_xb(h.p, N, wqkv + sq, dim, dim, zeros.p, k.p);
-    sddev::linear_bf16_xb(h.p, N, wqkv + 2 * sq, dim, dim, zeros.p, v.p);
-    sddev::rms_norm(q.p, N * H, D, wqn, eps, q.p);   /* the per-head QK norms: rows of 128 */
-    sddev::rms_norm(k.p, N * H, D, wkn, eps, k.p);
-    sddev::rope(q.p, N, H, fr);
-    sddev::rope(k.p, N, H, fr);
+    DevHalf qb(static_cast<size_t>(N) * dim), kb(static_cast<size_t>(N) * dim), vb(static_cast<size_t>(N) * dim);
+    sddev::linear_bf16_xb16(h.p, N, wqkv, dim, dim, zeros.p, qb.p);
+    sddev::linear_bf16_xb16(h.p, N, wqkv + sq, dim, dim, zeros.p, kb.p);
+    sddev::linear_bf16_xb16(h.p, N, wqkv + 2 * sq, dim, dim, zeros.p, vb.p);
+    sddev::head_norm_rope_bf16(qb.p, N, H, wqn, eps, fr, qb.p);  /* the per-head QK norms (rows of 128) and the rotation */
+    sddev::head_norm_rope_bf16(kb.p, N, H, wkn, eps, fr, kb.p);
     DevBuf att(static_cast<size_t>(N) * dim);
-    sddev::attention(q.p, N, k.p, v.p, N, dim, H, att.p);
-    DevBuf o(static_cast<size_t>(N) * dim);
-    sddev::linear_bf16(att.p, N, wout, dim, dim, zeros.p, o.p);
-    sddev::rms_norm(o.p, N, dim, wn2, eps, o.p);
-    sddev::gate_add(x, N, dim, g_msa.p, o.p);
+    sddev::attention_bf16(qb.p, N, kb.p, vb.p, N, dim, H, att.p);
+    DevHalf attb(static_cast<size_t>(N) * dim);
+    sddev::to_bf16(att.p, attb.p, (size_t)N * dim);
+    DevHalf o(static_cast<size_t>(N) * dim);
+    sddev::linear_bf16_xb16(attb.p, N, wout, dim, dim, zeros.p, o.p);
+    sddev::rms_gate_add_bf16(x, N, dim, o.p, wn2, eps, g_msa.p);  /* x += g_msa * rms(o) wn2 */
     /* feed-forward (SwiGLU) */
     DevHalf h2(static_cast<size_t>(N) * dim);
     sddev::rms_mod_bf16(x, N, dim, wfn1, eps, sc_mlp.p, h2.p);
     DevBuf zerosF(F, true);
-    DevBuf a(static_cast<size_t>(N) * F), b(static_cast<size_t>(N) * F);
-    sddev::linear_bf16_xb(h2.p, N, w1, dim, F, zerosF.p, a.p);
-    sddev::linear_bf16_xb(h2.p, N, w3, dim, F, zerosF.p, b.p);
-    DevHalf gate(static_cast<size_t>(N) * F);  /* the SwiGLU's product in BF16: the down projection's input */
-    sddev::swiglu_bf16(a.p, b.p, gate.p, (size_t)N * F);
-    DevBuf f(static_cast<size_t>(N) * dim);
-    sddev::linear_bf16_xb(gate.p, N, w2, F, dim, zeros.p, f.p);
-    sddev::rms_norm(f.p, N, dim, wfn2, eps, f.p);
-    sddev::gate_add(x, N, dim, g_mlp.p, f.p);
+    DevHalf a(static_cast<size_t>(N) * F), b(static_cast<size_t>(N) * F);
+    sddev::linear_bf16_xb16(h2.p, N, w1, dim, F, zerosF.p, a.p);
+    sddev::linear_bf16_xb16(h2.p, N, w3, dim, F, zerosF.p, b.p);
+    DevHalf gate(static_cast<size_t>(N) * F);
+    sddev::swiglu_bf16_in(a.p, b.p, gate.p, (size_t)N * F);
+    DevHalf f(static_cast<size_t>(N) * dim);
+    sddev::linear_bf16_xb16(gate.p, N, w2, F, dim, zeros.p, f.p);
+    sddev::rms_gate_add_bf16(x, N, dim, f.p, wfn2, eps, g_mlp.p);
     return true;
 }
 

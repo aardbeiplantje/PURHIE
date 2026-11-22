@@ -67,18 +67,19 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
   `zimage_1024_verify`. Result: mean abs 3.18 levels, PSNR 27.7 dB, 39% of the bytes exact, 83% within 3 levels. ComfyUI's
   "simple" schedule gives the same timesteps as ours (t = 1 - k/9, then the shift 3: checked analytically). The rest is
   numerics (ComfyUI runs the DiT's linears in BF16; the VAE's precision there is not checked).
-- Decision open (the user's): BF16 outputs for the large linears. `SD_ROUND_OUT=1` (an experiment: each large linear's output
-  rounded to BF16) moves the image to PSNR 28.6 dB against ComfyUI (mean abs 2.78). A BF16-output hipBLASLt (the probe:
-  40 / 40 / 22 TFLOPS against 32 / 32 / 18 with FP32 output) would save about 0.5 s a step, but it changes the precision policy
-  (the project has kept FP32 activations since the BF16 errors of the Qwen and VAE paths). Not taken.
-- VAE (2026-11-22, the Flux AE decoder, one 1024 decode, about 3.3 s now, was 3.7): the mid block's attention (one head of 512,
-  16384 tokens) runs its two products by hipBLASLt in FP32 (`blt::gemm_f32`; `SD_ATTN_KERNEL=scalar` keeps the old: 8.62 s
-  against 8.41 s a step); the group norm in three passes over 64 chunks per group (`zimage_gn_sum/_var/_apply`, fixed-order
-  reductions; 0.33 s -> 0.15 s a decode; the one-step output moves by at most one level). The convolutions stay on the
-  128 x 128 FP32 kernel: hipBLASLt in FP32 for them is slower on this decoder (8.65 s against 8.11 s a step; opt-in
-  `SD_CONV_KERNEL=blt`). `SD_VAE_BF16=1` (the BF16 convolutions) changes the image by 0.04 levels on average against the FP32
-  VAE, the PSNR against ComfyUI unchanged (27.74 dB): its precision is fine, but it is not faster yet (its im2col and
-  transpose passes, about 1.6 s, are the cost).
+- BF16 outputs for the DiT's large linears (2026-11-22, the user's decision: yes): hipBLASLt's product with a BF16 output
+  (the bias as its epilogue) runs at 38 / 36 / 21 TFLOPS against 23 / 23 / 15 with the FP32 output, and the library's rounding
+  is round-to-nearest-even (256 of 256 outputs equal to it; the bench's `SD_BENCH_OUT16=1`). The DiT's chain now runs in BF16:
+  the QKV outputs go to the per-head norm and RoPE (`zimage_head_norm_rope_bf16`, BF16 in and out) and V to the transpose
+  (`zimage_transpose_pad_bf16_in`); the attention on BF16 q, k, v (`attention_bf16`); the o and f outputs to the fused RMS norm
+  and gated residual (`zimage_rms_gate_add_bf16`, the residual x stays FP32); a and b to the SwiGLU in BF16
+  (`zimage_swiglu_bf16_in`). Where hipBLASLt does not take the shape, the FP32 product is rounded to BF16
+  (`linear_bf16_xb16`). One step: 6.2 s (7.15 before). Nine steps: 24.2 s (34.5 before). Against ComfyUI at nine steps: PSNR
+  27.45 dB, mean abs 3.34 levels (FP32 chain: 27.74 dB, 3.17); the 256 check improves: exact 26.99%, within one level 80.06%,
+  mean abs 0.972 (was 22.54 / 79.36 / 1.022). With `SD_LINEAR_KERNEL=256b` the same chain runs on the kernel's FP32
+  product, rounded to BF16. The experiment that rounds only the linear outputs (`SD_ROUND_OUT=1`, FP32 consumers) gave 28.59 dB: the chain and
+  that experiment should match, and they differ by 1.1 dB. The likely cause is the algorithm the tuner picks by timing (each
+  plan's first call), not the rounding (checked); not yet proved.
 - VAE convolutions, BF16 by default (2026-11-22; `SD_VAE_CONV=fp32` keeps the FP32 kernel): the im2col written as BF16 in
   one pass through shared memory (`sd_im2col_bf16_tile`: a block is 64 consecutive pixels of one row and 8 channels; stride
   1, k <= 3, Wo a multiple of 64, cin a multiple of 8), the weights as BF16, one hipBLASLt BF16 product per convolution with
@@ -88,8 +89,9 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
   single-tap kernel's on all 48 convolutions of the 256 run. The gate moved by 0.8 points between two versions of the
   column kernel with identical columns: the product's algorithm is chosen by timing, so it may differ between runs; this is
   not yet proved, and it is the same kind of effect as the DiT's tuning.
-- Next, in order: the DiT's BF16 outputs for the large linears (the decision above: 1), then the server parameters (steps,
-  size) and the ComfyUI node.
+- Next, in order: the chain's remaining cost (the flash attention 0.43 s a step, the attention's FP32 output converted to BF16,
+  the modulation); the tuner's algorithm choice (fix it per shape, to make the results reproducible across runs); the server
+  parameters (steps, size) and the ComfyUI node.
 - DiT linears, measured 2026-11-22 (`tests/sd_gemm_bench`, the three DiT shapes; `SD_BENCH_DEVICE=1` puts W, x, y in
   device memory): `sd_gemm_wmma256b` runs at about 19-20 TFLOPS on QKV and MLP-up and 9-13 on MLP-down (K 10240: a 20 KB row
   stride, half the rate of MLP-up at the same FLOPs). The DiT step's linears take about 2.7 s (the engine's own timing).

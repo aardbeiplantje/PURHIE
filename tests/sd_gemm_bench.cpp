@@ -102,6 +102,40 @@ int main(int argc, char** argv) {
             sddev::linear_bf16(x, s.T, W, s.in, s.out, bias, y);
             best = std::fmin(best, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         }
+        if (std::getenv("SD_BENCH_OUT16")) {
+            /* the BF16 output (linear_bf16_out16): the input as BF16, the output rounded to BF16 by the library */
+            uint16_t* xb = static_cast<uint16_t*>(sddev::alloc(2 * nx, false));
+            uint16_t* y16 = static_cast<uint16_t*>(sddev::alloc(2 * ny, false));
+            for (size_t i = 0; i < nx; ++i) xb[i] = f2bf_host(hx[i]);
+            if (!sddev::linear_bf16_out16(xb, s.T, W, s.in, s.out, bias, y16)) {
+                std::printf("%s: [FAIL] the BF16 output is not taken\n", s.name);
+                return 1;
+            }
+            double best16 = 1e30;
+            for (int r = 0; r < reps; ++r) {
+                const auto t0 = std::chrono::steady_clock::now();
+                sddev::linear_bf16_out16(xb, s.T, W, s.in, s.out, bias, y16);
+                best16 = std::fmin(best16, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            }
+            double me = 0, mr = 0, signed_sum = 0;
+            int same_rne = 0, total = 0;
+            for (int q = 0; q < 256; ++q) {
+                const int t = (q * 977) % s.T, o = (q * 1237) % s.out;
+                double ref = hb[o];
+                for (int i = 0; i < s.in; ++i)
+                    ref += (double)bf2f_host(f2bf_host(hx[(size_t)t * s.in + i])) * (double)bf2f_host(hW[(size_t)o * s.in + i]);
+                me = std::fmax(me, std::fabs((double)bf2f_host(y16[(size_t)t * s.out + o]) - ref));
+                mr = std::fmax(mr, std::fabs(ref));
+                signed_sum += (double)bf2f_host(y16[(size_t)t * s.out + o]) - ref;
+                /* the library's bits against the round-to-nearest-even of the same fp32 value (in double: close, not exact) */
+                same_rne += (y16[(size_t)t * s.out + o] == f2bf_host((float)ref));
+                ++total;
+            }
+            std::printf("   mean signed error %.2e (bf16 ulp ~%.1e at this magnitude); bits equal to RNE of the reference: %d of %d\n",
+                        signed_sum / total, mr / 256.0 / 128.0, same_rne, total);
+            std::printf("%s: BF16 output %8.2f ms  %6.2f TFLOPS  max err %.2e of max %.2e (bf16 rounding: 4e-3)\n", s.name,
+                        best16 * 1e3, 2.0 * s.T * s.in * s.out / best16 / 1e12, me, mr);
+        }
         /* sampled outputs against the CPU dot product (the activations rounded to BF16, the products in double) */
         std::vector<float> hy(ny);
         if (devmem) hipMemcpy(hy.data(), y, 4 * ny, hipMemcpyDeviceToHost);

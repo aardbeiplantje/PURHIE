@@ -126,6 +126,21 @@ void attn21_text(const float* q, const float* k, const float* v, int J, int L, i
 void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, const float* b, float* y);
 // the same with the input already BF16 (xb: T x in, row-major; device-only memory from dalloc or alloc): no conversion
 void linear_bf16_xb(const uint16_t* xb, int T, const uint16_t* W, int in, int out, const float* b, float* y);
+// the same with the output in BF16 (hipBLASLt's BF16 output, the bias as its epilogue): false when the device path does not take
+// the shape (out >= 256, T >= 1024, in % 64 == 0, hipBLASLt on): the caller takes the FP32 path
+bool linear_bf16_out16(const uint16_t* xb, int T, const uint16_t* W, int in, int out, const float* b, uint16_t* y);
+// the same with the output always BF16 (the FP32 product rounded when hipBLASLt does not take the shape)
+bool linear_bf16_xb16(const uint16_t* xb, int T, const uint16_t* W, int in, int out, const float* b, uint16_t* y16);
+// the DiT's BF16 chain: rows of 128 (per token and head): y = rope(rms(x) w), BF16 in and out (y may be x)
+void head_norm_rope_bf16(const uint16_t* x, int T, int H, const uint16_t* w, float eps, const float* fr, uint16_t* y);
+// x[t] += g (rms(o[t]) w) for BF16 o: the RMS norm and the gated residual, in place on the FP32 x
+void rms_gate_add_bf16(float* x, int T, int C, const uint16_t* o, const uint16_t* w, float eps, const float* g);
+// y = BF16(x) (n values): an FP32 activation as the next GEMM's BF16 input
+void to_bf16(const float* x, uint16_t* y, size_t n);
+// g = BF16(silu(a) b) for BF16 a, b
+void swiglu_bf16_in(const uint16_t* a, const uint16_t* b, uint16_t* g, size_t n);
+// attention on BF16 q, k, v (T x C row-major, the head width 128): the output in FP32
+void attention_bf16(const uint16_t* q, int Tq, const uint16_t* k, const uint16_t* v, int Tk, int C, int heads, float* out);
 // y = BF16(rms(x) w s): the RMS norm (w BF16) and the AdaLN scale s (per channel), the GEMM input in BF16
 void rms_mod_bf16(const float* x, int T, int C, const uint16_t* w, float eps, const float* s, uint16_t* y);
 // g = BF16(silu(a) b), the SwiGLU's gate as the down projection's BF16 input

@@ -673,6 +673,76 @@ sd_im2col_bf16_tile(const float* x, int cin, int H, int W, int k, int p, int Wo,
     }
 }
 
+// The DiT's BF16 chain (the linears' outputs in BF16). head_norm_rope_bf16: per (token, head) row of 128 values (x in BF16,
+// y BF16, may be x): y = rope(rms(x) w), the same operations as sd_rms_norm (rows of 128) and zimage_rope, one rounding
+extern "C" __global__ void __launch_bounds__(128)
+zimage_head_norm_rope_bf16(const uint16_t* x, int H, const uint16_t* w, float eps, const float* fr, uint16_t* y) {
+    __shared__ float red[128];
+    __shared__ float nrm[128];
+    const long row = blockIdx.x;
+    const int t = (int)(row / H);
+    const int i = threadIdx.x;
+    const float xv = bf2f(x[row * 128 + i]);
+    red[i] = xv * xv;
+    __syncthreads();
+    for (int off = 64; off > 0; off >>= 1) {
+        if (i < off) red[i] += red[i + off];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(red[0] / 128.0f + eps);
+    nrm[i] = xv * inv * bf2f(w[i]);
+    __syncthreads();
+    if (i < 64) {
+        const float c = fr[(t * 64 + i) * 2], sn = fr[(t * 64 + i) * 2 + 1];
+        const float re = nrm[2 * i], im = nrm[2 * i + 1];
+        y[row * 128 + 2 * i] = f2bf(re * c - im * sn);
+        y[row * 128 + 2 * i + 1] = f2bf(re * sn + im * c);
+    }
+}
+
+// Vt[c * Tkp + j] = BF16 V[j * C + c] (zero for Tk <= j < Tkp): sd_transpose_pad_bf16 for V in BF16 (the same tile form)
+extern "C" __global__ void __launch_bounds__(256) zimage_transpose_pad_bf16_in(const uint16_t* V, int Tk, int Tkp, int C, uint16_t* Vt) {
+    __shared__ float tile[32][33];
+    const int tx = threadIdx.x & 31, ty = threadIdx.x >> 5;
+    const int tiles_c = (C + 31) / 32;
+    const int bc = blockIdx.x % tiles_c, bj = blockIdx.x / tiles_c;
+    const int c0 = bc * 32, j0 = bj * 32;
+    for (int k = 0; k < 4; ++k) {
+        const int j = j0 + ty + 8 * k, c = c0 + tx;
+        tile[ty + 8 * k][tx] = (j < Tk && c < C) ? bf2f(V[(long)j * C + c]) : 0.0f;
+    }
+    __syncthreads();
+    for (int k = 0; k < 4; ++k) {
+        const int c = c0 + ty + 8 * k, j = j0 + tx;
+        if (c < C && j < Tkp) Vt[(long)c * Tkp + j] = f2bf(tile[tx][ty + 8 * k]);
+    }
+}
+
+// x[t][c] += g[c] * (rms(o[t]) w[c]): the RMS norm of a BF16 row (sd_rms_norm's operations) and the gated residual
+// (zimage_gate_add), in place on the FP32 residual x
+extern "C" __global__ void __launch_bounds__(SD_THREADS)
+zimage_rms_gate_add_bf16(float* x, int C, const uint16_t* o, const uint16_t* w, float eps, const float* g) {
+    __shared__ float red[SD_THREADS];
+    const uint16_t* orow = o + (long)blockIdx.x * C;
+    float* xr = x + (long)blockIdx.x * C;
+    float q = 0.0f;
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) {
+        const float ov = bf2f(orow[i]);
+        q += ov * ov;
+    }
+    const float inv = rsqrtf(block_sum(q, red) / (float)C + eps);
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) xr[i] += g[i] * (bf2f(orow[i]) * inv * bf2f(w[i]));
+}
+
+// g = BF16(silu(a) b) with a, b in BF16 (the SwiGLU of the BF16 products)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) zimage_swiglu_bf16_in(const uint16_t* a, const uint16_t* b, uint16_t* g, long n) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i < n) {
+        const float av = bf2f(a[i]);
+        g[i] = f2bf(av / (1.0f + expf(-av)) * bf2f(b[i]));
+    }
+}
+
 // y[i] = BF16(y[i]) as FP32 (in place): a linear's output rounded to BF16 (the precision experiment: SD_ROUND_OUT)
 extern "C" __global__ void __launch_bounds__(SD_THREADS) sd_round_bf16(float* y, long n) {
     const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
