@@ -3,12 +3,15 @@
  * rounded to BF16 as the kernels do). Usage: sd_gemm_bench [repeats]. Needs the device path (the default). */
 #include "sd_device.h"
 
+#include <hip/hip_runtime.h>
+
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace {
 
@@ -51,11 +54,31 @@ int main(int argc, char** argv) {
     int rc = 0;
     for (const Shape& s : shapes) {
         const size_t nw = (size_t)s.out * s.in, nx = (size_t)s.T * s.in, ny = (size_t)s.T * s.out;
-        uint16_t* W = static_cast<uint16_t*>(sddev::alloc(2 * nw, false));
-        float* x = static_cast<float*>(sddev::alloc(4 * nx, false));
-        float* y = static_cast<float*>(sddev::alloc(4 * ny, false));
-        for (size_t i = 0; i < nw; ++i) W[i] = f2bf_host(0.1f * rnd());
-        for (size_t i = 0; i < nx; ++i) x[i] = rnd();
+        /* SD_BENCH_DEVICE=1: W, x and y in device memory (hipMalloc) instead of the engine's pinned host allocation */
+        const bool devmem = std::getenv("SD_BENCH_DEVICE") != nullptr;
+        uint16_t* W = static_cast<uint16_t*>(devmem ? nullptr : sddev::alloc(2 * nw, false));
+        float* x = static_cast<float*>(devmem ? nullptr : sddev::alloc(4 * nx, false));
+        float* y = static_cast<float*>(devmem ? nullptr : sddev::alloc(4 * ny, false));
+        if (devmem) {
+            void *dW, *dx, *dy;
+            hipMalloc(&dW, 2 * nw);
+            hipMalloc(&dx, 4 * nx);
+            hipMalloc(&dy, 4 * ny);
+            W = static_cast<uint16_t*>(dW);
+            x = static_cast<float*>(dx);
+            y = static_cast<float*>(dy);
+        }
+        std::vector<uint16_t> hW(nw);
+        std::vector<float> hx(nx);
+        for (size_t i = 0; i < nw; ++i) hW[i] = f2bf_host(0.1f * rnd());
+        for (size_t i = 0; i < nx; ++i) hx[i] = rnd();
+        if (devmem) {
+            hipMemcpy(W, hW.data(), 2 * nw, hipMemcpyHostToDevice);
+            hipMemcpy(x, hx.data(), 4 * nx, hipMemcpyHostToDevice);
+        } else {
+            std::memcpy(W, hW.data(), 2 * nw);
+            std::memcpy(x, hx.data(), 4 * nx);
+        }
         sddev::linear_bf16(x, s.T, W, s.in, s.out, nullptr, y);  /* warm-up: the kernel load and the first call */
         double best = 1e30;
         for (int r = 0; r < reps; ++r) {

@@ -444,7 +444,7 @@ $(QWENIMAGE_VERIFY): $(TESTSDIR)/qwenimage_verify.cpp $(SRCDIR)/sd_device.cpp $(
 $(ZIMAGE_1024_VERIFY): $(TESTSDIR)/zimage_1024_verify.cpp $(SRCDIR)/zimage_pipe.cpp $(SRCDIR)/zimage_pipe.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/zimage_1024_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
 
-$(SD_GEMM_BENCH): $(TESTSDIR)/sd_gemm_bench.cpp $(SRCDIR)/sd_device.cpp $(SRCDIR)/sd_device.h $(INFERENCE_LIB)
+$(SD_GEMM_BENCH): $(TESTSDIR)/sd_gemm_bench.cpp $(SRCDIR)/sd_device.cpp $(SRCDIR)/sd_device.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/sd_gemm_bench.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
 
 $(ZIMAGE_PIPE_VERIFY): $(TESTSDIR)/zimage_pipe_verify.cpp $(SRCDIR)/zimage_pipe.cpp $(SRCDIR)/zimage_pipe.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)

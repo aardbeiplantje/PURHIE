@@ -43,6 +43,23 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
   attention, FP32 scalar over 16384 tokens (about 0.55 s); (3) the DiT's linears and attention, the bigger block (about 3.8 s a
   step); then the 9-step match against the reference on an idle desktop, the sampler against ComfyUI's "simple" schedule, the
   server parameters (steps, size) and the ComfyUI node.
+- DiT linears, measured 2026-11-22 (`tests/sd_gemm_bench`, the three DiT shapes; `SD_BENCH_DEVICE=1` puts W, x, y in
+  device memory): `sd_gemm_wmma256b` runs at about 19-20 TFLOPS on QKV and MLP-up and 9-13 on MLP-down (K 10240: a 20 KB row
+  stride, half the rate of MLP-up at the same FLOPs). The DiT step's linears take about 2.7 s (the engine's own timing).
+  The profiler (rocprofv3, `SQ_WAIT_CNT_VMVS`) puts 58-63% of the wave cycles in waits on vector memory; LDS waits are 4%
+  (`ALUStalledByLDS` 0.1%, bank conflicts 3.9%); the L2 hit rate is 3%; the address translation is 2% busy.
+  Vendor check (hipBLAS / hipBLASLt, the same shapes, BF16 in): the default algorithm for FP32 output runs at 4-6 TFLOPS; its
+  algorithm 4 (of 8) at 32 / 32 / 18; BF16 output (`hipblasGemmEx`) at 40 / 40 / 22. Not adopted: a vendor dependency is a
+  design decision, not made. Tried and rejected (measured in the engine's kernels; do not repeat without a new idea): one LDS
+  tile with two blocks per CU (slower: 15.8 / 14.9 / 8.8); three register sets two tiles ahead (spills, 8 TFLOPS); the 256 x 256
+  tile with 16 waves (no gain; the engine's step 5.9 s against 5.4 s); 64-byte row pieces for the loads (no gain). Device-only
+  scratch for the BF16 copy of the input raised the bench 15-20%, not the engine's step (reverted). Pinned host memory against
+  device memory for the operands: +30% in the bench, not taken (the zero-copy rule).
+- Build trap, fixed: `sd_gemm_bench` did not depend on `libqwen.a` (it holds `sd_device.o` too), so it linked a stale device
+  library; its timings in that state were the previous build's. Benches and verifiers that link the device code depend on
+  `$(QWEN_MODEL_LIB)` now.
+- Open lead: the MLP-down shape. Its weights have a 20 KB row stride; the activation copy is ours to lay out (the weights are
+  read in place, so theirs is fixed).
 - Open: the 30 s target is unmeasured end to end; the DiT uses BF16-rounded GEMMs (linear_bf16), which cost accuracy elsewhere
   (see the FP32 fixes).
 
