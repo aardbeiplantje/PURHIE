@@ -6,8 +6,11 @@
 #include "kernel_loader.h"
 
 #include <hip/hip_runtime.h>
+#include <hipblaslt/hipblaslt.h>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -472,6 +475,152 @@ void attn21_text(const float* q, const float* k, const float* v, int J, int L, i
     sync();
 }
 
+/* Device-only scratch: hipMalloc memory for a buffer the host never reads or writes (the BF16 copy of a large linear's input).
+ * The GEMMs read it faster than the pinned allocation (hipBLASLt: 27 against 21 TFLOPS on the DiT's QKV, sd_gemm_bench).
+ * One buffer, grown when a call needs more; the device path's calls are serialised. */
+void* device_scratch(size_t bytes) {
+    static void* buf = nullptr;
+    static size_t cap = 0;
+    if (bytes > cap) {
+        if (buf) hipFree(buf);
+        buf = nullptr;
+        cap = 0;
+        if (hipMalloc(&buf, bytes) != hipSuccess) throw std::runtime_error("sd device: out of device memory");
+        cap = bytes;
+    }
+    return buf;
+}
+
+/* hipBLASLt for the large linears (the DiT's: out >= 256 and T >= 1024): y[t][o] = sum_i xb[t][i] W[o][i] + b[o], the BF16
+ * operands as the WMMA kernels take them, FP32 output and accumulation, the bias as the GEMM's epilogue. Column-major, as
+ * the library takes it: C (out x T) = W^T (out x in: the weights as stored) times xb^T (in x T). One plan per shape (and
+ * whether there is a bias); its algorithm is chosen once, by timing the heuristic's candidates on that shape: the first
+ * candidate ran at a quarter of the best one's speed on the DiT's shapes (PLAN.md). SD_LINEAR_KERNEL=256b keeps the
+ * kernel. A plan that fails leaves the kernel in charge of that shape. */
+namespace blt {
+
+struct Plan {
+    hipblasLtMatmulDesc_t desc = nullptr;
+    hipblasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr;
+    hipblasLtMatmulPreference_t pref = nullptr;
+    hipblasLtMatmulAlgo_t algo{};
+    size_t ws = 0;
+    bool tuned = false, failed = false;
+};
+
+hipblasLtHandle_t g_handle = nullptr;
+bool g_init_failed = false;
+std::map<std::array<int, 4>, Plan> g_plans;
+void* g_ws = nullptr;
+size_t g_ws_cap = 0;
+
+bool ensure_workspace(size_t bytes) {
+    if (bytes <= g_ws_cap) return true;
+    if (g_ws) hipFree(g_ws);
+    g_ws = nullptr;
+    g_ws_cap = 0;
+    if (hipMalloc(&g_ws, bytes) != hipSuccess) return false;  // device-only: the host never touches it
+    g_ws_cap = bytes;
+    return true;
+}
+
+bool enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("SD_LINEAR_KERNEL");
+        return !(e && std::strcmp(e, "256b") == 0);
+    }();
+    return on && !g_init_failed;
+}
+
+// one product with the algorithm given (its workspace: p.ws bytes of g_ws)
+bool run_once(const Plan& p, const hipblasLtMatmulAlgo_t& algo, const uint16_t* W, const uint16_t* xb, float* y,
+              const void* bias_ptr, bool has_bias) {
+    if (has_bias) hipblasLtMatmulDescSetAttribute(p.desc, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_ptr, sizeof(bias_ptr));
+    const float alpha = 1.0f, beta = 0.0f;
+    return hipblasLtMatmul(g_handle, p.desc, &alpha, W, p.la, xb, p.lb, &beta, y, p.lc, y, p.lc, &algo, g_ws, p.ws, nullptr) ==
+           HIPBLAS_STATUS_SUCCESS;
+}
+
+// the plan for (out, T, in, bias): created and tuned on its first call (with that call's operands)
+Plan* plan_for(int out, int T, int in, bool has_bias, const uint16_t* W, const uint16_t* xb, float* y, const float* b) {
+    if (!g_handle && hipblasLtCreate(&g_handle) != HIPBLAS_STATUS_SUCCESS) {
+        g_init_failed = true;
+        g_handle = nullptr;
+        return nullptr;
+    }
+    const std::array<int, 4> key = {out, T, in, has_bias ? 1 : 0};
+    auto it = g_plans.find(key);
+    if (it == g_plans.end()) {
+        Plan p;
+        bool ok = hipblasLtMatmulDescCreate(&p.desc, HIPBLAS_COMPUTE_32F, HIP_R_32F) == HIPBLAS_STATUS_SUCCESS;
+        const hipblasOperation_t opT = HIPBLAS_OP_T, opN = HIPBLAS_OP_N;
+        ok = ok && hipblasLtMatmulDescSetAttribute(p.desc, HIPBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT)) == HIPBLAS_STATUS_SUCCESS;
+        ok = ok && hipblasLtMatmulDescSetAttribute(p.desc, HIPBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN)) == HIPBLAS_STATUS_SUCCESS;
+        if (has_bias) {
+            const hipblasLtEpilogue_t epi = HIPBLASLT_EPILOGUE_BIAS;
+            const hipDataType bt = HIP_R_32F;
+            ok = ok && hipblasLtMatmulDescSetAttribute(p.desc, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof(epi)) == HIPBLAS_STATUS_SUCCESS;
+            ok = ok && hipblasLtMatmulDescSetAttribute(p.desc, HIPBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bt, sizeof(bt)) == HIPBLAS_STATUS_SUCCESS;
+        }
+        ok = ok && hipblasLtMatrixLayoutCreate(&p.la, HIP_R_16BF, in, out, in) == HIPBLAS_STATUS_SUCCESS;   // W^T: in x out
+        ok = ok && hipblasLtMatrixLayoutCreate(&p.lb, HIP_R_16BF, in, T, in) == HIPBLAS_STATUS_SUCCESS;     // xb^T: in x T
+        ok = ok && hipblasLtMatrixLayoutCreate(&p.lc, HIP_R_32F, out, T, out) == HIPBLAS_STATUS_SUCCESS;    // y: out x T
+        ok = ok && hipblasLtMatmulPreferenceCreate(&p.pref) == HIPBLAS_STATUS_SUCCESS;
+        const uint64_t maxws = (uint64_t)256 << 20;
+        ok = ok && hipblasLtMatmulPreferenceSetAttribute(p.pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &maxws, sizeof(maxws)) ==
+                       HIPBLAS_STATUS_SUCCESS;
+        p.failed = !ok;
+        it = g_plans.emplace(key, p).first;
+    }
+    Plan& p = it->second;
+    if (p.failed || p.tuned) return p.failed ? nullptr : &p;
+    /* the heuristic's candidates, each timed on this call's operands (the results overwrite y, which the call overwrites anyway) */
+    hipblasLtMatmulHeuristicResult_t heur[32];
+    int n = 0;
+    if (hipblasLtMatmulAlgoGetHeuristic(g_handle, p.desc, p.la, p.lb, p.lc, p.lc, p.pref, 32, heur, &n) != HIPBLAS_STATUS_SUCCESS || n < 1) {
+        p.failed = true;
+        return nullptr;
+    }
+    size_t maxws = 0;
+    for (int i = 0; i < n; ++i) maxws = std::max(maxws, (size_t)heur[i].workspaceSize);
+    if (!ensure_workspace(std::max<size_t>(maxws, 1))) {
+        p.failed = true;
+        return nullptr;
+    }
+    const void* bias_ptr = b;
+    double best = 1e30;
+    int best_i = -1;
+    for (int i = 0; i < n; ++i) {
+        p.ws = heur[i].workspaceSize;
+        if (!run_once(p, heur[i].algo, W, xb, y, bias_ptr, has_bias)) continue;
+        hipDeviceSynchronize();
+        double t = 1e30;
+        for (int r = 0; r < 3; ++r) {
+            const auto t0 = std::chrono::steady_clock::now();
+            run_once(p, heur[i].algo, W, xb, y, bias_ptr, has_bias);
+            hipDeviceSynchronize();
+            t = std::min(t, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        }
+        if (std::getenv("SD_BLT_LOG"))
+            std::fprintf(stderr, "blt: out %d T %d in %d bias %d candidate %d: %.2f ms (workspace %zu)\n", out, T, in, has_bias ? 1 : 0,
+                         i, t * 1e3, (size_t)heur[i].workspaceSize);
+        if (t < best) {
+            best = t;
+            best_i = i;
+        }
+    }
+    if (best_i < 0) {
+        p.failed = true;
+        return nullptr;
+    }
+    p.algo = heur[best_i].algo;
+    p.ws = heur[best_i].workspaceSize;
+    p.tuned = true;
+    return &p;
+}
+
+}  // namespace blt
+
 void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, const float* b, float* y) {
     if (out <= 0 || T <= 0) return;
     // the tensor-core tile (sd_gemm_wmma, 128 x 128 when the output has the rows for it; the F32 activations rounded on load:
@@ -486,7 +635,7 @@ void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, cons
             // the activations converted to BF16 once (the tile re-reads them once per 256 output rows: the F32 bytes were the
             // bottleneck, see sd_gemm_wmma256b)
             const long nb = (long)T * in;
-            uint16_t* xb = static_cast<uint16_t*>(alloc(sizeof(uint16_t) * (size_t)nb, false));
+            uint16_t* xb = static_cast<uint16_t*>(device_scratch(sizeof(uint16_t) * (size_t)nb));
             const float* xs = x;
             void* ac[] = {(void*)&xs, (void*)&xb, (void*)&nb};
             launch(f_to_bf16, dim3((unsigned)((nb + kThreads - 1) / kThreads)), ac);
@@ -498,11 +647,21 @@ void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, cons
             void* args[] = {(void*)&A, (void*)&lda, (void*)&B, (void*)&sbn, (void*)&C, (void*)&cs_m, (void*)&cs_n,
                             (void*)&bf, (void*)&alpha, (void*)&beta, (void*)&M, (void*)&N, (void*)&K, (void*)&bs0, (void*)&bs0,
                             (void*)&bs0};
-            check(hip_launch(f_gemm_wmma256b, (unsigned)((N + 127) / 128), (unsigned)((M + 255) / 256), 1, 256, 1, 1, 0,
-                                        nullptr, args, nullptr),
-                  "wmma gemm 256b");
+            bool done = false;
+            if (blt::enabled()) {
+                // hipBLASLt, with the bias as the epilogue (no bias: the plan without it)
+                blt::Plan* p = blt::plan_for(out, T, in, b != nullptr, W, xb, y, b);
+                if (p) {
+                    done = blt::run_once(*p, p->algo, W, xb, y, b, b != nullptr);
+                    if (!done) p->failed = true;
+                }
+            }
+            if (!done)
+                check(hip_launch(f_gemm_wmma256b, (unsigned)((N + 127) / 128), (unsigned)((M + 255) / 256), 1, 256, 1, 1, 0,
+                                            nullptr, args, nullptr),
+                      "wmma gemm 256b");
             sync();
-            release(xb, sizeof(uint16_t) * (size_t)nb);
+            // (device_scratch: kept for the next call)
             return;
         }
         const uint16_t* A = W;

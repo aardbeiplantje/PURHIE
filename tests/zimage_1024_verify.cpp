@@ -68,6 +68,14 @@ int main(int argc, char** argv) {
         return 1;
     }
     printf("  %d steps, 1024 x 1024: %.2f s\n", steps, secs);
+    /* ZI_DUMP=path: the output bytes (1024 x 1024 x 3) for a comparison between two engine settings */
+    if (const char* dump = getenv("ZI_DUMP")) {
+        FILE* df = fopen(dump, "wb");
+        if (df) {
+            fwrite(rgb.data(), 1, rgb.size(), df);
+            fclose(df);
+        }
+    }
     if (!have_ref) {
         printf("  no reference image for %d steps (run ref_1024.py %d to compare)\n", steps, steps);
         zi_close(p);

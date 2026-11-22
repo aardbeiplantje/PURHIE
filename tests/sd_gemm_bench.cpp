@@ -69,9 +69,12 @@ int main(int argc, char** argv) {
             y = static_cast<float*>(dy);
         }
         std::vector<uint16_t> hW(nw);
-        std::vector<float> hx(nx);
+        std::vector<float> hx(nx), hb(s.out);
+        for (int o = 0; o < s.out; ++o) hb[o] = 0.5f * rnd();
         for (size_t i = 0; i < nw; ++i) hW[i] = f2bf_host(0.1f * rnd());
         for (size_t i = 0; i < nx; ++i) hx[i] = rnd();
+        float* bias = static_cast<float*>(sddev::alloc(4 * (size_t)s.out, false));
+        std::memcpy(bias, hb.data(), 4 * (size_t)s.out);
         if (devmem) {
             hipMemcpy(W, hW.data(), 2 * nw, hipMemcpyHostToDevice);
             hipMemcpy(x, hx.data(), 4 * nx, hipMemcpyHostToDevice);
@@ -79,21 +82,24 @@ int main(int argc, char** argv) {
             std::memcpy(W, hW.data(), 2 * nw);
             std::memcpy(x, hx.data(), 4 * nx);
         }
-        sddev::linear_bf16(x, s.T, W, s.in, s.out, nullptr, y);  /* warm-up: the kernel load and the first call */
+        sddev::linear_bf16(x, s.T, W, s.in, s.out, bias, y);  /* warm-up: the kernel load and the first call */
         double best = 1e30;
         for (int r = 0; r < reps; ++r) {
             const auto t0 = std::chrono::steady_clock::now();
-            sddev::linear_bf16(x, s.T, W, s.in, s.out, nullptr, y);
+            sddev::linear_bf16(x, s.T, W, s.in, s.out, bias, y);
             best = std::fmin(best, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         }
         /* sampled outputs against the CPU dot product (the activations rounded to BF16, the products in double) */
+        std::vector<float> hy(ny);
+        if (devmem) hipMemcpy(hy.data(), y, 4 * ny, hipMemcpyDeviceToHost);
+        else std::memcpy(hy.data(), y, 4 * ny);
         double maxerr = 0, maxref = 0;
         for (int q = 0; q < 256; ++q) {
             const int t = (q * 977) % s.T, o = (q * 1237) % s.out;
-            double ref = 0;
+            double ref = hb[o];
             for (int i = 0; i < s.in; ++i)
-                ref += (double)bf2f_host(f2bf_host(x[(size_t)t * s.in + i])) * (double)bf2f_host(W[(size_t)o * s.in + i]);
-            maxerr = std::fmax(maxerr, std::fabs((double)y[(size_t)t * s.out + o] - ref));
+                ref += (double)bf2f_host(f2bf_host(hx[(size_t)t * s.in + i])) * (double)bf2f_host(hW[(size_t)o * s.in + i]);
+            maxerr = std::fmax(maxerr, std::fabs((double)hy[(size_t)t * s.out + o] - ref));
             maxref = std::fmax(maxref, std::fabs(ref));
         }
         const double tflops = 2.0 * s.T * s.in * s.out / best / 1e12;

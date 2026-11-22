@@ -23,7 +23,7 @@ HOST_SIMD := -mavx2 -mfma -mf16c -mavx512f -mavx512vl -mavx512bw -mavx512dq
 # Device/HIP kernel flags (with offloading)
 HIPFLAGS  := -Xarch_device -mno-wavefrontsize64 -isystem $(ROCM_PATH)/include --rocm-path=$(ROCM_PATH) -O3 --offload-arch=$(ARCH) --genco -D__HIP_PLATFORM_AMD__ -D__HIP_ENABLE_AMD_HSA__
 
-LDFLAGS   := -L$(ROCM_PATH)/lib -lamdhip64 -lhsa-runtime64 -Wl,-rpath,$(ROCM_PATH)/lib
+LDFLAGS   := -L$(ROCM_PATH)/lib -lamdhip64 -lhsa-runtime64 -lhipblaslt -Wl,-rpath,$(ROCM_PATH)/lib
 
 # `all` is the default goal; its rule is at the end of the file, after every variable it names is defined
 .DEFAULT_GOAL := all
@@ -220,22 +220,22 @@ $(MEL_VERIFY): $(TESTSDIR)/mel_verify.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/mel_verify.cpp $(SRCDIR)/mel.cpp -o $@
 
 $(QWEN3TTS_SPEECH_VERIFY): $(TESTSDIR)/qwen3tts_speech_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h $(SRCDIR)/qwen3tts.h $(SRCDIR)/qwen3tts_speech.cpp $(SRCDIR)/qwen3tts_speech.h $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
-	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/qwen3tts_speech_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/qwen3tts_speech_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -lhipblaslt -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
 
 $(SD_IMAGE_VERIFY): $(TESTSDIR)/sd_image_verify.cpp $(SRCDIR)/sd.cpp $(SRCDIR)/sd.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
-	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/sd_image_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -lz -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/sd_image_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -lhipblaslt -lz -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
 
 $(SD_UNET_VERIFY): $(TESTSDIR)/sd_unet_verify.cpp $(SRCDIR)/sd.cpp $(SRCDIR)/sd.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
-	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/sd_unet_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -lz -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/sd_unet_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -lhipblaslt -lz -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
 
 $(SD_VAE_VERIFY): $(TESTSDIR)/sd_vae_verify.cpp $(SRCDIR)/sd.cpp $(SRCDIR)/sd.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
-	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/sd_vae_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -lz -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/sd_vae_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -lhipblaslt -lz -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
 
 $(SD_TEXT_VERIFY): $(TESTSDIR)/sd_text_verify.cpp $(SRCDIR)/sd.cpp $(SRCDIR)/sd.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
-	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/sd_text_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -lz -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/sd_text_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -lhipblaslt -lz -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
 
 $(SPEAKER_VERIFY): $(TESTSDIR)/speaker_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/qwen3tts.h $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
-	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/speaker_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/speaker_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -lhipblaslt -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
 
 $(CODEC_ENCODE_VERIFY): $(TESTSDIR)/codec_encode_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kernel_loader.cpp $(OBJDIR)/kernels_embed.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/codec_encode_verify.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(SRCDIR)/kernel_loader.cpp $(OBJDIR)/kernels_embed.o $(LDFLAGS) -o $@
@@ -250,7 +250,7 @@ $(TALKER_SAMPLE_VERIFY): $(TESTSDIR)/talker_sample_verify.cpp $(SRCDIR)/talker_g
 	$(HIPCC) -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ $(TESTSDIR)/talker_sample_verify.cpp -o $@
 
 $(QWEN3TTS_VERIFY): $(TESTSDIR)/qwen3tts_verify.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/mel.h $(SRCDIR)/qwen3tts.h $(SRCDIR)/tokenizer.cpp $(SRCDIR)/quant_types.cpp $(SRCDIR)/gguf_mmap.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
-	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/qwen3tts_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/qwen3tts_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -lhipblaslt -Wl,-rpath,/opt/rocm/lib -fopenmp -o $@
 
 $(AUDIO_VERIFY): $(TESTSDIR)/audio_verify.cpp $(SRCDIR)/audio.cpp $(SRCDIR)/audio.h
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. $(TESTSDIR)/audio_verify.cpp $(SRCDIR)/audio.cpp -o $@
@@ -586,7 +586,7 @@ TEST_TARGET = $(BINDIR)/verify_minimal_test
 TEST_OBJ = $(OBJDIR)/verify_minimal_test.o
 
 $(TEST_TARGET): $(TEST_OBJ) verify_minimal.co
-	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/verify_minimal_test.cpp -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -o $@
+	$(CLANG) $(CXXFLAGS) -I. $(SRCDIR)/verify_minimal_test.cpp -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -lhipblaslt -o $@
 
 $(OBJDIR)/verify_minimal_test.o: $(SRCDIR)/verify_minimal_test.cpp
 	$(CLANG) $(CXXFLAGS) -I. -c $< -o $@

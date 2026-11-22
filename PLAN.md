@@ -39,18 +39,30 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
   used, not investigated.
 - Not yet checked: the 1024 engine output against the diffusers reference (9 steps). The reference's VAE decode stalled the
   desktop's graphics ring at 1024 (dmesg: ring gfx timeouts); run it only when the desktop is idle.
-- Next, in order: (1) fuse the BF16 conv's im2col and transpose into one kernel (about 0.8 s a decode); (2) the VAE's mid-block
-  attention, FP32 scalar over 16384 tokens (about 0.55 s); (3) the DiT's linears and attention, the bigger block (about 3.8 s a
-  step); then the 9-step match against the reference on an idle desktop, the sampler against ComfyUI's "simple" schedule, the
-  server parameters (steps, size) and the ComfyUI node.
+- hipBLASLt (2026-11-22, dependency added by the user's decision): the DiT's large linears (out >= 256, T >= 1024) run
+  `hipblasLtMatmul` (`src/sd_device.cpp`, namespace `blt`): BF16 operands, FP32 output and accumulation, the bias as the
+  epilogue, one plan per (out, T, in, bias); each plan times the heuristic's candidates once on its first call and keeps the
+  fastest (9 candidates on these shapes; the fastest was index 4). `SD_LINEAR_KERNEL=256b` keeps the kernel; `SD_BLT_LOG=1`
+  prints the candidates. The BF16 copy of the input is device-only scratch (`device_scratch`). Measured: the 9-step 1024
+  generation 36.2 s (43.0 s with the kernel); the bench (`sd_gemm_bench`, CPU-checked, bias included) 25 / 24 / 15 TFLOPS on
+  the three shapes with pinned W, x, y (device W, x, y: 27 / 28 / 16). The 1024 output against the kernel's: 65% of bytes
+  exact, 98% within 3 levels, mean abs 0.53, max 48 on a few pixels; both are fp32-accumulated GEMMs on BF16 operands, so the
+  difference is the summation order carried through nine steps (not checked against a reference: none at 1024). The 256 check
+  does not reach this path (T < 1024), so the bench is its gate.
+- Dependency: `libinference.so` needs `libhipblaslt.so.1` (the Makefile's link lines carry `-lhipblaslt`). The Dockerfile's
+  build stage takes all of ROCm from the tarball and the runtime stage copies `lib/*.so*` and `lib/hipblaslt/`: no change needed.
+- Next, in order: the 30 s target is 6 s away (36.2 s): (1) the rest of the DiT step (flash attention 0.4 s, the norms and
+  modulation about 0.6 s, the BF16 conversions 0.18 s, all per step); (2) the VAE (about 3.6 s a decode; the fused BF16
+  lowering and the mid-block attention); then the 9-step match against the reference on an idle desktop, the sampler against
+  ComfyUI's "simple" schedule, the server parameters (steps, size) and the ComfyUI node.
 - DiT linears, measured 2026-11-22 (`tests/sd_gemm_bench`, the three DiT shapes; `SD_BENCH_DEVICE=1` puts W, x, y in
   device memory): `sd_gemm_wmma256b` runs at about 19-20 TFLOPS on QKV and MLP-up and 9-13 on MLP-down (K 10240: a 20 KB row
   stride, half the rate of MLP-up at the same FLOPs). The DiT step's linears take about 2.7 s (the engine's own timing).
   The profiler (rocprofv3, `SQ_WAIT_CNT_VMVS`) puts 58-63% of the wave cycles in waits on vector memory; LDS waits are 4%
   (`ALUStalledByLDS` 0.1%, bank conflicts 3.9%); the L2 hit rate is 3%; the address translation is 2% busy.
   Vendor check (hipBLAS / hipBLASLt, the same shapes, BF16 in): the default algorithm for FP32 output runs at 4-6 TFLOPS; its
-  algorithm 4 (of 8) at 32 / 32 / 18; BF16 output (`hipblasGemmEx`) at 40 / 40 / 22. Not adopted: a vendor dependency is a
-  design decision, not made. Tried and rejected (measured in the engine's kernels; do not repeat without a new idea): one LDS
+  algorithm 4 (of 8) at 32 / 32 / 18; BF16 output (`hipblasGemmEx`) at 40 / 40 / 22. Adopted 2026-11-22 (the user's
+  decision): see the hipBLASLt bullet below. Tried and rejected (measured in the engine's kernels; do not repeat without a new idea): one LDS
   tile with two blocks per CU (slower: 15.8 / 14.9 / 8.8); three register sets two tiles ahead (spills, 8 TFLOPS); the 256 x 256
   tile with 16 waves (no gain; the engine's step 5.9 s against 5.4 s); 64-byte row pieces for the loads (no gain). Device-only
   scratch for the BF16 copy of the input raised the bench 15-20%, not the engine's step (reverted). Pinned host memory against
