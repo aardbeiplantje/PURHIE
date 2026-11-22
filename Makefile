@@ -105,6 +105,7 @@ SD_TEXT_VERIFY = $(BINDIR)/sd_text_verify  # the image engine's CLIP tokenizer a
 QWENIMAGE_VERIFY = $(BINDIR)/qwenimage_verify  # Qwen-Image's FP8 linear layers on the device vs a host reference (tests/qwenimage_verify.cpp; run from build/co)
 ZIMAGE_1024_VERIFY = $(BINDIR)/zimage_1024_verify  # Z-Image-Turbo at 1024 x 1024 vs diffusers, and the time (tests/zimage_1024_verify.cpp; run from build/co)
 ZIMAGE_PIPE_VERIFY = $(BINDIR)/zimage_pipe_verify  # Z-Image-Turbo from the prompt to the image vs the reference (tests/zimage_pipe_verify.cpp; run from build/co)
+SD_GEMM_BENCH = $(BINDIR)/sd_gemm_bench  # the BF16 linears at the Z-Image DiT shapes: time, TFLOPS, error (tests/sd_gemm_bench.cpp)
 SPEAKER_VERIFY = $(BINDIR)/speaker_verify  # the TTS speaker encoder and the speaker mel vs qwen-tts (tests/speaker_verify.cpp)
 AUDIO_VERIFY = $(BINDIR)/audio_verify  # the band-limited resampler and the WAV decode vs librosa's soxr_hq (tests/audio_verify.cpp)
 AUDIO_FLAC_VERIFY = $(BINDIR)/audio_flac_verify  # the FLAC encoder on test signals (tests/audio_flac_verify.cpp; decoded with libsndfile in the check)
@@ -442,6 +443,9 @@ $(QWENIMAGE_VERIFY): $(TESTSDIR)/qwenimage_verify.cpp $(SRCDIR)/sd_device.cpp $(
 
 $(ZIMAGE_1024_VERIFY): $(TESTSDIR)/zimage_1024_verify.cpp $(SRCDIR)/zimage_pipe.cpp $(SRCDIR)/zimage_pipe.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/zimage_1024_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
+
+$(SD_GEMM_BENCH): $(TESTSDIR)/sd_gemm_bench.cpp $(SRCDIR)/sd_device.cpp $(SRCDIR)/sd_device.h $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/sd_gemm_bench.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
 
 $(ZIMAGE_PIPE_VERIFY): $(TESTSDIR)/zimage_pipe_verify.cpp $(SRCDIR)/zimage_pipe.cpp $(SRCDIR)/zimage_pipe.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/zimage_pipe_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
