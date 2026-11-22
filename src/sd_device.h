@@ -25,6 +25,10 @@ std::recursive_mutex& run_mutex();
 // Float memory (zeroed unless zero is false): pinned and device-visible when the device path is on, else calloc. Pooled.
 void* alloc(size_t bytes, bool zero = true);  // zero = false: the caller writes every byte (no memset: a CPU pass)
 void release(void* p, size_t bytes);
+// Device-only memory (hipMalloc, pooled): for buffers the host never reads or writes (the GEMM inputs in BF16). Not
+// host-visible: the host code must not touch these pointers.
+void* dalloc(size_t bytes);
+void drelease(void* p, size_t bytes);
 
 // Float32 activations: the memory of alloc, zeroed. Copies are deep (the image's tensors are small next to the weights).
 class Floats {
@@ -120,6 +124,12 @@ void dupup(const float* x, int H, int W, int in, int out, int factor_t, float* y
 void attn21_text(const float* q, const float* k, const float* v, int J, int L, int heads, float* out);
 // The same with bfloat16 weights (the checkpoint's BF16, raw bits): y[t][o] = b[o] + sum_i x[t][i] W[o][i]
 void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, const float* b, float* y);
+// the same with the input already BF16 (xb: T x in, row-major; device-only memory from dalloc or alloc): no conversion
+void linear_bf16_xb(const uint16_t* xb, int T, const uint16_t* W, int in, int out, const float* b, float* y);
+// y = BF16(rms(x) w s): the RMS norm (w BF16) and the AdaLN scale s (per channel), the GEMM input in BF16
+void rms_mod_bf16(const float* x, int T, int C, const uint16_t* w, float eps, const float* s, uint16_t* y);
+// g = BF16(silu(a) b), the SwiGLU's gate as the down projection's BF16 input
+void swiglu_bf16(const float* a, const float* b, uint16_t* g, size_t n);
 void linear_to_cm(const float* x, int T, const uint16_t* W, int in, int out, const uint16_t* b, float* y, bool accumulate);
 void group_norm(const float* x, int C, int HW, int groups, const uint16_t* gw, const uint16_t* gb, float eps, float* y);
 void silu(float* x, size_t n);

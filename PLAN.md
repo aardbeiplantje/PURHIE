@@ -51,10 +51,29 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
   does not reach this path (T < 1024), so the bench is its gate.
 - Dependency: `libinference.so` needs `libhipblaslt.so.1` (the Makefile's link lines carry `-lhipblaslt`). The Dockerfile's
   build stage takes all of ROCm from the tarball and the runtime stage copies `lib/*.so*` and `lib/hipblaslt/`: no change needed.
-- Next, in order: the 30 s target is 6 s away (36.2 s): (1) the rest of the DiT step (flash attention 0.4 s, the norms and
-  modulation about 0.6 s, the BF16 conversions 0.18 s, all per step); (2) the VAE (about 3.6 s a decode; the fused BF16
-  lowering and the mid-block attention); then the 9-step match against the reference on an idle desktop, the sampler against
-  ComfyUI's "simple" schedule, the server parameters (steps, size) and the ComfyUI node.
+- DiT, the non-GEMM part (2026-11-22, bit-identical to before: the 1024 one-step output matches byte for byte): the norm and
+  the AdaLN scale in one pass written as BF16 (`zimage_rms_mod_bf16`) feed the three projections and the two feed-forward
+  projections without conversion copies; the SwiGLU writes BF16 (`zimage_swiglu_bf16`) for the down projection; the BF16
+  inputs live in device-only memory (`sddev::dalloc`, pooled). The nine-step generation: 36.2 s -> 35.3 s.
+- DiT step, measured: 3.76 s wall (`zimage_1024_verify` 1 vs 2 steps). Of it the hipBLASLt products are about 2.6 s (seven
+  shapes: T = 4096 for the embedder and the noise refiner, 4224 for the main layers), flash attention 0.43 s, the RMS norms
+  0.14, SwiGLU 0.07, the gated residuals 0.06, the BF16 conversions (flash's q, k) 0.05, the modulation 0.05, RoPE 0.04.
+- The first image in a process pays the hipBLASLt tuning: about 2.3 s (7 plans; one warm-up run per candidate, and a timed
+  run only for the candidates within 2.5x of the best).
+- The ComfyUI reference, the workflow's own output (`comfy/zimage_mve_00001_.png`, 1024, 9 steps, seed 42, the same prompt as
+  `/data/zimage-ref/z1024/prompt.txt`): the engine matches it in content and composition. Its initial latent is torch's CPU
+  randn after `manual_seed(42)` (`noise.f32` in z1024 is not that: max abs diff 6.5). Write it with
+  `torch.Generator('cpu').manual_seed(42)`, `torch.randn(1, 16, 128, 128)[0]`, and pass it as `ZI_NOISE=<file>` to
+  `zimage_1024_verify`. Result: mean abs 3.18 levels, PSNR 27.7 dB, 39% of the bytes exact, 83% within 3 levels. ComfyUI's
+  "simple" schedule gives the same timesteps as ours (t = 1 - k/9, then the shift 3: checked analytically). The rest is
+  numerics (ComfyUI runs the DiT's linears in BF16; the VAE's precision there is not checked).
+- Decision open (the user's): BF16 outputs for the large linears. `SD_ROUND_OUT=1` (an experiment: each large linear's output
+  rounded to BF16) moves the image to PSNR 28.6 dB against ComfyUI (mean abs 2.78). A BF16-output hipBLASLt (the probe:
+  40 / 40 / 22 TFLOPS against 32 / 32 / 18 with FP32 output) would save about 0.5 s a step, but it changes the precision policy
+  (the project has kept FP32 activations since the BF16 errors of the Qwen and VAE paths). Not taken.
+- Next, in order: the VAE (about 3.6 s a decode: the fused BF16 lowering of the convolutions and the mid-block attention);
+  then the DiT's precision decision above, the sampler check against ComfyUI at 9 steps (done: the schedule), the server
+  parameters (steps, size) and the ComfyUI node.
 - DiT linears, measured 2026-11-22 (`tests/sd_gemm_bench`, the three DiT shapes; `SD_BENCH_DEVICE=1` puts W, x, y in
   device memory): `sd_gemm_wmma256b` runs at about 19-20 TFLOPS on QKV and MLP-up and 9-13 on MLP-down (K 10240: a 20 KB row
   stride, half the rate of MLP-up at the same FLOPs). The DiT step's linears take about 2.7 s (the engine's own timing).

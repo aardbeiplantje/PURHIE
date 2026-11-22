@@ -38,7 +38,7 @@ hipModule_t g_mod = nullptr;
 hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn_sum = nullptr, f_gn_sq = nullptr,
               f_gn_apply = nullptr, f_silu = nullptr, f_add = nullptr, f_upsample2 = nullptr, f_softmax = nullptr,
               f_layer_norm = nullptr, f_rms_norm = nullptr, f_zm_modulate = nullptr, f_zm_gate_add = nullptr, f_zm_swiglu = nullptr, f_zm_rope = nullptr, f_zm_ln_plain = nullptr, f_gn_f32 = nullptr, f_to_tok = nullptr, f_to_chw = nullptr, f_zq_rope = nullptr, f_zq_attn = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma256b = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
-              f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr, f_qi_linear_f8 = nullptr, f_qi_rms_f8 = nullptr, f_qi_affine = nullptr, f_qi_gelu = nullptr, f_qv_rms = nullptr, f_qv_patch = nullptr, f_qv_bias = nullptr, f_qv_upsample = nullptr, f_qi_hadamard = nullptr, f_qi_linear_i8 = nullptr, f_qi21_zc = nullptr, f_qi21_gather = nullptr, f_qi21_mul = nullptr, f_qi21_gated = nullptr, f_qi21_attn = nullptr, f_qi21_lbf = nullptr, f_qi21_dupup = nullptr, f_gemm_af128 = nullptr, f_transpose_bf16 = nullptr, f_bias_cm = nullptr;
+              f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr, f_qi_linear_f8 = nullptr, f_qi_rms_f8 = nullptr, f_qi_affine = nullptr, f_qi_gelu = nullptr, f_qv_rms = nullptr, f_qv_patch = nullptr, f_qv_bias = nullptr, f_qv_upsample = nullptr, f_qi_hadamard = nullptr, f_qi_linear_i8 = nullptr, f_qi21_zc = nullptr, f_qi21_gather = nullptr, f_qi21_mul = nullptr, f_qi21_gated = nullptr, f_qi21_attn = nullptr, f_qi21_lbf = nullptr, f_qi21_dupup = nullptr, f_gemm_af128 = nullptr, f_transpose_bf16 = nullptr, f_bias_cm = nullptr, f_zm_rms_mod_bf16 = nullptr, f_zm_swiglu_bf16 = nullptr, f_bf16_to_f32 = nullptr, f_round_bf16 = nullptr;
 
 constexpr int kThreads = 256;
 constexpr int kGroupSplit = 16;  // the group norm's partial sums per group
@@ -113,7 +113,7 @@ bool init() {
         const char* name;
     };
     const Entry entries[] = {
-        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"}, {&f_gemm_af128, "sd_gemm_af128"}, {&f_transpose_bf16, "sd_transpose_bf16"}, {&f_bias_cm, "sd_bias_cm"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_gemm_wmma256, "sd_gemm_wmma256"}, {&f_gemm_wmma256b, "sd_gemm_wmma256b"}, {&f_flash, "sd_flash_attn"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"}, {&f_qi_linear_f8, "qi_linear_f8"}, {&f_qi_rms_f8, "qi_rms_norm_f8"}, {&f_qi_affine, "qi_affine"}, {&f_qi_gelu, "qi_gelu_tanh"}, {&f_qv_rms, "qv_rms_tok"}, {&f_qv_patch, "qv_patch"}, {&f_qv_bias, "qv_bias_tok"}, {&f_qv_upsample, "qv_upsample2_tok"}, {&f_qi_hadamard, "qi_hadamard256"}, {&f_qi_linear_i8, "qi_linear_i8"}, {&f_qi21_zc, "qi21_zc_rms"}, {&f_qi21_gather, "qi21_gather_mod"}, {&f_qi21_mul, "qi21_mul_1p"}, {&f_qi21_gated, "qi21_gated_add"}, {&f_qi21_attn, "qi21_attn"}, {&f_qi21_lbf, "qi21_linear_bf16"}, {&f_qi21_dupup, "qi21_dupup"},
+        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"}, {&f_gemm_af128, "sd_gemm_af128"}, {&f_transpose_bf16, "sd_transpose_bf16"}, {&f_bias_cm, "sd_bias_cm"}, {&f_zm_rms_mod_bf16, "zimage_rms_mod_bf16"}, {&f_zm_swiglu_bf16, "zimage_swiglu_bf16"}, {&f_bf16_to_f32, "sd_bf16_to_f32"}, {&f_round_bf16, "sd_round_bf16"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_gemm_wmma256, "sd_gemm_wmma256"}, {&f_gemm_wmma256b, "sd_gemm_wmma256b"}, {&f_flash, "sd_flash_attn"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"}, {&f_qi_linear_f8, "qi_linear_f8"}, {&f_qi_rms_f8, "qi_rms_norm_f8"}, {&f_qi_affine, "qi_affine"}, {&f_qi_gelu, "qi_gelu_tanh"}, {&f_qv_rms, "qv_rms_tok"}, {&f_qv_patch, "qv_patch"}, {&f_qv_bias, "qv_bias_tok"}, {&f_qv_upsample, "qv_upsample2_tok"}, {&f_qi_hadamard, "qi_hadamard256"}, {&f_qi_linear_i8, "qi_linear_i8"}, {&f_qi21_zc, "qi21_zc_rms"}, {&f_qi21_gather, "qi21_gather_mod"}, {&f_qi21_mul, "qi21_mul_1p"}, {&f_qi21_gated, "qi21_gated_add"}, {&f_qi21_attn, "qi21_attn"}, {&f_qi21_lbf, "qi21_linear_bf16"}, {&f_qi21_dupup, "qi21_dupup"},
         {&f_transpose_pad, "sd_transpose_pad"}, {&f_softmax_bf16, "sd_softmax_bf16"}, {&f_softmax_bf16w, "sd_softmax_bf16_w"},
         {&f_gn_sum, "sd_gn_sum"},       {&f_gn_sq, "sd_gn_sq"},         {&f_gn_apply, "sd_gn_apply"},
         {&f_silu, "sd_silu"},           {&f_add, "sd_add"},             {&f_upsample2, "sd_upsample2"},
@@ -210,6 +210,41 @@ void release(void* p, size_t bytes) {
     }
     std::lock_guard<std::mutex> lk(g_pool_mu);
     g_free.push_back({p, round_up_page(bytes)});
+}
+
+namespace {
+std::mutex g_dpool_mu;
+std::vector<Block> g_dfree;  // the released device blocks, reused by dalloc (best fit)
+}  // namespace
+
+void* dalloc(size_t bytes) {
+    if (bytes == 0) return nullptr;
+    const size_t need = round_up_page(bytes);
+    if (!enabled()) return std::malloc(need);
+    {
+        std::lock_guard<std::mutex> lk(g_dpool_mu);
+        size_t best = (size_t)-1;
+        for (size_t i = 0; i < g_dfree.size(); ++i)
+            if (g_dfree[i].cap >= need && (best == (size_t)-1 || g_dfree[i].cap < g_dfree[best].cap)) best = i;
+        if (best != (size_t)-1) {
+            void* p = g_dfree[best].p;
+            g_dfree.erase(g_dfree.begin() + (long)best);
+            return p;
+        }
+    }
+    void* p = nullptr;
+    if (hipMalloc(&p, need) != hipSuccess) throw std::runtime_error("sd device: out of device memory");
+    return p;
+}
+
+void drelease(void* p, size_t bytes) {
+    if (!p) return;
+    if (!enabled()) {
+        std::free(p);
+        return;
+    }
+    std::lock_guard<std::mutex> lk(g_dpool_mu);
+    g_dfree.push_back({p, round_up_page(bytes)});
 }
 
 void conv2d(const float* x, int cin, int H, int W, const uint16_t* w, int cout, const uint16_t* b, int k, int p, int st, float* y,
@@ -335,6 +370,25 @@ void conv2d_f32(const float* x, int cin, int H, int W, const float* w, int cout,
 void linear_tok(const float* x, int T, const uint16_t* W, int in, int out, const uint16_t* b, float* y) {
     gemm<uint16_t>(f_gemm_ah, W, in, x, 1, in, y, 1, out, b, 1.0f, 0.0f, out, T, in);
     sync();
+}
+
+void linear_huge_xb(const uint16_t* xb, int T, const uint16_t* W, int in, int out, const float* b, float* y);
+
+void linear_bf16_xb(const uint16_t* xb, int T, const uint16_t* W, int in, int out, const float* b, float* y) {
+    if (out <= 0 || T <= 0) return;
+    if (in % 64 == 0 && out >= 256 && T >= 1024 && f_gemm_wmma256b) {
+        linear_huge_xb(xb, T, W, in, out, b, y);
+        return;
+    }
+    // the other shapes take FP32 activations: the BF16 values widened (exact)
+    const size_t nb = (size_t)T * in;
+    float* xf = static_cast<float*>(dalloc(sizeof(float) * nb));
+    long n = (long)nb;
+    const uint16_t* xbp = xb;
+    void* a[] = {(void*)&xbp, (void*)&xf, (void*)&n};
+    launch(f_bf16_to_f32, dim3(blocks(nb)), a);
+    linear_bf16(xf, T, W, in, out, b, y);
+    drelease(xf, sizeof(float) * nb);
 }
 
 void linear_f32(const float* x, int T, const float* W, int in, int out, const float* b, float* y) {
@@ -537,8 +591,19 @@ bool run_once(const Plan& p, const hipblasLtMatmulAlgo_t& algo, const uint16_t* 
               const void* bias_ptr, bool has_bias) {
     if (has_bias) hipblasLtMatmulDescSetAttribute(p.desc, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_ptr, sizeof(bias_ptr));
     const float alpha = 1.0f, beta = 0.0f;
-    return hipblasLtMatmul(g_handle, p.desc, &alpha, W, p.la, xb, p.lb, &beta, y, p.lc, y, p.lc, &algo, g_ws, p.ws, nullptr) ==
-           HIPBLAS_STATUS_SUCCESS;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = hipblasLtMatmul(g_handle, p.desc, &alpha, W, p.la, xb, p.lb, &beta, y, p.lc, y, p.lc, &algo, g_ws, p.ws, nullptr) ==
+                    HIPBLAS_STATUS_SUCCESS;
+    if (g_time_on) {  /* SD_TIME: the products' wall time (synchronous), in the same table as the kernels' */
+        hipStreamSynchronize(nullptr);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::lock_guard<std::mutex> lk(g_time_mu);
+        TimeStat& st = g_time_stats["hipblaslt_gemm"];
+        st.count += 1;
+        st.total += ms;
+        st.max = std::max(st.max, ms);
+    }
+    return ok;
 }
 
 // the plan for (out, T, in, bias): created and tuned on its first call (with that call's operands)
@@ -592,14 +657,23 @@ Plan* plan_for(int out, int T, int in, bool has_bias, const uint16_t* W, const u
     int best_i = -1;
     for (int i = 0; i < n; ++i) {
         p.ws = heur[i].workspaceSize;
+        /* one warm-up run (the library loads the algorithm's kernels then), then one timed run; a candidate whose warm-up is
+         * already well behind the best is not timed again (the tuning is a one-time cost of the first call) */
+        const auto w0 = std::chrono::steady_clock::now();
         if (!run_once(p, heur[i].algo, W, xb, y, bias_ptr, has_bias)) continue;
         hipDeviceSynchronize();
-        double t = 1e30;
-        for (int r = 0; r < 3; ++r) {
+        double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
+        if (best < 1e30 && t > 2.5 * best) {
+            if (std::getenv("SD_BLT_LOG"))
+                std::fprintf(stderr, "blt: out %d T %d in %d bias %d candidate %d: %.2f ms (warm-up only)\n", out, T, in,
+                             has_bias ? 1 : 0, i, t * 1e3);
+            continue;
+        }
+        {
             const auto t0 = std::chrono::steady_clock::now();
             run_once(p, heur[i].algo, W, xb, y, bias_ptr, has_bias);
             hipDeviceSynchronize();
-            t = std::min(t, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         }
         if (std::getenv("SD_BLT_LOG"))
             std::fprintf(stderr, "blt: out %d T %d in %d bias %d candidate %d: %.2f ms (workspace %zu)\n", out, T, in, has_bias ? 1 : 0,
@@ -621,6 +695,47 @@ Plan* plan_for(int out, int T, int in, bool has_bias, const uint16_t* W, const u
 
 }  // namespace blt
 
+/* the large linear with its input in BF16 (xb: T x in, row-major): hipBLASLt, or the 256 x 128 WMMA kernel when hipBLASLt is off
+ * or has no plan for the shape. The callers check the shape (out >= 256, T >= 1024, in % 64 == 0). */
+void linear_huge_xb(const uint16_t* xb, int T, const uint16_t* W, int in, int out, const float* b, float* y) {
+    const float alpha = 1.0f, beta = 0.0f;
+    const int M = out, N = T, K = in;
+    const long bs0 = 0;
+    const uint16_t* A = W;
+    const uint16_t* B = xb;
+    float* C = y;
+    const long lda = in, sbn = in, cs_m = 1, cs_n = out;
+    const float* bf = b;
+    void* args[] = {(void*)&A, (void*)&lda, (void*)&B, (void*)&sbn, (void*)&C, (void*)&cs_m, (void*)&cs_n,
+                    (void*)&bf, (void*)&alpha, (void*)&beta, (void*)&M, (void*)&N, (void*)&K, (void*)&bs0, (void*)&bs0,
+                    (void*)&bs0};
+    bool done = false;
+    if (blt::enabled()) {
+        // hipBLASLt, with the bias as the epilogue (no bias: the plan without it)
+        blt::Plan* p = blt::plan_for(out, T, in, b != nullptr, W, xb, y, b);
+        if (p) {
+            done = blt::run_once(*p, p->algo, W, xb, y, b, b != nullptr);
+            if (!done) p->failed = true;
+        }
+    }
+    if (!done)
+        check(hip_launch(f_gemm_wmma256b, (unsigned)((N + 127) / 128), (unsigned)((M + 255) / 256), 1, 256, 1, 1, 0, nullptr, args,
+                         nullptr),
+              "wmma gemm 256b");
+    sync();
+    /* SD_ROUND_OUT=1 (experiment): the output rounded to BF16, as a BF16 GEMM's output is */
+    static const bool round_out = [] {
+        const char* e = std::getenv("SD_ROUND_OUT");
+        return e && std::atoi(e) != 0;
+    }();
+    if (round_out) {
+        const long ny = (long)T * out;
+        void* ar[] = {(void*)&y, (void*)&ny};
+        launch(f_round_bf16, dim3(blocks((size_t)ny)), ar);
+        sync();
+    }
+}
+
 void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, const float* b, float* y) {
     if (out <= 0 || T <= 0) return;
     // the tensor-core tile (sd_gemm_wmma, 128 x 128 when the output has the rows for it; the F32 activations rounded on load:
@@ -639,30 +754,8 @@ void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, cons
             const float* xs = x;
             void* ac[] = {(void*)&xs, (void*)&xb, (void*)&nb};
             launch(f_to_bf16, dim3((unsigned)((nb + kThreads - 1) / kThreads)), ac);
-            const uint16_t* A = W;
-            const uint16_t* B = xb;
-            float* C = y;
-            const long lda = in, sbn = in, cs_m = 1, cs_n = out;
-            const float* bf = b;
-            void* args[] = {(void*)&A, (void*)&lda, (void*)&B, (void*)&sbn, (void*)&C, (void*)&cs_m, (void*)&cs_n,
-                            (void*)&bf, (void*)&alpha, (void*)&beta, (void*)&M, (void*)&N, (void*)&K, (void*)&bs0, (void*)&bs0,
-                            (void*)&bs0};
-            bool done = false;
-            if (blt::enabled()) {
-                // hipBLASLt, with the bias as the epilogue (no bias: the plan without it)
-                blt::Plan* p = blt::plan_for(out, T, in, b != nullptr, W, xb, y, b);
-                if (p) {
-                    done = blt::run_once(*p, p->algo, W, xb, y, b, b != nullptr);
-                    if (!done) p->failed = true;
-                }
-            }
-            if (!done)
-                check(hip_launch(f_gemm_wmma256b, (unsigned)((N + 127) / 128), (unsigned)((M + 255) / 256), 1, 256, 1, 1, 0,
-                                            nullptr, args, nullptr),
-                      "wmma gemm 256b");
-            sync();
-            // (device_scratch: kept for the next call)
-            return;
+            linear_huge_xb(xb, T, W, in, out, b, y);
+            return;  // (device_scratch: kept for the next call)
         }
         const uint16_t* A = W;
         const float* B = x;
@@ -810,6 +903,19 @@ void swiglu(const float* a0, const float* b0, float* g, size_t n0) {
     long n = (long)n0;
     void* a[] = {(void*)&a0, (void*)&b0, (void*)&g, (void*)&n};
     launch(f_zm_swiglu, dim3((unsigned)((n + kThreads - 1) / kThreads)), a);
+    sync();
+}
+
+void rms_mod_bf16(const float* x, int T, int C, const uint16_t* w, float eps, const float* s, uint16_t* y) {
+    void* a[] = {(void*)&x, (void*)&C, (void*)&w, (void*)&eps, (void*)&s, (void*)&y};
+    launch(f_zm_rms_mod_bf16, dim3((unsigned)T, 1, 1), a);
+    sync();
+}
+
+void swiglu_bf16(const float* a0, const float* b0, uint16_t* g, size_t n0) {
+    long n = (long)n0;
+    void* a[] = {(void*)&a0, (void*)&b0, (void*)&g, (void*)&n};
+    launch(f_zm_swiglu_bf16, dim3((unsigned)((n + kThreads - 1) / kThreads)), a);
     sync();
 }
 

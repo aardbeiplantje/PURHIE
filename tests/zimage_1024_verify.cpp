@@ -48,8 +48,11 @@ int main(int argc, char** argv) {
     std::vector<unsigned char> ref(1024 * 1024 * 3), rgb(1024 * 1024 * 3);
     /* the reference image is optional: without it the run only times the engine */
     const bool have_ref = read_bytes(dir + "image_" + std::to_string(steps) + ".u8", ref.data(), ref.size());
-    if (!read_bytes(dir + "noise.f32", noise.data(), noise.size() * 4)) {
-        printf("[FAIL] the noise (%snoise.f32)\n", dir.c_str());
+    /* ZI_NOISE=path: another initial latent (16 x 128 x 128 floats; ComfyUI's seed 42 is torch's CPU randn, see PLAN.md) */
+    const char* noise_path = getenv("ZI_NOISE");
+    const std::string noise_file = noise_path ? std::string(noise_path) : dir + "noise.f32";
+    if (!read_bytes(noise_file, noise.data(), noise.size() * 4)) {
+        printf("[FAIL] the noise (%s)\n", noise_file.c_str());
         zi_close(p);
         return 1;
     }

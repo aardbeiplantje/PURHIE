@@ -562,6 +562,38 @@ extern "C" __global__ void __launch_bounds__(256) sd_to_bf16(const float* x, uin
     if (i < n) y[i] = f2bf(x[i]);
 }
 
+// The DiT's producers of GEMM inputs, in BF16 (the same operations in the same order as the FP32 kernels they replace, one
+// rounding at the end: the results are bit-identical to rounding the FP32 outputs). y[t][c] = BF16(rms(x[t])[c] w[c] s[c]),
+// the RMS norm (sd_rms_norm) and the AdaLN scale (zimage_modulate) in one pass
+extern "C" __global__ void __launch_bounds__(SD_THREADS)
+zimage_rms_mod_bf16(const float* x, int C, const uint16_t* w, float eps, const float* s, uint16_t* y) {
+    __shared__ float red[SD_THREADS];
+    const float* xr = x + (long)blockIdx.x * C;
+    uint16_t* yr = y + (long)blockIdx.x * C;
+    float q = 0.0f;
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) q += xr[i] * xr[i];
+    const float inv = rsqrtf(block_sum(q, red) / (float)C + eps);
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) yr[i] = f2bf(xr[i] * inv * bf2f(w[i]) * s[i]);
+}
+
+// g[i] = BF16(silu(a[i]) * b[i]): zimage_swiglu's values, rounded to BF16 (the feed-forward's down projection takes them)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) zimage_swiglu_bf16(const float* a, const float* b, uint16_t* g, long n) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i < n) g[i] = f2bf(a[i] / (1.0f + expf(-a[i])) * b[i]);
+}
+
+// y[i] = BF16(y[i]) as FP32 (in place): a linear's output rounded to BF16 (the precision experiment: SD_ROUND_OUT)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) sd_round_bf16(float* y, long n) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i < n) y[i] = bf2f(f2bf(y[i]));
+}
+
+// y[i] = BF16 widened to FP32 (exact): the small-token linears take FP32 activations
+extern "C" __global__ void __launch_bounds__(SD_THREADS) sd_bf16_to_f32(const uint16_t* x, float* y, long n) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i < n) y[i] = bf2f(x[i]);
+}
+
 // colT[j][r] = BF16(col[r][j]) for col [K][nc] (sd_im2col's columns): a 32 x 32 tile through LDS, so the reads run along
 // the columns and the writes along the rows (block 32 x 8)
 extern "C" __global__ void __launch_bounds__(256) sd_transpose_bf16(const float* col, int K, int nc, uint16_t* colT) {

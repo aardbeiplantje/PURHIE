@@ -371,6 +371,16 @@ struct DevBuf {
     DevBuf(const DevBuf&) = delete;
     DevBuf& operator=(const DevBuf&) = delete;
 };
+
+/* BF16 device-only memory (sddev::dalloc): the GEMM inputs the host never reads */
+struct DevHalf {
+    uint16_t* p = nullptr;
+    size_t n = 0;
+    explicit DevHalf(size_t count) : n(count) { p = static_cast<uint16_t*>(sddev::dalloc(sizeof(uint16_t) * count)); }
+    ~DevHalf() { if (p) sddev::drelease(p, sizeof(uint16_t) * n); }
+    DevHalf(const DevHalf&) = delete;
+    DevHalf& operator=(const DevHalf&) = delete;
+};
 bool named(const SafeTensors& st, const std::string& name, std::vector<size_t> shape, const uint16_t*& ptr) {
     std::vector<size_t> s;
     if (!st.bf16_in_place(name, ptr, s) || s != shape) {
@@ -447,14 +457,14 @@ bool dev_refiner_block(const SafeTensors& st, const std::string& pre, float* x, 
     DevBuf zeros(3 * dim, true);  /* zeros: the biases of the GEMMs without one (11520 >= every output here) */
     const float eps = 1e-5f;
     /* attention */
-    DevBuf h(static_cast<size_t>(N) * dim);
-    sddev::rms_norm(x, N, dim, wn1, eps, h.p);
-    sddev::modulate(h.p, N, dim, sc_msa.p);
+    /* the norm and the AdaLN scale in one pass, written in BF16: the input of the three projections (no conversion copy) */
+    DevHalf h(static_cast<size_t>(N) * dim);
+    sddev::rms_mod_bf16(x, N, dim, wn1, eps, sc_msa.p, h.p);
     const size_t sq = (size_t)dim * dim;
     DevBuf q(static_cast<size_t>(N) * dim), k(static_cast<size_t>(N) * dim), v(static_cast<size_t>(N) * dim);
-    sddev::linear_bf16(h.p, N, wqkv, dim, dim, zeros.p, q.p);
-    sddev::linear_bf16(h.p, N, wqkv + sq, dim, dim, zeros.p, k.p);
-    sddev::linear_bf16(h.p, N, wqkv + 2 * sq, dim, dim, zeros.p, v.p);
+    sddev::linear_bf16_xb(h.p, N, wqkv, dim, dim, zeros.p, q.p);
+    sddev::linear_bf16_xb(h.p, N, wqkv + sq, dim, dim, zeros.p, k.p);
+    sddev::linear_bf16_xb(h.p, N, wqkv + 2 * sq, dim, dim, zeros.p, v.p);
     sddev::rms_norm(q.p, N * H, D, wqn, eps, q.p);   /* the per-head QK norms: rows of 128 */
     sddev::rms_norm(k.p, N * H, D, wkn, eps, k.p);
     sddev::rope(q.p, N, H, fr);
@@ -466,16 +476,16 @@ bool dev_refiner_block(const SafeTensors& st, const std::string& pre, float* x, 
     sddev::rms_norm(o.p, N, dim, wn2, eps, o.p);
     sddev::gate_add(x, N, dim, g_msa.p, o.p);
     /* feed-forward (SwiGLU) */
-    DevBuf h2(static_cast<size_t>(N) * dim);
-    sddev::rms_norm(x, N, dim, wfn1, eps, h2.p);
-    sddev::modulate(h2.p, N, dim, sc_mlp.p);
+    DevHalf h2(static_cast<size_t>(N) * dim);
+    sddev::rms_mod_bf16(x, N, dim, wfn1, eps, sc_mlp.p, h2.p);
     DevBuf zerosF(F, true);
     DevBuf a(static_cast<size_t>(N) * F), b(static_cast<size_t>(N) * F);
-    sddev::linear_bf16(h2.p, N, w1, dim, F, zerosF.p, a.p);
-    sddev::linear_bf16(h2.p, N, w3, dim, F, zerosF.p, b.p);
-    sddev::swiglu(a.p, b.p, a.p, (size_t)N * F);
+    sddev::linear_bf16_xb(h2.p, N, w1, dim, F, zerosF.p, a.p);
+    sddev::linear_bf16_xb(h2.p, N, w3, dim, F, zerosF.p, b.p);
+    DevHalf gate(static_cast<size_t>(N) * F);  /* the SwiGLU's product in BF16: the down projection's input */
+    sddev::swiglu_bf16(a.p, b.p, gate.p, (size_t)N * F);
     DevBuf f(static_cast<size_t>(N) * dim);
-    sddev::linear_bf16(a.p, N, w2, F, dim, zeros.p, f.p);
+    sddev::linear_bf16_xb(gate.p, N, w2, F, dim, zeros.p, f.p);
     sddev::rms_norm(f.p, N, dim, wfn2, eps, f.p);
     sddev::gate_add(x, N, dim, g_mlp.p, f.p);
     return true;

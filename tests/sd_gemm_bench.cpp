@@ -56,7 +56,20 @@ int main(int argc, char** argv) {
         const size_t nw = (size_t)s.out * s.in, nx = (size_t)s.T * s.in, ny = (size_t)s.T * s.out;
         /* SD_BENCH_DEVICE=1: W, x and y in device memory (hipMalloc) instead of the engine's pinned host allocation */
         const bool devmem = std::getenv("SD_BENCH_DEVICE") != nullptr;
-        uint16_t* W = static_cast<uint16_t*>(devmem ? nullptr : sddev::alloc(2 * nw, false));
+        /* SD_BENCH_REGISTERED=1: W as the engine has its weights: page-aligned memory registered read-only for the device
+         * (sddev::register_weights, the safetensors mapping's path) */
+        const bool regw = std::getenv("SD_BENCH_REGISTERED") != nullptr;
+        uint16_t* W = nullptr;
+        if (regw) {
+            void* wp = std::aligned_alloc(4096, (2 * nw + 4095) & ~(size_t)4095);
+            if (!wp || !sddev::register_weights(wp, 2 * nw)) {
+                std::printf("[FAIL] the weights' registration\n");
+                return 1;
+            }
+            W = static_cast<uint16_t*>(wp);
+        } else {
+            W = static_cast<uint16_t*>(devmem ? nullptr : sddev::alloc(2 * nw, false));
+        }
         float* x = static_cast<float*>(devmem ? nullptr : sddev::alloc(4 * nx, false));
         float* y = static_cast<float*>(devmem ? nullptr : sddev::alloc(4 * ny, false));
         if (devmem) {
