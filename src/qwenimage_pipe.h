@@ -15,7 +15,10 @@ void sigmas_for(int steps, int image_tokens, std::vector<float>& sig);
 
 /* the Euler sampler from the packed noise [gh * gw][64] with the text embeddings enc [L][3584]; out: the final packed latent
  * [gh * gw][64] (host memory). Returns false on an error. */
-bool dev_sample(const zimage::SafeTensors& dit, const float* noise, int gh, int gw, const float* enc, int L, int steps, float* out);
+/* bf16_timestep: false (the default): the exact sigma as the model's timestep. true: the timestep held in BF16 as the BF16 pipeline
+ * does; the BF16 pipeline differs from the FP32 result by 6 to 15 % over 8 steps (its own rounding), so it is not the reference here. */
+bool dev_sample(const zimage::SafeTensors& dit, const float* noise, int gh, int gw, const float* enc, int L, int steps, float* out,
+                bool bf16_timestep = false);
 
 /* the packed latent [gh * gw][64] to the channel-major latent [16][2 gh][2 gw] (the pipeline's _unpack_latents) */
 void unpack(const float* packed, int gh, int gw, float* lat);

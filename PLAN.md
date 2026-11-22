@@ -336,6 +336,13 @@ Quality and correctness:
   Recorded facts: true CFG 4 by default (two DiT passes); the sigmas linspace(1, 1/n, n) with the exponential dynamic shift
   (base 256 -> 0.5, max 8192 -> 0.9, shift_terminal 0.02); RoPE axes (16, 56, 56), theta 10000, scale_rope on (the text
   positions start at max(h/2, w/2)); the timestep is t/1000 with a 1000x sinusoid.
+  Status (2026-11-22, all stages on the device; `tests/qwenimage_verify`, all checks pass in one process): the FP8 linears (img_in,
+  q_proj: 2e-7); the text encoder (min row cosine 0.99967 against the BF16 oracle); the DiT forward (against the FP32 reference
+  streamed block by block: 6e-5 relative, cosine 1.0; the engine\'s joint attention runs in FP32 — the BF16 flash path was 1 % off);
+  the VAE decode (0.999999 cosine, 1.2 % relative: its convolutions are BF16 GEMMs that round the activations to BF16); the sampler
+  with exact timesteps (against the FP32 sampler reference, `ref_sampler_fp32_stream.py`: 1.2e-4 relative). The BF16 pipeline itself
+  (`ref_pipeline.py`) differs from these by 6 to 15 % over 8 steps: it is not the reference for the engine. Not yet: the server path
+  (`/v1/images/generations`) and the CFG (the default pipeline run has no negative prompt; true CFG 4 is for the negative case).
 - **Flux.2 dev** (`diffusion_models/flux2_dev_fp8mixed`: BF16 and FP8 layers with scales and a quantization table; double and
   single blocks, dim 6144); text `text_encoders/mistral_3_small_flux2_bf16`; VAE `vae/flux2-vae` (32 channels); LoRA
   `Flux_2-Turbo-LoRA`.

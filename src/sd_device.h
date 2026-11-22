@@ -135,6 +135,9 @@ void rope(float* q, int T, int heads, const float* fr);  // y = x rsqrt(mean(x^2
 void geglu(const float* pj, long rows, int ff, float* g);
 // The attention over token rows: q [Tq][C], k and v [Tk][C] (heads of width C / heads), out [Tq][C]; scores scaled by 1/sqrt(D).
 void attention(const float* q, int Tq, const float* k, const float* v, int Tk, int C, int heads, float* out);
+// The same in FP32 throughout (no BF16 rounding of Q, K, V; the device path of attention for head widths other than 128, and the
+// Qwen-Image DiT, whose 1 % error in the BF16 flash path was measured against the FP32 reference)
+void attention_f32(const float* q, int Tq, const float* k, const float* v, int Tk, int C, int heads, float* out);
 
 }  // namespace sddev
 

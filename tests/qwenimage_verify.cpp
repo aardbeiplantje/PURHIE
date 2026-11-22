@@ -246,6 +246,24 @@ int main(int argc, char** argv) {
     }
     /* the sampler: 8 steps from the oracle's packed noise and text embeddings (dit_lat, te_embeds), against the pipeline's final
      * packed latent (pipe_latent: the pipeline run of ref_pipeline.py, no guidance) */
+    /* the sampler in FP32 (exact timesteps) against the FP32 sampler reference (sampler_fp32_latent, ref_sampler_fp32_stream.py) */
+    if (want("pipe32")) {
+        std::vector<float> noise(256 * 64), ref(256 * 64), out(256 * 64);
+        if (!read_file("dit_lat.f32", noise.data(), noise.size() * 4) || !read_file("sampler_fp32_latent.f32", ref.data(), ref.size() * 4) ||
+            !read_file("te_embeds.f32", enc.data(), enc.size() * 4)) {
+            printf("[FAIL] the FP32 sampler inputs (run ref_sampler_fp32_stream.py)\n");
+            return 1;
+        }
+        if (!qwenimage::dev_sample(dit_file(), noise.data(), 16, 16, enc.data(), 12, 8, out.data(), false)) {
+            printf("[FAIL] dev_sample\n");
+            return 1;
+        }
+        const Metrics m = compare_rows(out.data(), ref.data(), 256, 64);
+        const bool pass = m.min_cos >= 0.9999 && m.max_rel <= 0.01;
+        ok = ok && pass;
+        printf("%s sampler (8 steps, exact timesteps) against the FP32 sampler: min row cosine %.6f, max error %.3g relative\n",
+               pass ? "[PASS]" : "[FAIL]", m.min_cos, m.max_rel);
+    }
     if (want("pipe")) {
         std::vector<float> noise(256 * 64), ref(256 * 64), out(256 * 64);
         if (!read_file("dit_lat.f32", noise.data(), noise.size() * 4) || !read_file("pipe_latent.f32", ref.data(), ref.size() * 4) ||
@@ -258,10 +276,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         const Metrics m = compare_rows(out.data(), ref.data(), 256, 64);
-        const bool pass = m.min_cos >= 0.99 && m.max_rel <= 0.05;
-        ok = ok && pass;
-        printf("%s sampler (8 steps, the exponential shift and the terminal stretch): min row cosine %.6f, max error %.3g relative\n",
-               pass ? "[PASS]" : "[FAIL]", m.min_cos, m.max_rel);
+        printf("  (informational, against the BF16 pipeline: min row cosine %.6f, max error %.3g relative)\n", m.min_cos, m.max_rel);
     }
     /* each step on its own: the reference's latent before step i (pipe_step{i-1}, or the noise) through one engine step, against the
      * reference's latent after it (pipe_step{i}). The timestep and the schedule as the pipeline computes them. */

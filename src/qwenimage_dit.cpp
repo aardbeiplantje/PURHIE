@@ -193,7 +193,7 @@ bool dev_dit_forward(const zimage::SafeTensors& st, const float* packed, int gh,
         sddev::rms_norm_f8(K.get() + (size_t)L * D, N * HEADS, HEAD, nk, EPS, K.get() + (size_t)L * D);
         sddev::rope(Q.get(), J, HEADS, frd.get());
         sddev::rope(K.get(), J, HEADS, frd.get());
-        sddev::attention(Q.get(), J, K.get(), V.get(), J, D, HEADS, A.get());
+        sddev::attention_f32(Q.get(), J, K.get(), V.get(), J, D, HEADS, A.get());  // FP32: the BF16 flash path was 1 % off the FP32 reference
         apply(ao, A.get() + (size_t)L * D, N, Oi.get());
         apply(tao, A.get(), L, Ot.get());
         sddev::gate_add(img.get(), N, D, ig1, Oi.get());

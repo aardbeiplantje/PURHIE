@@ -42,7 +42,8 @@ void sigmas_for(int steps, int image_tokens, std::vector<float>& sig) {
     sig[steps] = 0.0f;
 }
 
-bool dev_sample(const zimage::SafeTensors& dit, const float* noise, int gh, int gw, const float* enc, int L, int steps, float* out) {
+bool dev_sample(const zimage::SafeTensors& dit, const float* noise, int gh, int gw, const float* enc, int L, int steps, float* out,
+                bool bf16_timestep) {
     const int N = gh * gw;
     std::vector<float> sig, x((size_t)N * 64), v((size_t)N * 64);
     sigmas_for(steps, N, sig);
@@ -50,7 +51,7 @@ bool dev_sample(const zimage::SafeTensors& dit, const float* noise, int gh, int 
     for (int i = 0; i < steps; ++i) {
         /* the pipeline's timestep: sigma * 1000 held in the model's BF16, then divided by 1000 in BF16 (the model gets it in BF16) */
         const float t1000 = bf16_round(sig[i] * 1000.0f);
-        const float tmodel = bf16_round(t1000 / 1000.0f);
+        const float tmodel = bf16_timestep ? bf16_round(t1000 / 1000.0f) : sig[i];
         if (!dev_dit_forward(dit, x.data(), gh, gw, enc, L, tmodel, v.data())) return false;
         const float dt = sig[i + 1] - sig[i];
         for (size_t k = 0; k < x.size(); ++k) x[k] += dt * v[k];
