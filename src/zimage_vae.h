@@ -11,7 +11,7 @@ namespace zimage {
 
 /* latent [16][32][32] (the sampler's output, before the scaling) -> out [3][256][256] (host memory); the file's scaling
  * (0.3611) and shift (0.1159) are applied first, as the pipeline does before the decode. Returns false on an error. */
-bool dev_vae_decode(const SafeTensors& st, const float* latent, float* out);
+bool dev_vae_decode(const SafeTensors& st, const float* latent, float* out, int H0 = 32, int W0 = 32);
 
 }  // namespace zimage
 

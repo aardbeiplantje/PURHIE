@@ -495,9 +495,9 @@ bool dev_caption_pad_rows(const SafeTensors& st, float* cap, int L, int Lpad) {
 }
 
 
-bool dev_output(const SafeTensors& st, const float* J, const float* t256, float* lat) {
+bool dev_output(const SafeTensors& st, const float* J, const float* t256, float* lat, int gh, int gw) {
     if (!sddev::enabled()) { fprintf(stderr, "zimage: no device\n"); return false; }
-    const int dim = 3840, Npix = 256, C = 64;
+    const int dim = 3840, Npix = gh * gw, C = 64;
     const uint16_t *wada = nullptr, *wlin = nullptr;
     if (!named(st, "final_layer.adaLN_modulation.1.weight", {dim, 256}, wada) ||
         !named(st, "final_layer.linear.weight", {C, dim}, wlin))
@@ -518,8 +518,8 @@ bool dev_output(const SafeTensors& st, const float* J, const float* t256, float*
     DevBuf tok(static_cast<size_t>(Npix) * C);
     sddev::linear_bf16(y.p, Npix, wlin, dim, C, blin, tok.p);
     /* unpatchify (the inverse of patchify): tok [16 x 16 tokens][(ph, pw, c)] -> lat [c][32][32] */
-    const int H = 32, W = 32, Wt = 16;
-    for (int ht = 0; ht < 16; ++ht)
+    const int H = 2 * gh, W = 2 * gw, Wt = gw;
+    for (int ht = 0; ht < gh; ++ht)
         for (int wt = 0; wt < Wt; ++wt) {
             const float* t = tok.p + (size_t)(ht * Wt + wt) * C;
             for (int ph = 0; ph < 2; ++ph)
@@ -531,44 +531,46 @@ bool dev_output(const SafeTensors& st, const float* J, const float* t256, float*
 }
 
 
-bool dev_dit_forward(const SafeTensors& st, const float* lat, const float* cap, int L, float t, float* vel) {
+bool dev_dit_forward(const SafeTensors& st, const float* lat, const float* cap, int L, float t, float* vel, int gh, int gw) {
     if (!sddev::enabled()) { fprintf(stderr, "zimage: no device\n"); return false; }
-    const int NI = 256, LC = 32, S = NI + LC, DIM = 3840;
-    if (L < 1 || L > LC) { fprintf(stderr, "zimage: the caption has %d rows (1 to 32)\n", L); return false; }
-    /* the latent [16][1][32][32] as the patch embedding reads it (the sampler's latent, shared memory) */
+    const int NI = gh * gw, DIM = 3840;
+    if (L < 1) { fprintf(stderr, "zimage: the caption has no rows\n"); return false; }
+    /* the caption padded to a multiple of 32 (the reference pads by repeating the pad token rows) */
+    const int LC = (L + 31) / 32 * 32, S = NI + LC;
+    /* the latent [16][2 gh][2 gw] as the patch embedding reads it (the sampler's latent, shared memory) */
     float* J = static_cast<float*>(sddev::alloc(sizeof(float) * (size_t)S * DIM, false));
     float* jx = J;
     int nx = 0;
-    if (!dev_patch_embed(st, lat, 16, 32, 32, &jx, nx)) return false;
+    if (!dev_patch_embed(st, lat, 16, 2 * gh, 2 * gw, &jx, nx)) return false;
     float* jt = static_cast<float*>(sddev::alloc(sizeof(float) * 256, false));
     if (!dev_timestep_embed(st, t, jt)) return false;
     float* fri = static_cast<float*>(sddev::alloc(sizeof(float) * NI * 64 * 2, false));
-    rope_table_image(16, 16, LC + 1, fri);
+    rope_table_image(gh, gw, LC + 1, fri);
     if (!dev_refiner_block(st, "noise_refiner.0", J, NI, jt, fri) || !dev_refiner_block(st, "noise_refiner.1", J, NI, jt, fri))
         return false;
     float* jc = J + (size_t)NI * DIM;
     int lc = 0;
-    if (!dev_caption_embed(st, cap, L, &jc, lc)) return false;
-    /* the caption rows past L take the pad token (the reference's padding to 32) */
+    if (!dev_caption_embed(st, cap, L, &jc, lc) || lc != LC) return false;
+    /* the caption rows past L take the pad token (the reference's padding) */
     dev_caption_pad_rows(st, jc, L, LC);
-    int ids[LC * 3];
+    std::vector<int> ids((size_t)LC * 3);
     for (int r = 0; r < LC; ++r) { ids[r * 3] = 1 + r; ids[r * 3 + 1] = 0; ids[r * 3 + 2] = 0; }
     float* frc = static_cast<float*>(sddev::alloc(sizeof(float) * LC * 64 * 2, false));
-    rope_table_ids(ids, LC, frc);
+    rope_table_ids(ids.data(), LC, frc);
     if (!dev_refiner_block(st, "context_refiner.0", jc, LC, nullptr, frc, false) ||
         !dev_refiner_block(st, "context_refiner.1", jc, LC, nullptr, frc, false))
         return false;
-    int idj[S * 3];
-    for (int r = 0; r < NI; ++r) { idj[r * 3] = LC + 1; idj[r * 3 + 1] = r / 16; idj[r * 3 + 2] = r % 16; }
+    std::vector<int> idj((size_t)S * 3);
+    for (int r = 0; r < NI; ++r) { idj[r * 3] = LC + 1; idj[r * 3 + 1] = r / gw; idj[r * 3 + 2] = r % gw; }
     for (int r = 0; r < LC; ++r) { idj[(NI + r) * 3] = 1 + r; idj[(NI + r) * 3 + 1] = 0; idj[(NI + r) * 3 + 2] = 0; }
     float* frj = static_cast<float*>(sddev::alloc(sizeof(float) * S * 64 * 2, false));
-    rope_table_ids(idj, S, frj);
+    rope_table_ids(idj.data(), S, frj);
     for (int layer = 0; layer < 30; ++layer)
         if (!dev_refiner_block(st, "layers." + std::to_string(layer), J, S, jt, frj, true)) return false;
-    return dev_output(st, J, jt, vel);
+    return dev_output(st, J, jt, vel, gh, gw);
 }
 
-bool dev_sample(const SafeTensors& st, const float* noise, const float* cap, int L, int steps, float shift, float* out) {
+bool dev_sample(const SafeTensors& st, const float* noise, const float* cap, int L, int steps, float shift, float* out, int gh, int gw) {
     /* the sigmas: linspace(1, 1/steps, steps), shifted (shift * s / (1 + (shift - 1) s)), then 0 */
     std::vector<double> sig(steps + 1);
     for (int i = 0; i < steps; ++i) {
@@ -576,10 +578,11 @@ bool dev_sample(const SafeTensors& st, const float* noise, const float* cap, int
         sig[i] = shift * s0 / (1.0 + (shift - 1.0) * s0);
     }
     sig[steps] = 0.0;
-    std::vector<float> x(noise, noise + 16 * 32 * 32), vel(16 * 32 * 32);
+    const size_t nlat = (size_t)16 * (2 * gh) * (2 * gw);
+    std::vector<float> x(noise, noise + nlat), vel(nlat);
     for (int i = 0; i < steps; ++i) {
         /* the model's timestep: (1000 - t) / 1000 with t = sigma * 1000, i.e. 1 - sigma */
-        if (!dev_dit_forward(st, x.data(), cap, L, (float)(1.0 - sig[i]), vel.data())) return false;
+        if (!dev_dit_forward(st, x.data(), cap, L, (float)(1.0 - sig[i]), vel.data(), gh, gw)) return false;
         const float dt = (float)(sig[i + 1] - sig[i]);
         for (size_t k = 0; k < x.size(); ++k) x[k] += dt * (-vel[k]);  /* the pipeline negates the output */
     }

@@ -100,16 +100,16 @@ bool dev_refiner_block(const SafeTensors& st, const std::string& prefix, float* 
 
 /* The output: the final layer (LayerNorm, the scale 1 + Linear(SiLU(t)), the linear to 64) over the image rows of J (the
  * first 256 rows of the joint sequence, [288][3840]), then unpatchify into lat [16][32][32] (host memory, the result) */
-bool dev_output(const SafeTensors& st, const float* J, const float* t256, float* lat);
+bool dev_output(const SafeTensors& st, const float* J, const float* t256, float* lat, int gh = 16, int gw = 16);
 
 /* One forward of the DiT on the device: lat [16][32][32] (the latent: the sampler's), cap [L][2560] the caption's embeddings
  * (L 1 to 32; the rows past L take the pad token), t the model's timestep (1 - sigma), vel [16][32][32] the velocity (host) */
-bool dev_dit_forward(const SafeTensors& st, const float* lat, const float* cap, int L, float t, float* vel);
+bool dev_dit_forward(const SafeTensors& st, const float* lat, const float* cap, int L, float t, float* vel, int gh = 16, int gw = 16);
 
 /* The sampler: the flow-matching Euler steps from the noise [16][32][32]; sigmas linspace(1, 1/steps, steps) shifted by shift,
  * then 0; each step's velocity is negated (the pipeline's convention) and x += (sigma_next - sigma) * (-velocity). out: the final
  * latent [16][32][32] */
-bool dev_sample(const SafeTensors& st, const float* noise, const float* cap, int L, int steps, float shift, float* out);
+bool dev_sample(const SafeTensors& st, const float* noise, const float* cap, int L, int steps, float shift, float* out, int gh = 16, int gw = 16);
 
 }  // namespace zimage
 

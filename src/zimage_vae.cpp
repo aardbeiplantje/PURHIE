@@ -133,12 +133,12 @@ bool mid_attn(const SafeTensors& st, DevBuf& x, int C, int H, int W) {
 
 }  // namespace
 
-bool dev_vae_decode(const SafeTensors& st, const float* latent, float* out) {
+bool dev_vae_decode(const SafeTensors& st, const float* latent, float* out, int H0, int W0) {
     if (!sddev::enabled()) { fprintf(stderr, "zimage vae: no device\n"); return false; }
     const float scale = 0.3611f, shift = 0.1159f;  /* the Flux autoencoder's scaling and shift (its config) */
-    DevBuf x((size_t)16 * 32 * 32);
+    DevBuf x((size_t)16 * H0 * W0);
     for (size_t i = 0; i < x.size(); ++i) x.get()[i] = latent[i] / scale + shift;
-    int C = 16, H = 32, W = 32;
+    int C = 16, H = H0, W = W0;
     DevBuf c_in((size_t)0);
     if (!conv_named(st, "decoder.conv_in", x.get(), 16, H, W, c_in)) return false;
     x = std::move(c_in);
