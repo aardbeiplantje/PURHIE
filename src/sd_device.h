@@ -95,6 +95,8 @@ void linear_cm(const float* x, int T, const uint16_t* W, int in, int out, const 
 void linear_f32(const float* x, int T, const float* W, int in, int out, const float* b, float* y);
 // conv2d with F32 weights [cout][cin][k][k] (read in place) and F32 bias; the same im2col + GEMM as conv2d
 void conv2d_f32(const float* x, int cin, int H, int W, const float* w, int cout, const float* b, int k, int p, int st, float* y, int Ho, int Wo);
+/* the same convolution in FP32 throughout (no BF16 route): the accuracy-checked layers (AudioLDM 2's VAE) */
+void conv2d_f32_exact(const float* x, int cin, int H, int W, const float* w, int cout, const float* b, int k, int p, int st, float* y, int Ho, int Wo);
 // Qwen-Image's FP8 E4M3 linear (sd_gpu.hip qi_linear_f8): W [out][in] raw bytes read in place, times wscale; the bias is
 // bias_kind 0 none, 1 E4M3, 2 BF16 bits, 3 F32. y[t][o] = wscale sum_i x[t][i] W[o][i] + b[o]
 void linear_f8(const float* x, int T, const uint8_t* W, float wscale, int in, int out, const void* b, int bias_kind, float* y);
@@ -145,10 +147,12 @@ void audio_gemm_f32(const float* x, int T, int in, const float* W, const float* 
 void audio_layer_norm_f32(const float* x, int T, int C, const float* w, const float* b, float eps, float* y);
 /* causal attention with 64-wide heads (scale 1/8): qkv [T][3 H 64] -> out [T][H 64] */
 void audio_causal_attn_f32(const float* qkv, int T, int H, float* out);
-/* multi-head attention with 64-wide heads: q, k, v [T][C] with row stride ld; causal or not; kmask (T floats, 0 for a padding key,
- * device-accessible) or null; scores * scale + bias [H][T][T] (device-accessible) or none; out [T][C] */
-void audio_attention_f32(const float* q, const float* k, const float* v, int ld, int T, int H, bool causal, const float* kmask, float scale,
-                        const float* bias, float* out);
+/* multi-head attention (heads of D <= 128 wide, C = H * D): q [Tq][C], k and v [Tk][C] with row stride ld; causal (Tq = Tk) or not; kmask
+ * (Tk floats, 0 for a padding key, device-accessible) or null; scores * scale + bias [H][Tq][Tk] (device-accessible) or none; out [Tq][C] */
+void audio_attention_f32(const float* q, const float* k, const float* v, int ld, int Tq, int Tk, int H, int D, bool causal, const float* kmask,
+                         float scale, const float* bias, float* out);
+/* exact GELU (erf), in place */
+void audio_gelu_erf(float* x, size_t n);
 /* x = RMS norm (T5's: no mean, no bias) over the last dimension: y = x / sqrt(mean(x^2) + eps) * w, x [T][C] */
 void audio_rms_norm_f32(const float* x, int T, int C, const float* w, float eps, float* y);
 /* a = gelu_new(a) * b, in place (T5's gated GELU) */
@@ -165,8 +169,8 @@ void audio_conv_transpose1d(const float* x, int cin, int T, const float* w, cons
 void audio_leaky_relu(float* x, float slope, size_t n);
 void audio_scale(float* x, float s, size_t n);
 void audio_tanh(float* x, size_t n);
-/* exact GELU (erf), in place */
-void audio_gelu_erf(float* x, size_t n);
+/* nearest resampling of x [C][H][W] to [C][Ho][Wo] (PyTorch's nearest: the source index floor(dst * H / Ho)) */
+void audio_upsample_nearest(const float* x, int C, int H, int W, int Ho, int Wo, float* y);
 /* the device's BF16 values copied to host memory as float (debugging dumps; not a serving path) */
 void download_bf16_as_f32(const uint16_t* d, float* h, size_t n);
 // g = BF16(silu(a) b) for BF16 a, b

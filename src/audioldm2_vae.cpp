@@ -39,15 +39,15 @@ bool resnet(const zimage::SafeTensors& st, const std::string& p, const float* x,
     sddev::Floats N1((size_t)cin * HW), H1((size_t)cout * HW), N2((size_t)cout * HW), H2((size_t)cout * HW);
     sddev::group_norm_f32(x, cin, HW, kGroups, n1w, n1b, kEps, N1.data());
     sddev::silu(N1.data(), (size_t)cin * HW);
-    sddev::conv2d_f32(N1.data(), cin, H, W, c1w, cout, c1b, 3, 1, 1, H1.data(), H, W);
+    sddev::conv2d_f32_exact(N1.data(), cin, H, W, c1w, cout, c1b, 3, 1, 1, H1.data(), H, W);
     sddev::group_norm_f32(H1.data(), cout, HW, kGroups, n2w, n2b, kEps, N2.data());
     sddev::silu(N2.data(), (size_t)cout * HW);
-    sddev::conv2d_f32(N2.data(), cout, H, W, c2w, cout, c2b, 3, 1, 1, H2.data(), H, W);
+    sddev::conv2d_f32_exact(N2.data(), cout, H, W, c2w, cout, c2b, 3, 1, 1, H2.data(), H, W);
     if (cin != cout) {
         const float *sw, *sb;
         if (!get(st, p + "conv_shortcut.weight", sw) || !get(st, p + "conv_shortcut.bias", sb)) return false;
         sddev::Floats S((size_t)cout * HW);
-        sddev::conv2d_f32(x, cin, H, W, sw, cout, sb, 1, 0, 1, S.data(), H, W);
+        sddev::conv2d_f32_exact(x, cin, H, W, sw, cout, sb, 1, 0, 1, S.data(), H, W);
         sddev::add(H2.data(), S.data(), (size_t)cout * HW);
     } else {
         sddev::add(H2.data(), x, (size_t)cout * HW);
@@ -89,7 +89,7 @@ bool upsample(const zimage::SafeTensors& st, const std::string& p, Feat& f, int 
     Feat nxt;
     nxt.c = cout; nxt.h = 2 * f.h; nxt.w = 2 * f.w;
     nxt.buf = sddev::Floats((size_t)cout * nxt.h * nxt.w);
-    sddev::conv2d_f32(up.data(), f.c, nxt.h, nxt.w, w, cout, b, 3, 1, 1, nxt.buf.data(), nxt.h, nxt.w);
+    sddev::conv2d_f32_exact(up.data(), f.c, nxt.h, nxt.w, w, cout, b, 3, 1, 1, nxt.buf.data(), nxt.h, nxt.w);
     f = std::move(nxt);
     return true;
 }
@@ -108,11 +108,11 @@ bool vae_decode(const zimage::SafeTensors& st, const float* z, int h, int w, flo
         !get(st, "decoder.conv_in.bias", cb))
         return false;
     sddev::Floats P((size_t)8 * h * w);
-    sddev::conv2d_f32(zin.data(), 8, h, w, pqw, 8, pqb, 1, 0, 1, P.data(), h, w);
+    sddev::conv2d_f32_exact(zin.data(), 8, h, w, pqw, 8, pqb, 1, 0, 1, P.data(), h, w);
     Feat cur;
     cur.c = 512; cur.h = h; cur.w = w;
     cur.buf = sddev::Floats((size_t)512 * h * w);
-    sddev::conv2d_f32(P.data(), 8, h, w, cw, 512, cb, 3, 1, 1, cur.buf.data(), h, w);
+    sddev::conv2d_f32_exact(P.data(), 8, h, w, cw, 512, cb, 3, 1, 1, cur.buf.data(), h, w);
     /* mid block: resnet, attention, resnet (512 channels) */
     {
         Feat y;
@@ -153,7 +153,7 @@ bool vae_decode(const zimage::SafeTensors& st, const float* z, int h, int w, flo
     sddev::Floats N((size_t)cur.c * HW), M((size_t)HW);
     sddev::group_norm_f32(cur.buf.data(), cur.c, HW, kGroups, nw, nb, kEps, N.data());
     sddev::silu(N.data(), (size_t)cur.c * HW);
-    sddev::conv2d_f32(N.data(), cur.c, cur.h, cur.w, ow, 1, ob, 3, 1, 1, M.data(), cur.h, cur.w);
+    sddev::conv2d_f32_exact(N.data(), cur.c, cur.h, cur.w, ow, 1, ob, 3, 1, 1, M.data(), cur.h, cur.w);
     std::memcpy(mel, M.data(), sizeof(float) * (size_t)HW);
     return true;
 }

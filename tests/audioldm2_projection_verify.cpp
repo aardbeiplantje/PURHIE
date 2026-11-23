@@ -36,7 +36,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::vector<float> got(ref.size());
-    if (!audioldm2::projection_forward(st, clap.data(), Tc, t5.data(), Tt, got.data())) {
+    if (!audioldm2::projection_forward(st, clap.data(), Tc, t5.data(), Tt, nullptr, got.data(), nullptr)) {
         std::fprintf(stderr, "the projection device path failed\n");
         return 1;
     }

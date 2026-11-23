@@ -36,7 +36,7 @@ std::vector<Block> g_free;  // the released blocks, reused by alloc (best fit)
 
 int g_state = -1;  // -1: not tried, 0: host only, 1: device
 hipModule_t g_mod = nullptr;
-hipFunction_t f_audio_gemm = nullptr, f_audio_ln = nullptr, f_audio_attn = nullptr, f_audio_attn_g = nullptr, f_audio_gelu_erf = nullptr, f_audio_rms = nullptr, f_audio_gelu_mul = nullptr, f_audio_add_channel = nullptr, f_audio_copy = nullptr, f_audio_conv1d = nullptr, f_audio_convt1d = nullptr, f_audio_leaky = nullptr, f_audio_scale = nullptr, f_audio_tanh = nullptr;
+hipFunction_t f_audio_gemm = nullptr, f_audio_ln = nullptr, f_audio_attn = nullptr, f_audio_attn_g = nullptr, f_audio_gelu_erf = nullptr, f_audio_rms = nullptr, f_audio_gelu_mul = nullptr, f_audio_add_channel = nullptr, f_audio_copy = nullptr, f_audio_conv1d = nullptr, f_audio_convt1d = nullptr, f_audio_leaky = nullptr, f_audio_scale = nullptr, f_audio_tanh = nullptr, f_audio_upnear = nullptr;
 hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn_sum = nullptr, f_gn_sq = nullptr,
               f_gn_apply = nullptr, f_silu = nullptr, f_add = nullptr, f_upsample2 = nullptr, f_softmax = nullptr,
               f_layer_norm = nullptr, f_rms_norm = nullptr, f_zm_modulate = nullptr, f_zm_gate_add = nullptr, f_zm_swiglu = nullptr, f_zm_rope = nullptr, f_zm_ln_plain = nullptr, f_gn_f32 = nullptr, f_to_tok = nullptr, f_to_chw = nullptr, f_zq_rope = nullptr, f_zq_attn = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma256b = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
@@ -119,7 +119,7 @@ bool init() {
         {&f_audio_gemm, "audio_gemm_f32"}, {&f_audio_ln, "audio_ln_affine_f32"}, {&f_audio_attn, "audio_causal_attn_f32"},
         {&f_audio_attn_g, "audio_attn_f32"}, {&f_audio_gelu_erf, "audio_gelu_erf_f32"}, {&f_audio_rms, "audio_rms_f32"}, {&f_audio_gelu_mul, "audio_gelu_tanh_mul_f32"}, {&f_audio_add_channel, "audio_add_channel_f32"}, {&f_audio_copy, "audio_copy_f32"},
         {&f_audio_conv1d, "audio_conv1d_f32"}, {&f_audio_convt1d, "audio_conv_transpose1d_f32"}, {&f_audio_leaky, "audio_leaky_relu_f32"},
-        {&f_audio_scale, "audio_scale_f32"}, {&f_audio_tanh, "audio_tanh_f32"},
+        {&f_audio_scale, "audio_scale_f32"}, {&f_audio_tanh, "audio_tanh_f32"}, {&f_audio_upnear, "audio_upsample_nearest_f32"},
         {&f_transpose_pad, "sd_transpose_pad"}, {&f_softmax_bf16, "sd_softmax_bf16"}, {&f_softmax_bf16w, "sd_softmax_bf16_w"},
         {&f_gn_sum, "sd_gn_sum"},       {&f_gn_sq, "sd_gn_sq"},         {&f_gn_apply, "sd_gn_apply"},
         {&f_silu, "sd_silu"},           {&f_add, "sd_add"},             {&f_upsample2, "sd_upsample2"},
@@ -401,24 +401,11 @@ bool blt_conv_on() {
     return on;
 }
 
-void conv2d_f32(const float* x, int cin, int H, int W, const float* w, int cout, const float* b, int k, int p, int st, float* y,
-                int Ho, int Wo) {
+void conv2d_f32_fp32(const float* x, int cin, int H, int W, const float* w, int cout, const float* b, int k, int p, int st, float* y,
+                     int Ho, int Wo) {
     const long HWo = (long)Ho * Wo;
     const int K = cin * k * k;
     if (HWo <= 0 || K <= 0) return;
-    static const bool conv_fp32 = [] {
-        const char* e = std::getenv("SD_VAE_CONV");
-        return e && std::strcmp(e, "fp32") == 0;
-    }();
-    if (!conv_fp32 && (K % 8) == 0 && conv2d_blt_bf16(x, cin, H, W, w, cout, b, k, p, st, y, Ho, Wo)) return;
-    static const bool bf16_conv = [] {
-        const char* e = std::getenv("SD_VAE_BF16");
-        return e && std::atoi(e) != 0;
-    }();
-    if (bf16_conv && cout >= 128 && K % 64 == 0 && f_im2col && f_transpose_bf16 && f_bias_cm && f_gemm_wmma256b) {
-        conv2d_bf16(x, cin, H, W, w, cout, b, k, p, st, y, Ho, Wo);
-        return;
-    }
     const long nc_max = std::max<long>(1, std::min<long>(HWo, (long)(kColFloats / (size_t)K)));
     float* col = static_cast<float*>(alloc(sizeof(float) * (size_t)K * nc_max));
     for (long n0l = 0; n0l < HWo; n0l += nc_max) {
@@ -442,6 +429,35 @@ void conv2d_f32(const float* x, int cin, int H, int W, const float* w, int cout,
     sync();
     release(col, sizeof(float) * (size_t)K * nc_max);
 }
+
+void conv2d_f32(const float* x, int cin, int H, int W, const float* w, int cout, const float* b, int k, int p, int st, float* y,
+                int Ho, int Wo) {
+    const long HWo = (long)Ho * Wo;
+    const int K = cin * k * k;
+    if (HWo <= 0 || K <= 0) return;
+    static const bool conv_fp32 = [] {
+        const char* e = std::getenv("SD_VAE_CONV");
+        return e && std::strcmp(e, "fp32") == 0;
+    }();
+    if (!conv_fp32 && (K % 8) == 0 && conv2d_blt_bf16(x, cin, H, W, w, cout, b, k, p, st, y, Ho, Wo)) return;
+    static const bool bf16_conv = [] {
+        const char* e = std::getenv("SD_VAE_BF16");
+        return e && std::atoi(e) != 0;
+    }();
+    if (bf16_conv && cout >= 128 && K % 64 == 0 && f_im2col && f_transpose_bf16 && f_bias_cm && f_gemm_wmma256b) {
+        conv2d_bf16(x, cin, H, W, w, cout, b, k, p, st, y, Ho, Wo);
+        return;
+    }
+    conv2d_f32_fp32(x, cin, H, W, w, cout, b, k, p, st, y, Ho, Wo);
+}
+
+// The convolution in FP32 throughout (the im2col and the FP32 GEMM; no BF16 route): for the layers whose accuracy is checked
+// against the FP32 oracle (AudioLDM 2's VAE: the BF16 route is 1e-3 off at 128 x 128)
+void conv2d_f32_exact(const float* x, int cin, int H, int W, const float* w, int cout, const float* b, int k, int p, int st, float* y,
+                      int Ho, int Wo) {
+    conv2d_f32_fp32(x, cin, H, W, w, cout, b, k, p, st, y, Ho, Wo);
+}
+
 
 void linear_tok(const float* x, int T, const uint16_t* W, int in, int out, const uint16_t* b, float* y) {
     gemm<uint16_t>(f_gemm_ah, W, in, x, 1, in, y, 1, out, b, 1.0f, 0.0f, out, T, in);
@@ -1265,14 +1281,15 @@ void audio_layer_norm_f32(const float* x, int T, int C, const float* w, const fl
 }
 
 // qkv [T][3 H 64] -> out [T][H 64], causal, scale 1/8
-// q, k, v [T][C] with row stride ld, C = H * 64; causal or not; kmask (T floats on the device, 0 for a padding key) or null
-void audio_attention_f32(const float* q, const float* k, const float* v, int ld, int T, int H, bool causal, const float* kmask, float scale,
-                        const float* bias, float* out) {
-    int tt = T, hh = H, cc = causal ? 1 : 0, lld = ld;
+// q [Tq][C], k, v [Tk][C] with row stride ld, C = H * D (D <= 128); causal (Tq = Tk) or not; kmask (Tk floats on the device, 0 for a
+// padding key) or null; scores * scale + bias [H][Tq][Tk] (device-accessible) or none; out [Tq][C]
+void audio_attention_f32(const float* q, const float* k, const float* v, int ld, int Tq, int Tk, int H, int D, bool causal, const float* kmask,
+                         float scale, const float* bias, float* out) {
+    int tq = Tq, tk = Tk, hh = H, dd = D, cc = causal ? 1 : 0, lld = ld;
     const float* km = kmask;
     const float* bi = bias;
-    void* a[] = {(void*)&q, (void*)&k, (void*)&v, (void*)&lld, (void*)&tt, (void*)&hh, (void*)&cc, (void*)&km, (void*)&scale, (void*)&bi, (void*)&out};
-    check(hip_launch(f_audio_attn_g, (unsigned)T, (unsigned)H, 1, 64, 1, 1, (unsigned)(sizeof(float) * (64 + (size_t)T)), nullptr, a, nullptr),
+    void* a[] = {(void*)&q, (void*)&k, (void*)&v, (void*)&lld, (void*)&tq, (void*)&tk, (void*)&hh, (void*)&dd, (void*)&cc, (void*)&km, (void*)&scale, (void*)&bi, (void*)&out};
+    check(hip_launch(f_audio_attn_g, (unsigned)Tq, (unsigned)H, 1, 128, 1, 1, (unsigned)(sizeof(float) * (128 + (size_t)Tk)), nullptr, a, nullptr),
           "audio attention");
     sync();
 }
@@ -1284,11 +1301,27 @@ void audio_rms_norm_f32(const float* x, int T, int C, const float* w, float eps,
     sync();
 }
 
+// a = gelu_new(a) * b, in place (T5's gated GELU)
+void audio_gelu_tanh_mul(float* a, const float* b, size_t n) {
+    long nn = (long)n;
+    void* args[] = {(void*)&a, (void*)&b, (void*)&nn};
+    launch(f_audio_gelu_mul, dim3(blocks(n), 1, 1), args);
+    sync();
+}
+
 // h[c][p] += t[c] (HW positions per channel), in place
 void audio_add_channel(float* h, const float* t, int C, int HW) {
     const size_t n = (size_t)C * HW;
     void* a[] = {(void*)&h, (void*)&t, (void*)&C, (void*)&HW};
     launch(f_audio_add_channel, dim3(blocks(n), 1, 1), a);
+    sync();
+}
+
+// dst[0..n) = src[0..n)
+void audio_copy(float* dst, const float* src, size_t n) {
+    long nn = (long)n;
+    void* a[] = {(void*)&dst, (void*)&src, (void*)&nn};
+    launch(f_audio_copy, dim3(blocks(n), 1, 1), a);
     sync();
 }
 
@@ -1333,19 +1366,11 @@ void audio_tanh(float* x, size_t n) {
     sync();
 }
 
-// dst[0..n) = src[0..n)
-void audio_copy(float* dst, const float* src, size_t n) {
-    long nn = (long)n;
-    void* a[] = {(void*)&dst, (void*)&src, (void*)&nn};
-    launch(f_audio_copy, dim3(blocks(n), 1, 1), a);
-    sync();
-}
-
-// a = gelu_new(a) * b, in place (T5's gated GELU)
-void audio_gelu_tanh_mul(float* a, const float* b, size_t n) {
-    long nn = (long)n;
-    void* args[] = {(void*)&a, (void*)&b, (void*)&nn};
-    launch(f_audio_gelu_mul, dim3(blocks(n), 1, 1), args);
+// nearest resampling of x [C][H][W] to [C][Ho][Wo] (2x for the UNet and VAE upsamplers; any size for the UNet's skip sizes)
+void audio_upsample_nearest(const float* x, int C, int H, int W, int Ho, int Wo, float* y) {
+    const size_t n = (size_t)C * Ho * Wo;
+    void* a[] = {(void*)&x, (void*)&C, (void*)&H, (void*)&W, (void*)&Ho, (void*)&Wo, (void*)&y};
+    launch(f_audio_upnear, dim3(blocks(n), 1, 1), a);
     sync();
 }
 

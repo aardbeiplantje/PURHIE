@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
     }
     const int T = (int)ids.size();
     std::vector<float> got((size_t)T * 1024);
-    if (!audioldm2::t5_encoder_forward(st, ids.data(), T, got.data())) {
+    if (!audioldm2::t5_encoder_forward(st, ids.data(), nullptr, T, got.data())) {
         std::fprintf(stderr, "the T5 device path failed\n");
         return 1;
     }

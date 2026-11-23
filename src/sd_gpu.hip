@@ -1746,28 +1746,28 @@ extern "C" __global__ void __launch_bounds__(64) audio_causal_attn_f32(const flo
     out[(long)t * C + h * 64 + d] = acc * qs[0];
 }
 
-// Multi-head attention with 64-wide heads for AudioLDM 2's text models: q, k, v [T][C] with row stride ld (C = H * 64); causal
-// (keys up to the query) or not; kmask (T floats, 0 for a padding key) or null; scores * scale + bias[h][t][j] (bias null: none).
-// out [T][C]. Grid (T, H), 64 threads.
-extern "C" __global__ void __launch_bounds__(64) audio_attn_f32(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
-                                                                int ld, int T, int H, int causal, const float* __restrict__ kmask,
+// Multi-head attention for AudioLDM 2's models: q [Tq][C], k, v [Tk][C] with row stride ld (C = H * D, D <= 128); causal (keys up to the
+// query, Tq = Tk) or not; kmask (Tk floats, 0 for a padding key) or null; scores * scale + bias[h][t][j] (bias null: none). out [Tq][C]. Grid (Tq, H),
+// 128 threads (the head dimension's threads and the rest strided); the query and the scores in shared memory.
+extern "C" __global__ void __launch_bounds__(128) audio_attn_f32(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+                                                                int ld, int Tq, int Tk, int H, int D, int causal, const float* __restrict__ kmask,
                                                                 float scale, const float* __restrict__ bias, float* __restrict__ out) {
     extern __shared__ float sm[];
-    float* qs = sm;
-    float* sc = sm + 64;
+    float* qs = sm;        /* 128: the query (then, thread 0, the normalizer in qs[0]) */
+    float* sc = sm + 128;  /* Tk: the scores, then the probabilities */
     const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
-    const int C = H * 64;
-    qs[d] = q[(long)t * ld + h * 64 + d];
+    const int C = H * D;
+    if (d < D) qs[d] = q[(long)t * ld + h * D + d];
     __syncthreads();
-    const int jmax = causal ? t : T - 1;
-    for (int j = d; j <= jmax; j += 64) {
+    const int jmax = causal ? t : Tk - 1;
+    for (int j = d; j <= jmax; j += 128) {
         if (kmask && kmask[j] == 0.0f) {
             sc[j] = -INFINITY;
         } else {
             float acc = 0.0f;
-            const float* kr = k + (long)j * ld + h * 64;
-            for (int e = 0; e < 64; ++e) acc += qs[e] * kr[e];
-            sc[j] = acc * scale + (bias ? bias[((long)h * T + t) * T + j] : 0.0f);
+            const float* kr = k + (long)j * ld + h * D;
+            for (int e = 0; e < D; ++e) acc += qs[e] * kr[e];
+            sc[j] = acc * scale + (bias ? bias[((long)h * Tq + t) * Tk + j] : 0.0f);
         }
     }
     __syncthreads();
@@ -1782,9 +1782,11 @@ extern "C" __global__ void __launch_bounds__(64) audio_attn_f32(const float* __r
         qs[0] = 1.0f / sum;
     }
     __syncthreads();
-    float acc = 0.0f;
-    for (int j = 0; j <= jmax; ++j) acc += sc[j] * v[(long)j * ld + h * 64 + d];
-    out[(long)t * C + h * 64 + d] = acc * qs[0];
+    if (d < D) {
+        float acc = 0.0f;
+        for (int j = 0; j <= jmax; ++j) acc += sc[j] * v[(long)j * ld + h * D + d];
+        out[(long)t * C + h * D + d] = acc * qs[0];
+    }
 }
 
 // GELU (the exact erf form, as transformers' "gelu"), in place
@@ -1878,4 +1880,17 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) audio_scale_f32(float* 
 extern "C" __global__ void __launch_bounds__(SD_THREADS) audio_tanh_f32(float* x, long n) {
     const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
     if (i < n) x[i] = tanhf(x[i]);
+}
+
+// nearest resampling of x [C][H][W] to [C][Ho][Wo] (PyTorch's nearest: the source index floor(dst * H / Ho))
+extern "C" __global__ void __launch_bounds__(SD_THREADS) audio_upsample_nearest_f32(const float* __restrict__ x, int C, int H, int W, int Ho, int Wo,
+                                                                                     float* __restrict__ y) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= (long)C * Ho * Wo) return;
+    const int ox = (int)(i % Wo), oy = (int)((i / Wo) % Ho), c = (int)(i / ((long)Wo * Ho));
+    const float sy = (float)H / (float)Ho, sx = (float)W / (float)Wo;
+    int iy = (int)floorf((float)oy * sy), ix = (int)floorf((float)ox * sx);
+    iy = iy < H - 1 ? iy : H - 1;
+    ix = ix < W - 1 ? ix : W - 1;
+    y[i] = x[((long)c * H + iy) * W + ix];
 }

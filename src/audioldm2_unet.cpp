@@ -3,6 +3,7 @@
 #include "sd_device.h"
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -70,8 +71,9 @@ public:
 
     /* a Transformer2DModel with one basic block: y = x + proj_out(attn stack(proj_in(GN(x)))). ctx: the cross-attention's context
      * [Tc][cw] (cw its width), or null for self-attention */
-    bool transformer(const std::string& p, const float* x, int C, int H, int W, const float* ctx, int Tc, int cw, float* y) {
+    bool transformer(const std::string& p, const float* x, int C, int H, int W, const float* ctx, int Tc, int cw, const float* kmask, float* y) {
         const int HW = H * W, ff = 4 * C;
+        const float attn_scale = 1.0f / std::sqrt((float)(C / kHeads));
         const float *gw, *gb, *piw, *pib, *poW, *pob;
         if (!get(st_, p + "norm.weight", gw) || !get(st_, p + "norm.bias", gb) || !get(st_, p + "proj_in.weight", piw) ||
             !get(st_, p + "proj_in.bias", pib) || !get(st_, p + "proj_out.weight", poW) || !get(st_, p + "proj_out.bias", pob))
@@ -99,7 +101,7 @@ public:
         sddev::linear_f32(Ln.data(), HW, a1q, C, C, zero_.data(), Q.data());
         sddev::linear_f32(Ln.data(), HW, a1k, C, C, zero_.data(), K.data());
         sddev::linear_f32(Ln.data(), HW, a1v, C, C, zero_.data(), V.data());
-        sddev::attention_f32(Q.data(), HW, K.data(), V.data(), HW, C, kHeads, A.data());
+        sddev::audio_attention_f32(Q.data(), K.data(), V.data(), C, HW, HW, kHeads, C / kHeads, false, nullptr, attn_scale, nullptr, A.data());
         sddev::linear_f32(A.data(), HW, a1o, C, C, a1ob, O.data());
         sddev::add(X.data(), O.data(), N);
         /* cross-attention (self-attention when there is no context) */
@@ -108,11 +110,11 @@ public:
         if (ctx) {
             sddev::linear_f32(ctx, Tc, a2k, cw, C, zero_.data(), Kc.data());
             sddev::linear_f32(ctx, Tc, a2v, cw, C, zero_.data(), Vc.data());
-            sddev::attention_f32(Q.data(), HW, Kc.data(), Vc.data(), Tc, C, kHeads, A.data());
+            sddev::audio_attention_f32(Q.data(), Kc.data(), Vc.data(), C, HW, Tc, kHeads, C / kHeads, false, kmask, attn_scale, nullptr, A.data());
         } else {
             sddev::linear_f32(Ln.data(), HW, a2k, C, C, zero_.data(), K.data());
             sddev::linear_f32(Ln.data(), HW, a2v, C, C, zero_.data(), V.data());
-            sddev::attention_f32(Q.data(), HW, K.data(), V.data(), HW, C, kHeads, A.data());
+            sddev::audio_attention_f32(Q.data(), K.data(), V.data(), C, HW, HW, kHeads, C / kHeads, false, nullptr, attn_scale, nullptr, A.data());
         }
         sddev::linear_f32(A.data(), HW, a2o, C, C, a2ob, O.data());
         sddev::add(X.data(), O.data(), N);
@@ -131,7 +133,8 @@ public:
     }
 
     /* the three transformers of one resnet's layer (attentions[first..first+2]): self, the GPT-2 context, the T5 context */
-    bool attentions(const std::string& block, int first, Feat& f, int C, const float* ctx1, int T1, const float* ctx2, int T2) {
+    bool attentions(const std::string& block, int first, Feat& f, int C, const float* ctx1, int T1, const float* ctx2, int T2,
+                    const float* mask2) {
         for (int idx = 0; idx < 3; ++idx) {
             Feat nxt;
             nxt.buf = sddev::Floats((size_t)C * f.h * f.w);
@@ -140,7 +143,7 @@ public:
             const float* ctx = idx == 0 ? nullptr : (idx == 1 ? ctx1 : ctx2);
             const int Tc = idx == 0 ? 0 : (idx == 1 ? T1 : T2);
             const int cw = idx == 0 ? C : (idx == 1 ? 768 : 1024);
-            if (!transformer(p, f.buf.data(), C, f.h, f.w, ctx, Tc, cw, nxt.buf.data())) return false;
+            if (!transformer(p, f.buf.data(), C, f.h, f.w, ctx, Tc, cw, idx == 2 ? mask2 : nullptr, nxt.buf.data())) return false;
             f = std::move(nxt);
         }
         return true;
@@ -151,21 +154,23 @@ public:
         const float *w, *b;
         if (!get(st_, p + "conv.weight", w) || !get(st_, p + "conv.bias", b)) return false;
         Feat nxt;
-        nxt.c = cout; nxt.h = f.h / 2; nxt.w = f.w / 2;
+        /* the stride-2 convolution's output size: floor((H - 1) / 2) + 1 (ceil for any H) */
+        nxt.c = cout; nxt.h = (f.h - 1) / 2 + 1; nxt.w = (f.w - 1) / 2 + 1;
         nxt.buf = sddev::Floats((size_t)cout * nxt.h * nxt.w);
         sddev::conv2d_f32(f.buf.data(), f.c, f.h, f.w, w, cout, b, 3, 1, 2, nxt.buf.data(), nxt.h, nxt.w);
         f = std::move(nxt);
         return true;
     }
 
-    /* nearest 2x, then a 3 x 3 convolution (Upsample2D) */
-    bool upsample(const std::string& p, Feat& f, int cout) {
+    /* nearest resampling to (th, tw) (2x unless the skip connection is another size, as diffusers' upsample_size), then a 3 x 3
+     * convolution (Upsample2D) */
+    bool upsample(const std::string& p, Feat& f, int cout, int th, int tw) {
         const float *w, *b;
         if (!get(st_, p + "conv.weight", w) || !get(st_, p + "conv.bias", b)) return false;
-        sddev::Floats up((size_t)f.c * 4 * f.h * f.w);
-        sddev::upsample2(f.buf.data(), f.c, f.h, f.w, up.data());
         Feat nxt;
-        nxt.c = cout; nxt.h = 2 * f.h; nxt.w = 2 * f.w;
+        nxt.c = cout; nxt.h = th; nxt.w = tw;
+        sddev::Floats up((size_t)f.c * th * tw);
+        sddev::audio_upsample_nearest(f.buf.data(), f.c, f.h, f.w, th, tw, up.data());
         nxt.buf = sddev::Floats((size_t)cout * nxt.h * nxt.w);
         sddev::conv2d_f32(up.data(), f.c, nxt.h, nxt.w, w, cout, b, 3, 1, 1, nxt.buf.data(), nxt.h, nxt.w);
         f = std::move(nxt);
@@ -182,7 +187,7 @@ public:
         return c;
     }
 
-    bool run(const float* x, int H, int W, float t, const float* ctx1, int T1, const float* ctx2, int T2, float* out);
+    bool run(const float* x, int H, int W, float t, const float* ctx1, int T1, const float* ctx2, int T2, const int32_t* mask2, float* out);
 
 private:
     const zimage::SafeTensors& st_;
@@ -212,7 +217,8 @@ bool time_embed(const zimage::SafeTensors& st, float t, sddev::Floats& out_act) 
     return true;
 }
 
-bool Unet::run(const float* x_host, int H, int W, float t, const float* ctx1_host, int T1, const float* ctx2_host, int T2, float* out_host) {
+bool Unet::run(const float* x_host, int H, int W, float t, const float* ctx1_host, int T1, const float* ctx2_host, int T2, const int32_t* mask2_host,
+                float* out_host) {
     /* the kernels read and write device-accessible memory only: the inputs are copied in, the output copied out */
     sddev::Floats x((size_t)8 * H * W), ctx1((size_t)T1 * 768), ctx2((size_t)T2 * 1024), out((size_t)8 * H * W);
     std::memcpy(x.data(), x_host, sizeof(float) * (size_t)8 * H * W);
@@ -220,6 +226,9 @@ bool Unet::run(const float* x_host, int H, int W, float t, const float* ctx1_hos
     std::memcpy(ctx2.data(), ctx2_host, sizeof(float) * (size_t)T2 * 1024);
     const float* ctx1p = ctx1.data();
     const float* ctx2p = ctx2.data();
+    sddev::Floats mask2((size_t)T2);
+    for (int t2 = 0; t2 < T2; ++t2) mask2.data()[t2] = mask2_host ? (mask2_host[t2] ? 1.0f : 0.0f) : 1.0f;
+    const float* mask2p = mask2.data();
     sddev::Floats temb;
     if (!time_embed(st_, t, temb)) return false;
     /* conv_in: 8 -> 128 */
@@ -249,7 +258,7 @@ bool Unet::run(const float* x_host, int H, int W, float t, const float* ctx1_hos
             if (!resnet(blk + ".resnets." + std::to_string(r) + ".", cur.buf.data(), cur.c, cur.h, cur.w, temb.data(), chans[bi], y.buf.data()))
                 return false;
             cur = std::move(y);
-            if (bi > 0 && !attentions(blk, 3 * r, cur, chans[bi], ctx1p, T1, ctx2p, T2)) return false;
+            if (bi > 0 && !attentions(blk, 3 * r, cur, chans[bi], ctx1p, T1, ctx2p, T2, mask2p)) return false;
             Feat s;
             s.c = cur.c; s.h = cur.h; s.w = cur.w;
             s.buf = sddev::Floats((size_t)cur.c * cur.h * cur.w);
@@ -272,7 +281,7 @@ bool Unet::run(const float* x_host, int H, int W, float t, const float* ctx1_hos
         y.buf = sddev::Floats((size_t)y.c * y.h * y.w);
         if (!resnet("mid_block.resnets.0.", cur.buf.data(), cur.c, cur.h, cur.w, temb.data(), 640, y.buf.data())) return false;
         cur = std::move(y);
-        if (!attentions("mid_block", 0, cur, 640, ctx1p, T1, ctx2p, T2)) return false;
+        if (!attentions("mid_block", 0, cur, 640, ctx1p, T1, ctx2p, T2, mask2p)) return false;
         Feat z;
         z.c = 640; z.h = cur.h; z.w = cur.w;
         z.buf = sddev::Floats((size_t)z.c * z.h * z.w);
@@ -292,10 +301,13 @@ bool Unet::run(const float* x_host, int H, int W, float t, const float* ctx1_hos
             y.buf = sddev::Floats((size_t)y.c * y.h * y.w);
             if (!resnet(blk + ".resnets." + std::to_string(r) + ".", in.buf.data(), in.c, in.h, in.w, temb.data(), uch[bi], y.buf.data())) return false;
             cur = std::move(y);
-            if (bi < 3 && !attentions(blk, 3 * r, cur, uch[bi], ctx1p, T1, ctx2p, T2)) return false;
+            if (bi < 3 && !attentions(blk, 3 * r, cur, uch[bi], ctx1p, T1, ctx2p, T2, mask2p)) return false;
         }
         if (has_key(blk + ".upsamplers.0.conv.weight")) {
-            if (!upsample(blk + ".upsamplers.0.", cur, uch[bi])) return false;
+            /* the next skip connection's size (diffusers' upsample_size) when the sizes do not double */
+            int th = 2 * cur.h, tw = 2 * cur.w;
+            if (!skips.empty()) { th = skips.back().h; tw = skips.back().w; }
+            if (!upsample(blk + ".upsamplers.0.", cur, uch[bi], th, tw)) return false;
         }
     }
     /* conv_norm_out, SiLU, conv_out: 128 -> 8 */
@@ -314,11 +326,11 @@ bool Unet::run(const float* x_host, int H, int W, float t, const float* ctx1_hos
 }  // namespace
 
 bool unet_forward(const zimage::SafeTensors& st, const float* x, int H, int W, float t, const float* ctx1, int T1, const float* ctx2, int T2,
-                  float* out) {
+                  const int32_t* mask2, float* out) {
     if (!sddev::enabled()) { std::fprintf(stderr, "audioldm2 unet: no device\n"); return false; }
-    if (H < 8 || W < 8 || H % 8 || W % 8) { std::fprintf(stderr, "audioldm2 unet: H and W multiples of 8\n"); return false; }
+    if (H < 8 || W < 8) { std::fprintf(stderr, "audioldm2 unet: the latent is at least 8 x 8\n"); return false; }
     Unet u(st);
-    return u.run(x, H, W, t, ctx1, T1, ctx2, T2, out);
+    return u.run(x, H, W, t, ctx1, T1, ctx2, T2, mask2, out);
 }
 
 }  // namespace audioldm2

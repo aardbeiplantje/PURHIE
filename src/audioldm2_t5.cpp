@@ -41,7 +41,7 @@ int bucket(int rel) {
 
 }  // namespace
 
-bool t5_encoder_forward(const zimage::SafeTensors& st, const int32_t* ids, int T, float* hidden) {
+bool t5_encoder_forward(const zimage::SafeTensors& st, const int32_t* ids, const int32_t* mask, int T, float* hidden) {
     if (!sddev::enabled()) { std::fprintf(stderr, "audioldm2: no device\n"); return false; }
     if (T < 1 || T > 512) { std::fprintf(stderr, "audioldm2: the T5 encoder takes 1 to 512 tokens, not %d\n", T); return false; }
     const float *shared, *bias_table, *ln_final;
@@ -56,6 +56,9 @@ bool t5_encoder_forward(const zimage::SafeTensors& st, const int32_t* ids, int T
         if (ids[t] < 0 || ids[t] >= kVocab) { std::fprintf(stderr, "audioldm2: token id %d out of range\n", ids[t]); return false; }
         std::memcpy(X.data() + (size_t)t * kDim, shared + (size_t)ids[t] * kDim, sizeof(float) * kDim);
     }
+    /* the padding keys (mask 0) are masked: the device reads the mask as floats */
+    sddev::Floats KM((size_t)T);
+    for (int t = 0; t < T; ++t) KM.data()[t] = mask ? (mask[t] ? 1.0f : 0.0f) : 1.0f;
     sddev::Floats BIAS((size_t)kHeads * T * T);
     for (int h = 0; h < kHeads; ++h)
         for (int i = 0; i < T; ++i)
@@ -76,7 +79,7 @@ bool t5_encoder_forward(const zimage::SafeTensors& st, const int32_t* ids, int T
         sddev::linear_f32(Hb.data(), T, wq, kDim, kDim, Z.data(), Q.data());
         sddev::linear_f32(Hb.data(), T, wk, kDim, kDim, Z.data(), K.data());
         sddev::linear_f32(Hb.data(), T, wv, kDim, kDim, Z.data(), V.data());
-        sddev::audio_attention_f32(Q.data(), K.data(), V.data(), kDim, T, kHeads, false, nullptr, 1.0f, BIAS.data(), A.data());
+        sddev::audio_attention_f32(Q.data(), K.data(), V.data(), kDim, T, T, kHeads, 64, false, KM.data(), 1.0f, BIAS.data(), A.data());
         sddev::linear_f32(A.data(), T, wo, kDim, kDim, Z.data(), O.data());
         sddev::add(X.data(), O.data(), n);
         /* the feed-forward: RMS norm, gated GELU (wi_0 and wi_1), wo, the residual */

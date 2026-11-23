@@ -11,9 +11,9 @@
 
 namespace audioldm2 {
 
-/* ids: T tokens (no padding: one prompt). hidden [T][1024] (the encoder's last hidden state). The mapping of st is registered for the
- * device by the caller. False on any error. */
-bool t5_encoder_forward(const zimage::SafeTensors& st, const int32_t* ids, int T, float* hidden);
+/* ids: T tokens; mask: T entries (0 for a padding token, its keys are not attended; null: all real). hidden [T][1024] (the encoder's
+ * last hidden state). The mapping of st is registered for the device by the caller. False on any error. */
+bool t5_encoder_forward(const zimage::SafeTensors& st, const int32_t* ids, const int32_t* mask, int T, float* hidden);
 
 }  // namespace audioldm2
 

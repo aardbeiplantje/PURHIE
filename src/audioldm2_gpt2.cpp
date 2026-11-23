@@ -30,11 +30,12 @@ bool weight(const zimage::SafeTensors& st, const std::string& name, size_t n, co
 
 }  // namespace
 
-bool gpt2_forward(const zimage::SafeTensors& st, const float* x, int T, float* hidden6, float* last) {
+bool gpt2_forward(const zimage::SafeTensors& st, const float* x, int T, const int32_t* mask, float* hidden6, float* last) {
     if (!sddev::enabled()) { std::fprintf(stderr, "audioldm2: no device\n"); return false; }
     if (T < 1 || T > 1024) { std::fprintf(stderr, "audioldm2: the GPT-2 takes 1 to 1024 tokens, not %d\n", T); return false; }
     const size_t n = (size_t)T * kDim;
-    sddev::Floats X(n), H(n), QKV((size_t)T * 3 * kDim), A(n), O(n), M((size_t)T * kFF);
+    sddev::Floats X(n), H(n), QKV((size_t)T * 3 * kDim), A(n), O(n), M((size_t)T * kFF), KM((size_t)T);
+    for (int t = 0; t < T; ++t) KM.data()[t] = mask ? (mask[t] ? 1.0f : 0.0f) : 1.0f;
     std::memcpy(X.data(), x, sizeof(float) * n);
     /* the position embeddings (wpe: the first T rows, contiguous in the mapping) are added to the input, as GPT2Model does */
     const float* wpe = nullptr;
@@ -53,7 +54,7 @@ bool gpt2_forward(const zimage::SafeTensors& st, const float* x, int T, float* h
         /* attention: x += proj(attention(qkv(LN(x)))) */
         sddev::audio_layer_norm_f32(X.data(), T, kDim, ln1w, ln1b, 1e-5f, H.data());
         sddev::audio_gemm_f32(H.data(), T, kDim, wqkv, bqkv, 3 * kDim, QKV.data());
-        sddev::audio_causal_attn_f32(QKV.data(), T, kHeads, A.data());
+        sddev::audio_attention_f32(QKV.data(), QKV.data() + kDim, QKV.data() + 2 * kDim, 3 * kDim, T, T, kHeads, kDim / kHeads, true, KM.data(), 0.125f, nullptr, A.data());
         sddev::audio_gemm_f32(A.data(), T, kDim, wproj, bproj, kDim, O.data());
         sddev::add(X.data(), O.data(), n);
         /* feed-forward: x += proj(gelu(fc(LN(x)))) */
@@ -75,13 +76,16 @@ bool gpt2_forward(const zimage::SafeTensors& st, const float* x, int T, float* h
     return true;
 }
 
-bool gpt2_generate(const zimage::SafeTensors& st, const float* embeds, int T, int max_new, float* out) {
+bool gpt2_generate(const zimage::SafeTensors& st, const float* embeds, const int32_t* mask, int T, int max_new, float* out) {
     if (T < 1 || max_new < 1 || T + max_new > 1024) { std::fprintf(stderr, "audioldm2: the GPT-2 generation length\n"); return false; }
     std::vector<float> seq((size_t)(T + max_new) * kDim), last((size_t)(T + max_new) * kDim);
     std::memcpy(seq.data(), embeds, sizeof(float) * (size_t)T * kDim);
+    /* the mask of the sequence so far: the given one (padding keys masked), then ones for the generated tokens */
+    std::vector<int32_t> m((size_t)T + max_new, 1);
+    if (mask) for (int t = 0; t < T; ++t) m[t] = mask[t];
     int len = T;
     for (int k = 0; k < max_new; ++k) {
-        if (!gpt2_forward(st, seq.data(), len, nullptr, last.data())) return false;
+        if (!gpt2_forward(st, seq.data(), len, m.data(), nullptr, last.data())) return false;
         std::memcpy(seq.data() + (size_t)len * kDim, last.data() + (size_t)(len - 1) * kDim, sizeof(float) * kDim);
         ++len;
     }

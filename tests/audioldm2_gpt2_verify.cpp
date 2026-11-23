@@ -51,7 +51,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::vector<float> got6((size_t)T * 768), gotl((size_t)T * 768);
-    if (!audioldm2::gpt2_forward(st, x.data(), T, got6.data(), gotl.data())) {
+    if (!audioldm2::gpt2_forward(st, x.data(), T, nullptr, got6.data(), gotl.data())) {
         std::fprintf(stderr, "the GPT-2 device path failed\n");
         return 1;
     }
@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
     }
     const int Tp = (int)(gp.size() / 768);
     std::vector<float> gen(gout.size());
-    if (!audioldm2::gpt2_generate(st, gp.data(), Tp, (int)(gout.size() / 768), gen.data())) {
+    if (!audioldm2::gpt2_generate(st, gp.data(), nullptr, Tp, (int)(gout.size() / 768), gen.data())) {
         std::fprintf(stderr, "the GPT-2 generation failed\n");
         return 1;
     }

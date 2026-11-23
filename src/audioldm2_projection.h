@@ -6,11 +6,15 @@
 
 #include "zimage_dit.h"
 
+#include <cstdint>
+
 namespace audioldm2 {
 
-/* clap [Tc][512], t5 [Tt][1024] (float) -> out [(Tc + Tt + 4)][768]: sos, the CLAP rows, eos, sos_1, the T5 rows, eos_1.
- * The mapping of st is registered for the device by the caller. False on any error. */
-bool projection_forward(const zimage::SafeTensors& st, const float* clap, int Tc, const float* t5, int Tt, float* out);
+/* clap [Tc][512], t5 [Tt][1024] (float), t5_mask (Tt entries, 0 for a padding token; null: all real) -> out [(Tc + Tt + 4)][768]:
+ * sos, the CLAP rows, eos, sos_1, the T5 rows, eos_1; out_mask (Tc + Tt + 4 entries, may be null): the mask of those rows (the special
+ * tokens and the CLAP rows are real). The mapping of st is registered for the device by the caller. False on any error. */
+bool projection_forward(const zimage::SafeTensors& st, const float* clap, int Tc, const float* t5, int Tt, const int32_t* t5_mask, float* out,
+                        int32_t* out_mask);
 
 }  // namespace audioldm2
 

@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -22,11 +23,14 @@ static bool read_floats(const std::string& path, std::vector<float>& v) {
 }
 
 int main(int argc, char** argv) {
-    const std::string model = argc > 1 ? argv[1] : "/data/audioldm2/unet/diffusion_pytorch_model.safetensors";
-    const std::string dir = argc > 2 ? argv[2] : "/data/audioldm2-stages";
+    /* the latent size (H W) selects the reference files: 32 32 (default) or 125 16 (the 5-second clip) */
+    const int H = argc > 1 ? std::atoi(argv[1]) : 32, W = argc > 2 ? std::atoi(argv[2]) : 32;
+    const std::string suffix = (H == 32 && W == 32) ? "" : "_" + std::to_string(H) + "x" + std::to_string(W);
+    const std::string model = argc > 3 ? argv[3] : "/data/audioldm2/unet/diffusion_pytorch_model.safetensors";
+    const std::string dir = argc > 4 ? argv[4] : "/data/audioldm2-stages";
     std::vector<float> x, gen, t5, ref;
-    if (!read_floats(dir + "/unet_in.f32", x) || !read_floats(dir + "/gen_out.f32", gen) || !read_floats(dir + "/t5_hidden.f32", t5) ||
-        !read_floats(dir + "/unet_out.f32", ref)) {
+    if (!read_floats(dir + "/unet_in" + suffix + ".f32", x) || !read_floats(dir + "/gen_out.f32", gen) || !read_floats(dir + "/t5_hidden.f32", t5) ||
+        !read_floats(dir + "/unet_out" + suffix + ".f32", ref)) {
         std::fprintf(stderr, "cannot read the stage files in %s\n", dir.c_str());
         return 1;
     }
@@ -35,9 +39,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "the UNet file: %s\n", st.ok() ? "registration failed" : st.error().c_str());
         return 1;
     }
-    const int H = 32, W = 32, T1 = (int)(gen.size() / 768), T2 = (int)(t5.size() / 1024);
+    const int T1 = (int)(gen.size() / 768), T2 = (int)(t5.size() / 1024);
     std::vector<float> got(ref.size());
-    if (!audioldm2::unet_forward(st, x.data(), H, W, 500.0f, gen.data(), T1, t5.data(), T2, got.data())) {
+    if (!audioldm2::unet_forward(st, x.data(), H, W, 500.0f, gen.data(), T1, t5.data(), T2, nullptr, got.data())) {
         std::fprintf(stderr, "the UNet device path failed\n");
         return 1;
     }

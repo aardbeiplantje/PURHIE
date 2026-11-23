@@ -8,12 +8,15 @@
 
 #include "zimage_dit.h"
 
+#include <cstdint>
+
 namespace audioldm2 {
 
-/* x [8][H][W] (H, W multiples of 8); t: the timestep; ctx1 [T1][768] (encoder_hidden_states); ctx2 [T2][1024] (encoder_hidden_states_1).
- * out [8][H][W]. The mapping of st is registered for the device by the caller. False on any error. */
+/* x [8][H][W] (any H, W >= 8: the sizes follow diffusers' upsample_size); t: the timestep; ctx1 [T1][768] (encoder_hidden_states); ctx2
+ * [T2][1024] (encoder_hidden_states_1) with mask2 (T2 entries, 0 for a padding token; null: all real). out [8][H][W]. The mapping of st is
+ * registered for the device by the caller. False on any error. */
 bool unet_forward(const zimage::SafeTensors& st, const float* x, int H, int W, float t, const float* ctx1, int T1, const float* ctx2, int T2,
-                  float* out);
+                  const int32_t* mask2, float* out);
 
 }  // namespace audioldm2
 
