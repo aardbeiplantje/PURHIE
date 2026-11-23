@@ -45,8 +45,9 @@ The desktop's display runs on the same GPU as the engine, so a long or hung kern
 
 - Keep each kernel launch short: under about 50 ms, as Z-Image's largest single launch is. Split a long grid into several
   launches, and synchronize between stages, so the desktop's queues get the GPU between them.
-- Pass kernels only device memory: `sddev` buffers (`alloc`, `Floats`) or registered weights. A host pointer hangs the GPU
-  and resets the driver.
+- Pass kernels only memory the GPU can map: `mmap`ed files and `/dev/shm` buffers registered with `hipHostRegister`
+  (`sddev` `alloc`, `Floats`, registered weights), or `hipMalloc` memory. Plain unregistered `malloc` memory is not
+  mapped for the GPU here; a kernel that reads it hangs the GPU and resets the driver.
 
 Other GPU jobs may run alongside a test.
 
