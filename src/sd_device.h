@@ -137,6 +137,8 @@ void head_norm_rope_bf16(const uint16_t* x, int T, int H, const uint16_t* w, flo
 void rms_gate_add_bf16(float* x, int T, int C, const uint16_t* o, const uint16_t* w, float eps, const float* g);
 // y = BF16(x) (n values): an FP32 activation as the next GEMM's BF16 input
 void to_bf16(const float* x, uint16_t* y, size_t n);
+/* x[i] = BF16(x[i]) in place (the values stay FP32 containers) */
+void round_bf16_inplace(float* x, size_t n);
 // g = BF16(silu(a) b) for BF16 a, b
 void swiglu_bf16_in(const uint16_t* a, const uint16_t* b, uint16_t* g, size_t n);
 // attention on BF16 q, k, v (T x C row-major, the head width 128): the output in FP32

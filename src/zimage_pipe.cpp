@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -95,6 +96,13 @@ static int run(zi_pipe_t* pipe, const char* prompt, int height, int width, int s
         std::vector<float> lat((size_t)16 * LH * LW), pix((size_t)3 * height * width);
         if (!zimage::dev_sample(pipe->dit, noise_in, cap.data(), L, steps, kShift, lat.data(), gh, gw))
             throw std::runtime_error("the sampler failed");
+        /* ZI_DUMP_LATENT=path: the sampler's latent [16][LH][LW] (float32, before the VAE) for a comparison with ComfyUI's */
+        if (const char* dump = std::getenv("ZI_DUMP_LATENT")) {
+            if (FILE* df = std::fopen(dump, "wb")) {
+                std::fwrite(lat.data(), sizeof(float), lat.size(), df);
+                std::fclose(df);
+            }
+        }
         if (!zimage::dev_vae_decode(pipe->vae, lat.data(), pix.data(), LH, LW)) throw std::runtime_error("the decoder failed");
 
         /* [-1, 1] floats (channel-major) to 8-bit HWC, rounded and clamped */

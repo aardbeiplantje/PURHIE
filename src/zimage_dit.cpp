@@ -456,6 +456,9 @@ bool dev_refiner_block(const SafeTensors& st, const std::string& pre, float* x, 
     }
     DevBuf zeros(3 * dim, true);  /* zeros: the biases of the GEMMs without one (11520 >= every output here) */
     const float eps = 1e-5f;
+    /* the residual stream is BF16 after each block, as diffusers and ComfyUI carry it (1024 px vs ComfyUI: 27.45 dB with the
+     * FP32 residual, 30.16 dB with it); ZI_RESID_FP32=1 keeps the FP32 residual for comparisons */
+    static const bool resid_bf16 = std::getenv("ZI_RESID_FP32") == nullptr;
     /* attention: the projections' outputs in BF16 (hipBLASLt's BF16 output); the QK norms and RoPE on BF16 rows; the attention on
      * BF16 q, k, v. The residual x stays FP32 */
     DevHalf h(static_cast<size_t>(N) * dim);
@@ -474,6 +477,7 @@ bool dev_refiner_block(const SafeTensors& st, const std::string& pre, float* x, 
     DevHalf o(static_cast<size_t>(N) * dim);
     sddev::linear_bf16_xb16(attb.p, N, wout, dim, dim, zeros.p, o.p);
     sddev::rms_gate_add_bf16(x, N, dim, o.p, wn2, eps, g_msa.p);  /* x += g_msa * rms(o) wn2 */
+    if (resid_bf16) sddev::round_bf16_inplace(x, (size_t)N * dim);  /* the residual in BF16 */
     /* feed-forward (SwiGLU) */
     DevHalf h2(static_cast<size_t>(N) * dim);
     sddev::rms_mod_bf16(x, N, dim, wfn1, eps, sc_mlp.p, h2.p);
@@ -486,6 +490,7 @@ bool dev_refiner_block(const SafeTensors& st, const std::string& pre, float* x, 
     DevHalf f(static_cast<size_t>(N) * dim);
     sddev::linear_bf16_xb16(gate.p, N, w2, F, dim, zeros.p, f.p);
     sddev::rms_gate_add_bf16(x, N, dim, f.p, wfn2, eps, g_mlp.p);
+    if (resid_bf16) sddev::round_bf16_inplace(x, (size_t)N * dim);
     return true;
 }
 
@@ -539,6 +544,18 @@ bool dev_output(const SafeTensors& st, const float* J, const float* t256, float*
 }
 
 
+/* ZI_DIT_DUMP=dir: the token stream after each block of one DiT call (float32, rows x 3840), for the per-block comparison with
+ * the diffusers reference (tools in /data/zimage-ref): nr0, nr1 (image rows), cr0, cr1 (caption rows), L00..L29 (all rows) */
+static void dit_dump(const char* name, const float* rows, size_t n) {
+    const char* dir = std::getenv("ZI_DIT_DUMP");
+    if (!dir) return;
+    std::string path = std::string(dir) + "/" + name + ".f32";
+    if (FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(rows, sizeof(float), n, f);
+        std::fclose(f);
+    }
+}
+
 bool dev_dit_forward(const SafeTensors& st, const float* lat, const float* cap, int L, float t, float* vel, int gh, int gw) {
     if (!sddev::enabled()) { fprintf(stderr, "zimage: no device\n"); return false; }
     const int NI = gh * gw, DIM = 3840;
@@ -554,8 +571,10 @@ bool dev_dit_forward(const SafeTensors& st, const float* lat, const float* cap, 
     if (!dev_timestep_embed(st, t, jt)) return false;
     float* fri = static_cast<float*>(sddev::alloc(sizeof(float) * NI * 64 * 2, false));
     rope_table_image(gh, gw, LC + 1, fri);
-    if (!dev_refiner_block(st, "noise_refiner.0", J, NI, jt, fri) || !dev_refiner_block(st, "noise_refiner.1", J, NI, jt, fri))
-        return false;
+    if (!dev_refiner_block(st, "noise_refiner.0", J, NI, jt, fri)) return false;
+    dit_dump("nr0", J, (size_t)NI * DIM);
+    if (!dev_refiner_block(st, "noise_refiner.1", J, NI, jt, fri)) return false;
+    dit_dump("nr1", J, (size_t)NI * DIM);
     float* jc = J + (size_t)NI * DIM;
     int lc = 0;
     if (!dev_caption_embed(st, cap, L, &jc, lc) || lc != LC) return false;
@@ -565,16 +584,21 @@ bool dev_dit_forward(const SafeTensors& st, const float* lat, const float* cap, 
     for (int r = 0; r < LC; ++r) { ids[r * 3] = 1 + r; ids[r * 3 + 1] = 0; ids[r * 3 + 2] = 0; }
     float* frc = static_cast<float*>(sddev::alloc(sizeof(float) * LC * 64 * 2, false));
     rope_table_ids(ids.data(), LC, frc);
-    if (!dev_refiner_block(st, "context_refiner.0", jc, LC, nullptr, frc, false) ||
-        !dev_refiner_block(st, "context_refiner.1", jc, LC, nullptr, frc, false))
-        return false;
+    if (!dev_refiner_block(st, "context_refiner.0", jc, LC, nullptr, frc, false)) return false;
+    dit_dump("cr0", jc, (size_t)LC * DIM);
+    if (!dev_refiner_block(st, "context_refiner.1", jc, LC, nullptr, frc, false)) return false;
+    dit_dump("cr1", jc, (size_t)LC * DIM);
     std::vector<int> idj((size_t)S * 3);
     for (int r = 0; r < NI; ++r) { idj[r * 3] = LC + 1; idj[r * 3 + 1] = r / gw; idj[r * 3 + 2] = r % gw; }
     for (int r = 0; r < LC; ++r) { idj[(NI + r) * 3] = 1 + r; idj[(NI + r) * 3 + 1] = 0; idj[(NI + r) * 3 + 2] = 0; }
     float* frj = static_cast<float*>(sddev::alloc(sizeof(float) * S * 64 * 2, false));
     rope_table_ids(idj.data(), S, frj);
-    for (int layer = 0; layer < 30; ++layer)
+    for (int layer = 0; layer < 30; ++layer) {
         if (!dev_refiner_block(st, "layers." + std::to_string(layer), J, S, jt, frj, true)) return false;
+        char name[16];
+        std::snprintf(name, sizeof name, "L%02d", layer);
+        dit_dump(name, J, (size_t)S * DIM);
+    }
     return dev_output(st, J, jt, vel, gh, gw);
 }
 

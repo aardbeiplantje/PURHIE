@@ -1235,6 +1235,13 @@ void rms_gate_add_bf16(float* x, int T, int C, const uint16_t* o, const uint16_t
     sync();
 }
 
+void round_bf16_inplace(float* x, size_t n0) {
+    long n = (long)n0;
+    void* a[] = {(void*)&x, (void*)&n};
+    launch(f_round_bf16, dim3(blocks((size_t)n)), a);
+    sync();
+}
+
 void to_bf16(const float* x, uint16_t* y, size_t n0) {
     long n = (long)n0;
     void* a[] = {(void*)&x, (void*)&y, (void*)&n};
