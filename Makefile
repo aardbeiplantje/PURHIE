@@ -106,6 +106,7 @@ QWENIMAGE_VERIFY = $(BINDIR)/qwenimage_verify  # Qwen-Image's FP8 linear layers 
 ZIMAGE_1024_VERIFY = $(BINDIR)/zimage_1024_verify  # Z-Image-Turbo at 1024 x 1024 vs diffusers, and the time (tests/zimage_1024_verify.cpp; run from build/co)
 ZIMAGE_PIPE_VERIFY = $(BINDIR)/zimage_pipe_verify  # Z-Image-Turbo from the prompt to the image vs the reference (tests/zimage_pipe_verify.cpp; run from build/co)
 SD_GEMM_BENCH = $(BINDIR)/sd_gemm_bench  # the BF16 linears at the Z-Image DiT shapes: time, TFLOPS, error (tests/sd_gemm_bench.cpp)
+AUDIOLDM2_CLAP_VERIFY = $(BINDIR)/audioldm2_clap_verify  # the CLAP text encoder stage check (/data/audioldm2-stages)
 AUDIOLDM2_PROJECTION_VERIFY = $(BINDIR)/audioldm2_projection_verify  # the projection stage check (/data/audioldm2-stages)
 AUDIOLDM2_GPT2_VERIFY = $(BINDIR)/audioldm2_gpt2_verify  # the GPT-2 stage check against the diffusers oracle (/data/audioldm2-stages)
 ZIMAGE_BLOCK_DUMP = $(BINDIR)/zimage_block_dump  # one DiT call at 256 px with the per-block dump (ZI_DIT_DUMP); tests/zimage_block_dump.cpp
@@ -373,7 +374,7 @@ uninstall:
 	rm -f $(INSTALL_PKGCONFIGDIR)/rocm-inference.pc
 
 # Phase 4: Qwen 3 model static library
-QWEN_SRCS = $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_ops.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/deltanet.cpp $(SRCDIR)/attention.cpp $(SRCDIR)/gpu_ops.cpp $(SRCDIR)/kernel_loader.cpp $(SRCDIR)/glm5_ref.cpp $(SRCDIR)/glm5_gpu.cpp $(SRCDIR)/expert_cpu.cpp $(SRCDIR)/vision.cpp $(SRCDIR)/image.cpp $(SRCDIR)/mrope.cpp $(SRCDIR)/whisper.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/audio.cpp $(SRCDIR)/sd.cpp $(SRCDIR)/sd_device.cpp $(SRCDIR)/minimax_vae.cpp $(SRCDIR)/minimax_dit.cpp $(SRCDIR)/minimax_pipe.cpp $(SRCDIR)/safetensors_mmap.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_speech.cpp $(SRCDIR)/zimage_dit.cpp $(SRCDIR)/zimage_vae.cpp $(SRCDIR)/zimage_text.cpp $(SRCDIR)/zimage_pipe.cpp $(SRCDIR)/audioldm2_gpt2.cpp $(SRCDIR)/audioldm2_projection.cpp $(SRCDIR)/qwenimage_text.cpp $(SRCDIR)/qwenimage_dit.cpp $(SRCDIR)/qwenimage_vae.cpp $(SRCDIR)/qwenimage_pipe.cpp $(SRCDIR)/qwenimage21_dit.cpp $(SRCDIR)/qwenimage21_text.cpp $(SRCDIR)/qwenimage21_vae.cpp
+QWEN_SRCS = $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_ops.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/deltanet.cpp $(SRCDIR)/attention.cpp $(SRCDIR)/gpu_ops.cpp $(SRCDIR)/kernel_loader.cpp $(SRCDIR)/glm5_ref.cpp $(SRCDIR)/glm5_gpu.cpp $(SRCDIR)/expert_cpu.cpp $(SRCDIR)/vision.cpp $(SRCDIR)/image.cpp $(SRCDIR)/mrope.cpp $(SRCDIR)/whisper.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/audio.cpp $(SRCDIR)/sd.cpp $(SRCDIR)/sd_device.cpp $(SRCDIR)/minimax_vae.cpp $(SRCDIR)/minimax_dit.cpp $(SRCDIR)/minimax_pipe.cpp $(SRCDIR)/safetensors_mmap.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_speech.cpp $(SRCDIR)/zimage_dit.cpp $(SRCDIR)/zimage_vae.cpp $(SRCDIR)/zimage_text.cpp $(SRCDIR)/zimage_pipe.cpp $(SRCDIR)/audioldm2_gpt2.cpp $(SRCDIR)/audioldm2_projection.cpp $(SRCDIR)/audioldm2_clap.cpp $(SRCDIR)/qwenimage_text.cpp $(SRCDIR)/qwenimage_dit.cpp $(SRCDIR)/qwenimage_vae.cpp $(SRCDIR)/qwenimage_pipe.cpp $(SRCDIR)/qwenimage21_dit.cpp $(SRCDIR)/qwenimage21_text.cpp $(SRCDIR)/qwenimage21_vae.cpp
 QWEN_HDRS = $(SRCDIR)/whisper.h $(SRCDIR)/mel.h $(SRCDIR)/qwen3tts.h $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/qwen3tts_speech.h $(SRCDIR)/vision.h $(SRCDIR)/image.h $(SRCDIR)/mrope.h $(SRCDIR)/third_party/stb_image.h $(SRCDIR)/expert_pager.h $(SRCDIR)/expert_cpu.h $(SRCDIR)/qwen_model.h $(SRCDIR)/qwen_ops.h $(SRCDIR)/qmatvec.h $(SRCDIR)/deltanet.h $(SRCDIR)/attention.h $(SRCDIR)/gpu_ops.h $(SRCDIR)/inference_internal.h $(SRCDIR)/kernel_loader.h $(SRCDIR)/inference_log.h $(SRCDIR)/glm5_ref.h $(SRCDIR)/glm5_gpu.h
 # The engine's code objects, embedded in the library (kernels_embed.S, loaded by kernel_loader.cpp)
 ENGINE_COS = $(CODIR)/matvec_q.co $(CODIR)/gpu_ops.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/glm5_gpu.co $(CODIR)/talker_gpu.co $(CODIR)/sd_gpu.co $(CODIR)/minimax_vae.co $(CODIR)/codec_gpu.co
@@ -409,6 +410,7 @@ $(QWEN_MODEL_LIB): $(QWEN_SRCS) $(QWEN_HDRS) $(SRCDIR)/inference.h $(SRCDIR)/ggu
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/zimage_text.cpp -o $(OBJDIR)/zimage_text.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/audioldm2_gpt2.cpp -o $(OBJDIR)/audioldm2_gpt2.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/audioldm2_projection.cpp -o $(OBJDIR)/audioldm2_projection.o
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/audioldm2_clap.cpp -o $(OBJDIR)/audioldm2_clap.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/zimage_pipe.cpp -o $(OBJDIR)/zimage_pipe.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/qwenimage_text.cpp -o $(OBJDIR)/qwenimage_text.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/qwenimage_dit.cpp -o $(OBJDIR)/qwenimage_dit.o
@@ -421,7 +423,7 @@ $(QWEN_MODEL_LIB): $(QWEN_SRCS) $(QWEN_HDRS) $(SRCDIR)/inference.h $(SRCDIR)/ggu
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/qwen3tts_codec.cpp -o $(OBJDIR)/qwen3tts_codec.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/qwen3tts_speech.cpp -o $(OBJDIR)/qwen3tts_speech.o
 	rm -f $@
-	ar rcs $@ $(OBJDIR)/qwen_model.o $(OBJDIR)/qwen_ops.o $(OBJDIR)/qmatvec.o $(OBJDIR)/deltanet.o $(OBJDIR)/attention.o $(OBJDIR)/gpu_ops.o $(OBJDIR)/kernel_loader.o $(OBJDIR)/glm5_ref.o $(OBJDIR)/glm5_gpu.o $(OBJDIR)/expert_cpu.o $(OBJDIR)/vision.o $(OBJDIR)/image.o $(OBJDIR)/mrope.o $(OBJDIR)/whisper.o $(OBJDIR)/mel.o $(OBJDIR)/audio.o $(OBJDIR)/sd.o $(OBJDIR)/sd_device.o $(OBJDIR)/minimax_vae.o $(OBJDIR)/minimax_dit.o $(OBJDIR)/minimax_pipe.o $(OBJDIR)/safetensors_mmap.o $(OBJDIR)/qwen3tts.o $(OBJDIR)/qwen3tts_codec.o $(OBJDIR)/qwen3tts_speech.o $(OBJDIR)/kernels_embed.o $(OBJDIR)/zimage_dit.o $(OBJDIR)/zimage_vae.o $(OBJDIR)/zimage_text.o $(OBJDIR)/zimage_pipe.o $(OBJDIR)/audioldm2_gpt2.o $(OBJDIR)/audioldm2_projection.o $(OBJDIR)/qwenimage_text.o $(OBJDIR)/qwenimage_dit.o $(OBJDIR)/qwenimage_vae.o $(OBJDIR)/qwenimage_pipe.o $(OBJDIR)/qwenimage21_dit.o $(OBJDIR)/qwenimage21_text.o $(OBJDIR)/qwenimage21_vae.o
+	ar rcs $@ $(OBJDIR)/qwen_model.o $(OBJDIR)/qwen_ops.o $(OBJDIR)/qmatvec.o $(OBJDIR)/deltanet.o $(OBJDIR)/attention.o $(OBJDIR)/gpu_ops.o $(OBJDIR)/kernel_loader.o $(OBJDIR)/glm5_ref.o $(OBJDIR)/glm5_gpu.o $(OBJDIR)/expert_cpu.o $(OBJDIR)/vision.o $(OBJDIR)/image.o $(OBJDIR)/mrope.o $(OBJDIR)/whisper.o $(OBJDIR)/mel.o $(OBJDIR)/audio.o $(OBJDIR)/sd.o $(OBJDIR)/sd_device.o $(OBJDIR)/minimax_vae.o $(OBJDIR)/minimax_dit.o $(OBJDIR)/minimax_pipe.o $(OBJDIR)/safetensors_mmap.o $(OBJDIR)/qwen3tts.o $(OBJDIR)/qwen3tts_codec.o $(OBJDIR)/qwen3tts_speech.o $(OBJDIR)/kernels_embed.o $(OBJDIR)/zimage_dit.o $(OBJDIR)/zimage_vae.o $(OBJDIR)/zimage_text.o $(OBJDIR)/zimage_pipe.o $(OBJDIR)/audioldm2_gpt2.o $(OBJDIR)/audioldm2_projection.o $(OBJDIR)/audioldm2_clap.o $(OBJDIR)/qwenimage_text.o $(OBJDIR)/qwenimage_dit.o $(OBJDIR)/qwenimage_vae.o $(OBJDIR)/qwenimage_pipe.o $(OBJDIR)/qwenimage21_dit.o $(OBJDIR)/qwenimage21_text.o $(OBJDIR)/qwenimage21_vae.o
 
 # Phase 4: Qwen 3 demo binary
 $(QWEN_DEMO): $(SRCDIR)/demo_qwen.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/matvec_q.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/gpu_ops.co
@@ -448,6 +450,9 @@ $(QWENIMAGE_VERIFY): $(TESTSDIR)/qwenimage_verify.cpp $(SRCDIR)/sd_device.cpp $(
 
 $(ZIMAGE_1024_VERIFY): $(TESTSDIR)/zimage_1024_verify.cpp $(SRCDIR)/zimage_pipe.cpp $(SRCDIR)/zimage_pipe.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/zimage_1024_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
+
+$(AUDIOLDM2_CLAP_VERIFY): $(TESTSDIR)/audioldm2_clap_verify.cpp $(SRCDIR)/audioldm2_clap.cpp $(SRCDIR)/audioldm2_clap.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/audioldm2_clap_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
 
 $(AUDIOLDM2_PROJECTION_VERIFY): $(TESTSDIR)/audioldm2_projection_verify.cpp $(SRCDIR)/audioldm2_projection.cpp $(SRCDIR)/audioldm2_projection.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/audioldm2_projection_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@

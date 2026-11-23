@@ -145,6 +145,11 @@ void audio_gemm_f32(const float* x, int T, int in, const float* W, const float* 
 void audio_layer_norm_f32(const float* x, int T, int C, const float* w, const float* b, float eps, float* y);
 /* causal attention with 64-wide heads (scale 1/8): qkv [T][3 H 64] -> out [T][H 64] */
 void audio_causal_attn_f32(const float* qkv, int T, int H, float* out);
+/* multi-head attention with 64-wide heads (scale 1/8): q, k, v [T][C] with row stride ld; causal or not; kmask (T floats, 0 for
+ * a padding key, device-accessible) or null; out [T][C] */
+void audio_attention_f32(const float* q, const float* k, const float* v, int ld, int T, int H, bool causal, const float* kmask, float* out);
+/* exact GELU (erf), in place */
+void audio_gelu_erf(float* x, size_t n);
 /* the device's BF16 values copied to host memory as float (debugging dumps; not a serving path) */
 void download_bf16_as_f32(const uint16_t* d, float* h, size_t n);
 // g = BF16(silu(a) b) for BF16 a, b

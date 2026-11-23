@@ -1745,3 +1745,52 @@ extern "C" __global__ void __launch_bounds__(64) audio_causal_attn_f32(const flo
     for (int j = 0; j <= t; ++j) acc += sc[j] * qkv[(long)j * ld + 2 * C + h * 64 + d];
     out[(long)t * C + h * 64 + d] = acc * qs[0];
 }
+
+// Multi-head attention with 64-wide heads for AudioLDM 2's text models: q, k, v [T][C] with row stride ld (C = H * 64); causal
+// (keys up to the query) or not; kmask (T floats, 0 for a padding key) or null. out [T][C]. Grid (T, H), 64 threads; scale 1/8.
+extern "C" __global__ void __launch_bounds__(64) audio_attn_f32(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+                                                                int ld, int T, int H, int causal, const float* __restrict__ kmask,
+                                                                float* __restrict__ out) {
+    extern __shared__ float sm[];
+    float* qs = sm;
+    float* sc = sm + 64;
+    const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    const int C = H * 64;
+    const float scale = 0.125f;
+    qs[d] = q[(long)t * ld + h * 64 + d];
+    __syncthreads();
+    const int jmax = causal ? t : T - 1;
+    for (int j = d; j <= jmax; j += 64) {
+        if (kmask && kmask[j] == 0.0f) {
+            sc[j] = -INFINITY;
+        } else {
+            float acc = 0.0f;
+            const float* kr = k + (long)j * ld + h * 64;
+            for (int e = 0; e < 64; ++e) acc += qs[e] * kr[e];
+            sc[j] = acc * scale;
+        }
+    }
+    __syncthreads();
+    if (d == 0) {
+        float m = -INFINITY;
+        for (int j = 0; j <= jmax; ++j) m = fmaxf(m, sc[j]);
+        float sum = 0.0f;
+        for (int j = 0; j <= jmax; ++j) {
+            sc[j] = expf(sc[j] - m);
+            sum += sc[j];
+        }
+        qs[0] = 1.0f / sum;
+    }
+    __syncthreads();
+    float acc = 0.0f;
+    for (int j = 0; j <= jmax; ++j) acc += sc[j] * v[(long)j * ld + h * 64 + d];
+    out[(long)t * C + h * 64 + d] = acc * qs[0];
+}
+
+// GELU (the exact erf form, as transformers' "gelu"), in place
+extern "C" __global__ void __launch_bounds__(SD_THREADS) audio_gelu_erf_f32(float* x, long n) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= n) return;
+    const float v = x[i];
+    x[i] = 0.5f * v * (1.0f + erff(v * 0.7071067811865476f));
+}
