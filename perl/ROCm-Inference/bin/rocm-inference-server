@@ -1414,12 +1414,12 @@ route::post '/v1/images/generations' => sub {
     # steps: Z-Image-Turbo's (9 by default, as the ComfyUI workflow; the sd-turbo file takes its own one step)
     my $steps = $p->{steps};
     error(400, 'steps: a whole number from 1 to 50') if defined $steps && !($steps =~ /\A\d+\z/ && $steps >= 1 && $steps <= 50);
-    my $png = eval { $backend == $ZIMAGE ? $backend->generate($prompt, size => $size, seed => $seed, steps => $steps)
+    my $png = eval { (defined $ZIMAGE && $backend == $ZIMAGE) ? $backend->generate($prompt, size => $size, seed => $seed, steps => $steps)
                                          : $backend->generate($prompt, size => $size, seed => $seed) };
     error(400, $@ =~ s/ at \S+ line \d+\.?\n?\z//r) if $@;
     my $secs = Time::HiRes::time() - $t0;
     my $canvas = '';
-    if ($backend == $MINIMAX) { my ($cw, $ch) = ROCm::Inference::MiniMaxImage::canvas(split /x/, $size); $canvas = ", canvas ${cw}x$ch" }
+    if (defined $MINIMAX && $backend == $MINIMAX) { my ($cw, $ch) = ROCm::Inference::MiniMaxImage::canvas(split /x/, $size); $canvas = ", canvas ${cw}x$ch" }
     $LOG->info('request', event => 'image', msg => sprintf('%s: %s%s, seed %d, %.1f s, %d bytes of PNG', $model, $size, $canvas, $seed, $secs, length $png));
     return [200, ['Content-Type' => 'image/png'], $png] if $fmt eq 'png';
     require MIME::Base64;
