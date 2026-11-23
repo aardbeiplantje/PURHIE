@@ -13,6 +13,10 @@ namespace audioldm2 {
  * for the device by the caller (st.register_device()). False on any error. */
 bool gpt2_forward(const zimage::SafeTensors& st, const float* x, int T, float* hidden6, float* last);
 
+/* the pipeline's generate_language_model: each of max_new steps runs the GPT-2 on the sequence so far and appends the last
+ * hidden state (HF's hidden_states[-1]); out [max_new][768] gets the generated rows. embeds [T][768], T + max_new <= 1024. */
+bool gpt2_generate(const zimage::SafeTensors& st, const float* embeds, int T, int max_new, float* out);
+
 }  // namespace audioldm2
 
 #endif  /* AUDIOLDM2_GPT2_H */

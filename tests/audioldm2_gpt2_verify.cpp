@@ -58,5 +58,18 @@ int main(int argc, char** argv) {
     std::printf("GPT-2, T = %d tokens\n", T);
     const bool a = compare("hidden6", got6, h6);
     const bool b = compare("last", gotl, last);
-    return a && b ? 0 : 1;
+    /* the generation (generate_language_model: 8 steps on the projection's rows, gen_proj.f32 -> gen_out.f32) */
+    std::vector<float> gp, gout;
+    if (!read_floats(dir + "/gen_proj.f32", gp) || !read_floats(dir + "/gen_out.f32", gout)) {
+        std::fprintf(stderr, "cannot read gen_proj.f32 / gen_out.f32 in %s\n", dir.c_str());
+        return 1;
+    }
+    const int Tp = (int)(gp.size() / 768);
+    std::vector<float> gen(gout.size());
+    if (!audioldm2::gpt2_generate(st, gp.data(), Tp, (int)(gout.size() / 768), gen.data())) {
+        std::fprintf(stderr, "the GPT-2 generation failed\n");
+        return 1;
+    }
+    const bool c = compare("generate", gen, gout);
+    return a && b && c ? 0 : 1;
 }

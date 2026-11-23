@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace audioldm2 {
 namespace {
@@ -71,6 +72,20 @@ bool gpt2_forward(const zimage::SafeTensors& st, const float* x, int T, float* h
         sddev::audio_layer_norm_f32(X.data(), T, kDim, lfw, lfb, 1e-5f, LN.data());
         std::memcpy(last, LN.data(), sizeof(float) * n);
     }
+    return true;
+}
+
+bool gpt2_generate(const zimage::SafeTensors& st, const float* embeds, int T, int max_new, float* out) {
+    if (T < 1 || max_new < 1 || T + max_new > 1024) { std::fprintf(stderr, "audioldm2: the GPT-2 generation length\n"); return false; }
+    std::vector<float> seq((size_t)(T + max_new) * kDim), last((size_t)(T + max_new) * kDim);
+    std::memcpy(seq.data(), embeds, sizeof(float) * (size_t)T * kDim);
+    int len = T;
+    for (int k = 0; k < max_new; ++k) {
+        if (!gpt2_forward(st, seq.data(), len, nullptr, last.data())) return false;
+        std::memcpy(seq.data() + (size_t)len * kDim, last.data() + (size_t)(len - 1) * kDim, sizeof(float) * kDim);
+        ++len;
+    }
+    std::memcpy(out, seq.data() + (size_t)T * kDim, sizeof(float) * (size_t)max_new * kDim);
     return true;
 }
 
