@@ -1827,3 +1827,55 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) audio_copy_f32(float* d
     const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
     if (i < n) dst[i] = src[i];
 }
+
+// 1-D convolution (stride 1, dilation dil, zero padding pad): x [cin][T], w [cout][cin][k], b [cout] -> y [cout][Tout]
+extern "C" __global__ void __launch_bounds__(SD_THREADS) audio_conv1d_f32(const float* __restrict__ x, const float* __restrict__ w,
+                                                                          const float* __restrict__ b, int cin, int cout, int T, int k,
+                                                                          int pad, int dil, int Tout, float* __restrict__ y) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= (long)cout * Tout) return;
+    const int co = (int)(i / Tout), t = (int)(i % Tout);
+    float acc = b[co];
+    for (int ci = 0; ci < cin; ++ci)
+        for (int j = 0; j < k; ++j) {
+            const int ti = t - pad + j * dil;
+            if (ti >= 0 && ti < T) acc += x[(long)ci * T + ti] * w[((long)co * cin + ci) * k + j];
+        }
+    y[i] = acc;
+}
+
+// 1-D transposed convolution (stride s, zero padding pad): x [cin][T], w [cin][cout][k], b [cout] -> y [cout][Tout]
+extern "C" __global__ void __launch_bounds__(SD_THREADS) audio_conv_transpose1d_f32(const float* __restrict__ x, const float* __restrict__ w,
+                                                                                    const float* __restrict__ b, int cin, int cout, int T,
+                                                                                    int k, int stride, int pad, int Tout, float* __restrict__ y) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= (long)cout * Tout) return;
+    const int co = (int)(i / Tout), o = (int)(i % Tout);
+    float acc = b[co];
+    for (int j = 0; j < k; ++j) {
+        const int num = o + pad - j;
+        if (num < 0 || num % stride != 0) continue;
+        const int t = num / stride;
+        if (t >= T) continue;
+        for (int ci = 0; ci < cin; ++ci) acc += x[(long)ci * T + t] * w[((long)ci * cout + co) * k + j];
+    }
+    y[i] = acc;
+}
+
+// x = leaky_relu(x, slope), in place
+extern "C" __global__ void __launch_bounds__(SD_THREADS) audio_leaky_relu_f32(float* x, float slope, long n) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i < n && x[i] < 0.0f) x[i] *= slope;
+}
+
+// x = x * s, in place
+extern "C" __global__ void __launch_bounds__(SD_THREADS) audio_scale_f32(float* x, float s, long n) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i < n) x[i] *= s;
+}
+
+// x = tanh(x), in place
+extern "C" __global__ void __launch_bounds__(SD_THREADS) audio_tanh_f32(float* x, long n) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i < n) x[i] = tanhf(x[i]);
+}

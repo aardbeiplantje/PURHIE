@@ -157,6 +157,14 @@ void audio_gelu_tanh_mul(float* a, const float* b, size_t n);
 void audio_add_channel(float* h, const float* t, int C, int HW);
 /* dst[0..n) = src[0..n) (device-accessible buffers) */
 void audio_copy(float* dst, const float* src, size_t n);
+/* 1-D convolution, stride 1: x [cin][T] -> y [cout][Tout], Tout = T + 2 pad - dil (k - 1); w [cout][cin][k] */
+void audio_conv1d(const float* x, int cin, int T, const float* w, const float* b, int cout, int k, int pad, int dil, float* y, int Tout);
+/* 1-D transposed convolution: x [cin][T] -> y [cout][Tout], Tout = (T - 1) stride - 2 pad + k; w [cin][cout][k] */
+void audio_conv_transpose1d(const float* x, int cin, int T, const float* w, const float* b, int cout, int k, int stride, int pad, float* y,
+                            int Tout);
+void audio_leaky_relu(float* x, float slope, size_t n);
+void audio_scale(float* x, float s, size_t n);
+void audio_tanh(float* x, size_t n);
 /* exact GELU (erf), in place */
 void audio_gelu_erf(float* x, size_t n);
 /* the device's BF16 values copied to host memory as float (debugging dumps; not a serving path) */
