@@ -445,11 +445,19 @@ bool dev_refiner_block(const SafeTensors& st, const std::string& pre, float* x, 
         for (int i2 = 0; i2 < 4 * dim; ++i2) bada.p[i2] = bada_h[i2];
         DevBuf mod(4 * dim);
         sddev::linear_bf16(t256, 1, wada, 256, 4 * dim, bada.p, mod.p);
+        static const bool modq = std::getenv("ZI_NO_MODQ") == nullptr;  /* the adaLN output and 1 + it in BF16, as diffusers (ZI_NO_MODQ=1: off) */
+        if (modq) sddev::round_bf16_inplace(mod.p, 4 * dim);
         for (int c = 0; c < dim; ++c) {
             sc_msa.p[c] = 1.0f + mod.p[c];
             g_msa.p[c] = std::tanh(mod.p[dim + c]);
             sc_mlp.p[c] = 1.0f + mod.p[2 * dim + c];
             g_mlp.p[c] = std::tanh(mod.p[3 * dim + c]);
+        }
+        if (modq) {
+            sddev::round_bf16_inplace(sc_msa.p, dim);
+            sddev::round_bf16_inplace(sc_mlp.p, dim);
+            sddev::round_bf16_inplace(g_msa.p, dim);
+            sddev::round_bf16_inplace(g_mlp.p, dim);
         }
     } else {
         for (int c = 0; c < dim; ++c) sc_msa.p[c] = g_msa.p[c] = sc_mlp.p[c] = g_mlp.p[c] = 1.0f;
@@ -470,12 +478,30 @@ bool dev_refiner_block(const SafeTensors& st, const std::string& pre, float* x, 
     sddev::linear_bf16_xb16(h.p, N, wqkv + 2 * sq, dim, dim, zeros.p, vb.p);
     sddev::head_norm_rope_bf16(qb.p, N, H, wqn, eps, fr, qb.p);  /* the per-head QK norms (rows of 128) and the rotation */
     sddev::head_norm_rope_bf16(kb.p, N, H, wkn, eps, fr, kb.p);
+    if (const char* qd = std::getenv("ZI_QKV_DUMP"); qd && std::getenv("ZI_ATTN_LAYER") && pre == std::getenv("ZI_ATTN_LAYER")) {
+        /* debugging: the BF16 q, k, v after the norms and RoPE (the attention's inputs) of the layer ZI_ATTN_LAYER */
+        std::vector<float> hq((size_t)N * dim);
+        const char* suffix[4] = {".q", ".k", ".v", ".h"};
+        uint16_t* parts[4] = {qb.p, kb.p, vb.p, h.p};
+        for (int i = 0; i < 4; ++i) {
+            sddev::download_bf16_as_f32(parts[i], hq.data(), (size_t)N * dim);
+            if (FILE* f = std::fopen((std::string(qd) + suffix[i]).c_str(), "wb")) { std::fwrite(hq.data(), sizeof(float), hq.size(), f); std::fclose(f); }
+        }
+    }
     DevBuf att(static_cast<size_t>(N) * dim);
     sddev::attention_bf16(qb.p, N, kb.p, vb.p, N, dim, H, att.p);
     DevHalf attb(static_cast<size_t>(N) * dim);
     sddev::to_bf16(att.p, attb.p, (size_t)N * dim);
     DevHalf o(static_cast<size_t>(N) * dim);
     sddev::linear_bf16_xb16(attb.p, N, wout, dim, dim, zeros.p, o.p);
+    const char* ad = std::getenv("ZI_ATTN_DUMP");
+    const char* al = std::getenv("ZI_ATTN_LAYER");
+    if (ad && al && pre == al) {
+        /* the attention module's output (before the norm and the gate): the layer named by ZI_ATTN_LAYER */
+        std::vector<float> h((size_t)N * dim);
+        sddev::download_bf16_as_f32(o.p, h.data(), (size_t)N * dim);
+        if (FILE* f = std::fopen(ad, "wb")) { std::fwrite(h.data(), sizeof(float), h.size(), f); std::fclose(f); }
+    }
     sddev::rms_gate_add_bf16(x, N, dim, o.p, wn2, eps, g_msa.p);  /* x += g_msa * rms(o) wn2 */
     if (resid_bf16) sddev::round_bf16_inplace(x, (size_t)N * dim);  /* the residual in BF16 */
     /* feed-forward (SwiGLU) */

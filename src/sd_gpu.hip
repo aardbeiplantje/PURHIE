@@ -626,14 +626,21 @@ extern "C" __global__ void __launch_bounds__(256) sd_to_bf16(const float* x, uin
 // rounding at the end: the results are bit-identical to rounding the FP32 outputs). y[t][c] = BF16(rms(x[t])[c] w[c] s[c]),
 // the RMS norm (sd_rms_norm) and the AdaLN scale (zimage_modulate) in one pass
 extern "C" __global__ void __launch_bounds__(SD_THREADS)
-zimage_rms_mod_bf16(const float* x, int C, const uint16_t* w, float eps, const float* s, uint16_t* y) {
+zimage_rms_mod_bf16(const float* x, int C, const uint16_t* w, float eps, const float* s, uint16_t* y, int ex) {
     __shared__ float red[SD_THREADS];
     const float* xr = x + (long)blockIdx.x * C;
     uint16_t* yr = y + (long)blockIdx.x * C;
     float q = 0.0f;
     for (int i = threadIdx.x; i < C; i += SD_THREADS) q += xr[i] * xr[i];
     const float inv = rsqrtf(block_sum(q, red) / (float)C + eps);
-    for (int i = threadIdx.x; i < C; i += SD_THREADS) yr[i] = f2bf(xr[i] * inv * bf2f(w[i]) * s[i]);
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) {
+        if (ex) {  // diffusers' RMSNorm (BF16 x * rsqrt, then BF16 times the weight) and the BF16 scale
+            const float n1 = bf2f(f2bf(xr[i] * inv));
+            yr[i] = f2bf(bf2f(f2bf(n1 * bf2f(w[i]))) * s[i]);
+        } else {
+            yr[i] = f2bf(xr[i] * inv * bf2f(w[i]) * s[i]);
+        }
+    }
 }
 
 // g[i] = BF16(silu(a[i]) * b[i]): zimage_swiglu's values, rounded to BF16 (the feed-forward's down projection takes them)
@@ -721,7 +728,7 @@ extern "C" __global__ void __launch_bounds__(256) zimage_transpose_pad_bf16_in(c
 // x[t][c] += g[c] * (rms(o[t]) w[c]): the RMS norm of a BF16 row (sd_rms_norm's operations) and the gated residual
 // (zimage_gate_add), in place on the FP32 residual x
 extern "C" __global__ void __launch_bounds__(SD_THREADS)
-zimage_rms_gate_add_bf16(float* x, int C, const uint16_t* o, const uint16_t* w, float eps, const float* g) {
+zimage_rms_gate_add_bf16(float* x, int C, const uint16_t* o, const uint16_t* w, float eps, const float* g, int ex) {
     __shared__ float red[SD_THREADS];
     const uint16_t* orow = o + (long)blockIdx.x * C;
     float* xr = x + (long)blockIdx.x * C;
@@ -731,7 +738,14 @@ zimage_rms_gate_add_bf16(float* x, int C, const uint16_t* o, const uint16_t* w, 
         q += ov * ov;
     }
     const float inv = rsqrtf(block_sum(q, red) / (float)C + eps);
-    for (int i = threadIdx.x; i < C; i += SD_THREADS) xr[i] += g[i] * (bf2f(orow[i]) * inv * bf2f(w[i]));
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) {
+        if (ex) {  // diffusers: the normed value in BF16, the gate times it in BF16, the residual sum in BF16
+            const float nv = bf2f(f2bf(bf2f(f2bf(bf2f(orow[i]) * inv)) * bf2f(w[i])));
+            xr[i] = bf2f(f2bf(xr[i] + bf2f(f2bf(g[i] * nv))));
+        } else {
+            xr[i] += g[i] * (bf2f(orow[i]) * inv * bf2f(w[i]));
+        }
+    }
 }
 
 // g = BF16(silu(a) b) with a, b in BF16 (the SwiGLU of the BF16 products)

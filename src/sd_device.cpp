@@ -1211,7 +1211,8 @@ void swiglu(const float* a0, const float* b0, float* g, size_t n0) {
 }
 
 void rms_mod_bf16(const float* x, int T, int C, const uint16_t* w, float eps, const float* s, uint16_t* y) {
-    void* a[] = {(void*)&x, (void*)&C, (void*)&w, (void*)&eps, (void*)&s, (void*)&y};
+    static const int ex = std::getenv("ZI_NO_EXACT_RESID") == nullptr;  /* diffusers' BF16 rounding order (ZI_NO_EXACT_RESID=1: off) */
+    void* a[] = {(void*)&x, (void*)&C, (void*)&w, (void*)&eps, (void*)&s, (void*)&y, (void*)&ex};
     launch(f_zm_rms_mod_bf16, dim3((unsigned)T, 1, 1), a);
     sync();
 }
@@ -1230,9 +1231,19 @@ void head_norm_rope_bf16(const uint16_t* x, int T, int H, const uint16_t* w, flo
 }
 
 void rms_gate_add_bf16(float* x, int T, int C, const uint16_t* o, const uint16_t* w, float eps, const float* g) {
-    void* a[] = {(void*)&x, (void*)&C, (void*)&o, (void*)&w, (void*)&eps, (void*)&g};
+    static const int ex = std::getenv("ZI_NO_EXACT_RESID") == nullptr;  /* diffusers' BF16 rounding order */
+    void* a[] = {(void*)&x, (void*)&C, (void*)&o, (void*)&w, (void*)&eps, (void*)&g, (void*)&ex};
     launch(f_rga16, dim3((unsigned)T, 1, 1), a);
     sync();
+}
+
+void download_bf16_as_f32(const uint16_t* d, float* h, size_t n) {
+    std::vector<uint16_t> t(n);
+    check(hipMemcpy(t.data(), d, sizeof(uint16_t) * n, hipMemcpyDeviceToHost), "download");
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t u = (uint32_t)t[i] << 16;
+        std::memcpy(&h[i], &u, 4);
+    }
 }
 
 void round_bf16_inplace(float* x, size_t n0) {

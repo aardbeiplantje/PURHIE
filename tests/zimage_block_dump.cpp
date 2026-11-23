@@ -1,4 +1,4 @@
-/* One DiT call of the engine at 256 x 256 on the inputs of /data/zimage-ref/blocks (written by ref_blocks.py: x.f32, cap.f32, t.f32),
+/* One DiT call of the engine (256 or 512 px: from the inputs' size) on the inputs of /data/zimage-ref/blocks (written by ref_blocks.py: x.f32, cap.f32, t.f32),
  * with the per-block dump of dev_dit_forward (ZI_DIT_DUMP=dir must be set). Usage: zimage_block_dump [raw_dir] [dit.safetensors] */
 #include "zimage_dit.h"
 #include "sd_device.h"
@@ -33,8 +33,16 @@ int main(int argc, char** argv) {
         return 1;
     }
     const int L = (int)(cap.size() / 2560);
-    std::vector<float> vel((size_t)16 * 32 * 32);
-    if (!zimage::dev_dit_forward(st, x.data(), cap.data(), L, t[0], vel.data(), 16, 16)) {
+    /* the latent is 16 x side x side (side = 2 gh): the grid comes from the input's size */
+    int side = 0;
+    while ((size_t)side * side * 16 < x.size()) ++side;
+    if ((size_t)side * side * 16 != x.size() || side % 2) {
+        std::fprintf(stderr, "the input x is not 16 x side x side with an even side\n");
+        return 1;
+    }
+    const int gh = side / 2;
+    std::vector<float> vel(x.size());
+    if (!zimage::dev_dit_forward(st, x.data(), cap.data(), L, t[0], vel.data(), gh, gh)) {
         std::fprintf(stderr, "the DiT call failed\n");
         return 1;
     }

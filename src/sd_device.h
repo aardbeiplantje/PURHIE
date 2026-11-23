@@ -139,6 +139,8 @@ void rms_gate_add_bf16(float* x, int T, int C, const uint16_t* o, const uint16_t
 void to_bf16(const float* x, uint16_t* y, size_t n);
 /* x[i] = BF16(x[i]) in place (the values stay FP32 containers) */
 void round_bf16_inplace(float* x, size_t n);
+/* the device's BF16 values copied to host memory as float (debugging dumps; not a serving path) */
+void download_bf16_as_f32(const uint16_t* d, float* h, size_t n);
 // g = BF16(silu(a) b) for BF16 a, b
 void swiglu_bf16_in(const uint16_t* a, const uint16_t* b, uint16_t* g, size_t n);
 // attention on BF16 q, k, v (T x C row-major, the head width 128): the output in FP32
