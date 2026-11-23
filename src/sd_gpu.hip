@@ -1681,3 +1681,67 @@ qi21_dupup(const float* x, int H, int W, int in, int out, int factor_t, float* y
     const int c = k / repeats;
     y[e] = x[((long)(oy >> 1) * W + (ox >> 1)) * in + c];
 }
+
+// ---- AudioLDM 2's GPT-2 (the language model): fp32 kernels, simple on purpose (the stage check comes first) ----
+// y[t][o] = b[o] + sum_k x[t][k] W[k][o]: x [T][in], W [in][out] (GPT-2's Conv1D layout), y [T][out]
+extern "C" __global__ void __launch_bounds__(SD_THREADS) audio_gemm_f32(const float* __restrict__ x, int T, int in, const float* __restrict__ W,
+                                                                        const float* __restrict__ b, int out, float* __restrict__ y) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= (long)T * out) return;
+    const int o = (int)(i % out), t = (int)(i / out);
+    float acc = b[o];
+    const float* xr = x + (long)t * in;
+    for (int k = 0; k < in; ++k) acc += xr[k] * W[(long)k * out + o];
+    y[i] = acc;
+}
+
+// y[t][c] = (x[t][c] - mean) / sqrt(var + eps) * w[c] + b[c]: one block per row
+extern "C" __global__ void __launch_bounds__(SD_THREADS) audio_ln_affine_f32(const float* __restrict__ x, int C, const float* __restrict__ w,
+                                                                             const float* __restrict__ b, float eps, float* __restrict__ y) {
+    __shared__ float red[SD_THREADS];
+    const float* xr = x + (long)blockIdx.x * C;
+    float* yr = y + (long)blockIdx.x * C;
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) s += xr[i];
+    const float mean = block_sum(s, red) / (float)C;
+    float q = 0.0f;
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) {
+        const float d = xr[i] - mean;
+        q += d * d;
+    }
+    const float inv = rsqrtf(block_sum(q, red) / (float)C + eps);
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) yr[i] = (xr[i] - mean) * inv * w[i] + b[i];
+}
+
+// Causal multi-head attention with 64-wide heads: qkv [T][3 C] (q, k, v in the three parts, C = H * 64), out [T][C].
+// Grid (T, H), 64 threads (one per head dimension); the scores of a query live in shared memory (dynamic: (64 + T) floats).
+extern "C" __global__ void __launch_bounds__(64) audio_causal_attn_f32(const float* __restrict__ qkv, int T, int H, float* __restrict__ out, float scale) {
+    extern __shared__ float sm[];
+    float* qs = sm;        // 64: the query, then (thread 0) the normalizer
+    float* sc = sm + 64;   // T: the scores, then the probabilities
+    const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    const int C = H * 64, ld = 3 * C;
+    qs[d] = qkv[(long)t * ld + h * 64 + d];
+    __syncthreads();
+    for (int j = d; j <= t; j += 64) {
+        float acc = 0.0f;
+        const float* kr = qkv + (long)j * ld + C + h * 64;
+        for (int e = 0; e < 64; ++e) acc += qs[e] * kr[e];
+        sc[j] = acc * scale;
+    }
+    __syncthreads();
+    if (d == 0) {
+        float m = sc[0];
+        for (int j = 1; j <= t; ++j) m = fmaxf(m, sc[j]);
+        float sum = 0.0f;
+        for (int j = 0; j <= t; ++j) {
+            sc[j] = expf(sc[j] - m);
+            sum += sc[j];
+        }
+        qs[0] = 1.0f / sum;
+    }
+    __syncthreads();
+    float acc = 0.0f;
+    for (int j = 0; j <= t; ++j) acc += sc[j] * qkv[(long)j * ld + 2 * C + h * 64 + d];
+    out[(long)t * C + h * 64 + d] = acc * qs[0];
+}

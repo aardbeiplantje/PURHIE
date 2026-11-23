@@ -139,6 +139,12 @@ void rms_gate_add_bf16(float* x, int T, int C, const uint16_t* o, const uint16_t
 void to_bf16(const float* x, uint16_t* y, size_t n);
 /* x[i] = BF16(x[i]) in place (the values stay FP32 containers) */
 void round_bf16_inplace(float* x, size_t n);
+/* AudioLDM 2's GPT-2 (fp32): y = x W + b with x [T][in], W [in][out] (the GPT-2 Conv1D layout), b [out] */
+void audio_gemm_f32(const float* x, int T, int in, const float* W, const float* b, int out, float* y);
+/* LayerNorm with weight and bias over the last dimension, x [T][C] */
+void audio_layer_norm_f32(const float* x, int T, int C, const float* w, const float* b, float eps, float* y);
+/* causal attention with 64-wide heads (scale 1/8): qkv [T][3 H 64] -> out [T][H 64] */
+void audio_causal_attn_f32(const float* qkv, int T, int H, float* out);
 /* the device's BF16 values copied to host memory as float (debugging dumps; not a serving path) */
 void download_bf16_as_f32(const uint16_t* d, float* h, size_t n);
 // g = BF16(silu(a) b) for BF16 a, b

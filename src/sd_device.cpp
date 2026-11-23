@@ -36,6 +36,7 @@ std::vector<Block> g_free;  // the released blocks, reused by alloc (best fit)
 
 int g_state = -1;  // -1: not tried, 0: host only, 1: device
 hipModule_t g_mod = nullptr;
+hipFunction_t f_audio_gemm = nullptr, f_audio_ln = nullptr, f_audio_attn = nullptr;
 hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn_sum = nullptr, f_gn_sq = nullptr,
               f_gn_apply = nullptr, f_silu = nullptr, f_add = nullptr, f_upsample2 = nullptr, f_softmax = nullptr,
               f_layer_norm = nullptr, f_rms_norm = nullptr, f_zm_modulate = nullptr, f_zm_gate_add = nullptr, f_zm_swiglu = nullptr, f_zm_rope = nullptr, f_zm_ln_plain = nullptr, f_gn_f32 = nullptr, f_to_tok = nullptr, f_to_chw = nullptr, f_zq_rope = nullptr, f_zq_attn = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma256b = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
@@ -115,6 +116,7 @@ bool init() {
     };
     const Entry entries[] = {
         {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"}, {&f_gemm_af128, "sd_gemm_af128"}, {&f_transpose_bf16, "sd_transpose_bf16"}, {&f_bias_cm, "sd_bias_cm"}, {&f_zm_rms_mod_bf16, "zimage_rms_mod_bf16"}, {&f_zm_swiglu_bf16, "zimage_swiglu_bf16"}, {&f_bf16_to_f32, "sd_bf16_to_f32"}, {&f_round_bf16, "sd_round_bf16"}, {&f_gn_sum_part, "zimage_gn_sum"}, {&f_gn_var_part, "zimage_gn_var"}, {&f_gn_apply_part, "zimage_gn_apply"}, {&f_im2col_bf16_tile, "sd_im2col_bf16_tile"}, {&f_hnr16, "zimage_head_norm_rope_bf16"}, {&f_count_diff, "sd_count_diff"}, {&f_tp16, "zimage_transpose_pad_bf16_in"}, {&f_rga16, "zimage_rms_gate_add_bf16"}, {&f_sw16, "zimage_swiglu_bf16_in"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_gemm_wmma256, "sd_gemm_wmma256"}, {&f_gemm_wmma256b, "sd_gemm_wmma256b"}, {&f_flash, "sd_flash_attn"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"}, {&f_qi_linear_f8, "qi_linear_f8"}, {&f_qi_rms_f8, "qi_rms_norm_f8"}, {&f_qi_affine, "qi_affine"}, {&f_qi_gelu, "qi_gelu_tanh"}, {&f_qv_rms, "qv_rms_tok"}, {&f_qv_patch, "qv_patch"}, {&f_qv_bias, "qv_bias_tok"}, {&f_qv_upsample, "qv_upsample2_tok"}, {&f_qi_hadamard, "qi_hadamard256"}, {&f_qi_linear_i8, "qi_linear_i8"}, {&f_qi21_zc, "qi21_zc_rms"}, {&f_qi21_gather, "qi21_gather_mod"}, {&f_qi21_mul, "qi21_mul_1p"}, {&f_qi21_gated, "qi21_gated_add"}, {&f_qi21_attn, "qi21_attn"}, {&f_qi21_lbf, "qi21_linear_bf16"}, {&f_qi21_dupup, "qi21_dupup"},
+        {&f_audio_gemm, "audio_gemm_f32"}, {&f_audio_ln, "audio_ln_affine_f32"}, {&f_audio_attn, "audio_causal_attn_f32"},
         {&f_transpose_pad, "sd_transpose_pad"}, {&f_softmax_bf16, "sd_softmax_bf16"}, {&f_softmax_bf16w, "sd_softmax_bf16_w"},
         {&f_gn_sum, "sd_gn_sum"},       {&f_gn_sq, "sd_gn_sq"},         {&f_gn_apply, "sd_gn_apply"},
         {&f_silu, "sd_silu"},           {&f_add, "sd_add"},             {&f_upsample2, "sd_upsample2"},
@@ -1244,6 +1246,29 @@ void download_bf16_as_f32(const uint16_t* d, float* h, size_t n) {
         const uint32_t u = (uint32_t)t[i] << 16;
         std::memcpy(&h[i], &u, 4);
     }
+}
+
+void audio_gemm_f32(const float* x, int T, int in, const float* W, const float* b, int out, float* y) {
+    if (T <= 0 || out <= 0) return;
+    void* a[] = {(void*)&x, (void*)&T, (void*)&in, (void*)&W, (void*)&b, (void*)&out, (void*)&y};
+    launch(f_audio_gemm, dim3(blocks((size_t)T * out), 1, 1), a);
+    sync();
+}
+
+void audio_layer_norm_f32(const float* x, int T, int C, const float* w, const float* b, float eps, float* y) {
+    void* a[] = {(void*)&x, (void*)&C, (void*)&w, (void*)&b, (void*)&eps, (void*)&y};
+    launch(f_audio_ln, dim3((unsigned)T, 1, 1), a);
+    sync();
+}
+
+// qkv [T][3 H 64] -> out [T][H 64], causal, scale 1/8
+void audio_causal_attn_f32(const float* qkv, int T, int H, float* out) {
+    const float scale = 0.125f;
+    int tt = T, hh = H;
+    void* a[] = {(void*)&qkv, (void*)&tt, (void*)&hh, (void*)&out, (void*)&scale};
+    check(hip_launch(f_audio_attn, (unsigned)T, (unsigned)H, 1, 64, 1, 1, (unsigned)(sizeof(float) * (64 + (size_t)T)), nullptr, a, nullptr),
+          "audio causal attention");
+    sync();
 }
 
 void round_bf16_inplace(float* x, size_t n0) {
