@@ -7,6 +7,8 @@ import base64
 import io
 import json
 import os
+import socket
+import urllib.error
 import urllib.request
 
 import numpy as np
@@ -14,6 +16,22 @@ import torch
 from PIL import Image
 
 DEFAULT_SERVER = os.environ.get("ROCM_INFERENCE_URL", "http://rocm-inference:8080")
+
+class RocmInferenceError(RuntimeError):
+    """A request to the service failed: one line for the ComfyUI log, without the library's chained traceback."""
+
+
+def _fail(message):
+    raise RocmInferenceError("[rocm-inference] " + message) from None
+
+
+def _service_error(server, err):
+    """The message of an HTTP error: the service's JSON {error: {message}} when it sent one, else the status line."""
+    try:
+        detail = json.loads(err.read().decode("utf-8", "replace"))["error"]["message"]
+    except (ValueError, KeyError, TypeError):
+        detail = err.reason or "no detail"
+    return f"{server}: HTTP {err.code}: {detail}"
 
 
 class RocmInferenceImage:
@@ -50,9 +68,21 @@ class RocmInferenceImage:
         }).encode("utf-8")
         req = urllib.request.Request(base + "/v1/images/generations", data=body,
                                      headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=3600) as resp:
-            reply = json.loads(resp.read().decode("utf-8"))
-        png = base64.b64decode(reply["data"][0]["b64_json"])
+        try:
+            with urllib.request.urlopen(req, timeout=3600) as resp:
+                reply = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as err:
+            _fail(_service_error(base, err))
+        except urllib.error.URLError as err:
+            _fail(f"{base}: cannot connect ({err.reason}); check the server address (the node's server input or ROCM_INFERENCE_URL)")
+        except (socket.timeout, TimeoutError):
+            _fail(f"{base}: no answer within the timeout (the generation is still running on the server or the server hung)")
+        except ValueError:
+            _fail(f"{base}: the reply is not JSON (is the address the service's /rocm prefix?)")
+        try:
+            png = base64.b64decode(reply["data"][0]["b64_json"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            _fail(f"{base}: the reply has no image")
         rgb = np.asarray(Image.open(io.BytesIO(png)).convert("RGB"), dtype=np.float32) / 255.0
         return (torch.from_numpy(rgb)[None, ...],)
 

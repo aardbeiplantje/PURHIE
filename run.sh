@@ -24,6 +24,10 @@ while [ "$(docker ps -a -q -f name=^$D$)" ]; do
 done
 
 # Now run
+# ZIMAGE_DIR set: the Z-Image files are mounted at /zimage and the server gets --zimage /zimage (unless ROCM_ARGS has one)
+if [ -n "${ZIMAGE_DIR:-}" ] && [[ " ${ROCM_ARGS:-} " != *" --zimage "* ]]; then
+    ROCM_ARGS="${ROCM_ARGS:-} --zimage /zimage"
+fi
 exec docker run \
     --restart=always \
     --name $D \
@@ -46,6 +50,7 @@ exec docker run \
     $([ -n "$MODELS_DIR"    ] && echo "-v $MODELS_DIR:/models:rw") \
     $([ -n "$ROCM_STORE_DIR" ] && echo "-v $ROCM_STORE_DIR:/kvstore:rw") \
     $([ -n "$HF_HOME" ] && echo "-v $HF_HOME:/hf:rw") \
+    $([ -n "$ZIMAGE_DIR" ] && echo "-v $ZIMAGE_DIR:/zimage:ro") \
     -e XDG_CACHE_HOME=${XDG_CACHE_HOME:-/dev/shm} \
     -e HF_HOME=${HF_HOME:-/hf} \
     -e HF_TOKEN=${HF_TOKEN:-} \
