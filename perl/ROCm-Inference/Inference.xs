@@ -26,6 +26,7 @@
 #include "sd.h"
 #include "minimax_pipe.h"
 #include "zimage_pipe.h"
+#include "audioldm2_api.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -1335,6 +1336,80 @@ mm_rope_delta(h)
     SV* h
   CODE:
     RETVAL = inference_mm_rope_delta(handle_ptr(aTHX_ h, 0));
+  OUTPUT:
+    RETVAL
+
+
+# ---- AudioLDM 2 (text to audio): the C API over the pipeline (audioldm2_api.h); the Perl class is ROCm::Inference::AudioLDM2
+
+IV
+_aud_open(dir, clap_vocab, clap_merges, t5_pieces, t5_scores)
+    const char* dir
+    SV* clap_vocab
+    SV* clap_merges
+    SV* t5_pieces
+    SV* t5_scores
+  CODE:
+    /* the arrays: the CLAP's vocabulary (by id) and merges, the T5's pieces and scores (the tokenizer.json files) */
+    AV *cv, *cm, *tp, *ts;
+    SSize_t ncv, ncm, ntp, nts, i;
+    const char** cvp;
+    const char** cmp;
+    const char** tpp;
+    double* tsp;
+    aud_pipe_t* p;
+    if (!SvROK(clap_vocab) || SvTYPE(SvRV(clap_vocab)) != SVt_PVAV || !SvROK(clap_merges) || SvTYPE(SvRV(clap_merges)) != SVt_PVAV ||
+        !SvROK(t5_pieces) || SvTYPE(SvRV(t5_pieces)) != SVt_PVAV || !SvROK(t5_scores) || SvTYPE(SvRV(t5_scores)) != SVt_PVAV)
+        croak("ROCm::Inference: _aud_open: the tokenizers are array references");
+    cv = (AV*)SvRV(clap_vocab);
+    cm = (AV*)SvRV(clap_merges);
+    tp = (AV*)SvRV(t5_pieces);
+    ts = (AV*)SvRV(t5_scores);
+    ncv = av_len(cv) + 1;
+    ncm = av_len(cm) + 1;
+    ntp = av_len(tp) + 1;
+    nts = av_len(ts) + 1;
+    if (ntp != nts) croak("ROCm::Inference: _aud_open: the T5 pieces and scores differ in number");
+    cvp = (const char**)malloc(sizeof(char*) * (size_t)(ncv ? ncv : 1));
+    cmp = (const char**)malloc(sizeof(char*) * (size_t)(ncm ? ncm : 1));
+    tpp = (const char**)malloc(sizeof(char*) * (size_t)(ntp ? ntp : 1));
+    tsp = (double*)malloc(sizeof(double) * (size_t)(nts ? nts : 1));
+    if (!cvp || !cmp || !tpp || !tsp) croak("ROCm::Inference: out of memory");
+    for (i = 0; i < ncv; ++i) cvp[i] = SvPV_nolen(*av_fetch(cv, i, 0));
+    for (i = 0; i < ncm; ++i) cmp[i] = SvPV_nolen(*av_fetch(cm, i, 0));
+    for (i = 0; i < ntp; ++i) tpp[i] = SvPV_nolen(*av_fetch(tp, i, 0));
+    for (i = 0; i < nts; ++i) tsp[i] = SvNV(*av_fetch(ts, i, 0));
+    p = aud_open(dir, cvp, (size_t)ncv, cmp, (size_t)ncm, tpp, tsp, (size_t)ntp);
+    free(cvp); free(cmp); free(tpp); free(tsp);
+    if (!p) croak("ROCm::Inference: %s", aud_last_error());
+    RETVAL = PTR2IV(p);
+  OUTPUT:
+    RETVAL
+
+void
+_aud_close(h)
+    IV h
+  CODE:
+    aud_close(INT2PTR(aud_pipe_t*, h));
+
+SV*
+_aud_generate(h, prompt, negative, seconds, steps, guidance, seed)
+    IV h
+    SV* prompt
+    SV* negative
+    NV seconds
+    int steps
+    NV guidance
+    UV seed
+  CODE:
+    /* the waveform of the prompt as float32 samples (16 kHz, mono): the Perl side writes the WAV */
+    float* wav = NULL;
+    size_t n = 0;
+    if (aud_generate(INT2PTR(aud_pipe_t*, h), SvPV_nolen(prompt), SvOK(negative) ? SvPV_nolen(negative) : "", (float)seconds, steps,
+                     (float)guidance, (unsigned long long)seed, &wav, &n) != 0)
+        croak("ROCm::Inference: aud_generate: %s", aud_last_error());
+    RETVAL = newSVpvn((const char*)wav, (STRLEN)(n * sizeof(float)));
+    aud_free(wav);
   OUTPUT:
     RETVAL
 

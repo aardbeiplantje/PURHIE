@@ -841,6 +841,57 @@ sub DESTROY {
     $img->{h} = 0;
 }
 
+# AudioLDM 2 (text to audio, the model directory of diffusers' AudioLDM2Pipeline: text_encoder/, text_encoder_2/, projection_model/,
+# language_model/, unet/, vae/, vocoder/, and the tokenizers tokenizer/ (RoBERTa, the CLAP's) and tokenizer_2/ (T5's) with their
+# tokenizer.json files). The pipeline is engine code (src/audioldm2_pipeline.h); the tokenizers are read here.
+package ROCm::Inference::AudioLDM2;
+use JSON::PP ();
+
+sub _json {
+    my ($file) = @_;
+    open my $fh, '<:raw', $file or die "audioldm2: $file: $!\n";
+    local $/;
+    my $raw = <$fh>;
+    return JSON::PP->new->utf8->decode($raw);
+}
+
+sub new {
+    my ($class, $dir) = @_;
+    die "audioldm2: $dir is not a directory\n" unless -d $dir;
+    my $clap = _json("$dir/tokenizer/tokenizer.json");
+    my $t5 = _json("$dir/tokenizer_2/tokenizer.json");
+    my %id = %{ $clap->{model}{vocab} };
+    my @vocab;
+    $vocab[$id{$_}] = $_ for keys %id;
+    die "audioldm2: the CLAP vocabulary has gaps\n" if grep { !defined } @vocab;
+    my @merges = map { ref $_ ? join(' ', @$_) : $_ } @{ $clap->{model}{merges} };
+    my @pieces = map { $_->[0] } @{ $t5->{model}{vocab} };
+    my @scores = map { $_->[1] + 0 } @{ $t5->{model}{vocab} };
+    my $h = ROCm::Inference::_aud_open($dir, \@vocab, \@merges, \@pieces, \@scores);
+    return bless { h => $h, dir => $dir }, $class;
+}
+
+# generate($prompt, seconds => 5, steps => 100, guidance => 3.5, seed => 0, negative => ''): a mono 16-bit WAV (16 kHz) of the audio
+sub generate {
+    my ($self, $prompt, %o) = @_;
+    die "audioldm2: the prompt is required\n" unless defined $prompt && length $prompt;
+    my $seconds = $o{seconds} // 5;
+    my $steps = $o{steps} // 100;
+    my $guidance = $o{guidance} // 3.5;
+    my $seed = $o{seed} // 0;
+    my $negative = $o{negative} // '';
+    my $samples = ROCm::Inference::_aud_generate($self->{h}, $prompt, $negative, $seconds, $steps, $guidance, $seed);
+    return ROCm::Inference::speech_wav16($samples, 16000);
+}
+
+sub DESTROY {
+    my ($self) = @_;
+    ROCm::Inference::_aud_close($self->{h}) if $self->{h};
+    $self->{h} = 0;
+}
+
+1;
+
 # Z-Image-Turbo (text to image, 256 x 256 for now): the ComfyUI files of a directory in ComfyUI's layout
 # (diffusion_models/z_image_turbo_bf16.safetensors, vae/ae.safetensors, text_encoders/qwen_3_4b.safetensors), read in place,
 # and the Qwen3 tokenizer.json beside the text encoder (text_encoders/tokenizer.json: ComfyUI ships none; take it from the

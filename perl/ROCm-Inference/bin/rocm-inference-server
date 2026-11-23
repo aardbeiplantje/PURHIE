@@ -27,14 +27,14 @@ GetOptions(\%o, 'model=s', 'models-dir=s', 'models-max=i', 'models-margin=f', 'k
            'name=s', 'draft=s', 'store=s', 'max_tokens=i', 'swa-ring=i', 'stage=s', 'recache', 'kv-type=s',
            'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'preserve-thinking!', 'log!', 'log-level=s', 'log-format=s', 'log-color=s',
            'thinking-low=i', 'thinking-medium=i', 'thinking-high=i',
-           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'mmproj=s', 'whisper=s', 'tts=s', 'tts-codec=s', 'voices=s', 'sd=s', 'minimax=s', 'zimage=s', 'ffmpeg=s', 'help')
+           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'mmproj=s', 'whisper=s', 'tts=s', 'tts-codec=s', 'voices=s', 'sd=s', 'minimax=s', 'zimage=s', 'audioldm2=s', 'ffmpeg=s', 'help')
     or pod2usage(2);
 # The log: --nolog is level none; --log-level, --log-format, --log-color are checked by the formatter
 our $LOG = eval { ROCm::Inference::Log->new(level => ($o{log} // 1) ? ($o{'log-level'} // 'info') : 'none',
                                               format => $o{'log-format'} // 'text', color => $o{'log-color'} // 'auto') }
     or die "--log-level, --log-format, --log-color: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n";
 pod2usage(-verbose => 2, -exitval => 0) if $o{help};
-pod2usage("--model, --models-dir, --whisper, --tts, --sd, --minimax or --zimage is required\n") unless $o{model} || $o{'models-dir'} || $o{whisper} || $o{tts} || $o{sd} || $o{minimax} || $o{zimage};
+pod2usage("--model, --models-dir, --whisper, --tts, --sd, --minimax, --zimage or --audioldm2 is required\n") unless $o{model} || $o{'models-dir'} || $o{whisper} || $o{tts} || $o{sd} || $o{minimax} || $o{zimage} || $o{audioldm2};
 ROCm::Inference::_require_minijinja()
     or die "rocm-inference-server needs the Minijinja module $ROCm::Inference::MINIJINJA_VERSION\n";
 my $no_draft = ($o{draft} // '') eq 'none';  # (no draft head, not even a model's own MTP block)
@@ -67,7 +67,7 @@ my (%AUX, %AUX_FLAG);  # kind (whisper, tts, sd) -> its record; the kinds given 
 # The kinds of the models in GET /v1/models and the endpoints each one is served at (the client routes by these)
 my %ENDPOINTS = (chat => ["/v1/chat/completions", "/v1/completions"], embedding => ["/v1/embeddings"],
                  transcription => ["/v1/audio/transcriptions"], speech => ["/v1/audio/speech", "/v1/audio/voices"],
-                 image => ["/v1/images/generations"]);
+                 image => ["/v1/images/generations"], audio => ["/v1/audio/generations"]);
 my %AUX_KIND = (whisper => "transcription", tts => "speech", sd => "image");
 my ($AUDIO_DIR_SIG);   # the last signature of --models-dir's GGUF files
 # a record: id (the name a request gives), path, codec (tts), info {bytes} (its files), m (the model when loaded), used
@@ -247,6 +247,10 @@ die "--minimax $o{minimax}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" if 
 die "--zimage $o{zimage}: not a directory\n" if $o{zimage} && !-d $o{zimage};
 my $ZIMAGE = $o{zimage} ? eval { ROCm::Inference::ZImage->new($o{zimage}) } : undef;
 die "--zimage $o{zimage}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" if $o{zimage} && !$ZIMAGE;
+# the AudioLDM 2 pipeline (--audioldm2 DIR: the diffusers model directory of ROCm::Inference::AudioLDM2); its name is "audioldm2".
+die "--audioldm2 $o{audioldm2}: not a directory\n" if $o{audioldm2} && !-d $o{audioldm2};
+my $AUDIOLDM2 = $o{audioldm2} ? eval { ROCm::Inference::AudioLDM2->new($o{audioldm2}) } : undef;
+die "--audioldm2 $o{audioldm2}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" if $o{audioldm2} && !$AUDIOLDM2;
 
 my $kv_type = $o{'kv-type'} // 'auto';
 die "--kv-type: auto, f16, q8_0 or q4_0\n" unless $kv_type =~ /\A(?:auto|f16|q8_0|q4_0)\z/;
@@ -598,7 +602,7 @@ sub pick {
         if (defined $want) {  # a speech or image model asked for in a chat: the endpoint it is served at
             my ($aux) = grep { $_->{id} eq $want } values %AUX;
             my $kind = $aux ? $AUX_KIND{ $aux->{aux} } : $want eq 'minimax-h3-image' && $MINIMAX ? 'image'
-                : $want eq 'z-image-turbo' && $ZIMAGE ? 'image' : undef;
+                : $want eq 'z-image-turbo' && $ZIMAGE ? 'image' : $want eq 'audioldm2' && $AUDIOLDM2 ? 'audio' : undef;
             error(400, "'$want' is a $kind model: use $ENDPOINTS{$kind}[0]") if $kind;
         }
         error(404, "model '$want' not found (GET /v1/models lists them)", 'not_found_error')
@@ -675,7 +679,10 @@ sub listed_models {  # every model the server serves: the chat and embedding one
                           context_length => undef, n_ctx_train => undef, bytes => undef } : ()),
             ($ZIMAGE ? { id => 'z-image-turbo', object => 'model', created => $created, owned_by => 'rocm-inference',
                          status => { value => 'loaded' }, kind => 'image', arch => undef, endpoints => $ENDPOINTS{image}, capabilities => ['image'],
-                         context_length => undef, n_ctx_train => undef, bytes => undef } : ()));
+                         context_length => undef, n_ctx_train => undef, bytes => undef } : ()),
+            ($AUDIOLDM2 ? { id => 'audioldm2', object => 'model', created => $created, owned_by => 'rocm-inference',
+                            status => { value => 'loaded' }, kind => 'audio', arch => undef, endpoints => $ENDPOINTS{audio}, capabilities => ['audio'],
+                            context_length => undef, n_ctx_train => undef, bytes => undef } : ()));
 }
 
 route::get '/health' => sub { { status => 'ok' } };
@@ -1426,6 +1433,40 @@ route::post '/v1/images/generations' => sub {
     return { created => time, data => [{ b64_json => MIME::Base64::encode_base64($png, '') }] };
 };
 
+# AudioLDM 2 (text to audio): a JSON body with the prompt, negative_prompt (optional), seconds (1 to 10: the clip's length,
+# 5 by default), steps (1 to 200: the sampler's, 100 by default), guidance_scale (0 to 20, 3.5 by default) and seed (0 by
+# default). The reply is the clip as a WAV file (mono, 16 kHz, 16 bit). One clip at a time, on the device (about 40 s for
+# 5 s at 100 steps).
+route::post '/v1/audio/generations' => sub {
+    my ($req) = @_;
+    my $p = $req->{json};
+    ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
+    error(503, 'no audio model: start the server with --audioldm2 DIR', 'server_error') unless $AUDIOLDM2;
+    my $model = $p->{model} // 'audioldm2';
+    error(400, "model: '$model' is not served (this server has audioldm2)") unless $model eq 'audioldm2';
+    my $prompt = $p->{prompt};
+    error(400, "'prompt' is required") unless defined $prompt && !ref $prompt && length $prompt;
+    error(400, 'prompt: at most 1000 characters') if length $prompt > 1000;
+    my $negative = $p->{negative_prompt} // '';
+    error(400, 'negative_prompt: a string of at most 1000 characters') if ref $negative || length $negative > 1000;
+    my $seconds = $p->{seconds} // 5;
+    error(400, 'seconds: from 1 to 10') unless "$seconds" =~ /\A\d+(?:\.\d+)?\z/ && $seconds >= 1 && $seconds <= 10;
+    my $steps = $p->{steps} // 100;
+    error(400, 'steps: a whole number from 1 to 200') unless "$steps" =~ /\A\d+\z/ && $steps >= 1 && $steps <= 200;
+    my $guidance = $p->{guidance_scale} // 3.5;
+    error(400, 'guidance_scale: a number from 0 to 20') unless "$guidance" =~ /\A\d+(?:\.\d+)?\z/ && $guidance <= 20;
+    my $seed = $p->{seed} // 0;
+    error(400, 'seed: a whole number') unless "$seed" =~ /\A\d+\z/;
+    my $t0 = Time::HiRes::time();
+    my $wav = eval { $AUDIOLDM2->generate($prompt, seconds => $seconds, steps => $steps, guidance => $guidance, seed => $seed,
+                                          negative => $negative) };
+    error(500, $@ =~ s/ at \S+ line \d+\.?\n?\z//r, 'server_error') if $@;
+    my $secs = Time::HiRes::time() - $t0;
+    $LOG->info('request', event => 'audio', msg => sprintf('%s: %s s, %d steps, guidance %s, seed %s, %.1f s to make, %d bytes of WAV',
+        $model, $seconds, $steps, $guidance, $seed, $secs, length $wav));
+    return [200, ['Content-Type' => 'audio/wav'], $wav];
+};
+
 route::post '/v1/chat/completions' => sub {
     my ($req) = @_;
     my $p = $req->{json};
@@ -2054,6 +2095,11 @@ prefill is its own (taken from a reset of its sequence; the images are encoded w
 A speech model (C<rocm-convert> of a Whisper checkpoint, e.g. openai/whisper-tiny) for C</v1/audio/transcriptions>.
 Runs on the host (not the GPU), one request at a time. A server with only this option needs no chat model.
 
+=item --audioldm2 F<dir>
+
+An AudioLDM 2 model directory (the diffusers layout: C<text_encoder>, C<tokenizer>, C<unet>, C<vae>, C<vocoder> and the
+rest) for C</v1/audio/generations>. Loaded at the start, on the GPU. A server with only this option needs no chat model.
+
 =item --ffmpeg F<ffmpeg>
 
 The encoder of the C<mp3>, C<opus> and C<aac> formats of C</v1/audio/speech> (its C<response_format>; C<wav>, C<pcm> and
@@ -2191,6 +2237,10 @@ input longer than the embedding model's context (2048 tokens at most) is an erro
 Requests are served one at a time (with C<--parallel> N, N per model at once); a model keeps its last
 conversation, so its next turn only prefills what is new (C<--store> extends that to every conversation, of every
 model). A client that disconnects stops its reply.
+
+C<POST /v1/audio/generations> (with C<--audioldm2>): a JSON body with the C<prompt> (text to audio: the clip is made
+from it), C<negative_prompt> (optional), C<seconds> (1 to 10, 5 by default), C<steps> (1 to 200, 100 by default),
+C<guidance_scale> (3.5 by default) and C<seed> (0 by default). The reply is the clip as a WAV file (mono, 16 kHz, 16 bit).
 
 =head1 NGINX
 
