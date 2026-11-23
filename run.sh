@@ -28,6 +28,10 @@ done
 if [ -n "${ZIMAGE_DIR:-}" ] && [[ " ${ROCM_ARGS:-} " != *" --zimage "* ]]; then
     ROCM_ARGS="${ROCM_ARGS:-} --zimage /zimage"
 fi
+# AUDIOLDM2_DIR set: the AudioLDM 2 model directory is mounted at /audioldm2 and the server gets --audioldm2 /audioldm2 (unless ROCM_ARGS has one)
+if [ -n "${AUDIOLDM2_DIR:-}" ] && [[ " ${ROCM_ARGS:-} " != *" --audioldm2 "* ]]; then
+    ROCM_ARGS="${ROCM_ARGS:-} --audioldm2 /audioldm2"
+fi
 exec docker run \
     --restart=always \
     --name $D \
@@ -51,6 +55,7 @@ exec docker run \
     $([ -n "$ROCM_STORE_DIR" ] && echo "-v $ROCM_STORE_DIR:/kvstore:rw") \
     $([ -n "$HF_HOME" ] && echo "-v $HF_HOME:/hf:rw") \
     $([ -n "$ZIMAGE_DIR" ] && echo "-v $ZIMAGE_DIR:/zimage:ro") \
+    $([ -n "$AUDIOLDM2_DIR" ] && echo "-v $AUDIOLDM2_DIR:/audioldm2:ro") \
     -e XDG_CACHE_HOME=${XDG_CACHE_HOME:-/dev/shm} \
     -e HF_HOME=${HF_HOME:-/hf} \
     -e HF_TOKEN=${HF_TOKEN:-} \
