@@ -70,3 +70,6 @@ requests*.log
 .build-trigger
 
 MiniMax-H3-Image
+
+# nested TRELLIS.2 clone (its own repo, not part of this one)
+TRELLIS.2/
