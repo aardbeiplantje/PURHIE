@@ -22,6 +22,9 @@ tokenizer_t* tokenizer_create(const char** vocab, size_t vocab_size,
 // Returns NULL on failure.
 tokenizer_t* tokenizer_load_from_gguf(void* gguf_model);
 
+// The GPT-2 / RoBERTa byte-level BPE (its regex; no BOS or EOS added: the caller adds them) from a vocabulary and merges
+tokenizer_t* tokenizer_create_gpt2(const char** vocab, size_t vocab_size, const char** merges, size_t merges_size);
+
 // Free tokenizer
 void tokenizer_free(tokenizer_t* tok);
 

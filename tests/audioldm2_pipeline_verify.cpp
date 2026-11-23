@@ -23,14 +23,6 @@ static bool read_bytes(const std::string& path, std::vector<unsigned char>& v) {
     return got == v.size();
 }
 
-static bool read_ids(const std::string& path, std::vector<int32_t>& v) {
-    std::vector<unsigned char> b;
-    if (!read_bytes(path, b)) return false;
-    v.resize(b.size() / 4);
-    std::memcpy(v.data(), b.data(), v.size() * 4);
-    return true;
-}
-
 /* the 16-bit PCM data of a WAV file's "data" chunk (the reference is written by the diffusers run: a plain 44-byte header) */
 static bool read_ref(const std::string& path, std::vector<float>& out) {
     std::vector<unsigned char> b;
@@ -49,6 +41,19 @@ static bool read_ref(const std::string& path, std::vector<float>& out) {
     return false;
 }
 
+static bool read_lines(const std::string& path, std::vector<std::string>& out) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::string cur;
+    for (int c; (c = std::fgetc(f)) != EOF;) {
+        if (c == '\n') { out.push_back(cur); cur.clear(); }
+        else cur += (char)c;
+    }
+    if (!cur.empty()) out.push_back(cur);
+    std::fclose(f);
+    return true;
+}
+
 int main(int argc, char** argv) {
     const int steps = argc > 1 ? std::atoi(argv[1]) : 100;
     const float seconds = argc > 2 ? (float)std::atof(argv[2]) : 5.0f;
@@ -56,21 +61,33 @@ int main(int argc, char** argv) {
     const uint64_t seed = argc > 4 ? (uint64_t)std::atoll(argv[4]) : 0;
     const std::string out_path = argc > 5 ? argv[5] : "";
     const std::string dir = "/data/audioldm2";
-    const std::string tok = "/data/audioldm2-stages/tok_";
-    audioldm2::Tokens pos, neg;
-    if (!read_ids(tok + "pos_clap_ids.i32", pos.clap_ids) || !read_ids(tok + "pos_clap_mask.i32", pos.clap_mask) ||
-        !read_ids(tok + "pos_t5_ids.i32", pos.t5_ids) || !read_ids(tok + "neg_clap_ids.i32", neg.clap_ids) ||
-        !read_ids(tok + "neg_clap_mask.i32", neg.clap_mask) || !read_ids(tok + "neg_t5_ids.i32", neg.t5_ids)) {
-        std::fprintf(stderr, "cannot read the token files (tools/audioldm2_tokens.py)\n");
+    /* the tokenizers from the text exports (tools/audioldm2_export_tokenizers.py); the prompt's ids are checked against the
+     * diffusers tokenization in the test (the reference is the ocean prompt) */
+    const std::string tdir = "/data/audioldm2-stages/";
+    std::vector<std::string> clap_vocab, clap_merges, t5_lines, t5_pieces;
+    std::vector<double> t5_scores;
+    if (!read_lines(tdir + "clap_vocab.txt", clap_vocab) || !read_lines(tdir + "clap_merges.txt", clap_merges) ||
+        !read_lines(tdir + "t5_pieces.tsv", t5_lines)) {
+        std::fprintf(stderr, "cannot read the tokenizer exports (tools/audioldm2_export_tokenizers.py)\n");
         return 1;
+    }
+    for (const auto& l : t5_lines) {
+        const size_t tab = l.rfind('\t');
+        if (tab == std::string::npos) continue;
+        t5_pieces.push_back(l.substr(0, tab));
+        t5_scores.push_back(std::atof(l.c_str() + tab + 1));
     }
     audioldm2::Pipeline pipe(dir);
     if (!pipe.ok()) {
         std::fprintf(stderr, "the pipeline: %s\n", pipe.error().c_str());
         return 1;
     }
+    if (!pipe.load_tokenizers(clap_vocab, clap_merges, t5_pieces, t5_scores)) {
+        std::fprintf(stderr, "the tokenizers\n");
+        return 1;
+    }
     std::vector<float> wav;
-    if (!pipe.generate(pos, neg, seconds, steps, guidance, seed, wav)) {
+    if (!pipe.generate_text("ocean waves crashing on a beach", "", seconds, steps, guidance, seed, wav)) {
         std::fprintf(stderr, "the pipeline failed\n");
         return 1;
     }

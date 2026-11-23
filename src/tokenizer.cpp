@@ -135,7 +135,63 @@ uint32_t ascii_lower(uint32_t c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
 
 // ---------------------------------------------------------------- pre-tokenizers
 
-enum PreType { PRE_QWEN2, PRE_QWEN35, PRE_GEMMA4, PRE_LLAMA3, PRE_SPM };
+enum PreType { PRE_QWEN2, PRE_QWEN35, PRE_GEMMA4, PRE_LLAMA3, PRE_SPM, PRE_GPT2 };
+
+// Word lengths (in codepoints) for GPT-2's regex (RoBERTa's too):
+//   's|'t|'re|'ve|'m|'ll|'d | ?\p{L}+ | ?\p{N}+ | ?[^\s\p{L}\p{N}]+ | \s+(?!\S) | \s+
+// (case-sensitive contractions; a single space before a word belongs to the word; no combining marks)
+std::vector<size_t> split_gpt2(const std::vector<uint32_t>& cpts) {
+    std::vector<size_t> words;
+    const size_t end = cpts.size();
+    auto cpt = [&](size_t i) { return i < end ? cpts[i] : OUT_OF_RANGE; };
+    auto flags = [&](size_t i) { return cpt_flags(cpt(i)); };
+    const uint16_t letter = CPT_LETTER, number = CPT_NUMBER, ws = CPT_WHITESPACE;
+    const uint16_t other_stop = ws | letter | number;
+    size_t pos = 0;
+    while (pos < end) {
+        const uint32_t c = cpt(pos);
+        size_t len = 0;
+        // contractions
+        if (c == '\'' && pos + 1 < end) {
+            const uint32_t n1 = cpt(pos + 1);
+            if (n1 == 's' || n1 == 't' || n1 == 'm' || n1 == 'd') len = 2;
+            else if (pos + 2 < end) {
+                const uint32_t n2 = cpt(pos + 2);
+                if ((n1 == 'r' && n2 == 'e') || (n1 == 'v' && n2 == 'e') || (n1 == 'l' && n2 == 'l')) len = 3;
+            }
+        }
+        // ?\p{L}+ , ?\p{N}+ , ?[^\s\p{L}\p{N}]+ (an optional space first)
+        if (!len) {
+            const size_t sp = (c == ' ') ? 1 : 0;
+            const uint16_t f = flags(pos + sp);
+            if ((f & letter) && pos + sp < end) {
+                size_t n = sp;
+                while (flags(pos + n) & letter) n++;
+                len = n;
+            } else if ((f & number) && pos + sp < end) {
+                size_t n = sp;
+                while (flags(pos + n) & number) n++;
+                len = n;
+            } else if (pos + sp < end && !(f & other_stop)) {
+                size_t n = sp;
+                while (pos + n < end && !(flags(pos + n) & other_stop)) n++;
+                len = n;
+            }
+        }
+        // \s+(?!\S) then \s+
+        if (!len && (flags(pos) & ws)) {
+            size_t n = 0;
+            while (pos + n < end && (flags(pos + n) & ws)) n++;
+            /* the run followed by a non-space keeps its last space for the next word */
+            if (pos + n < end && n > 1) n--;
+            len = n;
+        }
+        if (!len) len = 1;  // anything else: one codepoint
+        words.push_back(len);
+        pos += len;
+    }
+    return words;
+}
 
 // Word lengths (in codepoints) for llama.cpp's qwen2 / qwen35 regex:
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N} | ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
@@ -433,7 +489,7 @@ struct tokenizer {
             return;
         }
         const std::vector<uint32_t> cpts = utf8_to_cpts(text);
-        const std::vector<size_t> words = split_qwen(cpts, pre == PRE_QWEN35, pre == PRE_LLAMA3 ? 3 : 1);
+        const std::vector<size_t> words = pre == PRE_GPT2 ? split_gpt2(cpts) : split_qwen(cpts, pre == PRE_QWEN35, pre == PRE_LLAMA3 ? 3 : 1);
         const ByteMap& bm = byte_map();
         size_t start = 0;
         for (size_t len : words) {
@@ -531,6 +587,15 @@ tokenizer_t* tokenizer_create(const char** vocab, size_t vocab_size, const char*
         if (!sp) continue;
         t->merge_rank.emplace(std::string(s, sp - s) + " " + std::string(sp + 1), (int)i);
     }
+    return t;
+}
+
+tokenizer_t* tokenizer_create_gpt2(const char** vocab, size_t vocab_size, const char** merges, size_t merges_size) {
+    tokenizer* t = static_cast<tokenizer*>(tokenizer_create(vocab, vocab_size, merges, merges_size));
+    if (!t) return nullptr;
+    t->pre = PRE_GPT2;
+    t->add_bos = false;
+    t->add_eos = false;
     return t;
 }
 

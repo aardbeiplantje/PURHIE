@@ -3,6 +3,7 @@
 #include "audioldm2_clap.h"
 #include "audioldm2_gpt2.h"
 #include "audioldm2_projection.h"
+#include "audioldm2_tokenizer.h"
 #include "audioldm2_t5.h"
 #include "audioldm2_unet.h"
 #include "audioldm2_vae.h"
@@ -43,6 +44,30 @@ Pipeline::Pipeline(const std::string& dir) {
 }
 
 Pipeline::~Pipeline() = default;
+
+bool Pipeline::load_tokenizers(const std::vector<std::string>& clap_vocab, const std::vector<std::string>& clap_merges,
+                               const std::vector<std::string>& t5_pieces, const std::vector<double>& t5_scores) {
+    if (t5_pieces.size() != t5_scores.size() || clap_vocab.empty() || t5_pieces.empty()) {
+        std::fprintf(stderr, "audioldm2: the tokenizers' vocabularies are empty or do not match\n");
+        return false;
+    }
+    clap_tok_.reset(new ClapTokenizer(clap_vocab, clap_merges));
+    if (!clap_tok_->ok()) return false;
+    /* the ids of <unk> and </s> in the T5 vocabulary (2 and 1 for T5) */
+    t5_tok_.reset(new T5Tokenizer(t5_pieces, t5_scores, 2, 1));
+    return true;
+}
+
+bool Pipeline::generate_text(const std::string& prompt, const std::string& negative, float seconds, int steps, float guidance, uint64_t seed,
+                             std::vector<float>& wav) {
+    if (!clap_tok_ || !t5_tok_) { std::fprintf(stderr, "audioldm2: the tokenizers are not loaded\n"); return false; }
+    Tokens pos, neg;
+    clap_tok_->encode(prompt, pos.clap_ids, pos.clap_mask);
+    pos.t5_ids = t5_tok_->encode(prompt);
+    clap_tok_->encode(negative, neg.clap_ids, neg.clap_mask);
+    neg.t5_ids = t5_tok_->encode(negative);
+    return generate(pos, neg, seconds, steps, guidance, seed, wav);
+}
 
 bool Pipeline::generate(const Tokens& pos, const Tokens& neg, float seconds, int steps, float guidance, uint64_t seed, std::vector<float>& wav) {
     if (!ok()) { std::fprintf(stderr, "audioldm2: %s\n", error_.c_str()); return false; }

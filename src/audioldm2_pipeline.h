@@ -30,10 +30,19 @@ public:
     /* the waveform (16 kHz, mono) of the prompt: seconds of audio, the sampler's steps, the classifier-free guidance scale, the seed of
      * the initial latent (torch's CPU randn). neg: the negative prompt's tokens (the empty prompt). False on any error. */
     bool generate(const Tokens& pos, const Tokens& neg, float seconds, int steps, float guidance, uint64_t seed, std::vector<float>& wav);
+    /* the tokenizers (the RoBERTa BPE of the CLAP text encoder: its vocabulary and merges; the T5 unigram: its pieces and scores, the
+     * unknown id 2 and the end id 1). Read by the caller from the tokenizer.json files. */
+    bool load_tokenizers(const std::vector<std::string>& clap_vocab, const std::vector<std::string>& clap_merges,
+                         const std::vector<std::string>& t5_pieces, const std::vector<double>& t5_scores);
+    /* the same from texts: the prompt and the negative prompt (empty: no negative text) */
+    bool generate_text(const std::string& prompt, const std::string& negative, float seconds, int steps, float guidance, uint64_t seed,
+                       std::vector<float>& wav);
 
 private:
     struct Files;
     std::unique_ptr<Files> f_;
+    std::unique_ptr<class ClapTokenizer> clap_tok_;
+    std::unique_ptr<class T5Tokenizer> t5_tok_;
     std::string error_;
 };
 
