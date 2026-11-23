@@ -4,6 +4,7 @@
 #include "sd_device.h"
 
 #include "kernel_loader.h"
+#include "blt_calib.h"
 
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
@@ -863,47 +864,83 @@ bool gemm_impl(bool bf16, int M, int N, int K, const void* A, long lda, const vo
             p.failed = true;
             return false;
         }
-        /* the candidates' outputs: the first candidate's is the reference; a candidate whose bits differ is never chosen (the
-         * choice must not depend on the timing). The span: the rows M of cs_m words */
-        const size_t span = (size_t)M * (size_t)cs_m * sizeof(float);
-        void* ref = dalloc(span);
-        bool have_ref = false;
-        double best = 1e30;
-        int best_i = -1;
-        for (int i = 0; i < n; ++i) {
-            if (!run(heur[i].algo, heur[i].workspaceSize)) continue;
-            hipDeviceSynchronize();
-            if (!have_ref) {
-                hipMemcpy(ref, C, span, hipMemcpyDeviceToDevice);
-                have_ref = true;
-            } else if (diff_words(C, ref, span) != 0) {
-                continue;
-            }
-            const auto t0 = std::chrono::steady_clock::now();
-            run(heur[i].algo, heur[i].workspaceSize);
-            hipDeviceSynchronize();
-            const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            if (std::getenv("SD_BLT_LOG"))
-                std::fprintf(stderr, "blt product: M %d N %d K %d lda %ld ldb %ld cs_m %ld bf16 %d candidate %d: %.3f ms\n", M, N, K, lda,
-                             ldb, cs_m, bf16 ? 1 : 0, i, t * 1e3);
-            if (t < best) {
-                best = t;
-                best_i = i;
+        /* the calibrated algorithm of this shape (blt_calib.h), when the heuristic offers it */
+        const bool calib_mode = std::getenv("SD_BLT_CALIBRATE") != nullptr;
+        if (!calib_mode && !std::getenv("SD_BLT_NOCALIB")) {
+            for (const BltCalib& ce : kBltCalib) {
+                if (ce.M != M || ce.N != N || ce.K != K || ce.lda != lda || ce.ldb != ldb || ce.opN != (opN ? 1L : 0L) ||
+                    ce.cs_m != cs_m || ce.bf16 != (bf16 ? 1 : 0))
+                    continue;
+                for (int i = 0; i < n && !p.tuned; ++i)
+                    if (std::memcmp(heur[i].algo.data, ce.algo, sizeof ce.algo) == 0) {
+                        p.algo = heur[i].algo;
+                        p.ws = heur[i].workspaceSize;
+                        p.tuned = true;
+                    }
+                if (std::getenv("SD_BLT_LOG"))
+                    std::fprintf(stderr, "calib table: M %d N %d K %d: %s\n", M, N, K, p.tuned ? "taken" : "not offered by the heuristic");
+                break;
             }
         }
-        drelease(ref, span);
-        if (best_i < 0) {
-            p.failed = true;
-            return false;
+        if (!p.tuned) {
+            /* the candidates' outputs: the first candidate's is the reference; a candidate whose bits differ is never chosen (the
+             * choice must not depend on the timing). The span: the rows M of cs_m words. (Calibration: every candidate is timed.) */
+            const size_t span = (size_t)M * (size_t)cs_m * sizeof(float);
+            void* ref = dalloc(span);
+            bool have_ref = false;
+            double best = 1e30;
+            int best_i = -1;
+            for (int i = 0; i < n; ++i) {
+                if (!run(heur[i].algo, heur[i].workspaceSize)) continue;
+                hipDeviceSynchronize();
+                if (!have_ref) {
+                    hipMemcpy(ref, C, span, hipMemcpyDeviceToDevice);
+                    have_ref = true;
+                } else if (!calib_mode && diff_words(C, ref, span) != 0) {
+                    continue;
+                }
+                const auto t0 = std::chrono::steady_clock::now();
+                run(heur[i].algo, heur[i].workspaceSize);
+                hipDeviceSynchronize();
+                const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                if (calib_mode) {
+                    std::fprintf(stderr, "calib: M %ld N %ld K %ld lda %ld ldb %ld opN %d cs_m %ld bf16 %d candidate %d: %.3f ms algo ",
+                                 (long)M, (long)N, (long)K, lda, ldb, opN ? 1 : 0, cs_m, bf16 ? 1 : 0, i, t * 1e3);
+                    for (int b = 0; b < 16; ++b) std::fprintf(stderr, "%02x", heur[i].algo.data[b]);
+                    std::fprintf(stderr, "\n");
+                } else if (std::getenv("SD_BLT_LOG")) {
+                    std::fprintf(stderr, "blt product: M %d N %d K %d lda %ld ldb %ld cs_m %ld bf16 %d candidate %d: %.3f ms\n", M, N, K,
+                                 lda, ldb, cs_m, bf16 ? 1 : 0, i, t * 1e3);
+                }
+                if (t < best) {
+                    best = t;
+                    best_i = i;
+                }
+            }
+            drelease(ref, span);
+            if (best_i < 0) {
+                p.failed = true;
+                return false;
+            }
+            p.algo = heur[best_i].algo;
+            p.ws = heur[best_i].workspaceSize;
+            p.tuned = true;
         }
-        p.algo = heur[best_i].algo;
-        p.ws = heur[best_i].workspaceSize;
-        p.tuned = true;
     }
     if (!ensure_workspace(std::max<size_t>(p.ws, 1))) return false;
+    const auto tp0 = std::chrono::steady_clock::now();
     if (!run(p.algo, p.ws)) {
         p.failed = true;
         return false;
+    }
+    if (g_time_on) {  /* SD_TIME: the convolutions' and attention's products, synchronous, in the table */
+        hipStreamSynchronize(nullptr);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
+        std::lock_guard<std::mutex> lk(g_time_mu);
+        TimeStat& st = g_time_stats["blt_product"];
+        st.count += 1;
+        st.total += ms;
+        st.max = std::max(st.max, ms);
     }
     return true;
 }

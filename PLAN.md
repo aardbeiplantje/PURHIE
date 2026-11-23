@@ -104,6 +104,15 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
   `zi_generate_steps`. End to end through the Perl module, seed 42, 9 steps, 1024 x 1024: 27.44 dB against ComfyUI's PNG, 41 s
   with the model's load.
 - The ComfyUI node (2026-11-22): `steps` (9) and the size (1024 x 1024) are inputs now; the request carries the steps.
+- The calibrated algorithms (2026-11-23, `src/blt_calib.h`): the fastest candidate of each convolution and attention product
+  shape at 1024 x 1024 (15 shapes), identified by hipBLASLt's serialized descriptor (the first two bytes: the solution index).
+  The tuner takes the entry when the heuristic offers that algorithm; otherwise the same-bits rule. Measured: the convolution
+  products 1.36 s against 3.42 s over the two generations of a one-step run; one step 6.07 s against 7.3 s; nine steps 24.25 s
+  (25.5 s without). Reproducible: three processes give identical output. Against ComfyUI at nine steps: 27.45 dB, unchanged; the
+  output moves 0.04 levels on average against the rule-based choice. The table names the shapes of 1024 x 1024 only (other sizes
+  take the rule). To regenerate: `SD_BLT_CALIBRATE=1 zimage_1024_verify 1` (stderr: one `calib:` line per candidate), keep the
+  fastest per shape, write the table. `SD_BLT_NOCALIB=1` turns the table off (for the comparison).
+  Not yet: the linear plans (the DiT's BF16 outputs: the rule's first candidate is already the fastest class there).
 - Next, in order: the chain's remaining cost
   (flash attention 0.43 s a step, the attention's FP32 output converted to BF16, the modulation), and the calibrated table
   for the convolutions' algorithms (about 1.3 s a generation).
