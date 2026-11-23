@@ -1814,3 +1814,16 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) audio_gelu_tanh_mul_f32
     const float v = a[i];
     a[i] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v))) * b[i];
 }
+
+// h[c][p] += t[c] over the HW positions of each channel (the time embedding of a resnet), in place
+extern "C" __global__ void __launch_bounds__(SD_THREADS) audio_add_channel_f32(float* h, const float* t, int C, int HW) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= (long)C * HW) return;
+    h[i] += t[i / HW];
+}
+
+// dst[i] = src[i]
+extern "C" __global__ void __launch_bounds__(SD_THREADS) audio_copy_f32(float* dst, const float* src, long n) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i < n) dst[i] = src[i];
+}
