@@ -571,6 +571,10 @@ bool dev_dit_forward(const SafeTensors& st, const float* lat, const float* cap, 
     if (!dev_timestep_embed(st, t, jt)) return false;
     float* fri = static_cast<float*>(sddev::alloc(sizeof(float) * NI * 64 * 2, false));
     rope_table_image(gh, gw, LC + 1, fri);
+    /* the RoPE tables in BF16, as diffusers computes them (1024 px vs ComfyUI: 30.16 dB in FP32, 31.92 dB in BF16);
+     * ZI_ROPE_FP32=1 keeps FP32 */
+    const bool rope_bf16 = std::getenv("ZI_ROPE_FP32") == nullptr;
+    if (rope_bf16) sddev::round_bf16_inplace(fri, (size_t)NI * 64 * 2);
     if (!dev_refiner_block(st, "noise_refiner.0", J, NI, jt, fri)) return false;
     dit_dump("nr0", J, (size_t)NI * DIM);
     if (!dev_refiner_block(st, "noise_refiner.1", J, NI, jt, fri)) return false;
@@ -584,6 +588,7 @@ bool dev_dit_forward(const SafeTensors& st, const float* lat, const float* cap, 
     for (int r = 0; r < LC; ++r) { ids[r * 3] = 1 + r; ids[r * 3 + 1] = 0; ids[r * 3 + 2] = 0; }
     float* frc = static_cast<float*>(sddev::alloc(sizeof(float) * LC * 64 * 2, false));
     rope_table_ids(ids.data(), LC, frc);
+    if (rope_bf16) sddev::round_bf16_inplace(frc, (size_t)LC * 64 * 2);
     if (!dev_refiner_block(st, "context_refiner.0", jc, LC, nullptr, frc, false)) return false;
     dit_dump("cr0", jc, (size_t)LC * DIM);
     if (!dev_refiner_block(st, "context_refiner.1", jc, LC, nullptr, frc, false)) return false;
@@ -593,6 +598,7 @@ bool dev_dit_forward(const SafeTensors& st, const float* lat, const float* cap, 
     for (int r = 0; r < LC; ++r) { idj[(NI + r) * 3] = 1 + r; idj[(NI + r) * 3 + 1] = 0; idj[(NI + r) * 3 + 2] = 0; }
     float* frj = static_cast<float*>(sddev::alloc(sizeof(float) * S * 64 * 2, false));
     rope_table_ids(idj.data(), S, frj);
+    if (rope_bf16) sddev::round_bf16_inplace(frj, (size_t)S * 64 * 2);
     for (int layer = 0; layer < 30; ++layer) {
         if (!dev_refiner_block(st, "layers." + std::to_string(layer), J, S, jt, frj, true)) return false;
         char name[16];
