@@ -39,6 +39,17 @@ All binaries use the same zero-copy approach:
   from one process, with per-model settings (`NAME.json`, host rules) and least-recently-used eviction under the memory
   check (`make_room`). New model kinds join that policy; they do not get their own process.
 
+## GPU use
+
+The desktop's display runs on the same GPU as the engine, so a long or hung kernel can freeze the screen.
+
+- Keep each kernel launch short: under about 50 ms, as Z-Image's largest single launch is. Split a long grid into several
+  launches, and synchronize between stages, so the desktop's queues get the GPU between them.
+- Pass kernels only device memory: `sddev` buffers (`alloc`, `Floats`) or registered weights. A host pointer hangs the GPU
+  and resets the driver.
+
+Other GPU jobs may run alongside a test.
+
 ## Where Files Go (read this first)
 
 The agent runs in a Docker container. `/home/agent` is inside the container: the user cannot reach it from the host,
