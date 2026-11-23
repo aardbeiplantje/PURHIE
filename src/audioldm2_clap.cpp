@@ -76,7 +76,7 @@ bool clap_text_forward(const zimage::SafeTensors& st, const int32_t* ids, const 
         sddev::linear_f32(x, T, wq, kDim, kDim, bq, Q.data());
         sddev::linear_f32(x, T, wk, kDim, kDim, bk, K.data());
         sddev::linear_f32(x, T, wv, kDim, kDim, bv, V.data());
-        sddev::audio_attention_f32(Q.data(), K.data(), V.data(), kDim, T, kHeads, false, Mk.data(), A.data());
+        sddev::audio_attention_f32(Q.data(), K.data(), V.data(), kDim, T, kHeads, false, Mk.data(), 0.125f, nullptr, A.data());
         sddev::linear_f32(A.data(), T, wo, kDim, kDim, bo, O.data());
         sddev::add(O.data(), x, n);
         sddev::audio_layer_norm_f32(O.data(), T, kDim, lnaw, lnab, kEps, xo);

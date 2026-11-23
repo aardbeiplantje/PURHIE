@@ -1747,16 +1747,16 @@ extern "C" __global__ void __launch_bounds__(64) audio_causal_attn_f32(const flo
 }
 
 // Multi-head attention with 64-wide heads for AudioLDM 2's text models: q, k, v [T][C] with row stride ld (C = H * 64); causal
-// (keys up to the query) or not; kmask (T floats, 0 for a padding key) or null. out [T][C]. Grid (T, H), 64 threads; scale 1/8.
+// (keys up to the query) or not; kmask (T floats, 0 for a padding key) or null; scores * scale + bias[h][t][j] (bias null: none).
+// out [T][C]. Grid (T, H), 64 threads.
 extern "C" __global__ void __launch_bounds__(64) audio_attn_f32(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
                                                                 int ld, int T, int H, int causal, const float* __restrict__ kmask,
-                                                                float* __restrict__ out) {
+                                                                float scale, const float* __restrict__ bias, float* __restrict__ out) {
     extern __shared__ float sm[];
     float* qs = sm;
     float* sc = sm + 64;
     const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     const int C = H * 64;
-    const float scale = 0.125f;
     qs[d] = q[(long)t * ld + h * 64 + d];
     __syncthreads();
     const int jmax = causal ? t : T - 1;
@@ -1767,7 +1767,7 @@ extern "C" __global__ void __launch_bounds__(64) audio_attn_f32(const float* __r
             float acc = 0.0f;
             const float* kr = k + (long)j * ld + h * 64;
             for (int e = 0; e < 64; ++e) acc += qs[e] * kr[e];
-            sc[j] = acc * scale;
+            sc[j] = acc * scale + (bias ? bias[((long)h * T + t) * T + j] : 0.0f);
         }
     }
     __syncthreads();
@@ -1793,4 +1793,24 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) audio_gelu_erf_f32(floa
     if (i >= n) return;
     const float v = x[i];
     x[i] = 0.5f * v * (1.0f + erff(v * 0.7071067811865476f));
+}
+
+// RMS norm (T5's: no mean, no bias): y = x / sqrt(mean(x^2) + eps) * w, one block per row
+extern "C" __global__ void __launch_bounds__(SD_THREADS) audio_rms_f32(const float* __restrict__ x, int C, const float* __restrict__ w, float eps,
+                                                                       float* __restrict__ y) {
+    __shared__ float red[SD_THREADS];
+    const float* xr = x + (long)blockIdx.x * C;
+    float* yr = y + (long)blockIdx.x * C;
+    float q = 0.0f;
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) q += xr[i] * xr[i];
+    const float inv = rsqrtf(block_sum(q, red) / (float)C + eps);
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) yr[i] = xr[i] * inv * w[i];
+}
+
+// a = gelu_new(a) * b (T5's gated GELU: the tanh approximation), in place
+extern "C" __global__ void __launch_bounds__(SD_THREADS) audio_gelu_tanh_mul_f32(float* a, const float* b, long n) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= n) return;
+    const float v = a[i];
+    a[i] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v))) * b[i];
 }
