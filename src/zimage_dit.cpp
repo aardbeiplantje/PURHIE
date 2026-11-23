@@ -515,6 +515,14 @@ bool dev_refiner_block(const SafeTensors& st, const std::string& pre, float* x, 
     sddev::swiglu_bf16_in(a.p, b.p, gate.p, (size_t)N * F);
     DevHalf f(static_cast<size_t>(N) * dim);
     sddev::linear_bf16_xb16(gate.p, N, w2, F, dim, zeros.p, f.p);
+    if (const char* md = std::getenv("ZI_MLP_DUMP"); md && std::getenv("ZI_ATTN_LAYER") && pre == std::getenv("ZI_ATTN_LAYER")) {
+        /* debugging: the feed-forward's input (the modulated norm) and its output (before the gate) of the layer ZI_ATTN_LAYER */
+        std::vector<float> hm((size_t)N * dim);
+        sddev::download_bf16_as_f32(h2.p, hm.data(), (size_t)N * dim);
+        if (FILE* fm = std::fopen((std::string(md) + ".h2").c_str(), "wb")) { std::fwrite(hm.data(), sizeof(float), hm.size(), fm); std::fclose(fm); }
+        sddev::download_bf16_as_f32(f.p, hm.data(), (size_t)N * dim);
+        if (FILE* fm = std::fopen((std::string(md) + ".f").c_str(), "wb")) { std::fwrite(hm.data(), sizeof(float), hm.size(), fm); std::fclose(fm); }
+    }
     sddev::rms_gate_add_bf16(x, N, dim, f.p, wfn2, eps, g_mlp.p);
     if (resid_bf16) sddev::round_bf16_inplace(x, (size_t)N * dim);
     return true;
