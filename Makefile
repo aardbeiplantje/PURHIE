@@ -370,7 +370,7 @@ install: $(INFERENCE_SO) $(INFERENCE_LIB) $(PKGCONFIG)
 	cp -f $(INFERENCE_SO_1) $(DESTDIR)$(INSTALL_LIBDIR)/
 	ln -sf libinference.so.1.0 $(DESTDIR)$(INSTALL_LIBDIR)/libinference.so.1
 	ln -sf libinference.so.1 $(DESTDIR)$(INSTALL_LIBDIR)/libinference.so
-	cp -f $(SRCDIR)/inference.h $(SRCDIR)/sampler.h $(SRCDIR)/tokenizer.h $(SRCDIR)/vision.h $(SRCDIR)/image.h $(SRCDIR)/mrope.h $(SRCDIR)/whisper.h $(SRCDIR)/mel.h $(SRCDIR)/audio.h $(SRCDIR)/qwen3tts.h $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/qwen3tts_speech.h $(SRCDIR)/sd.h $(SRCDIR)/minimax_pipe.h $(SRCDIR)/zimage_pipe.h $(DESTDIR)$(INSTALL_INCDIR)/
+	cp -f $(SRCDIR)/inference.h $(SRCDIR)/sampler.h $(SRCDIR)/tokenizer.h $(SRCDIR)/vision.h $(SRCDIR)/image.h $(SRCDIR)/mrope.h $(SRCDIR)/whisper.h $(SRCDIR)/mel.h $(SRCDIR)/audio.h $(SRCDIR)/qwen3tts.h $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/qwen3tts_speech.h $(SRCDIR)/sd.h $(SRCDIR)/minimax_pipe.h $(SRCDIR)/zimage_pipe.h $(SRCDIR)/audioldm2_api.h $(DESTDIR)$(INSTALL_INCDIR)/
 	sed 's|^prefix=.*|prefix=$(PREFIX)|' $(PKGCONFIG) > $(DESTDIR)$(INSTALL_PKGCONFIGDIR)/rocm-inference.pc
 
 uninstall:
