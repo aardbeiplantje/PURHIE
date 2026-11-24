@@ -306,6 +306,7 @@ bool ShapeDecoder::forward(const int32_t* coords, int n, const float* feats, flo
     sddev::layer_norm_plain(h, N, C, 1e-5f, z);
     float* y = F((size_t)N * kOut);
     linear16(z, N, C, m.ow, m.ob, kOut, y);
+    *out_m = N;  // the count, also when the buffer is too small (the caller retries with it)
     if (N > out_capacity) {
         error_ = "the output has more voxels than the buffer";
         return false;

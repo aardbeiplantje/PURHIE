@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <algorithm>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -247,8 +248,8 @@ bool SsFlow::forward(const float* x, float t, const float* cond, int Lc, const f
         sddev::ss_head_norm_rope(QKV + kC, kN, 3 * kC, kH, kD, k.gk, ph);
         if (dbg) emit("dbg_qk", QKV, (size_t)kN * 3 * kC);
         for (int c0 = 0; c0 < kN; c0 += kQChunk)
-            sddev::audio_attention_f32(QKV + (size_t)c0 * 3 * kC, QKV + kC, QKV + 2 * kC, 3 * kC, kQChunk, kN, kH, kD,
-                                       false, nullptr, scale, nullptr, O + (size_t)c0 * kC);
+            sddev::audio_attention_f32(QKV + (size_t)c0 * 3 * kC, QKV + kC, QKV + 2 * kC, 3 * kC, std::min(kQChunk, kN - c0), kN,
+                                       kH, kD, false, nullptr, scale, nullptr, O + (size_t)c0 * kC);
         if (dbg) emit("dbg_attn", O, (size_t)kN * kC);
         sddev::linear_bf16(O, kN, k.wso, kC, kC, k.bso, P);
         sddev::ss_gate_add(h, kN, kC, vs[2], P);
@@ -270,8 +271,8 @@ bool SsFlow::forward(const float* x, float t, const float* cond, int Lc, const f
             emit("dbg_cv", Vc, (size_t)Lc * kC);
         }
         for (int c0 = 0; c0 < kN; c0 += kQChunk)
-            sddev::audio_attention_f32(Qc + (size_t)c0 * kC, Kc, Vc, kC, kQChunk, Lc, kH, kD, false, nullptr, scale, nullptr,
-                                       Oc + (size_t)c0 * kC);
+            sddev::audio_attention_f32(Qc + (size_t)c0 * kC, Kc, Vc, kC, std::min(kQChunk, kN - c0), Lc, kH, kD, false, nullptr,
+                                       scale, nullptr, Oc + (size_t)c0 * kC);
         if (dbg) emit("dbg_cross_attn", Oc, (size_t)kN * kC);
         sddev::linear_bf16(Oc, kN, k.wco, kC, kC, k.bco, Pc);
         sddev::ss_gate_add(h, kN, kC, ones, Pc);

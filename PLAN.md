@@ -266,17 +266,19 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
     small-model test `t/71-model-config.t` (sidecar override, bad key) and the server, audio, image and models-dir tests pass
     (8 files, 211 tests). To add a rule or a key: a line in `@HOST_RULES` or `%MODEL_KEY_OK`.
 
-20. **TRELLIS.2 (image to 3D), in progress.** On the engine, each stage checked against its oracle: the sparse-structure flow
-    and its decoder (`src/trellis_ss.cpp`, `src/trellis_ss_dec.cpp`; `tests/trellis_ss_verify.cpp`, `tests/trellis_ss_dec_verify.cpp`),
+20. **TRELLIS.2 (image to 3D), in progress.** On the engine, each stage checked against its oracle: the sparse-structure flow and
+    its decoder (`src/trellis_ss.cpp`, `src/trellis_ss_dec.cpp`; `tests/trellis_ss_verify.cpp`, `tests/trellis_ss_dec_verify.cpp`),
     the shape-SLAT flow (`src/trellis_slat.cpp`, `tests/trellis_slat_verify.cpp`; the attention scratch limits it to about 15000
     voxels), the shape decoder's sparse UNet (`src/trellis_sdec.cpp`, `tests/sdec_verify.cpp`), and the mesh step
-    (`src/trellis_mesh.cpp`, `tests/mesh_verify.cpp`: 13648 vertices and 24912 faces, identical to o-voxel's
-    `flexible_dual_grid_to_mesh`). The sparse convolution, channel-to-spatial and hash kernels are plain C-style device code in
-    `src/sd_gpu.hip`; the shape path needs no FlexGEMM or CuMesh port (those stay as the oracles). Next: the end-to-end shape path
-    (SS flow, SS decoder, occupied voxels by threshold and max-pool to 32³, SLAT flow, shape decoder, mesh), then texture. Oracles:
-    `tools/*_oracle.py` (outputs in `/data/trellis2/oracle_*`); weights: `/data/trellis2/` (TRELLIS.2-4B bf16, TRELLIS-image-large
-    decoder).
-
+    (`src/trellis_mesh.cpp`, `tests/mesh_verify.cpp`). The image-to-shape path of the 512 pipeline is chained in
+    `src/trellis_shape.cpp` (`tests/shape_verify.cpp` against `tools/trellis_shape_oracle.py`). It runs end to end; the occupied
+    voxels at 32^3 and the mesh are within the geometric tolerances (237 voxels against 302 in fp32, IoU 0.77, Chamfer 0.016 in box
+    units). Element-wise agreement is not reachable: the sparse-structure sampler amplifies bf16 rounding (the shipped bf16 model is
+    0.42 from fp32 over its 12 steps, the engine 0.35), so that check is geometric. Open: the sparse-structure sampler takes 14 to 17
+    minutes per shape, because the attention (`audio_attention_f32`, scalar fp32) runs about 1.5e12 multiply-adds per forward; next,
+    batched attention on hipBLASLt for both flows. Then the image encoder (DINOv3, not on the engine: the features are an input),
+    the 1024 cascade (its own flow model), and texture. Oracles: `tools/*_oracle.py` (outputs in `/data/trellis2/oracle_*`);
+    weights: `/data/trellis2/` (TRELLIS.2-4B bf16, TRELLIS-image-large decoder).
 21. **Qwen-Image 2.1 image edit (next, after TRELLIS.2).** The 2.1 DiT, text encoder and VAE run on the engine (items above
     in the Qwen-Image status), but there is no reference-image input and no edit route: `src/qwenimage21_*.cpp` has no edit
     path, and the server has no image-edit endpoint. Needs: the edit conditioning in the 2.1 DiT (how the reference image enters,
