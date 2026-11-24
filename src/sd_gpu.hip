@@ -2117,3 +2117,100 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) sp_c2s_gather(const flo
     const int j = (int)(e % cout);
     out[e] = src[((long)idx[p] * 8 + subidx[p]) * cc + j / rep];
 }
+
+// ---- the mesh step of the shape decoder (src/trellis_mesh.cpp): the dual grid to a mesh, plain C-style kernels.
+// The decoder's features per voxel: 0..2 the dual vertex (the margin-sigmoid), 3..5 the intersection flags, 6 the split weight.
+// Edge offsets: the four voxels around the x, y or z edge (flexible_dual_grid_to_mesh's edge_neighbor_voxel_offset).
+__device__ __forceinline__ void mesh_edge_offset(int a, int k, int* d) {
+    const int tab[3][4][3] = {{{0, 0, 0}, {0, 0, 1}, {0, 1, 1}, {0, 1, 0}},
+                              {{0, 0, 0}, {1, 0, 0}, {1, 0, 1}, {0, 0, 1}},
+                              {{0, 0, 0}, {0, 1, 0}, {1, 1, 0}, {1, 0, 0}}};
+    d[0] = tab[a][k][0];
+    d[1] = tab[a][k][1];
+    d[2] = tab[a][k][2];
+}
+
+// the vertex of each voxel: (coords + dual) * voxel + aabb0, dual = (1 + 2 margin) sigmoid(f) - margin
+extern "C" __global__ void __launch_bounds__(SD_THREADS) mesh_vertices(const int* coords, const float* feats, int n, float vox,
+                                                                      float aabb0, float margin, float* v) {
+    const int i = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= n) return;
+    for (int c = 0; c < 3; ++c) {
+        const float s = 1.0f / (1.0f + expf(-feats[i * 7 + c]));
+        const float dual = (1.0f + 2.0f * margin) * s - margin;
+        v[i * 3 + c] = ((float)coords[i * 4 + 1 + c] + dual) * vox + aabb0;
+    }
+}
+
+// the four voxels of each (voxel, axis) edge: q[((i * 3 + a) * 4 + k)] = coords[i] + offset(a, k)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) mesh_edge_queries(const int* coords, int n, int* q) {
+    const int e = blockIdx.x * SD_THREADS + threadIdx.x;  // over n * 12
+    if (e >= n * 12) return;
+    const int i = e / 12, ak = e % 12, a = ak / 4, k = ak % 4;
+    int d[3];
+    mesh_edge_offset(a, k, d);
+    q[e * 4 + 0] = coords[i * 4 + 0];
+    q[e * 4 + 1] = coords[i * 4 + 1] + d[0];
+    q[e * 4 + 2] = coords[i * 4 + 2] + d[1];
+    q[e * 4 + 3] = coords[i * 4 + 3] + d[2];
+}
+
+// lookup of nq coordinates in the table: out[k] = the voxel's index, or -1
+extern "C" __global__ void __launch_bounds__(SD_THREADS) sp_lookup(const int* q, int nq, const unsigned long long* keys,
+                                                                  const int* vals, unsigned int mask, int* out) {
+    const int k = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (k >= nq) return;
+    const unsigned long long key = sp_pack(q[4 * k], q[4 * k + 1], q[4 * k + 2], q[4 * k + 3]);
+    unsigned int h = sp_hash(key) & mask;
+    int found = -1;
+    for (;;) {
+        const unsigned long long kk = keys[h];
+        if (kk == SP_EMPTY) break;
+        if (kk == key) {
+            found = vals[h];
+            break;
+        }
+        h = (h + 1) & mask;
+    }
+    out[k] = found;
+}
+
+// an edge is a quad when its intersection flag is set and its four voxels exist: valid[e] = 1 then
+extern "C" __global__ void __launch_bounds__(SD_THREADS) mesh_edge_valid(const float* feats, int n, const int* look, int* valid) {
+    const int e = blockIdx.x * SD_THREADS + threadIdx.x;  // over n * 3
+    if (e >= n * 3) return;
+    const int i = e / 3, a = e % 3;
+    int ok = feats[i * 7 + 3 + a] > 0.0f;
+    for (int k = 0; k < 4; ++k) ok = ok && look[e * 4 + k] >= 0;
+    valid[e] = ok ? 1 : 0;
+}
+
+// the quads, in the order of the edges: quads[pos[e]] = the four voxels, for the valid edges
+extern "C" __global__ void __launch_bounds__(SD_THREADS) mesh_quads(const int* valid, const int* pos, const int* look, int ne,
+                                                                   int* quads) {
+    const int e = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (e >= ne) return;
+    if (!valid[e]) return;
+    for (int k = 0; k < 4; ++k) quads[pos[e] * 4 + k] = look[e * 4 + k];
+}
+
+// two triangles per quad: the split with the larger product of opposite split weights (softplus of feature 6)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) mesh_triangles(const int* quads, int L, const float* feats, int* faces) {
+    const int l = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (l >= L) return;
+    int q[4];
+    float w[4];
+    for (int k = 0; k < 4; ++k) {
+        q[k] = quads[l * 4 + k];
+        const float x = feats[q[k] * 7 + 6];
+        w[k] = x > 20.0f ? x : log1pf(expf(x));  // softplus
+    }
+    const float s02 = w[0] * w[2], s13 = w[1] * w[3];
+    if (s02 > s13) {  // split 1: (0, 1, 2), (0, 2, 3)
+        faces[l * 6 + 0] = q[0]; faces[l * 6 + 1] = q[1]; faces[l * 6 + 2] = q[2];
+        faces[l * 6 + 3] = q[0]; faces[l * 6 + 4] = q[2]; faces[l * 6 + 5] = q[3];
+    } else {          // split 2: (0, 1, 3), (3, 1, 2)
+        faces[l * 6 + 0] = q[0]; faces[l * 6 + 1] = q[1]; faces[l * 6 + 2] = q[3];
+        faces[l * 6 + 3] = q[3]; faces[l * 6 + 4] = q[1]; faces[l * 6 + 5] = q[2];
+    }
+}

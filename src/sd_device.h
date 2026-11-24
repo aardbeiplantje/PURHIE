@@ -244,6 +244,15 @@ void sp_exclusive_scan(const int* cnt, int n, int* off);
 void sp_c2s_fill(const int* coords, const unsigned char* bits, const int* off, int n, int* new_coords, int* idx, int* subidx);
 void sp_c2s_gather(const float* src, const int* idx, const int* subidx, long M, int cc, int rep, float* out);
 
+// the mesh step of the shape decoder (sd_gpu.hip): the vertices of the voxels; the four voxels of each edge (n * 12 coords);
+// a hash lookup (-1 when absent); the valid edges (quads); the quads' voxels in the edges' order; two triangles per quad
+void mesh_vertices(const int* coords, const float* feats, int n, float vox, float aabb0, float margin, float* v);
+void mesh_edge_queries(const int* coords, int n, int* q);
+void sp_lookup(const int* q, int nq, const unsigned long long* keys, const int* vals, unsigned int tsize, int* out);
+void mesh_edge_valid(const float* feats, int n, const int* look, int* valid);
+void mesh_quads(const int* valid, const int* pos, const int* look, int ne, int* quads);
+void mesh_triangles(const int* quads, int L, const float* feats, int* faces);
+
 }  // namespace sddev
 
 #endif  // SD_DEVICE_H

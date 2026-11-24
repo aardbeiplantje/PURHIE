@@ -42,7 +42,7 @@ hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn
               f_layer_norm = nullptr, f_rms_norm = nullptr, f_zm_modulate = nullptr, f_zm_gate_add = nullptr, f_zm_swiglu = nullptr, f_zm_rope = nullptr, f_zm_ln_plain = nullptr, f_gn_f32 = nullptr, f_to_tok = nullptr, f_to_chw = nullptr, f_zq_rope = nullptr, f_zq_attn = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma256b = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
               f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr, f_qi_linear_f8 = nullptr, f_qi_rms_f8 = nullptr, f_qi_affine = nullptr, f_qi_gelu = nullptr, f_qv_rms = nullptr, f_qv_patch = nullptr, f_qv_bias = nullptr, f_qv_upsample = nullptr, f_qi_hadamard = nullptr, f_qi_linear_i8 = nullptr, f_qi21_zc = nullptr, f_qi21_gather = nullptr, f_qi21_mul = nullptr, f_qi21_gated = nullptr, f_qi21_attn = nullptr, f_qi21_lbf = nullptr, f_qi21_dupup = nullptr, f_gemm_af128 = nullptr, f_transpose_bf16 = nullptr, f_bias_cm = nullptr, f_zm_rms_mod_bf16 = nullptr, f_zm_swiglu_bf16 = nullptr, f_bf16_to_f32 = nullptr, f_round_bf16 = nullptr, f_gn_sum_part = nullptr, f_gn_var_part = nullptr, f_gn_apply_part = nullptr, f_im2col_bf16_tile = nullptr, f_hnr16 = nullptr, f_count_diff = nullptr, f_tp16 = nullptr, f_rga16 = nullptr, f_sw16 = nullptr;
 
-hipFunction_t f_ss_affine = nullptr, f_ss_gate_add = nullptr, f_ss_head_norm_rope = nullptr; hipFunction_t f_sp_hash_insert = nullptr, f_sp_neighbor_map = nullptr, f_sp_subm_conv_f16w = nullptr; hipFunction_t f_sp_c2s_mask = nullptr, f_sp_exclusive_scan_serial = nullptr, f_sp_c2s_fill = nullptr, f_sp_c2s_gather = nullptr; hipFunction_t f_ss_im2col3 = nullptr, f_ss_gemm_f16w = nullptr, f_ss_pixel_shuffle3 = nullptr;
+hipFunction_t f_ss_affine = nullptr, f_ss_gate_add = nullptr, f_ss_head_norm_rope = nullptr; hipFunction_t f_sp_hash_insert = nullptr, f_sp_neighbor_map = nullptr, f_sp_subm_conv_f16w = nullptr; hipFunction_t f_sp_c2s_mask = nullptr, f_sp_exclusive_scan_serial = nullptr, f_sp_c2s_fill = nullptr, f_sp_c2s_gather = nullptr; hipFunction_t f_mesh_vertices = nullptr, f_mesh_edge_queries = nullptr, f_sp_lookup = nullptr, f_mesh_edge_valid = nullptr, f_mesh_quads = nullptr, f_mesh_triangles = nullptr; hipFunction_t f_ss_im2col3 = nullptr, f_ss_gemm_f16w = nullptr, f_ss_pixel_shuffle3 = nullptr;
 constexpr int kThreads = 256;
 constexpr int kGroupSplit = 16;  // the group norm's partial sums per group
 constexpr size_t kColFloats = (size_t)1 << 25;  // the im2col chunk: at most 128 MB (a launch covers enough tiles to fill the GPU)
@@ -129,6 +129,7 @@ bool init() {
         {&f_ss_im2col3, "ss_im2col3"}, {&f_ss_gemm_f16w, "ss_gemm_f16w"}, {&f_ss_pixel_shuffle3, "ss_pixel_shuffle3"},
         {&f_sp_hash_insert, "sp_hash_insert"}, {&f_sp_neighbor_map, "sp_neighbor_map"}, {&f_sp_subm_conv_f16w, "sp_subm_conv_f16w"},
         {&f_sp_c2s_mask, "sp_c2s_mask"}, {&f_sp_exclusive_scan_serial, "sp_exclusive_scan_serial"}, {&f_sp_c2s_fill, "sp_c2s_fill"}, {&f_sp_c2s_gather, "sp_c2s_gather"},
+        {&f_mesh_vertices, "mesh_vertices"}, {&f_mesh_edge_queries, "mesh_edge_queries"}, {&f_sp_lookup, "sp_lookup"}, {&f_mesh_edge_valid, "mesh_edge_valid"}, {&f_mesh_quads, "mesh_quads"}, {&f_mesh_triangles, "mesh_triangles"},
     };
     for (const Entry& e : entries)
         if (hipModuleGetFunction(e.f, g_mod, e.name) != hipSuccess) return false;
@@ -1712,6 +1713,51 @@ void sp_c2s_gather(const float* src, const int* idx, const int* subidx, long M, 
     void* a[] = {(void*)&src, (void*)&idx, (void*)&subidx, (void*)&mm, (void*)&c, (void*)&r, (void*)&out};
     long total = M * (long)cc * rep;
     launch(f_sp_c2s_gather, dim3((unsigned)((total + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+// the mesh step (sd_gpu.hip, src/trellis_mesh.cpp): see sd_device.h
+void mesh_vertices(const int* coords, const float* feats, int n, float vox, float aabb0, float margin, float* v) {
+    int nn = n;
+    float vx = vox, a0 = aabb0, mg = margin;
+    void* a[] = {(void*)&coords, (void*)&feats, (void*)&nn, (void*)&vx, (void*)&a0, (void*)&mg, (void*)&v};
+    launch(f_mesh_vertices, dim3((unsigned)((n + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void mesh_edge_queries(const int* coords, int n, int* q) {
+    int nn = n;
+    void* a[] = {(void*)&coords, (void*)&nn, (void*)&q};
+    launch(f_mesh_edge_queries, dim3((unsigned)((n * 12 + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void sp_lookup(const int* q, int nq, const unsigned long long* keys, const int* vals, unsigned int tsize, int* out) {
+    unsigned int mask = tsize - 1;
+    int nn = nq;
+    void* a[] = {(void*)&q, (void*)&nn, (void*)&keys, (void*)&vals, (void*)&mask, (void*)&out};
+    launch(f_sp_lookup, dim3((unsigned)((nq + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void mesh_edge_valid(const float* feats, int n, const int* look, int* valid) {
+    int nn = n;
+    void* a[] = {(void*)&feats, (void*)&nn, (void*)&look, (void*)&valid};
+    launch(f_mesh_edge_valid, dim3((unsigned)((n * 3 + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void mesh_quads(const int* valid, const int* pos, const int* look, int ne, int* quads) {
+    int nn = ne;
+    void* a[] = {(void*)&valid, (void*)&pos, (void*)&look, (void*)&nn, (void*)&quads};
+    launch(f_mesh_quads, dim3((unsigned)((ne + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void mesh_triangles(const int* quads, int L, const float* feats, int* faces) {
+    int ll = L;
+    void* a[] = {(void*)&quads, (void*)&ll, (void*)&feats, (void*)&faces};
+    launch(f_mesh_triangles, dim3((unsigned)((L + kThreads - 1) / kThreads), 1, 1), a);
     sync();
 }
 
