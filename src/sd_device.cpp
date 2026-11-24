@@ -42,7 +42,7 @@ hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn
               f_layer_norm = nullptr, f_rms_norm = nullptr, f_zm_modulate = nullptr, f_zm_gate_add = nullptr, f_zm_swiglu = nullptr, f_zm_rope = nullptr, f_zm_ln_plain = nullptr, f_gn_f32 = nullptr, f_to_tok = nullptr, f_to_chw = nullptr, f_zq_rope = nullptr, f_zq_attn = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma256b = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
               f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr, f_qi_linear_f8 = nullptr, f_qi_rms_f8 = nullptr, f_qi_affine = nullptr, f_qi_gelu = nullptr, f_qv_rms = nullptr, f_qv_patch = nullptr, f_qv_bias = nullptr, f_qv_upsample = nullptr, f_qi_hadamard = nullptr, f_qi_linear_i8 = nullptr, f_qi21_zc = nullptr, f_qi21_gather = nullptr, f_qi21_mul = nullptr, f_qi21_gated = nullptr, f_qi21_attn = nullptr, f_qi21_lbf = nullptr, f_qi21_dupup = nullptr, f_gemm_af128 = nullptr, f_transpose_bf16 = nullptr, f_bias_cm = nullptr, f_zm_rms_mod_bf16 = nullptr, f_zm_swiglu_bf16 = nullptr, f_bf16_to_f32 = nullptr, f_round_bf16 = nullptr, f_gn_sum_part = nullptr, f_gn_var_part = nullptr, f_gn_apply_part = nullptr, f_im2col_bf16_tile = nullptr, f_hnr16 = nullptr, f_count_diff = nullptr, f_tp16 = nullptr, f_rga16 = nullptr, f_sw16 = nullptr;
 
-hipFunction_t f_ss_affine = nullptr, f_ss_gate_add = nullptr, f_ss_head_norm_rope = nullptr; hipFunction_t f_sp_hash_insert = nullptr, f_sp_neighbor_map = nullptr, f_sp_subm_conv_f16w = nullptr; hipFunction_t f_ss_im2col3 = nullptr, f_ss_gemm_f16w = nullptr, f_ss_pixel_shuffle3 = nullptr;
+hipFunction_t f_ss_affine = nullptr, f_ss_gate_add = nullptr, f_ss_head_norm_rope = nullptr; hipFunction_t f_sp_hash_insert = nullptr, f_sp_neighbor_map = nullptr, f_sp_subm_conv_f16w = nullptr; hipFunction_t f_sp_c2s_mask = nullptr, f_sp_exclusive_scan_serial = nullptr, f_sp_c2s_fill = nullptr, f_sp_c2s_gather = nullptr; hipFunction_t f_ss_im2col3 = nullptr, f_ss_gemm_f16w = nullptr, f_ss_pixel_shuffle3 = nullptr;
 constexpr int kThreads = 256;
 constexpr int kGroupSplit = 16;  // the group norm's partial sums per group
 constexpr size_t kColFloats = (size_t)1 << 25;  // the im2col chunk: at most 128 MB (a launch covers enough tiles to fill the GPU)
@@ -128,6 +128,7 @@ bool init() {
         {&f_ss_affine, "ss_affine"}, {&f_ss_gate_add, "ss_gate_add"}, {&f_ss_head_norm_rope, "ss_head_norm_rope"},
         {&f_ss_im2col3, "ss_im2col3"}, {&f_ss_gemm_f16w, "ss_gemm_f16w"}, {&f_ss_pixel_shuffle3, "ss_pixel_shuffle3"},
         {&f_sp_hash_insert, "sp_hash_insert"}, {&f_sp_neighbor_map, "sp_neighbor_map"}, {&f_sp_subm_conv_f16w, "sp_subm_conv_f16w"},
+        {&f_sp_c2s_mask, "sp_c2s_mask"}, {&f_sp_exclusive_scan_serial, "sp_exclusive_scan_serial"}, {&f_sp_c2s_fill, "sp_c2s_fill"}, {&f_sp_c2s_gather, "sp_c2s_gather"},
     };
     for (const Entry& e : entries)
         if (hipModuleGetFunction(e.f, g_mod, e.name) != hipSuccess) return false;
@@ -1680,6 +1681,37 @@ void sp_subm_conv_f16w(const float* x, int n, int cin, const int* nb, const uint
     void* a[] = {(void*)&x, (void*)&nn, (void*)&ci, (void*)&nb, (void*)&W, (void*)&b, (void*)&co, (void*)&y, (void*)&oo0, (void*)&noo};
     check(hip_launch(f_sp_subm_conv_f16w, (unsigned)((n + 15) / 16), (unsigned)((no + 15) / 16), 1, 16, 16, 1, 0, nullptr, a, nullptr),
           "sparse submanifold conv");
+    sync();
+}
+
+// channel-to-spatial upsampling (sd_gpu.hip, src/sparse.c): see sd_device.h
+void sp_c2s_mask(const float* logit, int n, unsigned char* bits, int* cnt) {
+    int nn = n;
+    void* a[] = {(void*)&logit, (void*)&nn, (void*)&bits, (void*)&cnt};
+    launch(f_sp_c2s_mask, dim3((unsigned)((n + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void sp_exclusive_scan(const int* cnt, int n, int* off) {
+    int nn = n;
+    void* a[] = {(void*)&cnt, (void*)&nn, (void*)&off};
+    launch(f_sp_exclusive_scan_serial, dim3(1, 1, 1), a);
+    sync();
+}
+
+void sp_c2s_fill(const int* coords, const unsigned char* bits, const int* off, int n, int* new_coords, int* idx, int* subidx) {
+    int nn = n;
+    void* a[] = {(void*)&coords, (void*)&bits, (void*)&off, (void*)&nn, (void*)&new_coords, (void*)&idx, (void*)&subidx};
+    launch(f_sp_c2s_fill, dim3((unsigned)((n + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void sp_c2s_gather(const float* src, const int* idx, const int* subidx, long M, int cc, int rep, float* out) {
+    long mm = M;
+    int c = cc, r = rep;
+    void* a[] = {(void*)&src, (void*)&idx, (void*)&subidx, (void*)&mm, (void*)&c, (void*)&r, (void*)&out};
+    long total = M * (long)cc * rep;
+    launch(f_sp_c2s_gather, dim3((unsigned)((total + kThreads - 1) / kThreads), 1, 1), a);
     sync();
 }
 

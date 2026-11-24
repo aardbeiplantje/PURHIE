@@ -114,6 +114,7 @@ TRELLIS_SS_VERIFY = $(BINDIR)/trellis_ss_verify  # the TRELLIS.2 sparse-structur
 TRELLIS_SS_DEC_VERIFY = $(BINDIR)/trellis_ss_dec_verify  # the TRELLIS.2 sparse-structure decoder stage check (/data/trellis2)
 TRELLIS_SLAT_VERIFY = $(BINDIR)/trellis_slat_verify  # the TRELLIS.2 shape-SLAT flow stage check (/data/trellis2/oracle_slat)
 SPARSE_CONV_VERIFY = $(BINDIR)/sparse_conv_verify  # the engine sparse convolution against FlexGEMM (/data/trellis2/oracle_sparse)
+C2S_VERIFY = $(BINDIR)/c2s_verify  # the engine channel-to-spatial upsampling against the python op (/data/trellis2/oracle_sparse)
 AUDIOLDM2_T5_VERIFY = $(BINDIR)/audioldm2_t5_verify  # the T5 encoder stage check (/data/audioldm2-stages)
 AUDIOLDM2_CLAP_VERIFY = $(BINDIR)/audioldm2_clap_verify  # the CLAP text encoder stage check (/data/audioldm2-stages)
 AUDIOLDM2_PROJECTION_VERIFY = $(BINDIR)/audioldm2_projection_verify  # the projection stage check (/data/audioldm2-stages)
@@ -664,3 +665,6 @@ all: $(WMMA_TARGET) $(QWENIMAGE_VERIFY) $(ZIMAGE_1024_VERIFY) $(KV_VERIFY) $(GEM
 
 $(SPARSE_CONV_VERIFY): $(TESTSDIR)/sparse_conv_verify.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/sparse_conv_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
+
+$(C2S_VERIFY): $(TESTSDIR)/c2s_verify.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/c2s_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@

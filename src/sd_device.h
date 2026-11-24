@@ -236,6 +236,14 @@ void sp_neighbor_map(const int* coords, int n, const unsigned long long* keys, c
 void sp_subm_conv_f16w(const float* x, int n, int cin, const int* nb, const uint16_t* W, const float* b, int cout, float* y,
                        int o0, int no);
 
+// channel-to-spatial upsampling (factor 2): the children of each voxel where logit > 0, in increasing child index;
+// sp_c2s_mask: bits[i] (child bits) and cnt[i]; sp_exclusive_scan: off[0..n] (off[n] the total); sp_c2s_fill: the new coords
+// [M][4], idx[p] and subidx[p]; sp_c2s_gather: out[p][j] = src[(idx[p] * 8 + subidx[p]) * cc + j / rep]
+void sp_c2s_mask(const float* logit, int n, unsigned char* bits, int* cnt);
+void sp_exclusive_scan(const int* cnt, int n, int* off);
+void sp_c2s_fill(const int* coords, const unsigned char* bits, const int* off, int n, int* new_coords, int* idx, int* subidx);
+void sp_c2s_gather(const float* src, const int* idx, const int* subidx, long M, int cc, int rep, float* out);
+
 }  // namespace sddev
 
 #endif  // SD_DEVICE_H

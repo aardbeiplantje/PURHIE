@@ -2058,3 +2058,57 @@ extern "C" __global__ void __launch_bounds__(256) sp_subm_conv_f16w(const float*
     }
     y[(long)i * cout + o] = acc;
 }
+
+// ---- channel-to-spatial upsampling (factor 2, src/sparse.c): each voxel's children where the subdivision logit is > 0, in
+// increasing child index (k = x + 2 y + 4 z bits), so the output order is the python op's order.
+extern "C" __global__ void __launch_bounds__(SD_THREADS) sp_c2s_mask(const float* logit, int n, unsigned char* bits, int* cnt) {
+    const int i = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= n) return;
+    unsigned int b = 0;
+    for (int k = 0; k < 8; ++k)
+        if (logit[i * 8 + k] > 0.0f) b |= 1u << k;
+    bits[i] = (unsigned char)b;
+    cnt[i] = __popc(b);
+}
+
+// exclusive prefix sum of cnt[0..n) into off[0..n], off[n] = total (one thread: fine for the sizes of one decoder level)
+extern "C" __global__ void sp_exclusive_scan_serial(const int* cnt, int n, int* off) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    int s = 0;
+    for (int i = 0; i < n; ++i) {
+        off[i] = s;
+        s += cnt[i];
+    }
+    off[n] = s;
+}
+
+// new voxel p for each set child bit of voxel i: coords (b, 2x + dx, 2y + dy, 2z + dz); idx[p] = i; subidx[p] = k
+extern "C" __global__ void __launch_bounds__(SD_THREADS) sp_c2s_fill(const int* coords, const unsigned char* bits, const int* off,
+                                                                    int n, int* new_coords, int* idx, int* subidx) {
+    const int i = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= n) return;
+    const unsigned int b = bits[i];
+    int p = off[i];
+    for (int k = 0; k < 8; ++k) {
+        if (!((b >> k) & 1u)) continue;
+        new_coords[4 * p + 0] = coords[4 * i + 0];
+        new_coords[4 * p + 1] = 2 * coords[4 * i + 1] + (k & 1);
+        new_coords[4 * p + 2] = 2 * coords[4 * i + 2] + ((k >> 1) & 1);
+        new_coords[4 * p + 3] = 2 * coords[4 * i + 3] + ((k >> 2) & 1);
+        idx[p] = i;
+        subidx[p] = k;
+        ++p;
+    }
+}
+
+// out[p][j] = src[(idx[p] * 8 + subidx[p]) * cc + j / rep] for j < cc * rep: the child's channels (rep = 1), or the skip's
+// channels repeated (the python repeat_interleave of out_channels // (channels // 8))
+extern "C" __global__ void __launch_bounds__(SD_THREADS) sp_c2s_gather(const float* src, const int* idx, const int* subidx, long M,
+                                                                      int cc, int rep, float* out) {
+    const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    const int cout = cc * rep;
+    if (e >= M * cout) return;
+    const long p = e / cout;
+    const int j = (int)(e % cout);
+    out[e] = src[((long)idx[p] * 8 + subidx[p]) * cc + j / rep];
+}
