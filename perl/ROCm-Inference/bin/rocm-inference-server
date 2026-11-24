@@ -669,7 +669,49 @@ sub aux_entry {
              status => { value => $a->{m} ? 'loaded' : 'unloaded' }, kind => $kind, arch => undef, endpoints => $ENDPOINTS{$kind}, capabilities => [$kind],
              context_length => undef, n_ctx_train => undef, bytes => $a->{info}{bytes} };
 }
-sub listed_models {  # every model the server serves: the chat and embedding ones, then the speech and image ones
+# What each image model is for and how to call it (GET /v1/models lists these with the model; GET /v1/models?kind=image
+# lists the image models alone). The keys are the model ids; "sd" is the sd-turbo file (its id is the file's name).
+my %IMAGE_COMMON = (
+    prompt => { type => 'string', required => 1, note => 'at most 1000 characters' },
+    response_format => { type => 'string', default => 'b64_json', values => ['b64_json', 'png'],
+                         note => 'b64_json: the PNG in data[0].b64_json; png: the PNG bytes as image/png' },
+    n => { type => 'integer', default => 1, values => [1], note => 'one image per request' },
+);
+my %IMAGE_INFO = (
+    'z-image-turbo' => {
+        description => 'Text to image with Z-Image-Turbo (--zimage: the ComfyUI files). Nine steps, the default size 1024 x 1024.',
+        usage => 'POST /v1/images/generations {"model":"z-image-turbo","prompt":"a red square on a blue background","size":"1024x1024","steps":9,"seed":0}',
+        parameters => { %IMAGE_COMMON,
+            size => { type => 'string', default => '1024x1024', note => 'WIDTHxHEIGHT, multiples of 16 from 64 to 1024' },
+            steps => { type => 'integer', default => 9, min => 1, max => 50 },
+            seed => { type => 'integer', default => 0, min => 0, note => 'the same prompt, size, steps and seed give the same image' } },
+    },
+    'sd' => {
+        description => 'Text to image with sd-turbo (--sd, or a file in --models-dir): one step, quick drafts at 512 x 512.',
+        usage => 'POST /v1/images/generations {"model":"<id>","prompt":"a red square","size":"512x512","seed":0}',
+        parameters => { %IMAGE_COMMON,
+            size => { type => 'string', default => '512x512', note => 'WIDTHxHEIGHT, multiples of 8 from 64 to 1024' },
+            seed => { type => 'integer', default => 0, min => 0 } },
+    },
+    'minimax-h3-image' => {
+        description => 'Text to image with MiniMax-H3-Image (--minimax DIR: the released pipeline on the original checkpoints). Slow: about 166 s at 256 x 256; one image at a time.',
+        usage => 'POST /v1/images/generations {"model":"minimax-h3-image","prompt":"a red square","size":"1024x1024","seed":0}',
+        parameters => { %IMAGE_COMMON,
+            size => { type => 'string', default => '1024x1024', note => 'WIDTHxHEIGHT' },
+            seed => { type => 'integer', default => 0, min => 0 } },
+    },
+);
+sub with_image_info {  # an image model's entry with its purpose, usage and parameters
+    my ($e) = @_;
+    return $e unless ($e->{kind} // '') eq 'image';
+    my $info = $IMAGE_INFO{ $e->{id} } // $IMAGE_INFO{sd};
+    return { %$e, %$info };
+}
+sub listed_models {  # the entries of every model the server serves (see _listed_models), image models with their details
+    return map { with_image_info($_) } _listed_models();
+}
+
+sub _listed_models {  # every model the server serves: the chat and embedding ones, then the speech and image ones
     audio_rescan();
     scan();
     my @aux = sort { $a->{id} cmp $b->{id} } values %AUX;
@@ -687,8 +729,12 @@ sub listed_models {  # every model the server serves: the chat and embedding one
 
 route::get '/health' => sub { { status => 'ok' } };
 
-route::get '/v1/models' => sub {
-    { object => 'list', data => [ listed_models() ] };
+route::get '/v1/models' => sub {  # ?kind=image (or chat, embedding, speech, audio) lists the models of that kind
+    my ($req) = @_;
+    my @m = listed_models();
+    my $kind = $req->{args}{kind};
+    @m = grep { $_->{kind} eq $kind } @m if defined $kind && !ref $kind;
+    { object => 'list', data => [ @m ] };
 };
 route::get '/v1/models/*id' => sub {
     my ($req) = @_;
@@ -2241,6 +2287,9 @@ model). A client that disconnects stops its reply.
 C<POST /v1/audio/generations> (with C<--audioldm2>): a JSON body with the C<prompt> (text to audio: the clip is made
 from it), C<negative_prompt> (optional), C<seconds> (1 to 10, 5 by default), C<steps> (1 to 200, 100 by default),
 C<guidance_scale> (3.5 by default) and C<seed> (0 by default). The reply is the clip as a WAV file (mono, 16 kHz, 16 bit).
+
+C<GET /v1/models> lists every model; C<GET /v1/models?kind=image> lists the image models alone. An image model's entry has its
+C<description>, a C<usage> example and its C<parameters> (type, default, limits), and C<GET /v1/models/{id}> gives the same.
 
 =head1 NGINX
 
