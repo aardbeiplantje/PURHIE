@@ -212,6 +212,14 @@ void attention(const float* q, int Tq, const float* k, const float* v, int Tk, i
 // Qwen-Image DiT, whose 1 % error in the BF16 flash path was measured against the FP32 reference)
 void attention_f32(const float* q, int Tq, const float* k, const float* v, int Tk, int C, int heads, float* out);
 
+// TRELLIS.2 sparse-structure flow (sd_gpu.hip): x = x * s + sh per channel over [T][C]
+void ss_affine(float* x, int T, int C, const float* s, const float* sh);
+// h += g * y per channel over [T][C]
+void ss_gate_add(float* h, int T, int C, const float* g, const float* y);
+// per token and head (rows of D = 128): x = normalize(x) * sqrt(D) * gamma, then the RoPE pairs by phases [T][D/2][2] when
+// phases is not null; x has row stride ld (in place)
+void ss_head_norm_rope(float* x, int T, int ld, int H, int D, const float* gamma, const float* phases);
+
 }  // namespace sddev
 
 #endif  // SD_DEVICE_H

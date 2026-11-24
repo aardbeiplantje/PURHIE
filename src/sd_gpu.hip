@@ -1894,3 +1894,44 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) audio_upsample_nearest_
     ix = ix < W - 1 ? ix : W - 1;
     y[i] = x[((long)c * H + iy) * W + ix];
 }
+
+// ---- TRELLIS.2 sparse-structure flow (src/trellis_ss.cpp): x = x * s + sh per channel over [T][C]; h += g * y per channel;
+// per token and head the q/k RMS norm of the DiT (x = normalize(x) * sqrt(D) * gamma, F.normalize over the head's D values),
+// then the RoPE pairs (2i, 2i+1) rotated by phases[t][i] = (cos, sin) when phases is not null. D = 128, one block per (t, h).
+extern "C" __global__ void __launch_bounds__(SD_THREADS) ss_affine(float* x, long n, int C, const float* s, const float* sh) {
+    const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (e >= n) return;
+    const int c = (int)(e % C);
+    x[e] = x[e] * s[c] + sh[c];
+}
+
+extern "C" __global__ void __launch_bounds__(SD_THREADS) ss_gate_add(float* h, long n, int C, const float* g, const float* y) {
+    const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (e >= n) return;
+    h[e] += g[(int)(e % C)] * y[e];
+}
+
+extern "C" __global__ void __launch_bounds__(128) ss_head_norm_rope(float* x, int ld, int H, int D, const float* gamma, const float* phases) {
+    __shared__ float v[128];
+    __shared__ float red[128];
+    const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    float* row = x + (long)t * ld + (long)h * D;
+    const float a = row[d];
+    red[d] = a * a;
+    __syncthreads();
+    for (int s = 64; s > 0; s >>= 1) {
+        if (d < s) red[d] += red[d + s];
+        __syncthreads();
+    }
+    const float scale = sqrtf((float)D) / fmaxf(sqrtf(red[0]), 1e-12f);
+    float y = a * scale * gamma[h * D + d];
+    if (phases) {
+        v[d] = y;
+        __syncthreads();
+        const int i = d >> 1;
+        const float c = phases[((long)t * (D / 2) + i) * 2], sn = phases[((long)t * (D / 2) + i) * 2 + 1];
+        const float re = v[2 * i], im = v[2 * i + 1];
+        y = (d & 1) ? (re * sn + im * c) : (re * c - im * sn);
+    }
+    row[d] = y;
+}

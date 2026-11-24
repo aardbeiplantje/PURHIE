@@ -42,6 +42,7 @@ hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn
               f_layer_norm = nullptr, f_rms_norm = nullptr, f_zm_modulate = nullptr, f_zm_gate_add = nullptr, f_zm_swiglu = nullptr, f_zm_rope = nullptr, f_zm_ln_plain = nullptr, f_gn_f32 = nullptr, f_to_tok = nullptr, f_to_chw = nullptr, f_zq_rope = nullptr, f_zq_attn = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma256b = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
               f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr, f_qi_linear_f8 = nullptr, f_qi_rms_f8 = nullptr, f_qi_affine = nullptr, f_qi_gelu = nullptr, f_qv_rms = nullptr, f_qv_patch = nullptr, f_qv_bias = nullptr, f_qv_upsample = nullptr, f_qi_hadamard = nullptr, f_qi_linear_i8 = nullptr, f_qi21_zc = nullptr, f_qi21_gather = nullptr, f_qi21_mul = nullptr, f_qi21_gated = nullptr, f_qi21_attn = nullptr, f_qi21_lbf = nullptr, f_qi21_dupup = nullptr, f_gemm_af128 = nullptr, f_transpose_bf16 = nullptr, f_bias_cm = nullptr, f_zm_rms_mod_bf16 = nullptr, f_zm_swiglu_bf16 = nullptr, f_bf16_to_f32 = nullptr, f_round_bf16 = nullptr, f_gn_sum_part = nullptr, f_gn_var_part = nullptr, f_gn_apply_part = nullptr, f_im2col_bf16_tile = nullptr, f_hnr16 = nullptr, f_count_diff = nullptr, f_tp16 = nullptr, f_rga16 = nullptr, f_sw16 = nullptr;
 
+hipFunction_t f_ss_affine = nullptr, f_ss_gate_add = nullptr, f_ss_head_norm_rope = nullptr;
 constexpr int kThreads = 256;
 constexpr int kGroupSplit = 16;  // the group norm's partial sums per group
 constexpr size_t kColFloats = (size_t)1 << 25;  // the im2col chunk: at most 128 MB (a launch covers enough tiles to fill the GPU)
@@ -124,6 +125,7 @@ bool init() {
         {&f_gn_sum, "sd_gn_sum"},       {&f_gn_sq, "sd_gn_sq"},         {&f_gn_apply, "sd_gn_apply"},
         {&f_silu, "sd_silu"},           {&f_add, "sd_add"},             {&f_upsample2, "sd_upsample2"},
         {&f_softmax, "sd_softmax"},     {&f_layer_norm, "sd_layer_norm"}, {&f_rms_norm, "sd_rms_norm"}, {&f_zm_modulate, "zimage_modulate"}, {&f_zm_gate_add, "zimage_gate_add"}, {&f_zm_swiglu, "zimage_swiglu"}, {&f_zm_rope, "zimage_rope"}, {&f_zm_ln_plain, "zimage_layer_norm_plain"}, {&f_gn_f32, "zimage_group_norm_f32"}, {&f_to_tok, "zimage_to_tokens"}, {&f_to_chw, "zimage_to_chw"}, {&f_zq_rope, "zq_rope_half"}, {&f_zq_attn, "zq_causal_attn"}, {&f_geglu, "sd_geglu"},
+        {&f_ss_affine, "ss_affine"}, {&f_ss_gate_add, "ss_gate_add"}, {&f_ss_head_norm_rope, "ss_head_norm_rope"},
     };
     for (const Entry& e : entries)
         if (hipModuleGetFunction(e.f, g_mod, e.name) != hipSuccess) return false;
@@ -1597,6 +1599,30 @@ void attention(const float* q, int Tq, const float* k, const float* v, int Tk, i
     if (Tq <= 0 || Tk <= 0) return;
     if (C / heads == 128) attention_flash(q, Tq, k, v, Tk, C, heads, out);
     else attention_f32(q, Tq, k, v, Tk, C, heads, out);
+}
+
+// TRELLIS.2 sparse-structure flow (sd_gpu.hip, the ss_* kernels): see sd_device.h
+void ss_affine(float* x, int T, int C, const float* s, const float* sh) {
+    long n = (long)T * C;
+    int cc = C;
+    void* a[] = {(void*)&x, (void*)&n, (void*)&cc, (void*)&s, (void*)&sh};
+    launch(f_ss_affine, dim3((unsigned)((n + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void ss_gate_add(float* h, int T, int C, const float* g, const float* y) {
+    long n = (long)T * C;
+    int cc = C;
+    void* a[] = {(void*)&h, (void*)&n, (void*)&cc, (void*)&g, (void*)&y};
+    launch(f_ss_gate_add, dim3((unsigned)((n + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void ss_head_norm_rope(float* x, int T, int ld, int H, int D, const float* gamma, const float* phases) {
+    int ldc = ld, hh = H, dd = D;
+    void* a[] = {(void*)&x, (void*)&ldc, (void*)&hh, (void*)&dd, (void*)&gamma, (void*)&phases};
+    check(hip_launch(f_ss_head_norm_rope, (unsigned)T, (unsigned)H, 1, 128, 1, 1, 0, nullptr, a, nullptr), "ss head norm rope");
+    sync();
 }
 
 }  // namespace sddev
