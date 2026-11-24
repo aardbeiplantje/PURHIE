@@ -154,6 +154,14 @@ bool SafeTensors::bf16_in_place(const std::string& name, const uint16_t*& ptr, s
     return true;
 }
 
+bool SafeTensors::f16_in_place(const std::string& name, const uint16_t*& ptr, std::vector<size_t>& shape) const {
+    auto it = t_.find(name);
+    if (it == t_.end() || it->second.dtype != "F16") return false;
+    ptr = reinterpret_cast<const uint16_t*>(base_ + data_ + it->second.begin);
+    shape = it->second.shape;
+    return true;
+}
+
 bool SafeTensors::i8_in_place(const std::string& name, const int8_t*& ptr, std::vector<size_t>& shape) const {
     auto it = t_.find(name);
     if (it == t_.end() || it->second.dtype != "I8") return false;

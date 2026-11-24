@@ -30,6 +30,8 @@ public:
     bool register_device() const;
     /* a BF16 tensor's bits in the mapping (read in place by the GPU), its shape; false if absent or not BF16 */
     bool bf16_in_place(const std::string& name, const uint16_t*& ptr, std::vector<size_t>& shape) const;
+    /* the same for an F16 tensor (raw bits, read in place) */
+    bool f16_in_place(const std::string& name, const uint16_t*& ptr, std::vector<size_t>& shape) const;
     /* an I8 tensor's bytes in the mapping (read in place by the GPU's ConvRot linear), its shape; false if absent or not I8 */
     bool i8_in_place(const std::string& name, const int8_t*& ptr, std::vector<size_t>& shape) const;
     /* an F8_E4M3 tensor's bytes in the mapping (read in place by the GPU's FP8 linear), its shape; false if absent or not F8 */

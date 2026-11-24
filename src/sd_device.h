@@ -220,6 +220,14 @@ void ss_gate_add(float* h, int T, int C, const float* g, const float* y);
 // phases is not null; x has row stride ld (in place)
 void ss_head_norm_rope(float* x, int T, int ld, int H, int D, const float* gamma, const float* phases);
 
+// TRELLIS.2 sparse-structure decoder (sd_gpu.hip), token-major activations [V][C], V = n^3:
+// the 3x3x3 im2col of x [V][C] (padding 1) into P [V][C * 27]
+void ss_im2col3(const float* x, int C, int n, float* P);
+// y[v][o] = b[o] + sum_k P[v][k] W[o][k] over v in [v0, v0 + nv), o in [o0, o0 + no); W fp16 in place, P rows of K
+void ss_gemm_f16w(const float* P, long K, const uint16_t* W, const float* b, int Cout, long Vtot, float* y, int v0, int nv, int o0, int no);
+// the 3D pixel shuffle: x [(n)^3][Cout * 8] -> y [(2n)^3][Cout]
+void ss_pixel_shuffle3(const float* x, int Cout, int n, float* y);
+
 }  // namespace sddev
 
 #endif  // SD_DEVICE_H

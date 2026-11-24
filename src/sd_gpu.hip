@@ -1935,3 +1935,49 @@ extern "C" __global__ void __launch_bounds__(128) ss_head_norm_rope(float* x, in
     }
     row[d] = y;
 }
+
+// ---- TRELLIS.2 sparse-structure decoder (src/trellis_ss_dec.cpp): token-major activations [V][C], V = n^3 voxels
+// im2col of a 3x3x3 convolution with padding 1: P[v][c*27 + t] = x[neighbour t of v][c] (zero outside); x is [V][C]
+extern "C" __global__ void __launch_bounds__(SD_THREADS) ss_im2col3(const float* x, int C, int n, float* P) {
+    const long K = (long)C * 27, V = (long)n * n * n;
+    const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (e >= V * K) return;
+    const long v = e / K;
+    const int k = (int)(e % K);
+    const int c = k / 27, t = k % 27;
+    const int i = t / 9, j = (t / 3) % 3, q = t % 3;
+    const int xa = (int)(v / ((long)n * n)), yb = (int)((v / n) % n), zc = (int)(v % n);
+    const int xi = xa + i - 1, yi = yb + j - 1, zi = zc + q - 1;
+    float val = 0.0f;
+    if (xi >= 0 && xi < n && yi >= 0 && yi < n && zi >= 0 && zi < n)
+        val = x[(((long)xi * n + yi) * n + zi) * C + c];
+    P[e] = val;
+}
+
+// y[v][o] = b[o] + sum_k P[v][k] * W[o][k] for v in [v0, v0 + nv), o in [o0, o0 + no); W is fp16 (read in place)
+extern "C" __global__ void __launch_bounds__(256) ss_gemm_f16w(const float* P, long K, const uint16_t* W, const float* b,
+                                                              int Cout, long Vtot, float* y, int v0, int nv, int o0, int no) {
+    const int v = v0 + blockIdx.x * 16 + threadIdx.x;
+    const int o = o0 + blockIdx.y * 16 + threadIdx.y;
+    if (v >= v0 + nv || o >= o0 + no) return;
+    const float* p = P + (long)v * K;
+    const uint16_t* w = W + (long)o * K;
+    float acc = b[o];
+    for (long k = 0; k < K; ++k) acc += p[k] * h2f(w[k]);
+    y[(long)v * Cout + o] = acc;
+}
+
+// the 3D pixel shuffle, token-major: x [V_in][Cout * 8] -> y [V_out][Cout] with V_out = (2n)^3;
+// y[(X,Y,Z)][c] = x[(X/2,Y/2,Z/2)][c*8 + (X&1)*4 + (Y&1)*2 + (Z&1)] (the python reshape/permute of pixel_shuffle_3d)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) ss_pixel_shuffle3(const float* x, int Cout, int n, float* y) {
+    const long n2 = 2L * n;
+    const long Vo = n2 * n2 * n2;
+    const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (e >= Vo * Cout) return;
+    const long v = e / Cout;
+    const int c = (int)(e % Cout);
+    const int X = (int)(v / (n2 * n2)), Y = (int)((v / n2) % n2), Z = (int)(v % n2);
+    const int i = X & 1, j = Y & 1, q = Z & 1;
+    const long vin = ((long)(X >> 1) * n + (Y >> 1)) * n + (Z >> 1);
+    y[e] = x[vin * (Cout * 8L) + c * 8 + i * 4 + j * 2 + q];
+}
