@@ -211,6 +211,10 @@ void attention(const float* q, int Tq, const float* k, const float* v, int Tk, i
 // The same in FP32 throughout (no BF16 rounding of Q, K, V; the device path of attention for head widths other than 128, and the
 // Qwen-Image DiT, whose 1 % error in the BF16 flash path was measured against the FP32 reference)
 void attention_f32(const float* q, int Tq, const float* k, const float* v, int Tk, int C, int heads, float* out);
+// The same with row strides: q has Tq rows of ldq floats, k and v have Tk rows of ldk and ldv (the heads are columns of width C /
+// heads); out is [Tq][C] (contiguous). The trellis flows take their Q, K, V from one packed [T][3C] projection.
+void attention_f32_strided(const float* q, long ldq, int Tq, const float* k, long ldk, const float* v, long ldv, int Tk, int C,
+                           int heads, float* out);
 
 // TRELLIS.2 sparse-structure flow (sd_gpu.hip): x = x * s + sh per channel over [T][C]
 void ss_affine(float* x, int T, int C, const float* s, const float* sh);

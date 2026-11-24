@@ -1454,6 +1454,11 @@ bool blt_attn_on() {
 }
 
 void attention_f32(const float* q, int Tq, const float* k, const float* v, int Tk, int C, int heads, float* out) {
+    attention_f32_strided(q, C, Tq, k, C, v, C, Tk, C, heads, out);
+}
+
+void attention_f32_strided(const float* q, long ldq, int Tq, const float* k, long ldk, const float* v, long ldv, int Tk, int C,
+                           int heads, float* out) {
     const int D = C / heads;
     const float scale = 1.0f / std::sqrt((float)D);
     if (Tq <= 0 || Tk <= 0) return;
@@ -1463,13 +1468,17 @@ void attention_f32(const float* q, int Tq, const float* k, const float* v, int T
         for (int r0 = 0; r0 < Tq; r0 += R) {
             const int Rc = std::min(R, Tq - r0);
             // scores = scale * Q K^T for the chunk's rows, softmaxed, then the weighted values into the head's columns
-            const bool blt_ok = blt_attn_on() && blt::gemm_f32(Rc, Tk, D, q + (size_t)r0 * C + hd * D, C, k + hd * D, 1, C, S, Tk, scale);
-            if (!blt_ok) gemm<float>(f_gemm_af, q + (size_t)r0 * C + hd * D, C, k + hd * D, 1, C, S, Tk, 1, nullptr, scale, 0.0f, Rc, Tk, D);
+            const float* qh = q + (size_t)r0 * ldq + hd * D;
+            const float* kh = k + hd * D;
+            const float* vh = v + hd * D;
+            float* oh = out + (size_t)r0 * C + hd * D;
+            const bool blt_ok = blt_attn_on() && blt::gemm_f32(Rc, Tk, D, qh, ldq, kh, 1, ldk, S, Tk, scale);
+            if (!blt_ok) gemm<float>(f_gemm_af, qh, ldq, kh, 1, ldk, S, Tk, 1, nullptr, scale, 0.0f, Rc, Tk, D);
             int N = Tk;
             void* sm[] = {(void*)&S, (void*)&N};
             launch(f_softmax, dim3((unsigned)Rc, 1, 1), sm);
-            const bool blt_pv = blt_attn_on() && blt::gemm_f32(Rc, D, Tk, S, Tk, v + hd * D, C, 1, out + (size_t)r0 * C + hd * D, C, 1.0f);
-            if (!blt_pv) gemm<float>(f_gemm_af, S, Tk, v + hd * D, C, 1, out + (size_t)r0 * C + hd * D, C, 1, nullptr, 1.0f, 0.0f, Rc, D, Tk);
+            const bool blt_pv = blt_attn_on() && blt::gemm_f32(Rc, D, Tk, S, Tk, vh, ldv, 1, oh, C, 1.0f);
+            if (!blt_pv) gemm<float>(f_gemm_af, S, Tk, vh, ldv, 1, oh, C, 1, nullptr, 1.0f, 0.0f, Rc, D, Tk);
         }
     sync();
     release(S, sizeof(float) * (size_t)R * Tk);

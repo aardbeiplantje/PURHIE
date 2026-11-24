@@ -250,8 +250,8 @@ bool SlatFlow::forward(const int32_t* coords, int n, const float* feats, float t
         sddev::ss_head_norm_rope(QKV + kC, n, 3 * kC, kH, kD, k.gk, ph);
         for (int c0 = 0; c0 < n; c0 += kQChunk) {
             const int qn = std::min(kQChunk, n - c0);
-            sddev::audio_attention_f32(QKV + (size_t)c0 * 3 * kC, QKV + kC, QKV + 2 * kC, 3 * kC, qn, n, kH, kD, false,
-                                       nullptr, scale, nullptr, O + (size_t)c0 * kC);
+            sddev::attention_f32_strided(QKV + (size_t)c0 * 3 * kC, 3 * kC, qn, QKV + kC, 3 * kC, QKV + 2 * kC, 3 * kC, n, kC, kH,
+                                         O + (size_t)c0 * kC);
         }
         sddev::linear_bf16(O, n, k.wso, kC, kC, k.bso, P);
         sddev::ss_gate_add(h, n, kC, vs[2], P);
@@ -265,8 +265,7 @@ bool SlatFlow::forward(const int32_t* coords, int n, const float* feats, float t
         sddev::ss_head_norm_rope(Kc, Lc, kC, kH, kD, k.gck, nullptr);
         for (int c0 = 0; c0 < n; c0 += kQChunk) {
             const int qn = std::min(kQChunk, n - c0);
-            sddev::audio_attention_f32(Qc + (size_t)c0 * kC, Kc, Vc, kC, qn, Lc, kH, kD, false, nullptr, scale, nullptr,
-                                       Oc + (size_t)c0 * kC);
+            sddev::attention_f32_strided(Qc + (size_t)c0 * kC, kC, qn, Kc, kC, Vc, kC, Lc, kC, kH, Oc + (size_t)c0 * kC);
         }
         sddev::linear_bf16(Oc, n, k.wco, kC, kC, k.bco, Pc);
         sddev::ss_gate_add(h, n, kC, ones, Pc);
