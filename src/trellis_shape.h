@@ -40,7 +40,10 @@ struct ShapeConfig {
 
 struct ShapeResult {
     // wall-clock seconds of each stage: the sparse-structure sampling, its decoder, the shape-SLAT sampling, the shape decoder, the mesh
-    double seconds_ss = 0, seconds_ss_dec = 0, seconds_slat = 0, seconds_dec = 0, seconds_mesh = 0;
+    double seconds_ss = 0, seconds_ss_dec = 0, seconds_slat = 0, seconds_dec = 0, seconds_mesh = 0, seconds_hr = 0;
+    // the cascade: the 1024 flow's voxels (64^3, unique) and features; coords/slat/ss_latent/dec are the 512 stages
+    std::vector<int32_t> hr_coords;   // [M][4]
+    std::vector<float> hr_slat;       // [M][32] de-normalised
     std::vector<float> ss_latent;     // [8][16][16][16] the sparse-structure flow's sample
     std::vector<int32_t> coords;      // [N][4] the occupied voxels at 32^3 (batch, x, y, z), in the python order
     std::vector<float> slat;          // [N][32] the shape latent, de-normalised
@@ -54,19 +57,31 @@ struct ShapeResult {
 // N the occupied voxels).
 using NoiseFn = std::function<void(float* dst, size_t count)>;
 
+// The cascade's high-resolution voxels: the 512-grid coordinates [N][4] quantised to 64^3 the way the python pipeline does it (the
+// float (c + 0.5) / 512 * 64, truncated), then the unique voxels in lexicographic order (coords64: [M][4]).
+void cascade_voxels(const std::vector<int32_t>& coords512, std::vector<int32_t>& coords64);
+
 // The sparse-structure flow's RoPE table: [4096][64][2] (cos, sin) pairs of the 16^3 grid (RotaryPositionEmbedder, head dim 128).
 void ss_rope_table(float* out);
 
 class ShapePipeline {
 public:
     // The four checkpoints: the sparse-structure flow and its decoder, the shape-SLAT flow (512) and the shape decoder.
-    ShapePipeline(const std::string& ss_flow, const std::string& ss_dec, const std::string& slat_flow, const std::string& shape_dec);
+    // slat_flow_hr: the 1024 shape-SLAT flow, for run_cascade (optional).
+    ShapePipeline(const std::string& ss_flow, const std::string& ss_dec, const std::string& slat_flow, const std::string& shape_dec,
+                  const std::string& slat_flow_hr = std::string());
     ~ShapePipeline();
     ShapePipeline(const ShapePipeline&) = delete;
     ShapePipeline& operator=(const ShapePipeline&) = delete;
 
     bool ok() const { return ok_; }
     const std::string& error() const { return error_; }
+
+    // The 1024 cascade (the pipeline's '1024_cascade'): the sparse-structure flow and its occupied voxels as run; the 512 shape-SLAT
+    // flow on those voxels; the decoder's first four levels give the voxels at 512, quantised to 64^3 (unique); the 1024 flow on
+    // them; the decoder and the mesh at cfg.mesh_grid (1024). cond_lr: [Lc_lr][1024] (512 image features), cond_hr: [Lc_hr][1024].
+    bool run_cascade(const float* cond_lr, int Lc_lr, const float* cond_hr, int Lc_hr, const NoiseFn& noise, const ShapeConfig& cfg,
+                     ShapeResult& out);
 
     // The sparse-structure flow alone: the sample [8][16][16][16] from the noise (cond: [Lc][1024]).
     bool sample_sparse_structure(const float* cond, int Lc, const NoiseFn& noise, const FlowSampler& p, std::vector<float>& z);
@@ -75,6 +90,8 @@ public:
     bool run(const float* cond, int Lc, const NoiseFn& noise, const ShapeConfig& cfg, ShapeResult& out);
 
 private:
+    bool occupancy_32(const float* z, std::vector<int32_t>& coords);
+    bool decode_mesh(const std::vector<int32_t>& coords, const std::vector<float>& slat, int grid, const ShapeConfig& cfg, ShapeResult& out);
     struct Impl;
     std::unique_ptr<Impl> p_;
     bool ok_ = false;

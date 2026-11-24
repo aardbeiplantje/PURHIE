@@ -170,7 +170,7 @@ struct VoxelMap {
 }  // namespace
 
 bool ShapeDecoder::forward(const int32_t* coords, int n, const float* feats, float* out_feats, int32_t* out_coords, int* out_m,
-                           int out_capacity, const StageFn& stage) {
+                           int out_capacity, const StageFn& stage, int upsample_times) {
     if (!ok_) return false;
     if (!sddev::enabled()) {
         error_ = "no device";
@@ -237,6 +237,15 @@ bool ShapeDecoder::forward(const int32_t* coords, int n, const float* feats, flo
     int C = kChans[0];
 
     for (int i = 0; i < 5; ++i) {
+        if (upsample_times > 0 && i == upsample_times) {  // the coordinates of this level, before its blocks (python's upsample)
+            *out_m = N;  // the count, also when the buffer is too small (the caller retries with it)
+            if (N > out_capacity) {
+                error_ = "the coordinates have more voxels than the buffer";
+                return false;
+            }
+            std::memcpy(out_coords, ccoords, sizeof(int) * (size_t)N * 4);
+            return true;
+        }
         // the level's ConvNeXt blocks: h = mlp(LN(conv(h))) + h
         if (!m.levels[i].empty()) {
             VoxelMap mp = build_map(ccoords, N);

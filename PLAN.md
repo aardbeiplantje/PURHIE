@@ -269,14 +269,16 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
 20. **TRELLIS.2 (image to 3D), in progress.** On the engine, each stage checked against its oracle: the sparse-structure flow and
     its decoder (`src/trellis_ss.cpp`, `src/trellis_ss_dec.cpp`; `tests/trellis_ss_verify.cpp`, `tests/trellis_ss_dec_verify.cpp`),
     the shape-SLAT flow (`src/trellis_slat.cpp`, `tests/trellis_slat_verify.cpp`), the shape decoder's sparse UNet
-    (`src/trellis_sdec.cpp`, `tests/sdec_verify.cpp`), and the mesh step (`src/trellis_mesh.cpp`, `tests/mesh_verify.cpp`). The
-    attention of both flows is FP32 on hipBLASLt (`attention_f32_strided`). The image-to-shape path of the 512 pipeline is chained in
-    `src/trellis_shape.cpp` (`tests/shape_verify.cpp` against `tools/trellis_shape_oracle.py`) and runs end to end in about 2 minutes
-    (the sparse-structure sampler 109 s). Its end-to-end check is a smoke test: the 12-step sampler amplifies bf16 rounding (the
-    shipped bf16 model is 0.42 from fp32 over its steps; the engine variants land between 191 and 237 occupied voxels against 302 in
-    fp32), so element-wise agreement is not reachable and the bounds are wide (count ratio 0.5 to 2, IoU at least 0.5, Chamfer at most
-    0.1 box units). Open: the image encoder (DINOv3, not on the engine: the features are an input), the 1024 cascade (its own flow
-    model), texture. Oracles: `tools/*_oracle.py` (outputs in `/data/trellis2/oracle_*`); weights: `/data/trellis2/`.
+    (`src/trellis_sdec.cpp`, `tests/sdec_verify.cpp`), and the mesh step (`src/trellis_mesh.cpp`, `tests/mesh_verify.cpp`). The attention
+    of both flows is FP32 on hipBLASLt (`attention_f32_strided`). `src/trellis_shape.cpp` chains the 512 pipeline's shape half
+    (`tests/shape_verify.cpp` against `tools/trellis_shape_oracle.py`, about 2 minutes) and the 1024 cascade (`run_cascade`:
+    `tests/cascade_verify.cpp` against `tools/trellis_cascade_oracle.py`, about 2.5 minutes). The cascade's upsampled 512 voxels
+    (123208) and its 64^3 voxels (1525) match python exactly. The end-to-end checks are smoke tests: the 12-step sampler amplifies the
+    bf16 rounding of the flows (the shipped bf16 model is 0.42 from fp32 over its steps), so the bounds are wide (count ratio 0.5 to 2,
+    IoU at least 0.5, Chamfer at most 0.1 box units; the cascade's Chamfer is 0.070). Open: the image encoder, DINOv3 ViT-L/16
+    (`facebook/dinov3-vitl16-pretrain-lvd1689m`), is gated on Hugging Face and no token is set here, so the image features are an
+    input until its weights are on disk; texture next (its flow and decoder checkpoints are not on disk yet). Oracles:
+    `tools/*_oracle.py` (outputs in `/data/trellis2/oracle_*`); weights: `/data/trellis2/`.
 21. **Qwen-Image 2.1 image edit (next, after TRELLIS.2).** The 2.1 DiT, text encoder and VAE run on the engine (items above
     in the Qwen-Image status), but there is no reference-image input and no edit route: `src/qwenimage21_*.cpp` has no edit
     path, and the server has no image-edit endpoint. Needs: the edit conditioning in the 2.1 DiT (how the reference image enters,
