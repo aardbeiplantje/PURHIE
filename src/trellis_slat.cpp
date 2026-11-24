@@ -47,6 +47,7 @@ struct SlatFlow::Impl {
     zimage::SafeTensors st;
     std::vector<std::pair<void*, size_t>> owned;  // the fp32 vectors made at open, released at destruction
 
+    int in = kLat;  // the input features per voxel
     const uint16_t *w_in = nullptr, *w_t0 = nullptr, *w_t2 = nullptr, *w_ada = nullptr, *w_out = nullptr;
     float *b_in = nullptr, *b_t0 = nullptr, *b_t2 = nullptr, *b_ada = nullptr, *b_out = nullptr;
     struct Block {
@@ -73,8 +74,9 @@ struct SlatFlow::Impl {
     }
 };
 
-SlatFlow::SlatFlow(const std::string& safetensors_path) : p_(new Impl(safetensors_path)) {
+SlatFlow::SlatFlow(const std::string& safetensors_path, int in_channels) : p_(new Impl(safetensors_path)) {
     Impl& m = *p_;
+    m.in = in_channels;
     if (!m.st.ok()) {
         error_ = m.st.error();
         return;
@@ -88,7 +90,7 @@ SlatFlow::SlatFlow(const std::string& safetensors_path) : p_(new Impl(safetensor
         if (!good && !what) what = strdup(name.c_str());
         return good;
     };
-    need(m.weight("input_layer.weight", m.w_in, (size_t)kC * kLat), "input_layer.weight");
+    need(m.weight("input_layer.weight", m.w_in, (size_t)kC * m.in), "input_layer.weight");
     need(m.vec("input_layer.bias", m.b_in, kC), "input_layer.bias");
     need(m.weight("t_embedder.mlp.0.weight", m.w_t0, (size_t)kC * kFreq), "t_embedder.mlp.0.weight");
     need(m.vec("t_embedder.mlp.0.bias", m.b_t0, kC), "t_embedder.mlp.0.bias");
@@ -186,10 +188,10 @@ bool SlatFlow::forward(const int32_t* coords, int n, const float* feats, float t
     emit("slat_mod", mod, (size_t)6 * kC);
 
     // the tokens: the latent per voxel, then the input layer (32 -> 1536)
-    float* tok = S(N * kLat);
-    std::memcpy(tok, feats, sizeof(float) * N * kLat);
+    float* tok = S(N * m.in);
+    std::memcpy(tok, feats, sizeof(float) * N * m.in);
     float* h = S(N * kC);
-    sddev::linear_bf16(tok, n, m.w_in, kLat, kC, m.b_in, h);
+    sddev::linear_bf16(tok, n, m.w_in, m.in, kC, m.b_in, h);
     emit("slat_h0", h, N * kC);
 
     // the RoPE table of the voxel coordinates (host, small): 63 pairs over the three axes (21 frequencies each) and one identity
@@ -230,7 +232,6 @@ bool SlatFlow::forward(const int32_t* coords, int n, const float* feats, float t
     for (int j = 0; j < 6; ++j) vs[j] = S(kC);
     std::vector<float> ms(6 * kC);
 
-    const float scale = 1.0f / std::sqrt((float)kD);
     for (int b = 0; b < kBlocks; ++b) {
         const Impl::Block& k = m.blk[b];
         for (int j = 0; j < 6 * kC; ++j) ms[j] = k.mod[j] + mod[j];

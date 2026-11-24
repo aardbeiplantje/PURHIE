@@ -13,7 +13,9 @@ namespace trellis {
 
 class SlatFlow {
 public:
-    explicit SlatFlow(const std::string& safetensors_path);
+    // in_channels: the features per voxel the flow takes (32: the shape flow; 64: the texture flow, whose input is the noise and the
+    // normalised shape latent concatenated).
+    explicit SlatFlow(const std::string& safetensors_path, int in_channels = 32);
     ~SlatFlow();
     SlatFlow(const SlatFlow&) = delete;
     SlatFlow& operator=(const SlatFlow&) = delete;

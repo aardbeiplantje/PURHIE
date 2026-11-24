@@ -57,6 +57,11 @@ struct ShapeResult {
 // N the occupied voxels).
 using NoiseFn = std::function<void(float* dst, size_t count)>;
 
+// The sampler over a flat sample: x holds the noise on entry and the sample on exit. vel gives the velocity of x at the model's time
+// (1000 times the sampler's t): the conditional one, or with negative = true the negative one.
+using FlowVelocity = std::function<bool(const float* x, float t_model, bool negative, float* v)>;
+bool flow_sample(const FlowSampler& p, size_t count, const FlowVelocity& vel, float* x);
+
 // The cascade's high-resolution voxels: the 512-grid coordinates [N][4] quantised to 64^3 the way the python pipeline does it (the
 // float (c + 0.5) / 512 * 64, truncated), then the unique voxels in lexicographic order (coords64: [M][4]).
 void cascade_voxels(const std::vector<int32_t>& coords512, std::vector<int32_t>& coords64);

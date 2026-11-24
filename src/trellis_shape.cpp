@@ -36,8 +36,6 @@ constexpr int kLatent = 32;    // the shape-SLAT latent channels
 constexpr int kHeadDim = 128;  // the flows' head dim (1536 / 12)
 constexpr int kCond = 1024;    // the image features' channels
 
-// The model's velocity at x for the model's time (1000 times the sampler's t): the conditional one, or the negative one.
-using Velocity = std::function<bool(const float* x, float t_model, bool negative, float* v)>;
 
 double stddev_all(const float* x, size_t count) {
     double s = 0, s2 = 0;
@@ -51,7 +49,7 @@ double stddev_all(const float* x, size_t count) {
 }
 
 // FlowEulerGuidanceIntervalSampler.sample: x holds the noise on entry and the sample on exit.
-bool flow_sample(const FlowSampler& p, size_t count, const Velocity& vel, float* x) {
+bool flow_sample_impl(const FlowSampler& p, size_t count, const FlowVelocity& vel, float* x) {
     const double s = p.sigma_min;
     const int steps = p.steps;
     // t_seq = rescale * t / (1 + (rescale - 1) * t) for t = linspace(1, 0, steps + 1)
@@ -67,7 +65,8 @@ bool flow_sample(const FlowSampler& p, size_t count, const Velocity& vel, float*
         const float b = (float)(s + (1.0 - s) * t);  // sigma_min + (1 - sigma_min) t
         if (!vel(x, (float)(1000.0 * t), false, vpos.data())) return false;
         const float* v = vpos.data();
-        if (p.interval_lo <= t && t <= p.interval_hi) {
+        // guidance strength 1 is the conditional prediction alone (the python mixins: no negative pass, no rescale)
+        if (p.guidance != 1.0f && p.interval_lo <= t && t <= p.interval_hi) {
             // the guidance: strength * conditional + (1 - strength) * negative
             std::vector<float> vneg(count);
             if (!vel(x, (float)(1000.0 * t), true, vneg.data())) return false;
@@ -97,6 +96,10 @@ bool flow_sample(const FlowSampler& p, size_t count, const Velocity& vel, float*
 }
 
 }  // namespace
+
+bool flow_sample(const FlowSampler& p, size_t count, const FlowVelocity& vel, float* x) {
+    return flow_sample_impl(p, count, vel, x);
+}
 
 void ss_rope_table(float* out) {
     // RotaryPositionEmbedder(head_dim, 3) on the grid (x, y, z) in row-major order: 21 frequencies per axis (axis-major), then the

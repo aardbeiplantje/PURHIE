@@ -20,7 +20,6 @@ namespace {
 const int kChans[5] = {1024, 512, 256, 128, 64};
 const int kBlocks[5] = {4, 16, 8, 4, 0};
 constexpr int kLatent = 32;
-constexpr int kOut = 7;
 constexpr int kOChunk = 32;  // output channels per sparse-conv launch
 constexpr int kVChunk = 256; // voxels per dense-linear launch
 constexpr int kLChunk = 128; // output channels per dense-linear launch
@@ -68,10 +67,12 @@ struct ShapeDecoder::Impl {
         float *cb, *nw, *nb, *m0b, *m2b;
     };
     struct C2S {
-        const uint16_t *c1w, *sw, *c2w;
+        const uint16_t *c1w, *sw, *c2w;  // sw: the subdivision (absent in the guided decoder)
         float *c1b, *sb, *c2b, *n1w, *n1b;
         int in, out;
     };
+    int out_ch = 7;      // the output channels (7: shape; 6: texture)
+    bool guided = false;  // the texture decoder: the subdivisions come from the shape decoder
     std::vector<std::vector<ConvNeXt>> levels;  // [5][num_blocks]
     std::vector<C2S> up;                        // [4]
     const uint16_t *lw = nullptr, *ow = nullptr;
@@ -110,8 +111,10 @@ struct ShapeDecoder::Impl {
     }
 };
 
-ShapeDecoder::ShapeDecoder(const std::string& safetensors_path) : p_(new Impl(safetensors_path)) {
+ShapeDecoder::ShapeDecoder(const std::string& safetensors_path, int out_channels, bool guided) : p_(new Impl(safetensors_path)) {
     Impl& m = *p_;
+    m.out_ch = out_channels;
+    m.guided = guided;
     if (!m.st.ok()) {
         error_ = m.st.error();
         return;
@@ -121,7 +124,7 @@ ShapeDecoder::ShapeDecoder(const std::string& safetensors_path) : p_(new Impl(sa
         return;
     }
     bool good = m.f16("from_latent.weight", m.lw, (size_t)kChans[0] * kLatent) && m.vec("from_latent.bias", m.lb, kChans[0]);
-    good = good && m.f16("output_layer.weight", m.ow, (size_t)kOut * kChans[4]) && m.vec("output_layer.bias", m.ob, kOut);
+    good = good && m.f16("output_layer.weight", m.ow, (size_t)m.out_ch * kChans[4]) && m.vec("output_layer.bias", m.ob, m.out_ch);
     m.levels.resize(5);
     m.up.resize(4);
     for (int i = 0; good && i < 5; ++i) {
@@ -143,7 +146,7 @@ ShapeDecoder::ShapeDecoder(const std::string& safetensors_path) : p_(new Impl(sa
             u.out = O;
             good = m.f16(p + "conv1.weight", u.c1w, (size_t)8 * O * 27 * C) && m.vec(p + "conv1.bias", u.c1b, 8 * O) &&
                    m.vec(p + "norm1.weight", u.n1w, C) && m.vec(p + "norm1.bias", u.n1b, C) &&
-                   m.f16(p + "to_subdiv.weight", u.sw, (size_t)8 * C) && m.vec(p + "to_subdiv.bias", u.sb, 8) &&
+                   (m.guided || (m.f16(p + "to_subdiv.weight", u.sw, (size_t)8 * C) && m.vec(p + "to_subdiv.bias", u.sb, 8))) &&
                    m.f16(p + "conv2.weight", u.c2w, (size_t)O * 27 * O) && m.vec(p + "conv2.bias", u.c2b, O);
         }
     }
@@ -170,7 +173,18 @@ struct VoxelMap {
 }  // namespace
 
 bool ShapeDecoder::forward(const int32_t* coords, int n, const float* feats, float* out_feats, int32_t* out_coords, int* out_m,
-                           int out_capacity, const StageFn& stage, int upsample_times) {
+                           int out_capacity, const StageFn& stage, int upsample_times, std::vector<Subdivision>* subs_out) {
+    return run(coords, n, feats, out_feats, out_coords, out_m, out_capacity, stage, upsample_times, nullptr, subs_out);
+}
+
+bool ShapeDecoder::forward_guided(const int32_t* coords, int n, const float* feats, const std::vector<Subdivision>& guide, float* out_feats,
+                                  int32_t* out_coords, int* out_m, int out_capacity) {
+    return run(coords, n, feats, out_feats, out_coords, out_m, out_capacity, nullptr, 0, &guide, nullptr);
+}
+
+bool ShapeDecoder::run(const int32_t* coords, int n, const float* feats, float* out_feats, int32_t* out_coords, int* out_m,
+                       int out_capacity, const StageFn& stage, int upsample_times, const std::vector<Subdivision>* guide,
+                       std::vector<Subdivision>* subs_out) {
     if (!ok_) return false;
     if (!sddev::enabled()) {
         error_ = "no device";
@@ -178,6 +192,10 @@ bool ShapeDecoder::forward(const int32_t* coords, int n, const float* feats, flo
     }
     if (n <= 0) {
         error_ = "no voxels";
+        return false;
+    }
+    if (guide && guide->size() < 4) {
+        error_ = "the guide has fewer than four levels";
         return false;
     }
     Impl& m = *p_;
@@ -267,8 +285,17 @@ bool ShapeDecoder::forward(const int32_t* coords, int n, const float* feats, flo
         // the channel-to-spatial block (ResBlockC2S with the predicted subdivision)
         const Impl::C2S& u = m.up[i];
         const int O = u.out;
-        float* logits = F((size_t)N * 8);
-        linear16(h, N, C, u.sw, u.sb, 8, logits);
+        float* logits = nullptr;
+        if (!guide) {
+            logits = F((size_t)N * 8);
+            linear16(h, N, C, u.sw, u.sb, 8, logits);
+            if (subs_out) {  // this level's subdivision, for the texture decoder (python's return_subs)
+                Subdivision sd;
+                sd.coords.assign(ccoords, ccoords + (size_t)N * 4);
+                sd.logits.assign(logits, logits + (size_t)N * 8);
+                subs_out->push_back(std::move(sd));
+            }
+        }
         // the residual branch: LN (affine), SiLU, conv1 (8 children per voxel), then the upsampling
         VoxelMap mp = build_map(ccoords, N);
         float* a1 = F((size_t)N * C);
@@ -280,7 +307,22 @@ bool ShapeDecoder::forward(const int32_t* coords, int n, const float* feats, flo
         unsigned char* bits = static_cast<unsigned char*>(A((size_t)N));
         int* cnt = I((size_t)N);
         int* off = I((size_t)N + 1);
-        sddev::sp_c2s_mask(logits, N, bits, cnt);
+        if (!guide) {
+            sddev::sp_c2s_mask(logits, N, bits, cnt);
+        } else {  // the guide's subdivision of this level: the children with a positive logit (python: subdiv.feats > 0)
+            const Subdivision& g = (*guide)[i];
+            if (g.coords.size() != (size_t)N * 4 || std::memcmp(g.coords.data(), ccoords, sizeof(int) * (size_t)N * 4) != 0) {
+                error_ = "the guide's voxels at a level differ from the decoder's";
+                return false;
+            }
+            for (int k = 0; k < N; ++k) {
+                unsigned int b = 0;
+                for (int c = 0; c < 8; ++c)
+                    if (g.logits[(size_t)k * 8 + c] > 0.0f) b |= 1u << c;
+                bits[k] = (unsigned char)b;
+                cnt[k] = __builtin_popcount(b);
+            }
+        }
         sddev::sp_exclusive_scan(cnt, N, off);
         const int M = off[N];
         if (M <= 0) {
@@ -313,14 +355,14 @@ bool ShapeDecoder::forward(const int32_t* coords, int n, const float* feats, flo
     // the output: LN (no affine), the output layer to 7 channels
     float* z = F((size_t)N * C);
     sddev::layer_norm_plain(h, N, C, 1e-5f, z);
-    float* y = F((size_t)N * kOut);
-    linear16(z, N, C, m.ow, m.ob, kOut, y);
+    float* y = F((size_t)N * m.out_ch);
+    linear16(z, N, C, m.ow, m.ob, m.out_ch, y);
     *out_m = N;  // the count, also when the buffer is too small (the caller retries with it)
     if (N > out_capacity) {
         error_ = "the output has more voxels than the buffer";
         return false;
     }
-    std::memcpy(out_feats, y, sizeof(float) * (size_t)N * kOut);
+    std::memcpy(out_feats, y, sizeof(float) * (size_t)N * m.out_ch);
     std::memcpy(out_coords, ccoords, sizeof(int) * (size_t)N * 4);
     *out_m = N;
     return true;
