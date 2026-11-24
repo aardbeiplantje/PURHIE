@@ -268,10 +268,12 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
 
 20. **TRELLIS.2 (image to 3D), in progress.** On the engine: the sparse-structure flow and its decoder (`src/trellis_ss.cpp`,
     `src/trellis_ss_dec.cpp`; checks `tests/trellis_ss_verify.cpp`, `tests/trellis_ss_dec_verify.cpp`; oracles
-    `tools/trellis_ss_oracle.py`, `tools/trellis_ss_decoder_oracle.py`). Next: the shape-SLAT flow (sparse tokens, RoPE from voxel
-    coordinates; its attention scratch in shared memory limits the token count), then the sparse decoders, which need the
-    FlexGEMM port (`/work/rocm-hip/flexgemm`, branch `hip-port`), and the mesh steps (CuMesh and cubvh ports, branches
-    `hip-port`). Texture after the shape. Weights: `/data/trellis2/` (TRELLIS.2-4B bf16, TRELLIS-image-large decoder).
+    `tools/trellis_ss_oracle.py`, `tools/trellis_ss_decoder_oracle.py`), and the shape-SLAT flow (`src/trellis_slat.cpp`,
+    `tests/trellis_slat_verify.cpp`, `tools/trellis_slat_oracle.py`; checked on 6000 random voxels, all stages within the bf16
+    budget; the attention scratch limits it to about 15000 voxels, and real objects need checking against that). Next: the sparse
+    shape decoder, which uses sparse convolutions and so needs the FlexGEMM port (`/work/rocm-hip/flexgemm`, branch `hip-port`),
+    then the mesh steps (CuMesh and cubvh ports, branches `hip-port`). Texture after the shape. Weights: `/data/trellis2/`
+    (TRELLIS.2-4B bf16, TRELLIS-image-large decoder).
 
 21. **Qwen-Image 2.1 image edit (next, after TRELLIS.2).** The 2.1 DiT, text encoder and VAE run on the engine (items above
     in the Qwen-Image status), but there is no reference-image input and no edit route: `src/qwenimage21_*.cpp` has no edit
