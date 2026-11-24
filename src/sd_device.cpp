@@ -1676,9 +1676,9 @@ void sp_neighbor_map(const int* coords, int n, const unsigned long long* keys, c
 }
 
 void sp_subm_conv_f16w(const float* x, int n, int cin, const int* nb, const uint16_t* W, const float* b, int cout, float* y,
-                       int o0, int no) {
-    int nn = n, ci = cin, co = cout, oo0 = o0, noo = no;
-    void* a[] = {(void*)&x, (void*)&nn, (void*)&ci, (void*)&nb, (void*)&W, (void*)&b, (void*)&co, (void*)&y, (void*)&oo0, (void*)&noo};
+                       int o0, int no, int layout) {
+    int nn = n, ci = cin, co = cout, oo0 = o0, noo = no, lay = layout;
+    void* a[] = {(void*)&x, (void*)&nn, (void*)&ci, (void*)&nb, (void*)&W, (void*)&b, (void*)&co, (void*)&y, (void*)&oo0, (void*)&noo, (void*)&lay};
     check(hip_launch(f_sp_subm_conv_f16w, (unsigned)((n + 15) / 16), (unsigned)((no + 15) / 16), 1, 16, 16, 1, 0, nullptr, a, nullptr),
           "sparse submanifold conv");
     sync();

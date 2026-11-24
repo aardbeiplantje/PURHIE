@@ -24,6 +24,7 @@ y, _ = sparse_submanifold_conv3d(
 x.numpy().astype(np.float32).tofile(os.path.join(ORACLE_DIR, "sc_x.f32"))
 coords.numpy().astype(np.int32).tofile(os.path.join(ORACLE_DIR, "sc_coords.i32"))
 w16.contiguous().view(torch.int16).numpy().astype(np.uint16).tofile(os.path.join(ORACLE_DIR, "sc_w.u16"))
+w16.permute(0, 2, 3, 4, 1).reshape(CO, 27, CI).contiguous().view(torch.int16).numpy().astype(np.uint16).tofile(os.path.join(ORACLE_DIR, "sc_w_kc.u16"))  # FlexGEMM layout
 b.numpy().astype(np.float32).tofile(os.path.join(ORACLE_DIR, "sc_b.f32"))
 y.cpu().numpy().astype(np.float32).tofile(os.path.join(ORACLE_DIR, "sc_y.f32"))
 print("sparse conv oracle:", N, "voxels,", CI, "->", CO, "channels; |y| max", float(y.abs().max()))

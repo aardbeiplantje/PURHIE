@@ -230,11 +230,11 @@ void ss_pixel_shuffle3(const float* x, int Cout, int n, float* y);
 
 // sparse voxels (sd_gpu.hip, plain C-style kernels): the active voxels as int32 coords [N][4] = (batch, x, y, z).
 // sp_hash_build: a hash table of tsize (a power of two) 64-bit keys and values; sp_neighbor_map: nb[i][t] for the 27 offsets;
-// sp_subm_conv_f16w: the submanifold 3x3x3 convolution with the checkpoint's fp16 weights [Cout][Cin][27], y [N][Cout]
+// sp_subm_conv_f16w: the submanifold 3x3x3 convolution with the fp16 weights (the layout as the flag says), y [N][Cout]
 void sp_hash_build(const int* coords, int n, unsigned long long* keys, int* vals, unsigned int tsize);
 void sp_neighbor_map(const int* coords, int n, const unsigned long long* keys, const int* vals, unsigned int tsize, int* nb);
 void sp_subm_conv_f16w(const float* x, int n, int cin, const int* nb, const uint16_t* W, const float* b, int cout, float* y,
-                       int o0, int no);
+                       int o0, int no, int layout);  // layout 0: [Cout][Cin][27]; 1: [Cout][27][Cin] (FlexGEMM's)
 
 // channel-to-spatial upsampling (factor 2): the children of each voxel where logit > 0, in increasing child index;
 // sp_c2s_mask: bits[i] (child bits) and cnt[i]; sp_exclusive_scan: off[0..n] (off[n] the total); sp_c2s_fill: the new coords

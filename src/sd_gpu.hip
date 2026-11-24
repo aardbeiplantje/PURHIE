@@ -2044,7 +2044,7 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) sp_neighbor_map(const i
 // with W fp16 in the checkpoint's [Cout][Cin][3][3][3] layout (t = 9 * kx + 3 * ky + kz). y is [N][Cout].
 extern "C" __global__ void __launch_bounds__(256) sp_subm_conv_f16w(const float* x, int n, int cin, const int* nb,
                                                                    const unsigned short* W, const float* b, int cout,
-                                                                   float* y, int o0, int no) {
+                                                                   float* y, int o0, int no, int layout) {
     const int i = blockIdx.x * 16 + threadIdx.x;
     const int o = o0 + blockIdx.y * 16 + threadIdx.y;
     if (i >= n || o >= o0 + no) return;
@@ -2053,8 +2053,13 @@ extern "C" __global__ void __launch_bounds__(256) sp_subm_conv_f16w(const float*
         const int j = nb[(long)i * 27 + t];
         if (j < 0) continue;
         const float* xr = x + (long)j * cin;
-        const unsigned short* wr = W + ((long)o * cin) * 27 + t;
-        for (int c = 0; c < cin; ++c) acc += xr[c] * h2f(wr[(long)c * 27]);
+        if (layout == 0) {  // [Cout][Cin][27] (the PyTorch layout)
+            const unsigned short* wr = W + ((long)o * cin) * 27 + t;
+            for (int c = 0; c < cin; ++c) acc += xr[c] * h2f(wr[(long)c * 27]);
+        } else {            // [Cout][27][Cin] (FlexGEMM's layout, the shape decoder's checkpoint)
+            const unsigned short* wr = W + ((long)o * 27 + t) * cin;
+            for (int c = 0; c < cin; ++c) acc += xr[c] * h2f(wr[c]);
+        }
     }
     y[(long)i * cout + o] = acc;
 }

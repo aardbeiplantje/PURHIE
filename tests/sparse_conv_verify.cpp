@@ -54,22 +54,38 @@ int main(int argc, char** argv) {
 
     sddev::sp_hash_build(coords, N, keys, vals, tsize);
     sddev::sp_neighbor_map(coords, N, keys, vals, tsize, nb);
-    sddev::sp_subm_conv_f16w(x, N, CI, nb, W, b, CO, y, 0, CO);
 
     std::vector<float> ref((size_t)N * CO);
     std::memcpy(ref.data(), yb.data(), sizeof(float) * ref.size());
-    double num = 0, den = 0;
-    for (size_t i = 0; i < ref.size(); ++i) {
-        const double e = (double)y[i] - (double)ref[i];
-        num += e * e;
-        den += (double)ref[i] * ref[i];
+    bool ok_all = true;
+    for (int layout = 0; layout < 2; ++layout) {
+        std::vector<char> wl;
+        if (layout == 1) {  // FlexGEMM's [Cout][27][Cin], the shape decoder's checkpoint layout
+            if (!read_bytes(dir + "/sc_w_kc.u16", wl) || wl.size() != wb.size()) {
+                std::fprintf(stderr, "cannot read sc_w_kc.u16\n");
+                return 1;
+            }
+            std::memcpy(W, wl.data(), wl.size());
+        }
+        sddev::sp_subm_conv_f16w(x, N, CI, nb, W, b, CO, y, 0, CO, layout);
+        std::vector<float> got((size_t)N * CO);
+        std::memcpy(got.data(), y, sizeof(float) * got.size());
+        double num = 0, den = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            const double e = (double)got[i] - (double)ref[i];
+            num += e * e;
+            den += (double)ref[i] * ref[i];
+        }
+        const double rel = std::sqrt(num / den);
+        std::printf("sparse submanifold conv, layout %s (%d voxels, %d -> %d, table %u): rel L2 %.3e\n",
+                    layout == 0 ? "[Cout][Cin][27]" : "[Cout][27][Cin]", N, CI, CO, tsize, rel);
+        ok_all = ok_all && rel < 1e-4;
     }
-    const double rel = std::sqrt(num / den);
+    (void)ref;
     int hits = 0;
     for (int i = 0; i < N * 27; ++i) hits += nb[i] >= 0;
-    std::printf("sparse submanifold conv (%d voxels, %d -> %d, table %u): rel L2 %.3e, neighbours %d of %d\n", N, CI, CO,
-                tsize, rel, hits, N * 27);
-    std::printf("%s\n", rel < 1e-4 ? "PASS" : "FAIL");
+    std::printf("neighbours %d of %d\n", hits, N * 27);
+    std::printf("%s\n", ok_all ? "PASS" : "FAIL");
     sddev::release(coords, cb.size());
     sddev::release(x, xb.size());
     sddev::release(W, wb.size());
@@ -78,5 +94,5 @@ int main(int argc, char** argv) {
     sddev::release(vals, sizeof(int) * tsize);
     sddev::release(nb, sizeof(int) * (size_t)N * 27);
     sddev::release(y, sizeof(float) * (size_t)N * CO);
-    return rel < 1e-4 ? 0 : 1;
+    return ok_all ? 0 : 1;
 }
