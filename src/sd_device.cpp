@@ -42,7 +42,7 @@ hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn
               f_layer_norm = nullptr, f_rms_norm = nullptr, f_zm_modulate = nullptr, f_zm_gate_add = nullptr, f_zm_swiglu = nullptr, f_zm_rope = nullptr, f_zm_ln_plain = nullptr, f_gn_f32 = nullptr, f_to_tok = nullptr, f_to_chw = nullptr, f_zq_rope = nullptr, f_zq_attn = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma256b = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
               f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr, f_qi_linear_f8 = nullptr, f_qi_rms_f8 = nullptr, f_qi_affine = nullptr, f_qi_gelu = nullptr, f_qv_rms = nullptr, f_qv_patch = nullptr, f_qv_bias = nullptr, f_qv_upsample = nullptr, f_qi_hadamard = nullptr, f_qi_linear_i8 = nullptr, f_qi21_zc = nullptr, f_qi21_gather = nullptr, f_qi21_mul = nullptr, f_qi21_gated = nullptr, f_qi21_attn = nullptr, f_qi21_lbf = nullptr, f_qi21_dupup = nullptr, f_gemm_af128 = nullptr, f_transpose_bf16 = nullptr, f_bias_cm = nullptr, f_zm_rms_mod_bf16 = nullptr, f_zm_swiglu_bf16 = nullptr, f_bf16_to_f32 = nullptr, f_round_bf16 = nullptr, f_gn_sum_part = nullptr, f_gn_var_part = nullptr, f_gn_apply_part = nullptr, f_im2col_bf16_tile = nullptr, f_hnr16 = nullptr, f_count_diff = nullptr, f_tp16 = nullptr, f_rga16 = nullptr, f_sw16 = nullptr;
 
-hipFunction_t f_ss_affine = nullptr, f_ss_gate_add = nullptr, f_ss_head_norm_rope = nullptr; hipFunction_t f_ss_im2col3 = nullptr, f_ss_gemm_f16w = nullptr, f_ss_pixel_shuffle3 = nullptr;
+hipFunction_t f_ss_affine = nullptr, f_ss_gate_add = nullptr, f_ss_head_norm_rope = nullptr; hipFunction_t f_sp_hash_insert = nullptr, f_sp_neighbor_map = nullptr, f_sp_subm_conv_f16w = nullptr; hipFunction_t f_ss_im2col3 = nullptr, f_ss_gemm_f16w = nullptr, f_ss_pixel_shuffle3 = nullptr;
 constexpr int kThreads = 256;
 constexpr int kGroupSplit = 16;  // the group norm's partial sums per group
 constexpr size_t kColFloats = (size_t)1 << 25;  // the im2col chunk: at most 128 MB (a launch covers enough tiles to fill the GPU)
@@ -127,6 +127,7 @@ bool init() {
         {&f_softmax, "sd_softmax"},     {&f_layer_norm, "sd_layer_norm"}, {&f_rms_norm, "sd_rms_norm"}, {&f_zm_modulate, "zimage_modulate"}, {&f_zm_gate_add, "zimage_gate_add"}, {&f_zm_swiglu, "zimage_swiglu"}, {&f_zm_rope, "zimage_rope"}, {&f_zm_ln_plain, "zimage_layer_norm_plain"}, {&f_gn_f32, "zimage_group_norm_f32"}, {&f_to_tok, "zimage_to_tokens"}, {&f_to_chw, "zimage_to_chw"}, {&f_zq_rope, "zq_rope_half"}, {&f_zq_attn, "zq_causal_attn"}, {&f_geglu, "sd_geglu"},
         {&f_ss_affine, "ss_affine"}, {&f_ss_gate_add, "ss_gate_add"}, {&f_ss_head_norm_rope, "ss_head_norm_rope"},
         {&f_ss_im2col3, "ss_im2col3"}, {&f_ss_gemm_f16w, "ss_gemm_f16w"}, {&f_ss_pixel_shuffle3, "ss_pixel_shuffle3"},
+        {&f_sp_hash_insert, "sp_hash_insert"}, {&f_sp_neighbor_map, "sp_neighbor_map"}, {&f_sp_subm_conv_f16w, "sp_subm_conv_f16w"},
     };
     for (const Entry& e : entries)
         if (hipModuleGetFunction(e.f, g_mod, e.name) != hipSuccess) return false;
@@ -1650,6 +1651,35 @@ void ss_pixel_shuffle3(const float* x, int Cout, int n, float* y) {
     int cc = Cout, nn = n;
     void* a[] = {(void*)&x, (void*)&cc, (void*)&nn, (void*)&y};
     launch(f_ss_pixel_shuffle3, dim3((unsigned)((total + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+// sparse voxels (sd_gpu.hip, src/sparse.c): see sd_device.h
+void sp_hash_build(const int* coords, int n, unsigned long long* keys, int* vals, unsigned int tsize) {
+    // the table starts empty (every key 0xFF..): a host fill of the device-visible table, then the inserts
+    std::memset(keys, 0xFF, sizeof(unsigned long long) * tsize);
+    unsigned int mask = tsize - 1;
+    int nn = n;
+    void* a[] = {(void*)&coords, (void*)&nn, (void*)&keys, (void*)&vals, (void*)&mask};
+    launch(f_sp_hash_insert, dim3((unsigned)((n + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void sp_neighbor_map(const int* coords, int n, const unsigned long long* keys, const int* vals, unsigned int tsize, int* nb) {
+    unsigned int mask = tsize - 1;
+    int nn = n;
+    long total = (long)n * 27;
+    void* a[] = {(void*)&coords, (void*)&nn, (void*)&keys, (void*)&vals, (void*)&mask, (void*)&nb};
+    launch(f_sp_neighbor_map, dim3((unsigned)((total + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void sp_subm_conv_f16w(const float* x, int n, int cin, const int* nb, const uint16_t* W, const float* b, int cout, float* y,
+                       int o0, int no) {
+    int nn = n, ci = cin, co = cout, oo0 = o0, noo = no;
+    void* a[] = {(void*)&x, (void*)&nn, (void*)&ci, (void*)&nb, (void*)&W, (void*)&b, (void*)&co, (void*)&y, (void*)&oo0, (void*)&noo};
+    check(hip_launch(f_sp_subm_conv_f16w, (unsigned)((n + 15) / 16), (unsigned)((no + 15) / 16), 1, 16, 16, 1, 0, nullptr, a, nullptr),
+          "sparse submanifold conv");
     sync();
 }
 

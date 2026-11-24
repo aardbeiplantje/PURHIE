@@ -228,6 +228,14 @@ void ss_gemm_f16w(const float* P, long K, const uint16_t* W, const float* b, int
 // the 3D pixel shuffle: x [(n)^3][Cout * 8] -> y [(2n)^3][Cout]
 void ss_pixel_shuffle3(const float* x, int Cout, int n, float* y);
 
+// sparse voxels (sd_gpu.hip, plain C-style kernels): the active voxels as int32 coords [N][4] = (batch, x, y, z).
+// sp_hash_build: a hash table of tsize (a power of two) 64-bit keys and values; sp_neighbor_map: nb[i][t] for the 27 offsets;
+// sp_subm_conv_f16w: the submanifold 3x3x3 convolution with the checkpoint's fp16 weights [Cout][Cin][27], y [N][Cout]
+void sp_hash_build(const int* coords, int n, unsigned long long* keys, int* vals, unsigned int tsize);
+void sp_neighbor_map(const int* coords, int n, const unsigned long long* keys, const int* vals, unsigned int tsize, int* nb);
+void sp_subm_conv_f16w(const float* x, int n, int cin, const int* nb, const uint16_t* W, const float* b, int cout, float* y,
+                       int o0, int no);
+
 }  // namespace sddev
 
 #endif  // SD_DEVICE_H

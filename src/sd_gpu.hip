@@ -1981,3 +1981,80 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) ss_pixel_shuffle3(const
     const long vin = ((long)(X >> 1) * n + (Y >> 1)) * n + (Z >> 1);
     y[e] = x[vin * (Cout * 8L) + c * 8 + i * 4 + j * 2 + q];
 }
+
+// ---- sparse voxels (src/sparse.c): active voxels as int32 coords [N][4] = (batch, x, y, z), plain C-style kernels.
+// A hash table of 64-bit keys (open addressing, linear probing, power-of-two size) maps a voxel's key to its index.
+#define SP_EMPTY 0xFFFFFFFFFFFFFFFFull
+#define SP_BIAS (1 << 19)
+
+__device__ __forceinline__ unsigned long long sp_pack(int b, int x, int y, int z) {
+    return ((unsigned long long)b << 60) | ((unsigned long long)(x + SP_BIAS) << 40) |
+           ((unsigned long long)(y + SP_BIAS) << 20) | (unsigned long long)(z + SP_BIAS);
+}
+
+__device__ __forceinline__ unsigned int sp_hash(unsigned long long k) {
+    k ^= k >> 33;
+    k *= 0xff51afd7ed558ccdull;
+    k ^= k >> 33;
+    k *= 0xc4ceb9fe1a85ec53ull;
+    k ^= k >> 33;
+    return (unsigned int)k;
+}
+
+// insert voxel i with key pack(coords[i]) -> index i (coords are unique)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) sp_hash_insert(const int* coords, int n, unsigned long long* keys,
+                                                                       int* vals, unsigned int mask) {
+    const int i = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= n) return;
+    const unsigned long long key = sp_pack(coords[4 * i], coords[4 * i + 1], coords[4 * i + 2], coords[4 * i + 3]);
+    unsigned int h = sp_hash(key) & mask;
+    for (;;) {
+        const unsigned long long old = atomicCAS(&keys[h], SP_EMPTY, key);
+        if (old == SP_EMPTY) {
+            vals[h] = i;
+            return;
+        }
+        h = (h + 1) & mask;
+    }
+}
+
+// nb[i][t] = index of the voxel at offset t of voxel i (t = 9 * dx + 3 * dy + dz, each in {-1, 0, 1}), or -1 when absent
+extern "C" __global__ void __launch_bounds__(SD_THREADS) sp_neighbor_map(const int* coords, int n, const unsigned long long* keys,
+                                                                        const int* vals, unsigned int mask, int* nb) {
+    const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (e >= (long)n * 27) return;
+    const int i = (int)(e / 27), t = (int)(e % 27);
+    const int dx = t / 9 - 1, dy = (t / 3) % 3 - 1, dz = t % 3 - 1;
+    const unsigned long long key = sp_pack(coords[4 * i], coords[4 * i + 1] + dx, coords[4 * i + 2] + dy, coords[4 * i + 3] + dz);
+    unsigned int h = sp_hash(key) & mask;
+    int found = -1;
+    for (;;) {
+        const unsigned long long k = keys[h];
+        if (k == SP_EMPTY) break;
+        if (k == key) {
+            found = vals[h];
+            break;
+        }
+        h = (h + 1) & mask;
+    }
+    nb[e] = found;
+}
+
+// submanifold 3x3x3 convolution, one thread per (voxel, output channel): y[i][o] = b[o] + sum_t sum_c x[nb[i][t]][c] W[o][c][t]
+// with W fp16 in the checkpoint's [Cout][Cin][3][3][3] layout (t = 9 * kx + 3 * ky + kz). y is [N][Cout].
+extern "C" __global__ void __launch_bounds__(256) sp_subm_conv_f16w(const float* x, int n, int cin, const int* nb,
+                                                                   const unsigned short* W, const float* b, int cout,
+                                                                   float* y, int o0, int no) {
+    const int i = blockIdx.x * 16 + threadIdx.x;
+    const int o = o0 + blockIdx.y * 16 + threadIdx.y;
+    if (i >= n || o >= o0 + no) return;
+    float acc = b[o];
+    for (int t = 0; t < 27; ++t) {
+        const int j = nb[(long)i * 27 + t];
+        if (j < 0) continue;
+        const float* xr = x + (long)j * cin;
+        const unsigned short* wr = W + ((long)o * cin) * 27 + t;
+        for (int c = 0; c < cin; ++c) acc += xr[c] * h2f(wr[(long)c * 27]);
+    }
+    y[(long)i * cout + o] = acc;
+}

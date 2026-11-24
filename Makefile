@@ -113,6 +113,7 @@ AUDIOLDM2_UNET_VERIFY = $(BINDIR)/audioldm2_unet_verify  # the UNet stage check 
 TRELLIS_SS_VERIFY = $(BINDIR)/trellis_ss_verify  # the TRELLIS.2 sparse-structure flow stage check (/data/trellis2/oracle_ss)
 TRELLIS_SS_DEC_VERIFY = $(BINDIR)/trellis_ss_dec_verify  # the TRELLIS.2 sparse-structure decoder stage check (/data/trellis2)
 TRELLIS_SLAT_VERIFY = $(BINDIR)/trellis_slat_verify  # the TRELLIS.2 shape-SLAT flow stage check (/data/trellis2/oracle_slat)
+SPARSE_CONV_VERIFY = $(BINDIR)/sparse_conv_verify  # the engine sparse convolution against FlexGEMM (/data/trellis2/oracle_sparse)
 AUDIOLDM2_T5_VERIFY = $(BINDIR)/audioldm2_t5_verify  # the T5 encoder stage check (/data/audioldm2-stages)
 AUDIOLDM2_CLAP_VERIFY = $(BINDIR)/audioldm2_clap_verify  # the CLAP text encoder stage check (/data/audioldm2-stages)
 AUDIOLDM2_PROJECTION_VERIFY = $(BINDIR)/audioldm2_projection_verify  # the projection stage check (/data/audioldm2-stages)
@@ -660,3 +661,6 @@ verify_minimal: $(TEST_TARGET)
 
 # Last, so that every variable above is defined when its prerequisites are expanded
 all: $(WMMA_TARGET) $(QWENIMAGE_VERIFY) $(ZIMAGE_1024_VERIFY) $(KV_VERIFY) $(GEMM_VERIFY) $(LAYERNORM_VERIFY) $(ROPE_VERIFY) $(SOFTMAX_VERIFY) $(ACTFP4_VERIFY) $(TOKENIZER_VERIFY) $(TOKENIZER_GGUF_VERIFY) $(SAMPLER_VERIFY) $(DEQUANT_VERIFY) $(EXPERT_CPU_BENCH) $(VISION_VERIFY) $(MROPE_VERIFY) $(MM_VERIFY) $(IMAGE_VERIFY) $(MEL_VERIFY) $(WHISPER_VERIFY) $(WHISPER_FALLBACK_VERIFY) $(AUDIO_VERIFY) $(AUDIO_FLAC_VERIFY) $(CODEC_AFTER_VERIFY) $(TALKER_SAMPLE_VERIFY) $(QWEN3TTS_VERIFY) $(QWEN3TTS_CODEC_VERIFY) $(QWEN3TTS_SPEECH_VERIFY) $(SPEAKER_VERIFY) $(SD_TEXT_VERIFY) $(SD_VAE_VERIFY) $(SD_UNET_VERIFY) $(SD_IMAGE_VERIFY) $(MM_TE_VERIFY) $(MM_VAE_VERIFY) $(MM_DIT_VERIFY) $(CODEC_ENCODE_VERIFY) $(HEAD_Q8_VERIFY) $(MATVEC_VERIFY) $(ATTN_VERIFY) $(ATTN_DECODE_VERIFY) $(INFERENCE_LIB) $(INFERENCE_SO) $(PKGCONFIG) $(QWEN_MODEL_LIB) $(QWEN_DEMO) $(FORWARD_VERIFY) $(PERPLEXITY) $(PASSKEY) $(GENERATE_VERIFY) $(EVENTS_TEST) $(GEMMA4_VERIFY) $(SEQ_VERIFY) $(EMBED_VERIFY) $(QWEN4EXP_VERIFY) $(GLM5NEXT_VERIFY) $(MTP_VERIFY) $(MTP_OWN_VERIFY) $(E2E_TEST) $(MATVEC_BENCH) $(WMMA_LAYOUT_VERIFY) $(CAPI_SMOKE) $(STORE_VERIFY) $(SPLIT_VERIFY) $(ATTN_SPLIT_VERIFY) $(ATTN_BENCH) $(ZIMAGE_PIPE_VERIFY)
+
+$(SPARSE_CONV_VERIFY): $(TESTSDIR)/sparse_conv_verify.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/sparse_conv_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
