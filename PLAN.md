@@ -266,6 +266,19 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
     small-model test `t/71-model-config.t` (sidecar override, bad key) and the server, audio, image and models-dir tests pass
     (8 files, 211 tests). To add a rule or a key: a line in `@HOST_RULES` or `%MODEL_KEY_OK`.
 
+20. **TRELLIS.2 (image to 3D), in progress.** On the engine: the sparse-structure flow and its decoder (`src/trellis_ss.cpp`,
+    `src/trellis_ss_dec.cpp`; checks `tests/trellis_ss_verify.cpp`, `tests/trellis_ss_dec_verify.cpp`; oracles
+    `tools/trellis_ss_oracle.py`, `tools/trellis_ss_decoder_oracle.py`). Next: the shape-SLAT flow (sparse tokens, RoPE from voxel
+    coordinates; its attention scratch in shared memory limits the token count), then the sparse decoders, which need the
+    FlexGEMM port (`/work/rocm-hip/flexgemm`, branch `hip-port`), and the mesh steps (CuMesh and cubvh ports, branches
+    `hip-port`). Texture after the shape. Weights: `/data/trellis2/` (TRELLIS.2-4B bf16, TRELLIS-image-large decoder).
+
+21. **Qwen-Image 2.1 image edit (next, after TRELLIS.2).** The 2.1 DiT, text encoder and VAE run on the engine (items above
+    in the Qwen-Image status), but there is no reference-image input and no edit route: `src/qwenimage21_*.cpp` has no edit
+    path, and the server has no image-edit endpoint. Needs: the edit conditioning in the 2.1 DiT (how the reference image enters,
+    to be confirmed against the reference edit pipeline), a stage check against its python oracle, and a server route. The
+    ComfyUI edit workflow is in the uploads (`image_qwen_image_2_1_image_edit`), with the Edit Lightning LoRA.
+
 ## Audio, vision and image: status
 
 Verified against the references in the sections that follow. Each row says what works, what is open, and where it runs.
