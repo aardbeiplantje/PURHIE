@@ -144,16 +144,34 @@ bool run_textured(ShapePipeline& shape, TexturePipeline& tex, const float* cond,
         return false;
     }
     const size_t M = out.shape.dec_coords.size() / 4;
-    if (out.tex.coords != out.shape.dec_coords || out.tex.out.size() != M * 6 || out.shape.verts.size() != M * 3) {
+    if (out.tex.coords != out.shape.dec_coords || out.tex.out.size() != M * 6 || out.shape.verts.size() < M * 3) {
         error = "the texture voxels or the vertices differ from the shape decoder's voxels";
         return false;
     }
-    out.colors.resize(M * 3);
+    // the decoder's voxels: vertex i is voxel i; the colour is the base colour, clamped to [0, 1]
+    const size_t V = out.shape.verts.size() / 3;
+    out.colors.assign(V * 3, 0.0f);
     for (size_t i = 0; i < M; ++i)
         for (int c = 0; c < 3; ++c) {
             const float v = out.tex.out[i * 6 + c];
             out.colors[i * 3 + c] = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
         }
+    // the vertices of the holes that fill_holes closed (after the voxels): the mean colour of each fan's boundary vertices
+    std::vector<double> acc((V - M) * 3, 0.0);
+    std::vector<double> cnt(V - M, 0.0);
+    for (size_t t = 0; t < out.shape.faces.size() / 3; ++t) {
+        const int32_t* f = &out.shape.faces[t * 3];
+        if ((size_t)f[2] < M) continue;
+        if ((size_t)f[0] >= M || (size_t)f[1] >= M) continue;
+        for (int a = 0; a < 2; ++a) {
+            const size_t w = (size_t)f[a], nv = (size_t)f[2] - M;
+            for (int c = 0; c < 3; ++c) acc[nv * 3 + c] += out.colors[w * 3 + c];
+            cnt[nv] += 1;
+        }
+    }
+    for (size_t nv = 0; nv < V - M; ++nv)
+        for (int c = 0; c < 3; ++c)
+            out.colors[(M + nv) * 3 + c] = cnt[nv] > 0 ? (float)(acc[nv * 3 + c] / cnt[nv]) : 0.0f;
     return true;
 }
 

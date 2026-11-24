@@ -5,6 +5,7 @@
 // sparse std of one sequence is the global one).
 #include "trellis_shape.h"
 
+#include "trellis_fill.h"
 #include "trellis_mesh.h"
 #include "trellis_sdec.h"
 #include "trellis_slat.h"
@@ -254,6 +255,11 @@ bool ShapePipeline::decode_mesh(const std::vector<int32_t>& coords, const std::v
     if (!dual_grid_to_mesh(out.dec_coords.data(), out.dec_feats.data(), M, grid, -0.5f, 0.5f, cfg.margin, out.verts, out.faces, merr)) {
         error_ = "mesh: " + merr;
         return false;
+    }
+    if (cfg.hole_perimeter > 0) {
+        FillStats fs;
+        fill_small_holes(out.verts, out.faces, cfg.hole_perimeter, fs);
+        out.holes_filled = fs.filled;
     }
     out.seconds_mesh = seconds_since(t0);
     return true;

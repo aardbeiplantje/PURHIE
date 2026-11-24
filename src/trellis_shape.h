@@ -38,6 +38,7 @@ struct ShapeConfig {
     std::array<float, 32> slat_std{};
     int mesh_grid = 512;                     // the decode's resolution (the 512 pipeline)
     float margin = 0.5f;                     // the dual vertex margin
+    float hole_perimeter = 3e-2f;            // fill_holes: the boundary loops below this perimeter are closed (0 disables)
 };
 
 struct ShapeResult {
@@ -48,6 +49,7 @@ struct ShapeResult {
     std::vector<float> hr_slat;       // [M][32] de-normalised
     // the shape decoder's subdivisions at its four levels (the texture decoder's guide): the voxels of the 512 (or 1024) decode
     std::vector<Subdivision> subs;
+    int holes_filled = 0;  // the mesh's boundary loops closed by fill_holes (their new vertices follow the decoder's voxels)
     std::vector<float> ss_latent;     // [8][16][16][16] the sparse-structure flow's sample
     std::vector<int32_t> coords;      // [N][4] the occupied voxels at 32^3 (batch, x, y, z), in the python order
     std::vector<float> slat;          // [N][32] the shape latent, de-normalised
