@@ -12,6 +12,8 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include "trellis_sdec.h"
+
 #include <vector>
 
 namespace trellis {
@@ -44,6 +46,8 @@ struct ShapeResult {
     // the cascade: the 1024 flow's voxels (64^3, unique) and features; coords/slat/ss_latent/dec are the 512 stages
     std::vector<int32_t> hr_coords;   // [M][4]
     std::vector<float> hr_slat;       // [M][32] de-normalised
+    // the shape decoder's subdivisions at its four levels (the texture decoder's guide): the voxels of the 512 (or 1024) decode
+    std::vector<Subdivision> subs;
     std::vector<float> ss_latent;     // [8][16][16][16] the sparse-structure flow's sample
     std::vector<int32_t> coords;      // [N][4] the occupied voxels at 32^3 (batch, x, y, z), in the python order
     std::vector<float> slat;          // [N][32] the shape latent, de-normalised

@@ -120,6 +120,7 @@ MESH_VERIFY = $(BINDIR)/mesh_verify  # the engine mesh step (dual grid to mesh) 
 SHAPE_VERIFY = $(BINDIR)/shape_verify  # the engine image-to-shape path (512) against the python pipeline (/data/trellis2/oracle_shape)
 CASCADE_VERIFY = $(BINDIR)/cascade_verify  # the engine 1024 cascade against the python pipeline (/data/trellis2/oracle_cascade)
 TEX_VERIFY = $(BINDIR)/tex_verify  # the engine texture path (512) against the python pipeline (/data/trellis2/oracle_tex)
+TEXTURED_VERIFY = $(BINDIR)/textured_verify  # the end-to-end textured run (512) against the python shape and texture oracles
 AUDIOLDM2_T5_VERIFY = $(BINDIR)/audioldm2_t5_verify  # the T5 encoder stage check (/data/audioldm2-stages)
 AUDIOLDM2_CLAP_VERIFY = $(BINDIR)/audioldm2_clap_verify  # the CLAP text encoder stage check (/data/audioldm2-stages)
 AUDIOLDM2_PROJECTION_VERIFY = $(BINDIR)/audioldm2_projection_verify  # the projection stage check (/data/audioldm2-stages)
@@ -692,3 +693,6 @@ $(CASCADE_VERIFY): $(TESTSDIR)/cascade_verify.cpp $(SRCDIR)/trellis_shape.cpp $(
 
 $(TEX_VERIFY): $(TESTSDIR)/tex_verify.cpp $(SRCDIR)/trellis_tex.cpp $(SRCDIR)/trellis_tex.h $(SRCDIR)/trellis_shape.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/tex_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
+
+$(TEXTURED_VERIFY): $(TESTSDIR)/textured_verify.cpp $(SRCDIR)/trellis_tex.cpp $(SRCDIR)/trellis_tex.h $(SRCDIR)/trellis_shape.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/textured_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@

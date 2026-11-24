@@ -132,4 +132,29 @@ bool TexturePipeline::run(const int32_t* coords, int n, const float* shape_slat,
     return decode(coords, n, out.tex_slat.data(), subs, out);
 }
 
+bool run_textured(ShapePipeline& shape, TexturePipeline& tex, const float* cond, int Lc, const NoiseFn& noise, const ShapeConfig& scfg,
+                  const TexConfig& tcfg, TexturedMesh& out, std::string& error) {
+    if (!shape.run(cond, Lc, noise, scfg, out.shape)) {
+        error = "shape: " + shape.error();
+        return false;
+    }
+    const int N = (int)(out.shape.coords.size() / 4);
+    if (!tex.run(out.shape.coords.data(), N, out.shape.slat.data(), out.shape.subs, cond, Lc, noise, tcfg, out.tex)) {
+        error = "texture: " + tex.error();
+        return false;
+    }
+    const size_t M = out.shape.dec_coords.size() / 4;
+    if (out.tex.coords != out.shape.dec_coords || out.tex.out.size() != M * 6 || out.shape.verts.size() != M * 3) {
+        error = "the texture voxels or the vertices differ from the shape decoder's voxels";
+        return false;
+    }
+    out.colors.resize(M * 3);
+    for (size_t i = 0; i < M; ++i)
+        for (int c = 0; c < 3; ++c) {
+            const float v = out.tex.out[i * 6 + c];
+            out.colors[i * 3 + c] = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+        }
+    return true;
+}
+
 }  // namespace trellis

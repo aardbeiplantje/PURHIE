@@ -230,12 +230,16 @@ bool ShapePipeline::decode_mesh(const std::vector<int32_t>& coords, const std::v
     int cap = 256 * N, M = 0;
     out.dec_feats.resize((size_t)cap * 7);
     out.dec_coords.resize((size_t)cap * 4);
-    bool dec_ok = m.shape_dec->forward(coords.data(), N, slat.data(), out.dec_feats.data(), out.dec_coords.data(), &M, cap);
+    out.subs.clear();
+    bool dec_ok = m.shape_dec->forward(coords.data(), N, slat.data(), out.dec_feats.data(), out.dec_coords.data(), &M, cap, nullptr, 0,
+                                       &out.subs);
     if (!dec_ok && M > cap) {
         cap = M;
         out.dec_feats.resize((size_t)cap * 7);
         out.dec_coords.resize((size_t)cap * 4);
-        dec_ok = m.shape_dec->forward(coords.data(), N, slat.data(), out.dec_feats.data(), out.dec_coords.data(), &M, cap);
+        out.subs.clear();
+        dec_ok = m.shape_dec->forward(coords.data(), N, slat.data(), out.dec_feats.data(), out.dec_coords.data(), &M, cap, nullptr, 0,
+                                      &out.subs);
     }
     if (!dec_ok) {
         error_ = "shape decoder: " + m.shape_dec->error();

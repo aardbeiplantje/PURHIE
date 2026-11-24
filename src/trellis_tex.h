@@ -59,4 +59,18 @@ private:
     std::string error_;
 };
 
+// The end-to-end textured mesh: the shape (the sparse structure, the 512 shape latent, the shape decoder, the mesh), then the texture on
+// the shape decoder's voxels, then each vertex's base colour: vertex i is made from the decoder's voxel i, and the texture decoder returns
+// the same voxels in the same order, so its row i is the vertex's texture (base colour: channels 0 to 2, clamped to [0, 1]).
+struct TexturedMesh {
+    ShapeResult shape;          // the shape stages (the mesh, the voxels, the subdivisions)
+    TexResult tex;              // the texture stages
+    std::vector<float> colors;  // [V][3] the base colour of each vertex, in [0, 1]
+};
+
+// noise is called three times, in order: the sparse-structure latent, the shape latent, the texture latent. cond: [Lc][1024] (the image
+// features, which the shape and the texture both take).
+bool run_textured(ShapePipeline& shape, TexturePipeline& tex, const float* cond, int Lc, const NoiseFn& noise, const ShapeConfig& scfg,
+                  const TexConfig& tcfg, TexturedMesh& out, std::string& error);
+
 }  // namespace trellis
