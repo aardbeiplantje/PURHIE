@@ -73,3 +73,7 @@ MiniMax-H3-Image
 
 # nested TRELLIS.2 clone (its own repo, not part of this one)
 TRELLIS.2/
+
+# nested CuMesh clones (their own repos, not part of this one)
+cumesh/
+cumesh-ssh/
