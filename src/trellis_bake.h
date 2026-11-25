@@ -56,6 +56,8 @@ std::vector<uint8_t> encode_png(const std::vector<uint8_t>& pixels, int width, i
 
 // A binary glTF (.glb): the unwrapped mesh with the python path's axes (y and z swapped, y negated) and uv v flipped, the two PNG textures.
 bool write_glb(const std::string& path, const UvMesh& uv, const std::vector<float>& normals, const BakedTextures& tex, std::string& error);
+// The same GLB in memory (the server's reply).
+bool encode_glb(const UvMesh& uv, const std::vector<float>& normals, const BakedTextures& tex, std::vector<uint8_t>& glb, std::string& error);
 
 // The whole export: the charts (trellis_charts.h), the unwrap of each chart by xatlas, the texture baked from the voxel attributes at
 // texture_size texels, and the GLB at path.

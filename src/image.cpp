@@ -114,6 +114,21 @@ bool smart_size(int h, int w, int factor, long long min_pixels, long long max_pi
 
 extern "C" {
 
+int image_decode_rgba(const unsigned char* data, size_t n, unsigned char** rgba_out, int* w_out, int* h_out, int* has_alpha) {
+    int w = 0, h = 0, comp = 0;
+    if (!data || n == 0 || n > (size_t)0x7fffffff) return -1;
+    unsigned char* px = stbi_load_from_memory(data, (int)n, &w, &h, &comp, 4);
+    if (!px || w <= 0 || h <= 0) {
+        if (px) stbi_image_free(px);
+        return -1;
+    }
+    *rgba_out = px;  // (stb's allocation: image_free releases it)
+    *w_out = w;
+    *h_out = h;
+    if (has_alpha) *has_alpha = (comp == 2 || comp == 4) ? 1 : 0;
+    return 0;
+}
+
 int image_decode_rgb(const unsigned char* data, size_t n, unsigned char** rgb_out, int* w_out, int* h_out) {
     if (!data || !rgb_out || !w_out || !h_out || n == 0 || n > 0x7fffffffu) return -1;
     int w = 0, h = 0, comp = 0;

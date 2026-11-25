@@ -944,6 +944,82 @@ sub DESTROY {
     $img->{h} = 0;
 }
 
+# TRELLIS.2 (an image to a textured 3D model, binary glTF): the files of a directory, read in place: the TRELLIS.2-4B checkpoints
+# (DIR/TRELLIS.2-4B/ or DIR itself: pipeline.json and ckpts/), TRELLIS-image-large's sparse-structure decoder
+# (DIR/TRELLIS-image-large/ckpts/, DIR/ckpts/ or DIR: ss_dec_conv3d_16l8_fp16.safetensors), DINOv3 (DIR or DIR/clip_vision:
+# dino_v3_L_naf_fp32.safetensors) and, optional, BiRefNet (DIR or DIR/background_removal: birefnet.safetensors; without it only images
+# with an alpha channel are cut out). The pipeline is engine code (src/trellis_image_to_3d.h); a job runs on a background thread, one at
+# a time, so the caller polls it.
+package ROCm::Inference::Trellis2;
+
+my @T2_CKPTS = qw(ss_flow_img_dit_1_3B_64_bf16 slat_flow_img2shape_dit_1_3B_512_bf16 slat_flow_img2shape_dit_1_3B_1024_bf16
+                  shape_dec_next_dc_f16c32_fp16 slat_flow_imgshape2tex_dit_1_3B_512_bf16 slat_flow_imgshape2tex_dit_1_3B_1024_bf16
+                  tex_dec_next_dc_f16c32_fp16);
+
+# the files of DIR: { trellis2_dir, ss_dec, dinov3, birefnet (undef: none), all => [every file] }; dies when one is missing
+sub files {
+    my ($class, $dir, %o) = @_;
+    my ($first) = sub { (grep { -f } @_)[0] };
+    my ($t2) = grep { -f "$_/pipeline.json" && -d "$_/ckpts" } ("$dir/TRELLIS.2-4B", $dir);
+    die "trellis2: no TRELLIS.2-4B directory (pipeline.json and ckpts/) in $dir\n" unless $t2;
+    my @ck = map { "$t2/ckpts/$_.safetensors" } @T2_CKPTS;
+    for my $f (@ck) { die "trellis2: no file $f\n" unless -f $f }
+    my $ss = $o{ss_dec} // $first->(map { "$_/ss_dec_conv3d_16l8_fp16.safetensors" } "$dir/TRELLIS-image-large/ckpts", "$dir/ckpts", $dir);
+    die "trellis2: no ss_dec_conv3d_16l8_fp16.safetensors (TRELLIS-image-large's ckpts) in $dir\n" unless $ss && -f $ss;
+    my $dino = $o{dinov3} // $first->(map { "$_/dino_v3_L_naf_fp32.safetensors" } $dir, "$dir/clip_vision");
+    die "trellis2: no dino_v3_L_naf_fp32.safetensors in $dir or $dir/clip_vision\n" unless $dino && -f $dino;
+    my $bir = $o{birefnet} // $first->(map { "$_/birefnet.safetensors" } $dir, "$dir/background_removal");
+    return { trellis2_dir => $t2, ss_dec => $ss, dinov3 => $dino, birefnet => $bir,
+             all => [ "$t2/pipeline.json", @ck, $ss, $dino, grep { defined } $bir ] };
+}
+
+# the bytes of the files (the memory the models take when loaded: they are registered for the device)
+sub bytes {
+    my ($class, $dir, %o) = @_;
+    my $f = $class->files($dir, %o);
+    my $n = 0;
+    $n += (stat $_)[7] // 0 for @{ $f->{all} };
+    return $n;
+}
+
+sub new {
+    my ($class, $dir, %o) = @_;
+    my $f = $class->files($dir, %o);
+    my $h = ROCm::Inference::_t2_open(@$f{qw(trellis2_dir ss_dec dinov3)}, $f->{birefnet});
+    return bless { h => $h, dir => $dir, files => $f }, $class;
+}
+
+sub has_background_removal { my ($t) = @_; ROCm::Inference::_t2_has_background_removal($t->{h}) }
+
+# $t->start($image_bytes, resolution => 1024, seed => 0, faces => 700000, texture_size => 4096, remove_background => 'auto'):
+# 1 when the job started, 0 when one is running already. The image: PNG, JPEG, BMP, GIF or TGA bytes. remove_background: 'auto' (the
+# alpha when the image has one, else BiRefNet), true (BiRefNet) or false (the whole image). Dies on a bad image or option.
+sub start {
+    my ($t, $image, %o) = @_;
+    my $rb = $o{remove_background} // 'auto';
+    $rb = $rb eq 'auto' ? -1 : $rb ? 1 : 0;
+    my $r = ROCm::Inference::_t2_start($t->{h}, $image, $o{resolution} // 1024, $o{seed} // 0, $o{faces} // 700000,
+                                        $o{texture_size} // 4096, $rb);
+    return $r == 0 ? 1 : 0;
+}
+
+# the job: { status => running | done | failed | none, stage, step, steps, seconds }
+sub poll {
+    my ($t) = @_;
+    my ($st, $stage, $step, $steps, $secs) = ROCm::Inference::_t2_poll($t->{h});
+    my %name = (0 => 'running', 1 => 'done', -1 => 'failed', 2 => 'none');
+    return { status => $name{$st} // 'none', stage => $stage, step => $step, steps => $steps, seconds => $secs };
+}
+
+# the finished job's GLB bytes (the job is cleared); dies with the error of a failed job
+sub take { my ($t) = @_; ROCm::Inference::_t2_take($t->{h}) }
+
+sub DESTROY {
+    my ($t) = @_;
+    ROCm::Inference::_t2_close($t->{h}) if $t->{h};
+    $t->{h} = 0;
+}
+
 package ROCm::Inference::Speech;
 
 sub new {

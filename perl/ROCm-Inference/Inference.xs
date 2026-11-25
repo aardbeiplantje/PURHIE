@@ -27,6 +27,7 @@
 #include "minimax_pipe.h"
 #include "zimage_pipe.h"
 #include "audioldm2_api.h"
+#include "trellis2_api.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -1808,5 +1809,83 @@ _sd_generate_png(h, prompt, seed, width, height)
     free(rgb);
     RETVAL = newSVpvn((const char*)png, (STRLEN)n);
     sd_free_png(png);
+  OUTPUT:
+    RETVAL
+
+IV
+_t2_open(dir, ss_dec, dinov3, birefnet)
+    const char* dir
+    const char* ss_dec
+    const char* dinov3
+    SV* birefnet
+  CODE:
+    /* TRELLIS.2 (trellis2_api.h): the models opened and registered for the device; birefnet: a path, or undef / '' for none */
+    const char* bf = SvOK(birefnet) ? SvPV_nolen(birefnet) : NULL;
+    t2_pipe_t* p = t2_open(dir, ss_dec, dinov3, bf && *bf ? bf : NULL);
+    if (!p) croak("ROCm::Inference: t2_open: %s", t2_last_error());
+    RETVAL = PTR2IV(p);
+  OUTPUT:
+    RETVAL
+
+void
+_t2_close(h)
+    IV h
+  CODE:
+    t2_close(INT2PTR(t2_pipe_t*, h));
+
+int
+_t2_has_background_removal(h)
+    IV h
+  CODE:
+    RETVAL = t2_has_background_removal(INT2PTR(t2_pipe_t*, h));
+  OUTPUT:
+    RETVAL
+
+int
+_t2_start(h, image, resolution, seed, faces, texture_size, remove_background)
+    IV h
+    SV* image
+    int resolution
+    UV seed
+    int faces
+    int texture_size
+    int remove_background
+  CODE:
+    /* a job on a background thread: 0 started, 1 a job is running; an error croaks (the image, an option, no background removal) */
+    STRLEN n;
+    const char* bytes = SvPVbyte(image, n);
+    int r = t2_start(INT2PTR(t2_pipe_t*, h), (const unsigned char*)bytes, (size_t)n, resolution, (unsigned long long)seed, faces,
+                     texture_size, remove_background);
+    if (r < 0) croak("ROCm::Inference: t2_start: %s", t2_last_error());
+    RETVAL = r;
+  OUTPUT:
+    RETVAL
+
+void
+_t2_poll(h)
+    IV h
+  PPCODE:
+    /* (status, stage, step, steps, seconds): status 0 running, 1 done, -1 failed, 2 no job */
+    char stage[128];
+    int step = 0, steps = 0;
+    double seconds = 0;
+    int st = t2_poll(INT2PTR(t2_pipe_t*, h), stage, sizeof stage, &step, &steps, &seconds);
+    EXTEND(SP, 5);
+    mPUSHi(st);
+    mPUSHp(stage, strlen(stage));
+    mPUSHi(step);
+    mPUSHi(steps);
+    mPUSHn(seconds);
+
+SV*
+_t2_take(h)
+    IV h
+  CODE:
+    /* the finished job's GLB bytes (the job is cleared); a failed job croaks with its error */
+    unsigned char* glb = NULL;
+    size_t n = 0;
+    if (t2_take(INT2PTR(t2_pipe_t*, h), &glb, &n) != 0) croak("ROCm::Inference: t2_take: %s", t2_last_error());
+    RETVAL = newSVpvn((const char*)glb, (STRLEN)n);
+    t2_free(glb);
   OUTPUT:
     RETVAL

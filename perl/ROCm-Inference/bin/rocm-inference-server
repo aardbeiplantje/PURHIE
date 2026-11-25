@@ -27,14 +27,14 @@ GetOptions(\%o, 'model=s', 'models-dir=s', 'models-max=i', 'models-margin=f', 'k
            'name=s', 'draft=s', 'store=s', 'max_tokens=i', 'swa-ring=i', 'stage=s', 'recache', 'kv-type=s',
            'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'preserve-thinking!', 'log!', 'log-level=s', 'log-format=s', 'log-color=s',
            'thinking-low=i', 'thinking-medium=i', 'thinking-high=i',
-           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'mmproj=s', 'whisper=s', 'tts=s', 'tts-codec=s', 'voices=s', 'sd=s', 'minimax=s', 'zimage=s', 'audioldm2=s', 'ffmpeg=s', 'help')
+           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'mmproj=s', 'whisper=s', 'tts=s', 'tts-codec=s', 'voices=s', 'sd=s', 'minimax=s', 'zimage=s', 'audioldm2=s', 'trellis2=s', 'ffmpeg=s', 'help')
     or pod2usage(2);
 # The log: --nolog is level none; --log-level, --log-format, --log-color are checked by the formatter
 our $LOG = eval { ROCm::Inference::Log->new(level => ($o{log} // 1) ? ($o{'log-level'} // 'info') : 'none',
                                               format => $o{'log-format'} // 'text', color => $o{'log-color'} // 'auto') }
     or die "--log-level, --log-format, --log-color: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n";
 pod2usage(-verbose => 2, -exitval => 0) if $o{help};
-pod2usage("--model, --models-dir, --whisper, --tts, --sd, --minimax, --zimage or --audioldm2 is required\n") unless $o{model} || $o{'models-dir'} || $o{whisper} || $o{tts} || $o{sd} || $o{minimax} || $o{zimage} || $o{audioldm2};
+pod2usage("--model, --models-dir, --whisper, --tts, --sd, --minimax, --zimage, --audioldm2 or --trellis2 is required\n") unless $o{model} || $o{'models-dir'} || $o{whisper} || $o{tts} || $o{sd} || $o{minimax} || $o{zimage} || $o{audioldm2} || $o{trellis2};
 ROCm::Inference::_require_minijinja()
     or die "rocm-inference-server needs the Minijinja module $ROCm::Inference::MINIJINJA_VERSION\n";
 my $no_draft = ($o{draft} // '') eq 'none';  # (no draft head, not even a model's own MTP block)
@@ -67,8 +67,8 @@ my (%AUX, %AUX_FLAG);  # kind (whisper, tts, sd) -> its record; the kinds given 
 # The kinds of the models in GET /v1/models and the endpoints each one is served at (the client routes by these)
 my %ENDPOINTS = (chat => ["/v1/chat/completions", "/v1/completions"], embedding => ["/v1/embeddings"],
                  transcription => ["/v1/audio/transcriptions"], speech => ["/v1/audio/speech", "/v1/audio/voices"],
-                 image => ["/v1/images/generations"], audio => ["/v1/audio/generations"]);
-my %AUX_KIND = (whisper => "transcription", tts => "speech", sd => "image");
+                 image => ["/v1/images/generations"], audio => ["/v1/audio/generations"], '3d' => ["/v1/3d/generations"]);
+my %AUX_KIND = (whisper => "transcription", tts => "speech", sd => "image", trellis2 => "3d");
 my ($AUDIO_DIR_SIG);   # the last signature of --models-dir's GGUF files
 # a record: id (the name a request gives), path, codec (tts), info {bytes} (its files), m (the model when loaded), used
 # (for the least recently used), queue / running (no job on it: idle), and dir (it is a unit of the memory policy)
@@ -99,6 +99,7 @@ sub aux_load {
     my $m = eval {
         $kind eq 'whisper' ? whisper_load($a->{path})
       : $kind eq 'tts'     ? speech_load($a->{path}, $a->{codec})
+      : $kind eq 'trellis2' ? ROCm::Inference::Trellis2->new($a->{path})
       :                      sd_load($a->{path});
     };
     if (!$m) {
@@ -251,6 +252,16 @@ die "--zimage $o{zimage}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" if $o
 die "--audioldm2 $o{audioldm2}: not a directory\n" if $o{audioldm2} && !-d $o{audioldm2};
 my $AUDIOLDM2 = $o{audioldm2} ? eval { ROCm::Inference::AudioLDM2->new($o{audioldm2}) } : undef;
 die "--audioldm2 $o{audioldm2}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" if $o{audioldm2} && !$AUDIOLDM2;
+# TRELLIS.2 (--trellis2 DIR: the files of ROCm::Inference::Trellis2): an image to a textured 3D model (binary glTF); its name is
+# "trellis-2". A unit of the memory policy (its files, about 16 GB, are registered for the device when it is loaded): loaded by its
+# first request, unloaded when another model needs the room and no job runs. The files are checked at the start.
+die "--trellis2 $o{trellis2}: not a directory\n" if $o{trellis2} && !-d $o{trellis2};
+if ($o{trellis2}) {
+    my $bytes = eval { ROCm::Inference::Trellis2->bytes($o{trellis2}) };
+    die "--trellis2 $o{trellis2}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" unless defined $bytes;
+    $AUX{trellis2} = { id => 'trellis-2', aux => 'trellis2', path => $o{trellis2}, info => { bytes => $bytes }, dir => 1, m => undef,
+                       used => 0, queue => [], running => [] };
+}
 
 my $kv_type = $o{'kv-type'} // 'auto';
 die "--kv-type: auto, f16, q8_0 or q4_0\n" unless $kv_type =~ /\A(?:auto|f16|q8_0|q4_0)\z/;
@@ -678,6 +689,22 @@ my %IMAGE_COMMON = (
     n => { type => 'integer', default => 1, values => [1], note => 'one image per request' },
 );
 my %IMAGE_INFO = (
+    'trellis-2' => {
+        description => 'An image to a textured 3D model (binary glTF) with TRELLIS.2 (--trellis2 DIR). The object is cut out (the image\'s '
+                     . 'alpha channel, or BiRefNet) and cropped as the ComfyUI workflow does; 512, or the 1024 cascade; simplified to 700,000 '
+                     . 'faces with a 4096 texture. A job takes minutes: POST starts it, GET polls it, GET .../content gives the GLB.',
+        usage => 'POST /v1/3d/generations {"model":"trellis-2","image":"<base64 PNG>","resolution":1024,"seed":0}; then '
+               . 'GET /v1/3d/generations/<id> until its status is completed; then GET /v1/3d/generations/<id>/content',
+        parameters => {
+            image => { type => 'string', required => 1,
+                       note => 'the image in base64 (PNG, JPEG; WebP through ffmpeg) or a data URL; or multipart/form-data with the file in the part "image"' },
+            resolution => { type => 'integer', default => 1024, values => [512, 1024], note => '1024: the cascade' },
+            seed => { type => 'integer', default => 0, min => 0 },
+            faces => { type => 'integer', default => 700000, min => 1000, max => 10000000, note => 'the faces after the simplification' },
+            texture_size => { type => 'integer', default => 4096, values => [512, 1024, 2048, 4096] },
+            remove_background => { type => 'string', default => 'auto', values => ['auto', 'true', 'false'],
+                                   note => 'auto: the alpha channel when the image has one, else BiRefNet' } },
+    },
     'z-image-turbo' => {
         description => 'Text to image with Z-Image-Turbo (--zimage: the ComfyUI files). Nine steps, the default size 1024 x 1024.',
         usage => 'POST /v1/images/generations {"model":"z-image-turbo","prompt":"a red square on a blue background","size":"1024x1024","steps":9,"seed":0}',
@@ -703,7 +730,7 @@ my %IMAGE_INFO = (
 );
 sub with_image_info {  # an image model's entry with its purpose, usage and parameters
     my ($e) = @_;
-    return $e unless ($e->{kind} // '') eq 'image';
+    return $e unless ($e->{kind} // '') =~ /\A(?:image|3d)\z/;
     my $info = $IMAGE_INFO{ $e->{id} } // $IMAGE_INFO{sd};
     return { %$e, %$info };
 }
@@ -1438,6 +1465,7 @@ route::get '/v1/audio/voices' => sub {
 # minute at 512 x 512 with sd-turbo's one step).
 route::post '/v1/images/generations' => sub {
     my ($req) = @_;
+    job3d_busy();
     my $p = $req->{json};
     ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
     my $sd_name = $AUX{sd} ? $AUX{sd}{id} : undef;
@@ -1479,12 +1507,156 @@ route::post '/v1/images/generations' => sub {
     return { created => time, data => [{ b64_json => MIME::Base64::encode_base64($png, '') }] };
 };
 
+# ---- 3D (TRELLIS.2). POST /v1/3d/generations starts a job on an image and answers at once with its id (a job takes minutes);
+# GET /v1/3d/generations/ID is its state (in_progress with the stage and its step, completed, failed); GET /v1/3d/generations/ID/content
+# is the model (binary glTF, model/gltf-binary); GET /v1/3d/generations lists the jobs kept. The request: JSON with the image in base64
+# (or a data URL), or multipart/form-data with the image file in the part "image"; the options: resolution (512, or 1024: the cascade;
+# 1024 by default), seed (0), faces (700000: the simplification's target), texture_size (4096), remove_background (auto: the alpha
+# channel when the image has one, else BiRefNet; true; false: the whole image). One job at a time (429 while one runs); the image and
+# audio generators answer 503 meanwhile (the job holds the device layer). The last few finished jobs keep their models for downloads.
+my (%JOB3D, @JOB3D_ORDER, $JOB3D_RUN);
+my $job3d_seq = 0;
+my $JOB3D_KEEP = 4;
+sub job3d_reap {  # the running job's state; a finished job's model (or error) into its record
+    return unless defined $JOB3D_RUN;
+    my $j = $JOB3D{$JOB3D_RUN};
+    my $a = $AUX{trellis2};
+    if (!$j || !$a || !$a->{m}) {
+        undef $JOB3D_RUN;
+        $a->{busy} = 0 if $a;
+        return;
+    }
+    my $p = $a->{m}->poll;
+    @$j{qw(stage step steps seconds)} = @$p{qw(stage step steps seconds)};
+    return if $p->{status} eq 'running';
+    my $glb = eval { $a->{m}->take };
+    if (defined $glb) {
+        @$j{qw(status glb bytes)} = ('completed', $glb, length $glb);
+    } else {
+        $j->{status} = 'failed';
+        $j->{error} = ($@ || 'the job ended without a model') =~ s/ at \S+ line \d+\.?\n?\z//r =~ s/\AROCm::Inference: t2_take: //r;
+    }
+    $LOG->info('request', event => '3d', msg => sprintf('%s: %s, %.1f s%s', $j->{id}, $j->{status}, $j->{seconds} // 0,
+        $j->{status} eq 'completed' ? ", $j->{bytes} bytes of GLB" : ": $j->{error}"));
+    undef $JOB3D_RUN;
+    $a->{busy} = 0;
+    $a->{used} = ++$stamp;
+    while (@JOB3D_ORDER > $JOB3D_KEEP) { delete $JOB3D{ shift @JOB3D_ORDER } }
+}
+sub job3d_busy {  # a running 3D job holds the device layer: the image and audio generators answer 503 meanwhile
+    job3d_reap();
+    return unless defined $JOB3D_RUN;
+    error(503, "the device is busy with a 3D generation ($JOB3D_RUN): try again when it completes (GET /v1/3d/generations/$JOB3D_RUN)",
+          'server_error');
+}
+sub job3d_entry {
+    my ($j) = @_;
+    return { id => $j->{id}, object => '3d.generation', model => 'trellis-2', created => $j->{created}, status => $j->{status},
+             options => $j->{options}, seconds => 0 + sprintf('%.1f', $j->{seconds} // 0),
+             ($j->{status} eq 'in_progress' ? (progress => { stage => $j->{stage}, step => $j->{step}, steps => $j->{steps} }) : ()),
+             ($j->{status} eq 'completed' ? (bytes => $j->{bytes}, content => "/v1/3d/generations/$j->{id}/content") : ()),
+             ($j->{status} eq 'failed' ? (error => $j->{error}) : ()) };
+}
+sub image_to_png {  # an image ffmpeg reads (WebP, ...) as PNG bytes with its alpha, or undef
+    my ($bytes) = @_;
+    return undef unless $FFMPEG;
+    my $in = File::Temp->new(SUFFIX => '.img');
+    binmode $in;
+    print $in $bytes;
+    close $in;
+    my $out = File::Temp->new(SUFFIX => '.png');
+    close $out;
+    system($FFMPEG, '-v', 'error', '-y', '-i', "$in", '-frames:v', '1', '-pix_fmt', 'rgba', "$out") == 0 or return undef;
+    open my $fh, '<:raw', "$out" or return undef;
+    my $png = do { local $/; <$fh> };
+    return defined $png && length $png ? $png : undef;
+}
+
+route::post '/v1/3d/generations' => sub {
+    my ($req) = @_;
+    my $a = $AUX{trellis2} or error(503, 'no 3D model: start the server with --trellis2 DIR', 'server_error');
+    job3d_reap();
+    error(429, "a 3D generation is running ($JOB3D_RUN): poll GET /v1/3d/generations/$JOB3D_RUN, then try again", 'rate_limit_error')
+        if defined $JOB3D_RUN;
+    my $ct = $req->{headers}{'content-type'} // '';
+    my ($p, $image);
+    if ($ct =~ m{multipart/form-data}i) {
+        my $parts = eval { ROCm::Inference::Multipart::parse($req->{body}, $ct) }
+            or error(400, 'bad multipart body: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r));
+        my $f = $parts->{image} or error(400, "'image' is required (the image file)");
+        $image = $f->{data};
+        $p = { map { my $v = $parts->{$_}{data}; $v =~ s/\A\s+|\s+\z//g; ($_ => $v) } grep { $_ ne 'image' } keys %$parts };
+    } else {
+        $p = $req->{json};
+        ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json) or multipart/form-data');
+        my $b64 = $p->{image};
+        error(400, "'image' is required: the image in base64 (PNG, JPEG, WebP) or a data URL") unless defined $b64 && !ref $b64 && length $b64;
+        $b64 =~ s/\Adata:[^,]*,//;
+        $image = decode_base64($b64);
+    }
+    error(400, 'image: empty, or not base64') unless defined $image && length $image;
+    my $model = $p->{model} // 'trellis-2';
+    error(400, "model: '$model' is not served (this server has trellis-2)") unless $model eq 'trellis-2';
+    my $res = $p->{resolution} // 1024;
+    error(400, "resolution: 512 or 1024, not '$res'") unless $res =~ /\A(?:512|1024)\z/;
+    my $seed = $p->{seed} // 0;
+    error(400, 'seed: a whole number') unless $seed =~ /\A\d+\z/;
+    my $faces = $p->{faces} // 700000;
+    error(400, 'faces: a whole number from 1000 to 10000000') unless $faces =~ /\A\d+\z/ && $faces >= 1000 && $faces <= 10000000;
+    my $tex = $p->{texture_size} // 4096;
+    error(400, 'texture_size: 512, 1024, 2048 or 4096') unless $tex =~ /\A(?:512|1024|2048|4096)\z/;
+    my $rb = $p->{remove_background} // 'auto';
+    $rb = $rb ? 'true' : 'false' if ref $rb;  # a JSON boolean
+    error(400, "remove_background: auto, true or false, not '$rb'") unless $rb =~ /\A(?:auto|true|false|1|0)\z/;
+    my %opts = (resolution => 0 + $res, seed => 0 + $seed, faces => 0 + $faces, texture_size => 0 + $tex,
+                remove_background => $rb eq 'auto' ? 'auto' : ($rb eq 'true' || $rb eq '1') ? 1 : 0);
+    my $T = eval { aux_get('trellis2') } or error(500, '3D model: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r), 'server_error');
+    my $started = eval { $T->start($image, %opts) };
+    if (!defined $started && $@ =~ /cannot be decoded/) {  # WebP and the other formats stb_image does not read: through ffmpeg, as PNG
+        my $png = image_to_png($image);
+        $started = eval { $T->start($png, %opts) } if defined $png;
+    }
+    error(400, ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) =~ s/\AROCm::Inference: t2_start: //r) unless defined $started;
+    error(429, 'a 3D generation is running: try again when it completes', 'rate_limit_error') unless $started;
+    my $id = sprintf('3d_%d_%d', time, ++$job3d_seq);
+    $JOB3D{$id} = { id => $id, created => time, status => 'in_progress', options => { %opts, remove_background => $rb },
+                    stage => 'starting', step => 0, steps => 0, seconds => 0 };
+    push @JOB3D_ORDER, $id;
+    $JOB3D_RUN = $id;
+    $a->{busy} = 1;
+    $a->{used} = ++$stamp;
+    $LOG->info('request', event => '3d', msg => sprintf('%s: started, %d bytes of image, resolution %d, seed %d, %d faces, texture %d, background %s',
+                                                    $id, length $image, $res, $seed, $faces, $tex, $rb));
+    return job3d_entry($JOB3D{$id});
+};
+
+route::get '/v1/3d/generations' => sub {
+    job3d_reap();
+    return { object => 'list', data => [ map { job3d_entry($JOB3D{$_}) } reverse @JOB3D_ORDER ] };
+};
+
+route::get '/v1/3d/generations/:id' => sub {
+    my ($req) = @_;
+    job3d_reap();
+    my $j = $JOB3D{ $req->{params}{id} } or error(404, "no 3D generation '$req->{params}{id}'", 'not_found_error');
+    return job3d_entry($j);
+};
+
+route::get '/v1/3d/generations/:id/content' => sub {
+    my ($req) = @_;
+    job3d_reap();
+    my $j = $JOB3D{ $req->{params}{id} } or error(404, "no 3D generation '$req->{params}{id}'", 'not_found_error');
+    error(409, "the 3D generation is $j->{status}" . ($j->{error} ? ": $j->{error}" : '')) unless $j->{status} eq 'completed';
+    return [200, ['Content-Type' => 'model/gltf-binary', 'Content-Disposition' => "attachment; filename=\"$j->{id}.glb\""], $j->{glb}];
+};
+
 # AudioLDM 2 (text to audio): a JSON body with the prompt, negative_prompt (optional), seconds (1 to 10: the clip's length,
 # 5 by default), steps (1 to 200: the sampler's, 100 by default), guidance_scale (0 to 20, 3.5 by default) and seed (0 by
 # default). The reply is the clip as a WAV file (mono, 16 kHz, 16 bit). One clip at a time, on the device (about 40 s for
 # 5 s at 100 steps).
 route::post '/v1/audio/generations' => sub {
     my ($req) = @_;
+    job3d_busy();
     my $p = $req->{json};
     ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
     error(503, 'no audio model: start the server with --audioldm2 DIR', 'server_error') unless $AUDIOLDM2;
@@ -2146,6 +2318,16 @@ Runs on the host (not the GPU), one request at a time. A server with only this o
 An AudioLDM 2 model directory (the diffusers layout: C<text_encoder>, C<tokenizer>, C<unet>, C<vae>, C<vocoder> and the
 rest) for C</v1/audio/generations>. Loaded at the start, on the GPU. A server with only this option needs no chat model.
 
+=item --trellis2 F<dir>
+
+TRELLIS.2, an image to a textured 3D model (binary glTF), for C</v1/3d/generations>; its name is C<trellis-2>. The
+directory holds the TRELLIS.2-4B checkpoints (F<dir/TRELLIS.2-4B> or F<dir> itself: F<pipeline.json> and F<ckpts/>),
+TRELLIS-image-large's sparse-structure decoder (F<ss_dec_conv3d_16l8_fp16.safetensors> in F<dir/TRELLIS-image-large/ckpts>,
+F<dir/ckpts> or F<dir>), DINOv3 (F<dino_v3_L_naf_fp32.safetensors> in F<dir> or F<dir/clip_vision>) and, optional, BiRefNet
+(F<birefnet.safetensors> in F<dir> or F<dir/background_removal>: without it only images with an alpha channel are cut out).
+The files are checked at the start; the model is loaded by its first request (about 16 GB, registered for the device) and is
+a unit of the memory policy, as a chat model is (never unloaded while a job runs).
+
 =item --ffmpeg F<ffmpeg>
 
 The encoder of the C<mp3>, C<opus> and C<aac> formats of C</v1/audio/speech> (its C<response_format>; C<wav>, C<pcm> and
@@ -2288,7 +2470,17 @@ C<POST /v1/audio/generations> (with C<--audioldm2>): a JSON body with the C<prom
 from it), C<negative_prompt> (optional), C<seconds> (1 to 10, 5 by default), C<steps> (1 to 200, 100 by default),
 C<guidance_scale> (3.5 by default) and C<seed> (0 by default). The reply is the clip as a WAV file (mono, 16 kHz, 16 bit).
 
-C<GET /v1/models> lists every model; C<GET /v1/models?kind=image> lists the image models alone. An image model's entry has its
+C<POST /v1/3d/generations> (with C<--trellis2>): an image to a textured 3D model. A JSON body with the C<image> in base64
+(PNG, JPEG; WebP and the rest through ffmpeg) or as a data URL, or C<multipart/form-data> with the image file in the part
+C<image>; the options C<resolution> (512, or 1024: the cascade; 1024 by default), C<seed> (0), C<faces> (700000: the
+simplification's target), C<texture_size> (4096) and C<remove_background> (C<auto>: the alpha channel when the image has
+one, else BiRefNet; C<true>; C<false>: the whole image). A job takes minutes (about 3.5 at 512 on this machine), so the reply
+comes at once with the job's C<id>: C<GET /v1/3d/generations/{id}> is its state (C<in_progress> with the stage and its step,
+C<completed>, C<failed> with the error), C<GET /v1/3d/generations/{id}/content> is the model (C<model/gltf-binary>) and
+C<GET /v1/3d/generations> lists the jobs kept (the last four). One job at a time (429 while one runs); the image and audio
+generators answer 503 meanwhile (the job holds the device layer); chat, embeddings and speech go on.
+
+C<GET /v1/models> lists every model; C<GET /v1/models?kind=image> lists the image models alone. An image (or 3D) model's entry has its
 C<description>, a C<usage> example and its C<parameters> (type, default, limits), and C<GET /v1/models/{id}> gives the same.
 
 =head1 NGINX

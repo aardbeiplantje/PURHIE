@@ -12,6 +12,8 @@ extern "C" {
 
 /* Decodes an image in memory to RGB8 (w * h * 3 bytes, row-major). 0, or -1. Free with image_free. */
 int image_decode_rgb(const unsigned char* data, size_t n, unsigned char** rgb_out, int* w_out, int* h_out);
+/* The same as RGBA8 (w * h * 4 bytes); *has_alpha is 1 when the file has an alpha channel (else the alpha is 255). 0, or -1. */
+int image_decode_rgba(const unsigned char* data, size_t n, unsigned char** rgba_out, int* w_out, int* h_out, int* has_alpha);
 void image_free(void* p);
 
 /* The processor: the image (rgb, w x h) resized to (h', w') with h', w' multiples of factor = patch * merge whose product

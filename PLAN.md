@@ -305,6 +305,11 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
     black): `vase_1024.glb`, 4.35M faces to 670k, about 814 s of stages (cascade 245 s, texture flow 140 s, the two decoders 90 s
     each before the single-run fix, unwrap 74 s). The user found it about the same as the ComfyUI result, if anything sharper (the
     workflow remeshes at 768 and smooths the normals). The ComfyUI run (1106.2 s) also generates the image and runs the 1536 cascade.
+    Served (2026-11-25): `rocm-inference-server --trellis2 DIR` (`trellis-2`, kind `3d`, a unit of the memory policy, loaded by its
+    first request): `POST /v1/3d/generations` starts a job on a background thread (`src/trellis_image_to_3d.cpp`, `src/trellis2_api.h`)
+    and answers its id at once; `GET /v1/3d/generations/{id}` polls it, `.../content` gives the GLB; one job at a time (429), the image
+    and audio generators answer 503 meanwhile (the job holds the device layer); `t/72-trellis2.t` passes (18 checks, a 512 job in about
+    3.5 minutes). Images with an alpha channel are cut out by it; the textures are deflated now (the 512 vase: 148 MB to 53 MB).
     Open: (a) BiRefNet on the engine (a C++/HIP port, as DINOv3 was), so the background removal leaves python; (b) the 1536 cascade
     (memory is no longer the limit; its time is); (c) the normal-map and AO bakes and their GLB inputs; (d) UnwrapMesh's "pec"
     segmenter (ours is CuMesh's charts); (e) python's to_glb clean-up; (f) the simplify stops below its target (667k for 700k), where

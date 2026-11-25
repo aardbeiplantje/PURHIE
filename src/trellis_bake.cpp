@@ -6,6 +6,8 @@
 
 #include "xatlas.h"
 
+#include <zlib.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -372,38 +374,23 @@ std::vector<uint8_t> encode_png(const std::vector<uint8_t>& pixels, int width, i
     ihdr.push_back(0);
     ihdr.push_back(0);
     png_chunk(out, "IHDR", ihdr);
-    // the scanlines (filter 0), then zlib with stored deflate blocks
+    // the scanlines (filter 0), deflated by zlib (the textures were 117 MB stored at 4096 texels)
     std::vector<uint8_t> raw;
     raw.reserve((size_t)height * (1 + (size_t)width * channels));
     for (int y = 0; y < height; ++y) {
         raw.push_back(0);
         raw.insert(raw.end(), pixels.begin() + (size_t)y * width * channels, pixels.begin() + (size_t)(y + 1) * width * channels);
     }
-    std::vector<uint8_t> z = {0x78, 0x01};
-    size_t off = 0;
-    do {
-        const size_t len = std::min<size_t>(65535, raw.size() - off);
-        const bool last = off + len == raw.size();
-        z.push_back(last ? 1 : 0);
-        z.push_back((uint8_t)len);
-        z.push_back((uint8_t)(len >> 8));
-        z.push_back((uint8_t)~len);
-        z.push_back((uint8_t)(~len >> 8));
-        z.insert(z.end(), raw.begin() + off, raw.begin() + off + len);
-        off += len;
-    } while (off < raw.size());
-    uint32_t a = 1, b = 0;
-    for (uint8_t v : raw) {
-        a = (a + v) % 65521;
-        b = (b + a) % 65521;
-    }
-    put_be32(z, (b << 16) | a);
+    uLongf zn = compressBound((uLong)raw.size());
+    std::vector<uint8_t> z(zn);
+    if (compress2(z.data(), &zn, raw.data(), (uLong)raw.size(), 6) != Z_OK) return {};
+    z.resize(zn);
     png_chunk(out, "IDAT", z);
     png_chunk(out, "IEND", {});
     return out;
 }
 
-bool write_glb(const std::string& path, const UvMesh& uv, const std::vector<float>& normals, const BakedTextures& tex, std::string& error) {
+bool encode_glb(const UvMesh& uv, const std::vector<float>& normals, const BakedTextures& tex, std::vector<uint8_t>& glb, std::string& error) {
     const size_t V = uv.positions.size() / 3, F = uv.faces.size() / 3;
     if (V == 0 || F == 0 || normals.empty()) {
         error = "nothing to write";
@@ -485,7 +472,7 @@ bool write_glb(const std::string& path, const UvMesh& uv, const std::vector<floa
                   png_base.size(), off_img1, png_mr.size(), bin.size());
     std::string js(json);
     while (js.size() % 4) js.push_back(' ');
-    std::vector<uint8_t> glb;
+    glb.clear();
     const uint32_t total = (uint32_t)(12 + 8 + js.size() + 8 + bin.size());
     glb.insert(glb.end(), {'g', 'l', 'T', 'F'});
     put_le32(glb, 2);
@@ -496,6 +483,12 @@ bool write_glb(const std::string& path, const UvMesh& uv, const std::vector<floa
     put_le32(glb, (uint32_t)bin.size());
     glb.insert(glb.end(), {'B', 'I', 'N', 0});
     glb.insert(glb.end(), bin.begin(), bin.end());
+    return true;
+}
+
+bool write_glb(const std::string& path, const UvMesh& uv, const std::vector<float>& normals, const BakedTextures& tex, std::string& error) {
+    std::vector<uint8_t> glb;
+    if (!encode_glb(uv, normals, tex, glb, error)) return false;
     FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) {
         error = "cannot write " + path;
