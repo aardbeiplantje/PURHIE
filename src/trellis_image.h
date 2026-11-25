@@ -16,5 +16,9 @@ bool image_condition(DinoV3& enc, const uint8_t* rgb, int w, int h, int size, st
 
 // The PIL-style resize of 8-bit RGB (LANCZOS, support 3, the filter stretched by the reduction; each pass rounded to 8 bits).
 std::vector<uint8_t> resize_lanczos_rgb8(const uint8_t* rgb, int w, int h, int ow, int oh);
+// PIL's resize of 8-bit pixels (ch channels) with a filter: bilinear (support 1), bicubic (a = -0.5, support 2) or Lanczos-3, each
+// stretched by the reduction (antialiased), a horizontal then a vertical pass, rounded and clipped to 8 bits.
+enum class PilFilter { Bilinear, Bicubic, Lanczos };
+std::vector<uint8_t> resize_pil8(const uint8_t* px, int w, int h, int ch, int ow, int oh, PilFilter f);
 
 }  // namespace trellis

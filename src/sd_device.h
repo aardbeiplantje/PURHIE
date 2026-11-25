@@ -278,6 +278,22 @@ void simp_compress_f(const int* fmap, const int* vmap, const int* oldf, int F, i
 // mesh charts (sd_gpu.hip chart_*; trellis_charts.cpp drives them): the face areas and normals; the cone of each chart (cn [C][4]: axis, half
 // angle) and area from its faces (coff, cface); the perimeter of each chart from its chart-graph edges (c2e_off, c2e); the cost of each
 // chart-graph edge (ek: min << 32 | max; elen its length); the cheapest edge of each chart (prop); the collapse (cmap, flag); the refinement.
+// BiRefNet (sd_gpu.hip bir_*; birefnet.cpp drives them). Tokens [T][C]; maps [C][H][W]. The Swin windows: gather (the shifted, padded
+// frame: Hp x Wp in whole windows of ws), scatter-add back, the window attention (head size 32, the relative position bias table F16,
+// the shift mask), the patch merging's gather. The decoder: the bilinear resize with align_corners, the batch norm's scale and shift
+// with the ReLU, the channel means and their broadcast, the sigmoid gate, image2patches, the deformable convolution's columns.
+void bir_window_gather(const float* n, int H, int W, int C, int Hp, int Wp, int ws, int shift, float* out);
+void bir_window_scatter_add(float* x, int H, int W, int C, int Hp, int Wp, int ws, int shift, const float* src);
+void bir_window_attn(const float* qkv, float* out, int Hp, int Wp, int ws, int shift, int heads, int C, const uint16_t* bias, float scale);
+void bir_patch_merge(const float* x, int H, int W, int C, float* out);
+void bir_resize_ac(const float* x, int C, int Hi, int Wi, int Ho, int Wo, float* y);
+void bir_bn_act(float* x, int C, long HW, const float* s, const float* b, bool relu);
+void bir_channel_mean(const float* x, int C, long HW, float* out);
+void bir_fill_channels(float* y, int C, long HW, const float* v);
+void bir_gate(float* p, int C, long HW, const float* g);
+void bir_patches(const float* img, int Ci, int H, int W, int hg, int wg, float* out);
+void bir_deform_cols(const float* x, int Ci, int H, int W, const float* off, const float* mod, int k, int pad, long r0, int nrows, float* cols);
+
 void chart_face_geom(const float* v, const int* f, int F, float* fn, float* fa);
 void chart_cones(const int* coff, const int* cface, const float* fn, const float* fa, int C, float* cn, float* carea);
 void chart_perims(const int* c2e_off, const int* c2e, const float* elen, int C, float* perim);

@@ -22,8 +22,26 @@ struct Taps {
     std::vector<double> w;
 };
 
-std::vector<Taps> lanczos_taps(int in, int out) {
-    const double scale = (double)in / out, fscale = std::fmax(1.0, scale), support = 3.0 * fscale;
+double pil_filter(PilFilter f, double x) {
+    x = std::fabs(x);
+    switch (f) {
+        case PilFilter::Bilinear:
+            return x < 1.0 ? 1.0 - x : 0.0;
+        case PilFilter::Bicubic: {  // a = -0.5, PIL's
+            const double a = -0.5;
+            if (x < 1.0) return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0;
+            if (x < 2.0) return (((x - 5.0) * x + 8.0) * x - 4.0) * a;
+            return 0.0;
+        }
+        default:
+            return lanczos3(x);
+    }
+}
+
+double pil_support(PilFilter f) { return f == PilFilter::Bilinear ? 1.0 : f == PilFilter::Bicubic ? 2.0 : 3.0; }
+
+std::vector<Taps> pil_taps(int in, int out, PilFilter f) {
+    const double scale = (double)in / out, fscale = std::fmax(1.0, scale), support = pil_support(f) * fscale;
     std::vector<Taps> taps(out);
     for (int o = 0; o < out; ++o) {
         const double center = (o + 0.5) * scale;
@@ -31,7 +49,7 @@ std::vector<Taps> lanczos_taps(int in, int out) {
         taps[o].first = lo;
         double sum = 0;
         for (int i = lo; i < hi; ++i) {
-            const double wt = lanczos3((i - center + 0.5) / fscale);
+            const double wt = pil_filter(f, (i - center + 0.5) / fscale);
             taps[o].w.push_back(wt);
             sum += wt;
         }
@@ -47,24 +65,28 @@ uint8_t clip8(double v) {
 
 }  // namespace
 
-std::vector<uint8_t> resize_lanczos_rgb8(const uint8_t* rgb, int w, int h, int ow, int oh) {
-    std::vector<uint8_t> tmp((size_t)h * ow * 3), out((size_t)oh * ow * 3);
-    const std::vector<Taps> tx = lanczos_taps(w, ow), ty = lanczos_taps(h, oh);
+std::vector<uint8_t> resize_pil8(const uint8_t* px, int w, int h, int ch, int ow, int oh, PilFilter f) {
+    std::vector<uint8_t> tmp((size_t)h * ow * ch), out((size_t)oh * ow * ch);
+    const std::vector<Taps> tx = pil_taps(w, ow, f), ty = pil_taps(h, oh, f);
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < ow; ++x)
-            for (int c = 0; c < 3; ++c) {
+            for (int c = 0; c < ch; ++c) {
                 double s = 0;
-                for (size_t k = 0; k < tx[x].w.size(); ++k) s += tx[x].w[k] * rgb[((size_t)y * w + tx[x].first + k) * 3 + c];
-                tmp[((size_t)y * ow + x) * 3 + c] = clip8(s);
+                for (size_t k = 0; k < tx[x].w.size(); ++k) s += tx[x].w[k] * px[((size_t)y * w + tx[x].first + k) * ch + c];
+                tmp[((size_t)y * ow + x) * ch + c] = clip8(s);
             }
     for (int y = 0; y < oh; ++y)
         for (int x = 0; x < ow; ++x)
-            for (int c = 0; c < 3; ++c) {
+            for (int c = 0; c < ch; ++c) {
                 double s = 0;
-                for (size_t k = 0; k < ty[y].w.size(); ++k) s += ty[y].w[k] * tmp[((size_t)(ty[y].first + k) * ow + x) * 3 + c];
-                out[((size_t)y * ow + x) * 3 + c] = clip8(s);
+                for (size_t k = 0; k < ty[y].w.size(); ++k) s += ty[y].w[k] * tmp[((size_t)(ty[y].first + k) * ow + x) * ch + c];
+                out[((size_t)y * ow + x) * ch + c] = clip8(s);
             }
     return out;
+}
+
+std::vector<uint8_t> resize_lanczos_rgb8(const uint8_t* rgb, int w, int h, int ow, int oh) {
+    return resize_pil8(rgb, w, h, 3, ow, oh, PilFilter::Lanczos);
 }
 
 bool image_condition(DinoV3& enc, const uint8_t* rgb, int w, int h, int size, std::vector<float>& cond, std::string& error) {

@@ -2,6 +2,7 @@
 // thread (trellis2_api.h).
 #include "trellis_image_to_3d.h"
 
+#include "birefnet.h"
 #include "dinov3.h"
 #include "image.h"
 #include "sd_device.h"
@@ -121,6 +122,7 @@ bool crop_to_mask(const uint8_t* rgb, const float* mask, int w, int h, float mar
 struct ImageTo3D::Impl {
     ImageTo3DFiles files;
     std::unique_ptr<DinoV3> enc;
+    std::unique_ptr<BiRefNet> bir;  // null: no background removal (only images with an alpha channel are cut out)
     std::unique_ptr<ShapePipeline> shape;
     std::unique_ptr<TexturePipeline> tex;
     float smean[32], sstd[32], tmean[32], tstd[32];
@@ -139,6 +141,13 @@ ImageTo3D::ImageTo3D(const ImageTo3DFiles& files) : p_(new Impl) {
     if (!m.enc->ok()) {
         m.error = "image encoder: " + m.enc->error();
         return;
+    }
+    if (!files.birefnet.empty()) {
+        m.bir.reset(new BiRefNet(files.birefnet));
+        if (!m.bir->ok()) {
+            m.error = "background removal: " + m.bir->error();
+            return;
+        }
     }
     m.shape.reset(new ShapePipeline(ck + "ss_flow_img_dit_1_3B_64_bf16.safetensors", files.ss_dec,
                                     ck + "slat_flow_img2shape_dit_1_3B_512_bf16.safetensors", ck + "shape_dec_next_dc_f16c32_fp16.safetensors",
@@ -160,7 +169,7 @@ ImageTo3D::~ImageTo3D() = default;
 
 bool ImageTo3D::ok() const { return p_->ok; }
 const std::string& ImageTo3D::error() const { return p_->error; }
-bool ImageTo3D::has_background_removal() const { return false; }
+bool ImageTo3D::has_background_removal() const { return p_->bir != nullptr; }
 const std::vector<uint8_t>& ImageTo3D::last_input() const { return p_->last_input; }
 const std::vector<std::pair<std::string, double>>& ImageTo3D::last_timings() const { return p_->timings; }
 
@@ -206,6 +215,12 @@ bool ImageTo3D::generate(const uint8_t* rgba, int w, int h, bool has_alpha, cons
         margin = 1.0f;  // the whole image, squared with black
     } else if (has_alpha && !opaque && opt.remove_background != 1) {
         for (size_t i = 0; i < npx; ++i) mask[i] = rgba[i * 4 + 3] / 255.0f;
+    } else if (m.bir) {
+        report("background removal", 0, 0);
+        if (!m.bir->mask(rgb.data(), w, h, mask)) {
+            m.error = "background removal: " + m.bir->error();
+            return false;
+        }
     } else {
         m.error = "no background removal (BiRefNet) in this pipeline: give an image with an alpha channel, or remove_background 0";
         return false;

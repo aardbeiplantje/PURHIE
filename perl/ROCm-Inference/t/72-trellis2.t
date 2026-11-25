@@ -11,13 +11,13 @@ use Time::HiRes qw(sleep);
 
 # bin/rocm-inference-server --trellis2 DIR: /v1/3d/generations starts a job on an image (TRELLIS.2, an image to a textured 3D
 # model); GET /v1/3d/generations/ID polls it, GET .../content gives the binary glTF. Checked: the listing (kind 3d), the errors
-# (no image, an image that cannot be decoded), a 512 job on an image with an alpha channel, the busy answers while it runs (429
-# for a second job, 503 for the image generator), the model's header. Needs the TRELLIS.2 files (ROCM_INFERENCE_TEST_TRELLIS2=DIR,
-# as --trellis2 takes them) and an image with an alpha channel (ROCM_INFERENCE_TEST_TRELLIS2_IMAGE: a PNG with the object cut out);
-# about four minutes at 512.
+# (no image, an image that cannot be decoded), a 512 job, the busy answers while it runs (429 for a second job, 503 for the image
+# generator), the model's header. Needs the TRELLIS.2 files (ROCM_INFERENCE_TEST_TRELLIS2=DIR, as --trellis2 takes them) and an image
+# (ROCM_INFERENCE_TEST_TRELLIS2_IMAGE: a PNG with the object cut out by its alpha channel, or, when DIR holds birefnet.safetensors, a
+# photo that BiRefNet cuts out); about four minutes at 512.
 my $dirt = $ENV{ROCM_INFERENCE_TEST_TRELLIS2};
 my $img = $ENV{ROCM_INFERENCE_TEST_TRELLIS2_IMAGE};
-plan skip_all => 'set ROCM_INFERENCE_TEST_TRELLIS2 (the --trellis2 directory) and ROCM_INFERENCE_TEST_TRELLIS2_IMAGE (an RGBA PNG) to run'
+plan skip_all => 'set ROCM_INFERENCE_TEST_TRELLIS2 (the --trellis2 directory) and ROCM_INFERENCE_TEST_TRELLIS2_IMAGE (a PNG) to run'
     unless $dirt && -d $dirt && $img && -f $img;
 plan skip_all => 'Web::Route is not installed' unless eval { require Web::Route; 1 };
 

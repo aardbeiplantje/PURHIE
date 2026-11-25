@@ -2737,3 +2737,193 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) attn_flash_d64(const fl
     (void)heads;
     attn_flash_body<64>(q, ldq, Tq, k, ldk, v, ldv, Tk, C, scale, out);
 }
+
+// ---- BiRefNet (src/birefnet.cpp): the Swin backbone's windows and the decoder's steps. Tokens are [T][C] (row-major positions);
+// the decoder's maps are channel-major [C][H][W].
+
+// the windows of a stage (Hp x Wp: H x W padded to whole windows) in the shifted frame: window w, position r = (ri, ci) is the padded
+// grid's ((wy ws + ri + shift) % Hp, (wx ws + ci + shift) % Wp) (torch.roll by -shift), zero in the padding. out: [nW ws ws][C]
+extern "C" __global__ void __launch_bounds__(SD_THREADS) bir_window_gather(const float* n, int H, int W, int C, int Hp, int Wp, int ws, int shift,
+                                                                          float* out) {
+    const long total = (long)Hp * Wp * C;
+    const long idx = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (idx >= total) return;
+    const long tok = idx / C;
+    const int c = (int)(idx % C), N = ws * ws, nWw = Wp / ws;
+    const int w = (int)(tok / N), r = (int)(tok % N);
+    const int py = (w / nWw) * ws + r / ws, px = (w % nWw) * ws + r % ws;
+    const int oy = (py + shift) % Hp, ox = (px + shift) % Wp;
+    out[idx] = (oy < H && ox < W) ? n[((long)oy * W + ox) * C + c] : 0.0f;
+}
+
+// the windows back to the token grid (the roll undone, the padding dropped), added: x += the window outputs (the residual)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) bir_window_scatter_add(float* x, int H, int W, int C, int Hp, int Wp, int ws, int shift,
+                                                                               const float* src) {
+    const long total = (long)Hp * Wp * C;
+    const long idx = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (idx >= total) return;
+    const long tok = idx / C;
+    const int c = (int)(idx % C), N = ws * ws, nWw = Wp / ws;
+    const int w = (int)(tok / N), r = (int)(tok % N);
+    const int py = (w / nWw) * ws + r / ws, px = (w % nWw) * ws + r % ws;
+    const int oy = (py + shift) % Hp, ox = (px + shift) % Wp;
+    if (oy < H && ox < W) x[((long)oy * W + ox) * C + c] += src[idx];
+}
+
+// the attention of one window and one head (head size 32): q k^T scaled, plus the relative position bias (table [(2ws-1)^2][heads],
+// F16), plus the shift mask (-100 between the regions of the shifted frame), softmax, times v. qkv: [nW N][3C] (q, k, v; each head
+// h at h * 32); out: [nW N][C]. One thread per query row (online softmax); the window's keys and values in LDS.
+extern "C" __global__ void __launch_bounds__(SD_THREADS) bir_window_attn(const float* qkv, float* out, int nWw, int Hp, int Wp, int ws, int shift,
+                                                                        int heads, int C, const uint16_t* bias, float scale) {
+    constexpr int D = 32, NMAX = 144;
+    __shared__ float sK[NMAX][D + 1];
+    __shared__ float sV[NMAX][D];
+    __shared__ int sReg[NMAX];
+    const int w = blockIdx.x, h = blockIdx.y, N = ws * ws, t = threadIdx.x;
+    const long base = (long)w * N;
+    const int wy = w / nWw, wx = w % nWw;
+    for (int e = t; e < N * D; e += SD_THREADS) {
+        const int j = e / D, d = e % D;
+        sK[j][d] = qkv[(base + j) * 3 * C + C + h * D + d];
+        sV[j][d] = qkv[(base + j) * 3 * C + 2 * C + h * D + d];
+    }
+    for (int j = t; j < N; j += SD_THREADS) {
+        const int py = wy * ws + j / ws, px = wx * ws + j % ws;
+        const int hs = py < Hp - ws ? 0 : (py < Hp - shift ? 1 : 2), wsg = px < Wp - ws ? 0 : (px < Wp - shift ? 1 : 2);
+        sReg[j] = hs * 3 + wsg;
+    }
+    __syncthreads();
+    if (t >= N) return;
+    float q[D];
+    for (int d = 0; d < D; ++d) q[d] = qkv[(base + t) * 3 * C + h * D + d] * scale;
+    const int ri = t / ws, ci = t % ws, span = 2 * ws - 1;
+    float m = -1e30f, l = 0.0f, acc[D];
+    for (int d = 0; d < D; ++d) acc[d] = 0.0f;
+    for (int j = 0; j < N; ++j) {
+        float s = 0.0f;
+        for (int d = 0; d < D; ++d) s += q[d] * sK[j][d];
+        const int rj = j / ws, cj = j % ws;
+        s += h2f(bias[((ri - rj + ws - 1) * span + (ci - cj + ws - 1)) * heads + h]);
+        if (shift > 0 && sReg[t] != sReg[j]) s += -100.0f;
+        const float mn = fmaxf(m, s);
+        const float a = expf(m - mn), p = expf(s - mn);
+        l = l * a + p;
+        for (int d = 0; d < D; ++d) acc[d] = acc[d] * a + p * sV[j][d];
+        m = mn;
+    }
+    const float inv = 1.0f / l;
+    for (int d = 0; d < D; ++d) out[(base + t) * C + h * D + d] = acc[d] * inv;
+}
+
+// the patch merging's gather: out [(H/2)(W/2)][4C], the four neighbours in the order (0,0), (1,0), (0,1), (1,1) (row, column)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) bir_patch_merge(const float* x, int H, int W, int C, float* out) {
+    const int H2 = H / 2, W2 = W / 2;
+    const long total = (long)H2 * W2 * 4 * C;
+    const long idx = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (idx >= total) return;
+    const long tok = idx / (4 * C);
+    const int rem = (int)(idx % (4 * C)), k = rem / C, c = rem % C;
+    const int i = (int)(tok / W2), j = (int)(tok % W2);
+    const int dy = (k == 1 || k == 3) ? 1 : 0, dx = (k >= 2) ? 1 : 0;
+    out[idx] = x[((long)(2 * i + dy) * W + 2 * j + dx) * C + c];
+}
+
+// bilinear resizing with align_corners (torch's F.interpolate): [C][Hi][Wi] -> [C][Ho][Wo]
+extern "C" __global__ void __launch_bounds__(SD_THREADS) bir_resize_ac(const float* x, int C, int Hi, int Wi, int Ho, int Wo, float* y) {
+    const long total = (long)C * Ho * Wo;
+    const long idx = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (idx >= total) return;
+    const int c = (int)(idx / ((long)Ho * Wo));
+    const int oy = (int)((idx / Wo) % Ho), ox = (int)(idx % Wo);
+    const float sh = Ho > 1 ? (float)(Hi - 1) / (float)(Ho - 1) : 0.0f, sw = Wo > 1 ? (float)(Wi - 1) / (float)(Wo - 1) : 0.0f;
+    const float fy = sh * oy, fx = sw * ox;
+    const int y0 = (int)fy, x0 = (int)fx;
+    const int y1 = y0 + (y0 < Hi - 1 ? 1 : 0), x1 = x0 + (x0 < Wi - 1 ? 1 : 0);
+    const float ly = fy - y0, lx = fx - x0;
+    const float* p = x + (long)c * Hi * Wi;
+    const float v = (1.0f - ly) * ((1.0f - lx) * p[(long)y0 * Wi + x0] + lx * p[(long)y0 * Wi + x1]) +
+                    ly * ((1.0f - lx) * p[(long)y1 * Wi + x0] + lx * p[(long)y1 * Wi + x1]);
+    y[idx] = v;
+}
+
+// the batch norm (inference: a scale and a shift per channel) and the ReLU, in place on [C][HW]
+extern "C" __global__ void __launch_bounds__(SD_THREADS) bir_bn_act(float* x, int C, long HW, const float* s, const float* b, int relu) {
+    const long idx = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (idx >= (long)C * HW) return;
+    const int c = (int)(idx / HW);
+    float v = x[idx] * s[c] + b[c];
+    if (relu && v < 0.0f) v = 0.0f;
+    x[idx] = v;
+}
+
+// the mean of each channel of [C][HW] (one block per channel)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) bir_channel_mean(const float* x, int C, long HW, float* out) {
+    __shared__ float part[SD_THREADS];
+    const int c = blockIdx.x;
+    float s = 0.0f;
+    for (long i = threadIdx.x; i < HW; i += SD_THREADS) s += x[(long)c * HW + i];
+    part[threadIdx.x] = s;
+    __syncthreads();
+    for (int o = SD_THREADS / 2; o > 0; o >>= 1) {
+        if ((int)threadIdx.x < o) part[threadIdx.x] += part[threadIdx.x + o];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[c] = part[0] / (float)HW;
+}
+
+// [C][HW] filled with one value per channel (the global pooling's branch, broadcast)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) bir_fill_channels(float* y, int C, long HW, const float* v) {
+    const long idx = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (idx >= (long)C * HW) return;
+    y[idx] = v[idx / HW];
+}
+
+// p [C][HW] times the sigmoid of a [HW] (the decoder's gradient attention)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) bir_gate(float* p, int C, long HW, const float* a) {
+    const long idx = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (idx >= (long)C * HW) return;
+    p[idx] *= 1.0f / (1.0f + expf(-a[idx % HW]));
+}
+
+// image2patches ('b c (hg h) (wg w) -> b (c hg wg) h w'): img [Ci][H][W] -> out [Ci hg wg][H/hg][W/wg]
+extern "C" __global__ void __launch_bounds__(SD_THREADS) bir_patches(const float* img, int Ci, int H, int W, int hg, int wg, float* out) {
+    const int ph = H / hg, pw = W / wg;
+    const long total = (long)Ci * hg * wg * ph * pw;
+    const long idx = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (idx >= total) return;
+    const int o = (int)(idx / ((long)ph * pw));
+    const int y = (int)((idx / pw) % ph), x = (int)(idx % pw);
+    const int c = o / (hg * wg), g = o % (hg * wg), gi = g / wg, gj = g % wg;
+    out[idx] = img[((long)c * H + gi * ph + y) * W + gj * pw + x];
+}
+
+// the columns of a modulated deformable convolution (torchvision's deform_conv2d: stride 1, dilation 1, one offset group), for the
+// output pixels r0 .. r0 + nrows: cols [nrows][Ci k k] (token-major, the weight's (c, i, j) order). off [2 k k][H][W] (dy, dx per
+// tap), mod [k k][H][W] (the modulator conv's output: the mask is 2 sigmoid of it). Bilinear sampling, zero outside the map.
+extern "C" __global__ void __launch_bounds__(SD_THREADS) bir_deform_cols(const float* x, int Ci, int H, int W, const float* off, const float* mod,
+                                                                        int k, int pad, long r0, int nrows, float* cols) {
+    const int kk = k * k;
+    const long total = (long)nrows * Ci * kk;
+    const long idx = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (idx >= total) return;
+    const long rr = idx / ((long)Ci * kk);
+    const int rem = (int)(idx % ((long)Ci * kk)), c = rem / kk, tap = rem % kk, i = tap / k, j = tap % k;
+    const long r = r0 + rr;
+    const int oy = (int)(r / W), ox = (int)(r % W);
+    const long HW = (long)H * W;
+    const float dy = off[(long)(2 * tap) * HW + r], dx = off[(long)(2 * tap + 1) * HW + r];
+    const float mval = 2.0f / (1.0f + expf(-mod[(long)tap * HW + r]));
+    const float yy = (float)(oy - pad + i) + dy, xx = (float)(ox - pad + j) + dx;
+    float v = 0.0f;
+    if (!(yy <= -1.0f || yy >= (float)H || xx <= -1.0f || xx >= (float)W)) {
+        const int yl = (int)floorf(yy), xl = (int)floorf(xx), yh = yl + 1, xh = xl + 1;
+        const float ly = yy - yl, lx = xx - xl, hy = 1.0f - ly, hx = 1.0f - lx;
+        const float* p = x + (long)c * HW;
+        const float v1 = (yl >= 0 && xl >= 0) ? p[(long)yl * W + xl] : 0.0f;
+        const float v2 = (yl >= 0 && xh <= W - 1) ? p[(long)yl * W + xh] : 0.0f;
+        const float v3 = (yh <= H - 1 && xl >= 0) ? p[(long)yh * W + xl] : 0.0f;
+        const float v4 = (yh <= H - 1 && xh <= W - 1) ? p[(long)yh * W + xh] : 0.0f;
+        v = hy * hx * v1 + hy * lx * v2 + ly * hx * v3 + ly * lx * v4;
+    }
+    cols[idx] = mval * v;
+}

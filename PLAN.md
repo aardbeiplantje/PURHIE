@@ -310,7 +310,12 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
     and answers its id at once; `GET /v1/3d/generations/{id}` polls it, `.../content` gives the GLB; one job at a time (429), the image
     and audio generators answer 503 meanwhile (the job holds the device layer); `t/72-trellis2.t` passes (18 checks, a 512 job in about
     3.5 minutes). Images with an alpha channel are cut out by it; the textures are deflated now (the 512 vase: 148 MB to 53 MB).
-    Open: (a) BiRefNet on the engine (a C++/HIP port, as DINOv3 was), so the background removal leaves python; (b) the 1536 cascade
+    BiRefNet on the engine (2026-11-25, `src/birefnet.{h,cpp}`, the `bir_*` kernels): the Swin-L backbone at 1024 and 512, the
+    context skips, the squeeze, the decoder with the deformable ASPP (torchvision's modulated sampling) and the gradient gates; the
+    F16 weights read in place, the batch norms as scales and shifts. `birefnet_verify` against the python model's dumps: all 25
+    stages within 1e-5 of the norm, the 2000 x 2000 vase mask within 3 of 255 (mean 0.001); 2.8 s a forward. The server's jobs cut
+    out photos with no alpha channel with it (`birefnet.safetensors` in DIR or DIR/background_removal), so python is no longer needed.
+    Open: (b) the 1536 cascade
     (memory is no longer the limit; its time is); (c) the normal-map and AO bakes and their GLB inputs; (d) UnwrapMesh's "pec"
     segmenter (ours is CuMesh's charts); (e) python's to_glb clean-up; (f) the simplify stops below its target (667k for 700k), where
     python's stops at it; (g) the unwrap (74 s on the vase: xatlas per chart, single-threaded) and the host sorts, to move to the
@@ -538,8 +543,8 @@ Quality and correctness:
 - **Flux.2 dev** (`diffusion_models/flux2_dev_fp8mixed`: BF16 and FP8 layers with scales and a quantization table; double and
   single blocks, dim 6144); text `text_encoders/mistral_3_small_flux2_bf16`; VAE `vae/flux2-vae` (32 channels); LoRA
   `Flux_2-Turbo-LoRA`.
-- **Utility models:** BiRefNet (`background_removal/birefnet`), MoGe-2 (`geometry_estimation/moge_2_vitl_normal`), DINOv3
-  (`clip_vision/dino_v3_L_naf_fp32`). Also TRELLIS.2 and Pixal3D in `diffusion_models` (3D: deferred).
+- **Utility models:** BiRefNet (`background_removal/birefnet`: done, item 20), MoGe-2 (`geometry_estimation/moge_2_vitl_normal`),
+  DINOv3 (`clip_vision/dino_v3_L_naf_fp32`: done, item 20). Also Pixal3D in `diffusion_models` (3D: deferred; TRELLIS.2 is item 20).
 
 Decisions (2026-11-20): the component API and the node package are on hold until the engine supports the models. The node API is
 ComfyUI's, not ours: a node is a Python class (`INPUT_TYPES` classmethod, `RETURN_TYPES`, `FUNCTION`, `CATEGORY`; registered
