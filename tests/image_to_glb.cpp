@@ -114,6 +114,18 @@ int main(int argc, char** argv) {
         tcfg.tex_std[c] = tnorm[32 + c];
     }
 
+    // the progress: each sampler step as it finishes (stderr), with the stage and the flow's tokens (the 32 latent channels), so a long run
+    // shows where it is; the decoders print nothing until they finish
+    const auto run_start = std::chrono::steady_clock::now();
+    auto step_log = [run_start](const char* stage, size_t per_token) {
+        return [run_start, stage, per_token](int step, const float*, size_t count) {
+            std::fprintf(stderr, "  %s: step %d done at %.1f s (%zu values, %zu tokens)\n", stage, step + 1,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - run_start).count(), count, count / per_token);
+        };
+    };
+    scfg.ss.on_step = step_log("sparse structure", 1);
+    scfg.slat.on_step = step_log("shape SLAT", 32);
+    tcfg.sampler.on_step = step_log("texture flow", 32);
     std::mt19937 rng(seed);
     std::normal_distribution<float> gauss(0.0f, 1.0f);
     trellis::NoiseFn noise = [&](float* dst, size_t count) {
@@ -132,6 +144,9 @@ int main(int argc, char** argv) {
     }
     std::fprintf(stderr, "run done: %zu vertices, %zu faces, %zu texture voxels, %d holes filled\n", tm.shape.verts.size() / 3,
                  tm.shape.faces.size() / 3, tm.tex.coords.size() / 4, tm.shape.holes_filled);
+    std::fprintf(stderr, "stages: sparse structure %.1f s, shape SLAT %.1f s, shape decoder %.1f s, mesh %.1f s, cascade %.1f s, texture flow %.1f s, texture decoder %.1f s\n",
+                 tm.shape.seconds_ss, tm.shape.seconds_slat, tm.shape.seconds_dec, tm.shape.seconds_mesh, tm.shape.seconds_hr, tm.tex.seconds_flow,
+                 tm.tex.seconds_dec);
     trellis::VoxelAttributes attr;
     attr.coords = tm.tex.coords;
     attr.feats = tm.tex.out;

@@ -292,6 +292,13 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
     to be confirmed against the reference edit pipeline), a stage check against its python oracle, and a server route. The
     ComfyUI edit workflow is in the uploads (`image_qwen_image_2_1_image_edit`), with the Edit Lightning LoRA.
 
+22. **FLUX.2 dev (image generation), not started.** The weights are on disk (see the ComfyUI section): the DiT
+    `diffusion_models/flux2_dev_fp8mixed` (BF16 and FP8 layers with scales and a quantization table; double and single blocks, dim
+    6144), the text encoder `text_encoders/mistral_3_small_flux2_bf16`, the VAE `vae/flux2-vae` (32 channels) and the Turbo LoRA
+    `loras/Flux_2-Turbo-LoRA_comfyui`. Needs: the DiT on the engine (the FP8 layers stay FP8 in the FP8 operand path, per the policy in
+    the ComfyUI section), the text encoder, the 32-channel VAE decoder, a stage check against a python oracle, and a server route.
+    The oracle needs a diffusers build with Flux.2 (0.35.2 has none) or ComfyUI on CPU. Open: the sampler's steps and the LoRA's role.
+
 ## Audio, vision and image: status
 
 Verified against the references in the sections that follow. Each row says what works, what is open, and where it runs.
