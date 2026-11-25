@@ -27,7 +27,15 @@ constexpr int kBlocks = 30;
 constexpr int kCond = 1024;   // image feature channels
 constexpr int kLat = 32;      // latent channels per voxel (in and out)
 constexpr int kFreq = 256;    // timestep embedding size
-constexpr int kQChunk = 256;  // queries per attention launch (AGENTS.md: keep each launch short)
+// queries per attention launch: about kAttnPairs query-key pairs (about 40 ms per launch on the fused kernel at 12 heads), so each
+// launch stays short (AGENTS.md, GPU use) and still has enough workgroups to fill the GPU; at least 256, in whole 64-query blocks
+constexpr size_t kAttnPairs = (size_t)1 << 24;
+int attn_rows(int tq, int tk) {
+    size_t r = kAttnPairs / (size_t)(tk > 0 ? tk : 1);
+    r -= r % 64;
+    if (r < 256) r = 256;
+    return (int)std::min<size_t>(r, (size_t)(tq > 0 ? tq : 1));
+}
 constexpr int kAxisFreq = 21; // head_dim / 2 / 3 frequencies per axis (SparseRotaryPositionEmbedder)
 
 float bf16_to_f32(uint16_t v) {
@@ -254,8 +262,9 @@ bool SlatFlow::forward(const int32_t* coords, int n, const float* feats, float t
         sddev::ss_head_norm_rope(QKV, n, 3 * kC, kH, kD, k.gq, ph);
         sddev::ss_head_norm_rope(QKV + kC, n, 3 * kC, kH, kD, k.gk, ph);
         const auto a0 = std::chrono::steady_clock::now();
-        for (int c0 = 0; c0 < n; c0 += kQChunk) {
-            const int qn = std::min(kQChunk, n - c0);
+        const int qrows = attn_rows(n, n);
+        for (int c0 = 0; c0 < n; c0 += qrows) {
+            const int qn = std::min(qrows, n - c0);
             sddev::attention_f32_strided(QKV + (size_t)c0 * 3 * kC, 3 * kC, qn, QKV + kC, 3 * kC, QKV + 2 * kC, 3 * kC, n, kC, kH,
                                          O + (size_t)c0 * kC);
         }
@@ -271,8 +280,9 @@ bool SlatFlow::forward(const int32_t* coords, int n, const float* feats, float t
         sddev::ss_head_norm_rope(Qc, n, kC, kH, kD, k.gcq, nullptr);
         sddev::ss_head_norm_rope(Kc, Lc, kC, kH, kD, k.gck, nullptr);
         const auto a1 = std::chrono::steady_clock::now();
-        for (int c0 = 0; c0 < n; c0 += kQChunk) {
-            const int qn = std::min(kQChunk, n - c0);
+        const int crows = attn_rows(n, Lc);
+        for (int c0 = 0; c0 < n; c0 += crows) {
+            const int qn = std::min(crows, n - c0);
             sddev::attention_f32_strided(Qc + (size_t)c0 * kC, kC, qn, Kc, kC, Vc, kC, Lc, kC, kH, Oc + (size_t)c0 * kC);
         }
         att_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - a1).count();

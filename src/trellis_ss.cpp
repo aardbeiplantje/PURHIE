@@ -26,7 +26,15 @@ constexpr int kBlocks = 30;
 constexpr int kCond = 1024;   // image feature channels
 constexpr int kIn = 8;        // latent channels
 constexpr int kFreq = 256;    // timestep embedding size
-constexpr int kQChunk = 256;  // queries per attention launch (each launch stays short: AGENTS.md, GPU use)
+// queries per attention launch: about kAttnPairs query-key pairs (about 40 ms per launch on the fused kernel at 12 heads), so each
+// launch stays short (AGENTS.md, GPU use) and still has enough workgroups to fill the GPU; at least 256, in whole 64-query blocks
+constexpr size_t kAttnPairs = (size_t)1 << 24;
+int attn_rows(int tq, int tk) {
+    size_t r = kAttnPairs / (size_t)(tk > 0 ? tk : 1);
+    r -= r % 64;
+    if (r < 256) r = 256;
+    return (int)std::min<size_t>(r, (size_t)(tq > 0 ? tq : 1));
+}
 
 float bf16_to_f32(uint16_t v) {
     const uint32_t u = (uint32_t)v << 16;
@@ -247,8 +255,9 @@ bool SsFlow::forward(const float* x, float t, const float* cond, int Lc, const f
         sddev::ss_head_norm_rope(QKV, kN, 3 * kC, kH, kD, k.gq, ph);
         sddev::ss_head_norm_rope(QKV + kC, kN, 3 * kC, kH, kD, k.gk, ph);
         if (dbg) emit("dbg_qk", QKV, (size_t)kN * 3 * kC);
-        for (int c0 = 0; c0 < kN; c0 += kQChunk)
-            sddev::attention_f32_strided(QKV + (size_t)c0 * 3 * kC, 3 * kC, std::min(kQChunk, kN - c0), QKV + kC, 3 * kC,
+        const int qrows = attn_rows(kN, kN);
+        for (int c0 = 0; c0 < kN; c0 += qrows)
+            sddev::attention_f32_strided(QKV + (size_t)c0 * 3 * kC, 3 * kC, std::min(qrows, kN - c0), QKV + kC, 3 * kC,
                                          QKV + 2 * kC, 3 * kC, kN, kC, kH, O + (size_t)c0 * kC);
         if (dbg) emit("dbg_attn", O, (size_t)kN * kC);
         sddev::linear_bf16(O, kN, k.wso, kC, kC, k.bso, P);
@@ -270,8 +279,9 @@ bool SsFlow::forward(const float* x, float t, const float* cond, int Lc, const f
             emit("dbg_ck", Kc, (size_t)Lc * kC);
             emit("dbg_cv", Vc, (size_t)Lc * kC);
         }
-        for (int c0 = 0; c0 < kN; c0 += kQChunk)
-            sddev::attention_f32_strided(Qc + (size_t)c0 * kC, kC, std::min(kQChunk, kN - c0), Kc, kC, Vc, kC, Lc, kC, kH,
+        const int crows = attn_rows(kN, Lc);
+        for (int c0 = 0; c0 < kN; c0 += crows)
+            sddev::attention_f32_strided(Qc + (size_t)c0 * kC, kC, std::min(crows, kN - c0), Kc, kC, Vc, kC, Lc, kC, kH,
                                          Oc + (size_t)c0 * kC);
         if (dbg) emit("dbg_cross_attn", Oc, (size_t)kN * kC);
         sddev::linear_bf16(Oc, kN, k.wco, kC, kC, k.bco, Pc);

@@ -25,6 +25,8 @@ std::recursive_mutex& run_mutex();
 // Float memory (zeroed unless zero is false): pinned and device-visible when the device path is on, else calloc. Pooled.
 void* alloc(size_t bytes, bool zero = true);  // zero = false: the caller writes every byte (no memset: a CPU pass)
 void release(void* p, size_t bytes);
+// The pinned pool's bytes handed out (in use) and released but kept for reuse (cached, at most 16 GiB; the largest go back beyond it).
+void pinned_bytes(size_t& in_use, size_t& cached);
 // Device-only memory (hipMalloc, pooled): for buffers the host never reads or writes (the GEMM inputs in BF16). Not
 // host-visible: the host code must not touch these pointers.
 void* dalloc(size_t bytes);

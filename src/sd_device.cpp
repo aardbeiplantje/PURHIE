@@ -21,6 +21,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -191,6 +192,29 @@ void unregister_weights(const void* base) {
 
 std::recursive_mutex& run_mutex() { return g_run; }
 
+namespace {
+// The capacity of each pinned block handed out: a reused block can be larger than its request, so a release must keep the block's true
+// size (recording the request instead loses the rest of the block and makes the pool grow). The bytes handed out and the bytes cached.
+std::unordered_map<void*, size_t> g_cap;
+size_t g_live_bytes = 0, g_cached_bytes = 0;
+// the released blocks each pool keeps for reuse at most; beyond it the largest go back to the system
+constexpr size_t kPoolCacheBytes = (size_t)16 << 30;
+
+// the cached pinned blocks back to the system, the largest first, until at most keep bytes stay cached (g_pool_mu held)
+void trim_pinned(size_t keep) {
+    if (g_cached_bytes <= keep) return;
+    (void)hipDeviceSynchronize();  // no kernel may still read a block that is freed
+    while (g_cached_bytes > keep && !g_free.empty()) {
+        size_t big = 0;
+        for (size_t i = 1; i < g_free.size(); ++i)
+            if (g_free[i].cap > g_free[big].cap) big = i;
+        (void)hipHostFree(g_free[big].p);
+        g_cached_bytes -= g_free[big].cap;
+        g_free.erase(g_free.begin() + (long)big);
+    }
+}
+}  // namespace
+
 void* alloc(size_t bytes, bool zero) {
     if (bytes == 0) return nullptr;
     const size_t need = round_up_page(bytes);
@@ -205,23 +229,32 @@ void* alloc(size_t bytes, bool zero) {
         for (size_t i = 0; i < g_free.size(); ++i)
             if (g_free[i].cap >= need && (best == (size_t)-1 || g_free[i].cap < g_free[best].cap)) best = i;
         if (best != (size_t)-1) {
-            void* p = g_free[best].p;
+            const Block b = g_free[best];
             g_free.erase(g_free.begin() + (long)best);
-            if (zero) std::memset(p, 0, need);
-            return p;
+            g_cached_bytes -= b.cap;
+            g_cap[b.p] = b.cap;
+            g_live_bytes += b.cap;
+            if (zero) std::memset(b.p, 0, need);
+            return b.p;
         }
     }
     void* p = nullptr;
     if (hipHostMalloc(&p, need, hipHostMallocDefault) != hipSuccess) {
-        // the pool keeps every released block, and a request reuses only a block at least its size: the cached blocks go back to the
-        // system, and the request is made once more
+        // the cached blocks go back to the system, and the request is made once more
+        size_t live = 0;
         {
             std::lock_guard<std::mutex> lk(g_pool_mu);
-            for (const auto& b : g_free) hipHostFree(b.p);
-            g_free.clear();
+            trim_pinned(0);
+            live = g_live_bytes;
         }
         if (hipHostMalloc(&p, need, hipHostMallocDefault) != hipSuccess)
-            throw std::runtime_error("sd device: out of pinned memory (" + std::to_string(need) + " bytes)");
+            throw std::runtime_error("sd device: out of pinned memory (" + std::to_string(need) + " bytes requested, " + std::to_string(live) +
+                                     " bytes in use)");
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_pool_mu);
+        g_cap[p] = need;
+        g_live_bytes += need;
     }
     if (zero) std::memset(p, 0, need);
     return p;
@@ -234,12 +267,41 @@ void release(void* p, size_t bytes) {
         return;
     }
     std::lock_guard<std::mutex> lk(g_pool_mu);
-    g_free.push_back({p, round_up_page(bytes)});
+    size_t cap = round_up_page(bytes);
+    const auto it = g_cap.find(p);
+    if (it != g_cap.end()) {  // the block's true size
+        cap = it->second;
+        g_cap.erase(it);
+        g_live_bytes -= cap;
+    }
+    g_free.push_back({p, cap});
+    g_cached_bytes += cap;
+    trim_pinned(kPoolCacheBytes);
+}
+
+void pinned_bytes(size_t& in_use, size_t& cached) {
+    std::lock_guard<std::mutex> lk(g_pool_mu);
+    in_use = g_live_bytes;
+    cached = g_cached_bytes;
 }
 
 namespace {
 std::mutex g_dpool_mu;
-std::vector<Block> g_dfree;  // the released device blocks, reused by dalloc (best fit)
+std::vector<Block> g_dfree;                // the released device blocks, reused by dalloc (best fit)
+std::unordered_map<void*, size_t> g_dcap;  // the capacity of each device block handed out (as g_cap)
+size_t g_dcached_bytes = 0;
+
+// the cached device blocks back to the system, the largest first (g_dpool_mu held; hipFree synchronises)
+void trim_device(size_t keep) {
+    while (g_dcached_bytes > keep && !g_dfree.empty()) {
+        size_t big = 0;
+        for (size_t i = 1; i < g_dfree.size(); ++i)
+            if (g_dfree[i].cap > g_dfree[big].cap) big = i;
+        (void)hipFree(g_dfree[big].p);
+        g_dcached_bytes -= g_dfree[big].cap;
+        g_dfree.erase(g_dfree.begin() + (long)big);
+    }
+}
 }  // namespace
 
 void* dalloc(size_t bytes) {
@@ -252,13 +314,25 @@ void* dalloc(size_t bytes) {
         for (size_t i = 0; i < g_dfree.size(); ++i)
             if (g_dfree[i].cap >= need && (best == (size_t)-1 || g_dfree[i].cap < g_dfree[best].cap)) best = i;
         if (best != (size_t)-1) {
-            void* p = g_dfree[best].p;
+            const Block b = g_dfree[best];
             g_dfree.erase(g_dfree.begin() + (long)best);
-            return p;
+            g_dcached_bytes -= b.cap;
+            g_dcap[b.p] = b.cap;
+            return b.p;
         }
     }
     void* p = nullptr;
-    if (hipMalloc(&p, need) != hipSuccess) throw std::runtime_error("sd device: out of device memory");
+    if (hipMalloc(&p, need) != hipSuccess) {
+        {
+            std::lock_guard<std::mutex> lk(g_dpool_mu);
+            trim_device(0);
+        }
+        if (hipMalloc(&p, need) != hipSuccess) throw std::runtime_error("sd device: out of device memory (" + std::to_string(need) + " bytes)");
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_dpool_mu);
+        g_dcap[p] = need;
+    }
     return p;
 }
 
@@ -269,9 +343,16 @@ void drelease(void* p, size_t bytes) {
         return;
     }
     std::lock_guard<std::mutex> lk(g_dpool_mu);
-    g_dfree.push_back({p, round_up_page(bytes)});
+    size_t cap = round_up_page(bytes);
+    const auto it = g_dcap.find(p);
+    if (it != g_dcap.end()) {
+        cap = it->second;
+        g_dcap.erase(it);
+    }
+    g_dfree.push_back({p, cap});
+    g_dcached_bytes += cap;
+    trim_device(kPoolCacheBytes);
 }
-
 void conv2d(const float* x, int cin, int H, int W, const uint16_t* w, int cout, const uint16_t* b, int k, int p, int st, float* y,
             int Ho, int Wo) {
     const long HWo = (long)Ho * Wo;

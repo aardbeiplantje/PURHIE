@@ -163,13 +163,51 @@ ShapeDecoder::~ShapeDecoder() = default;
 
 namespace {
 
+// a device buffer (sddev::alloc memory, mapped for the GPU and the host), released when it goes out of scope; movable
+class DevBuf {
+public:
+    DevBuf() = default;
+    explicit DevBuf(size_t bytes) : p_(sddev::alloc(bytes ? bytes : 1, false)), bytes_(bytes ? bytes : 1) {}
+    DevBuf(DevBuf&& o) noexcept : p_(o.p_), bytes_(o.bytes_) {
+        o.p_ = nullptr;
+        o.bytes_ = 0;
+    }
+    DevBuf& operator=(DevBuf&& o) noexcept {
+        if (this != &o) {
+            reset();
+            p_ = o.p_;
+            bytes_ = o.bytes_;
+            o.p_ = nullptr;
+            o.bytes_ = 0;
+        }
+        return *this;
+    }
+    DevBuf(const DevBuf&) = delete;
+    DevBuf& operator=(const DevBuf&) = delete;
+    ~DevBuf() { reset(); }
+    void reset() {
+        if (p_) sddev::release(p_, bytes_);
+        p_ = nullptr;
+        bytes_ = 0;
+    }
+    float* f() const { return static_cast<float*>(p_); }
+    int* i() const { return static_cast<int*>(p_); }
+    unsigned char* u8() const { return static_cast<unsigned char*>(p_); }
+    unsigned long long* u64() const { return static_cast<unsigned long long*>(p_); }
+
+private:
+    void* p_ = nullptr;
+    size_t bytes_ = 0;
+};
+
+DevBuf floats(size_t n) { return DevBuf(sizeof(float) * n); }
+DevBuf ints(size_t n) { return DevBuf(sizeof(int) * n); }
+
 // a voxel set's neighbour map, built on the device: the table (keys, values) and nb[n][27]
 struct VoxelMap {
     int n = 0;
     unsigned int tsize = 0;
-    unsigned long long* keys = nullptr;
-    int* vals = nullptr;
-    int* nb = nullptr;
+    DevBuf keys, vals, nb;
 };
 
 }  // namespace
@@ -184,9 +222,23 @@ bool ShapeDecoder::forward_guided(const int32_t* coords, int n, const float* fea
     return run(coords, n, feats, out_feats, out_coords, out_m, out_capacity, nullptr, 0, &guide, nullptr);
 }
 
+bool ShapeDecoder::forward(const int32_t* coords, int n, const float* feats, std::vector<float>& out_feats, std::vector<int32_t>& out_coords,
+                           const StageFn& stage, int upsample_times, std::vector<Subdivision>* subs_out) {
+    out_feats.clear();
+    out_coords.clear();
+    return run(coords, n, feats, nullptr, nullptr, nullptr, 0, stage, upsample_times, nullptr, subs_out, &out_feats, &out_coords);
+}
+
+bool ShapeDecoder::forward_guided(const int32_t* coords, int n, const float* feats, const std::vector<Subdivision>& guide,
+                                  std::vector<float>& out_feats, std::vector<int32_t>& out_coords) {
+    out_feats.clear();
+    out_coords.clear();
+    return run(coords, n, feats, nullptr, nullptr, nullptr, 0, nullptr, 0, &guide, nullptr, &out_feats, &out_coords);
+}
+
 bool ShapeDecoder::run(const int32_t* coords, int n, const float* feats, float* out_feats, int32_t* out_coords, int* out_m,
                        int out_capacity, const StageFn& stage, int upsample_times, const std::vector<Subdivision>* guide,
-                       std::vector<Subdivision>* subs_out) {
+                       std::vector<Subdivision>* subs_out, std::vector<float>* vfeats, std::vector<int32_t>* vcoords) {
     if (!ok_) return false;
     if (!sddev::enabled()) {
         error_ = "no device";
@@ -201,20 +253,10 @@ bool ShapeDecoder::run(const int32_t* coords, int n, const float* feats, float* 
         return false;
     }
     Impl& m = *p_;
-    std::vector<std::pair<void*, size_t>> bufs;
-    struct Guard {
-        std::vector<std::pair<void*, size_t>>& b;
-        ~Guard() {
-            for (auto& o : b) sddev::release(o.first, o.second);
-        }
-    } guard{bufs};
-    auto A = [&](size_t bytes) {
-        void* p = sddev::alloc(bytes, false);
-        bufs.push_back({p, bytes});
-        return p;
-    };
-    auto F = [&](size_t cnt) { return static_cast<float*>(A(sizeof(float) * cnt)); };
-    auto I = [&](size_t cnt) { return static_cast<int*>(A(sizeof(int) * cnt)); };
+    // Each buffer lives only while it is needed: a level's block temporaries are allocated once and reused by its blocks (the output
+    // alternates between two buffers), and the maps and the subdivision's buffers go as soon as they are used. Only the features and the
+    // coordinates of the current voxel set carry over from a level to the next (holding everything until the end needed about 75 GB
+    // for the 1024 decode).
 
     // a dense linear over token rows: y[v][o] = b[o] + sum_k x[v][k] W[o][k]  (fp16 W in place)
     auto linear16 = [&](const float* x, int V, int K, const uint16_t* W, const float* b, int O, float* y) {
@@ -228,17 +270,17 @@ bool ShapeDecoder::run(const int32_t* coords, int n, const float* feats, float* 
         mp.n = nv;
         mp.tsize = 1;
         while (mp.tsize < 2u * (unsigned)nv) mp.tsize <<= 1;
-        mp.keys = static_cast<unsigned long long*>(A(sizeof(unsigned long long) * mp.tsize));
-        mp.vals = I(mp.tsize);
-        mp.nb = I((size_t)nv * 27);
-        sddev::sp_hash_build(vc, nv, mp.keys, mp.vals, mp.tsize);
-        sddev::sp_neighbor_map(vc, nv, mp.keys, mp.vals, mp.tsize, mp.nb);
+        mp.keys = DevBuf(sizeof(unsigned long long) * mp.tsize);
+        mp.vals = ints(mp.tsize);
+        mp.nb = ints((size_t)nv * 27);
+        sddev::sp_hash_build(vc, nv, mp.keys.u64(), mp.vals.i(), mp.tsize);
+        sddev::sp_neighbor_map(vc, nv, mp.keys.u64(), mp.vals.i(), mp.tsize, mp.nb.i());
         return mp;
     };
     // the sparse 3x3x3 convolution of x [N][cin] on a voxel set: y [N][cout]
     auto conv = [&](const float* x, int cin, const VoxelMap& mp, const uint16_t* W, const float* b, int cout, float* y) {
         for (int o0 = 0; o0 < cout; o0 += kOChunk)
-            sddev::sp_subm_conv_f16w(x, mp.n, cin, mp.nb, W, b, cout, y, o0, std::min(kOChunk, cout - o0), 1);
+            sddev::sp_subm_conv_f16w(x, mp.n, cin, mp.nb.i(), W, b, cout, y, o0, std::min(kOChunk, cout - o0), 1);
     };
     // the layer norm with the affine gains (fp32), in place from x into y
     auto ln_affine = [&](const float* x, int V, int C, const float* w, const float* bb, float eps, float* y) {
@@ -247,78 +289,83 @@ bool ShapeDecoder::run(const int32_t* coords, int n, const float* feats, float* 
     };
 
     // the tokens: from_latent
-    int* ccoords = I((size_t)n * 4);  // the current voxel set's coordinates
-    std::memcpy(ccoords, coords, sizeof(int) * (size_t)n * 4);
-    float* fin = F((size_t)n * kLatent);
-    std::memcpy(fin, feats, sizeof(float) * (size_t)n * kLatent);
+    DevBuf cc = ints((size_t)n * 4);  // the current voxel set's coordinates
+    std::memcpy(cc.i(), coords, sizeof(int) * (size_t)n * 4);
     int N = n;
-    float* h = F((size_t)N * kChans[0]);
-    linear16(fin, N, kLatent, m.lw, m.lb, kChans[0], h);
+    DevBuf h = floats((size_t)N * kChans[0]);  // the current features [N][C]
+    {
+        DevBuf fin = floats((size_t)n * kLatent);
+        std::memcpy(fin.f(), feats, sizeof(float) * (size_t)n * kLatent);
+        linear16(fin.f(), N, kLatent, m.lw, m.lb, kChans[0], h.f());
+    }
     int C = kChans[0];
 
     const auto dec_t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < 5; ++i) {
         if (upsample_times > 0 && i == upsample_times) {  // the coordinates of this level, before its blocks (python's upsample)
+            if (vcoords) {
+                vcoords->assign(cc.i(), cc.i() + (size_t)N * 4);
+                return true;
+            }
             *out_m = N;  // the count, also when the buffer is too small (the caller retries with it)
             if (N > out_capacity) {
                 error_ = "the coordinates have more voxels than the buffer";
                 return false;
             }
-            std::memcpy(out_coords, ccoords, sizeof(int) * (size_t)N * 4);
+            std::memcpy(out_coords, cc.i(), sizeof(int) * (size_t)N * 4);
             return true;
         }
         // the level's ConvNeXt blocks: h = mlp(LN(conv(h))) + h
         if (!m.levels[i].empty()) {
-            VoxelMap mp = build_map(ccoords, N);
+            const VoxelMap mp = build_map(cc.i(), N);
+            DevBuf t1 = floats((size_t)N * C), t2 = floats((size_t)N * 4 * C), t4 = floats((size_t)N * C), next = floats((size_t)N * C);
             for (const auto& cn : m.levels[i]) {
-                float* t1 = F((size_t)N * C);
-                float* t2 = F((size_t)N * 4 * C);
-                float* t3 = F((size_t)N * C);
-                float* t4 = F((size_t)N * C);
-                conv(h, C, mp, cn.cw, cn.cb, C, t1);
-                ln_affine(t1, N, C, cn.nw, cn.nb, 1e-6f, t4);
-                linear16(t4, N, C, cn.m0w, cn.m0b, 4 * C, t2);
-                sddev::silu(t2, (size_t)N * 4 * C);
-                linear16(t2, N, 4 * C, cn.m2w, cn.m2b, C, t3);
-                sddev::add(t3, h, (size_t)N * C);  // t3 += h
-                h = t3;
+                conv(h.f(), C, mp, cn.cw, cn.cb, C, t1.f());
+                ln_affine(t1.f(), N, C, cn.nw, cn.nb, 1e-6f, t4.f());
+                linear16(t4.f(), N, C, cn.m0w, cn.m0b, 4 * C, t2.f());
+                sddev::silu(t2.f(), (size_t)N * 4 * C);
+                linear16(t2.f(), N, 4 * C, cn.m2w, cn.m2b, C, next.f());
+                sddev::add(next.f(), h.f(), (size_t)N * C);  // next += h
+                std::swap(h, next);
             }
-        }
+        }  // the temporaries, the spare features and the map go here
         if (progress_) {
-            std::fprintf(stderr, "    decoder level %d: %d voxels, %.1f s\n", i, N,
-                         std::chrono::duration<double>(std::chrono::steady_clock::now() - dec_t0).count());
+            size_t in_use = 0, cached = 0;
+            sddev::pinned_bytes(in_use, cached);
+            std::fprintf(stderr, "    decoder level %d: %d voxels, %.1f s, pinned %.1f GB in use, %.1f GB cached\n", i, N,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - dec_t0).count(), in_use / 1e9, cached / 1e9);
         }
         if (i == 4) break;  // the last level has no upsampling
         // the channel-to-spatial block (ResBlockC2S with the predicted subdivision)
         const Impl::C2S& u = m.up[i];
         const int O = u.out;
-        float* logits = nullptr;
+        DevBuf logits;
         if (!guide) {
-            logits = F((size_t)N * 8);
-            linear16(h, N, C, u.sw, u.sb, 8, logits);
+            logits = floats((size_t)N * 8);
+            linear16(h.f(), N, C, u.sw, u.sb, 8, logits.f());
             if (subs_out) {  // this level's subdivision, for the texture decoder (python's return_subs)
                 Subdivision sd;
-                sd.coords.assign(ccoords, ccoords + (size_t)N * 4);
-                sd.logits.assign(logits, logits + (size_t)N * 8);
+                sd.coords.assign(cc.i(), cc.i() + (size_t)N * 4);
+                sd.logits.assign(logits.f(), logits.f() + (size_t)N * 8);
                 subs_out->push_back(std::move(sd));
             }
         }
         // the residual branch: LN (affine), SiLU, conv1 (8 children per voxel), then the upsampling
-        VoxelMap mp = build_map(ccoords, N);
-        float* a1 = F((size_t)N * C);
-        ln_affine(h, N, C, u.n1w, u.n1b, 1e-6f, a1);
-        sddev::silu(a1, (size_t)N * C);
-        float* c1 = F((size_t)N * 8 * O);
-        conv(a1, C, mp, u.c1w, u.c1b, 8 * O, c1);
+        DevBuf c1 = floats((size_t)N * 8 * O);
+        {
+            const VoxelMap mp = build_map(cc.i(), N);
+            DevBuf a1 = floats((size_t)N * C);
+            ln_affine(h.f(), N, C, u.n1w, u.n1b, 1e-6f, a1.f());
+            sddev::silu(a1.f(), (size_t)N * C);
+            conv(a1.f(), C, mp, u.c1w, u.c1b, 8 * O, c1.f());
+        }
         // the subdivision: the children where the logit is positive, their voxels
-        unsigned char* bits = static_cast<unsigned char*>(A((size_t)N));
-        int* cnt = I((size_t)N);
-        int* off = I((size_t)N + 1);
+        DevBuf bits((size_t)N), cnt = ints((size_t)N), off = ints((size_t)N + 1);
         if (!guide) {
-            sddev::sp_c2s_mask(logits, N, bits, cnt);
+            sddev::sp_c2s_mask(logits.f(), N, bits.u8(), cnt.i());
         } else {  // the guide's subdivision of this level: the children with a positive logit (python: subdiv.feats > 0)
             const Subdivision& g = (*guide)[i];
-            if (g.coords.size() != (size_t)N * 4 || std::memcmp(g.coords.data(), ccoords, sizeof(int) * (size_t)N * 4) != 0) {
+            if (g.coords.size() != (size_t)N * 4 || std::memcmp(g.coords.data(), cc.i(), sizeof(int) * (size_t)N * 4) != 0) {
                 error_ = "the guide's voxels at a level differ from the decoder's";
                 return false;
             }
@@ -326,51 +373,70 @@ bool ShapeDecoder::run(const int32_t* coords, int n, const float* feats, float* 
                 unsigned int b = 0;
                 for (int c = 0; c < 8; ++c)
                     if (g.logits[(size_t)k * 8 + c] > 0.0f) b |= 1u << c;
-                bits[k] = (unsigned char)b;
-                cnt[k] = __builtin_popcount(b);
+                bits.u8()[k] = (unsigned char)b;
+                cnt.i()[k] = __builtin_popcount(b);
             }
         }
-        sddev::sp_exclusive_scan(cnt, N, off);
-        const int M = off[N];
+        logits.reset();
+        sddev::sp_exclusive_scan(cnt.i(), N, off.i());
+        const int M = off.i()[N];
         if (M <= 0) {
             error_ = "the subdivision produced no voxels";
             return false;
         }
-        int* newc = I((size_t)M * 4);
-        int* idx = I((size_t)M);
-        int* subidx = I((size_t)M);
-        sddev::sp_c2s_fill(ccoords, bits, off, N, newc, idx, subidx);
-        float* hc = F((size_t)M * O);
-        sddev::sp_c2s_gather(c1, idx, subidx, M, O, 1, hc);
-        float* skip = F((size_t)M * O);
-        sddev::sp_c2s_gather(h, idx, subidx, M, C / 8, O / (C / 8), skip);
+        DevBuf newc = ints((size_t)M * 4), idx = ints((size_t)M), subidx = ints((size_t)M);
+        sddev::sp_c2s_fill(cc.i(), bits.u8(), off.i(), N, newc.i(), idx.i(), subidx.i());
+        bits.reset();
+        cnt.reset();
+        off.reset();
+        DevBuf hc = floats((size_t)M * O);
+        sddev::sp_c2s_gather(c1.f(), idx.i(), subidx.i(), M, O, 1, hc.f());
+        c1.reset();
+        DevBuf skip = floats((size_t)M * O);
+        sddev::sp_c2s_gather(h.f(), idx.i(), subidx.i(), M, C / 8, O / (C / 8), skip.f());
+        h.reset();  // the level's features are used up
+        idx.reset();
+        subidx.reset();
         // the second branch: LN (no affine), SiLU, conv2 on the new voxels, plus the skip
-        float* a2 = F((size_t)M * O);
-        sddev::layer_norm_plain(hc, M, O, 1e-6f, a2);
-        sddev::silu(a2, (size_t)M * O);
-        VoxelMap mp2 = build_map(newc, M);
-        float* c2 = F((size_t)M * O);
-        conv(a2, O, mp2, u.c2w, u.c2b, O, c2);
-        sddev::add(c2, skip, (size_t)M * O);
-        h = c2;
-        ccoords = newc;
+        DevBuf a2 = floats((size_t)M * O);
+        sddev::layer_norm_plain(hc.f(), M, O, 1e-6f, a2.f());
+        hc.reset();
+        sddev::silu(a2.f(), (size_t)M * O);
+        DevBuf c2 = floats((size_t)M * O);
+        {
+            const VoxelMap mp2 = build_map(newc.i(), M);
+            conv(a2.f(), O, mp2, u.c2w, u.c2b, O, c2.f());
+        }
+        a2.reset();
+        sddev::add(c2.f(), skip.f(), (size_t)M * O);
+        skip.reset();
+        h = std::move(c2);
+        cc = std::move(newc);
         N = M;
         C = O;
-        if (i == 0 && stage) stage("sdec_l0", h, ccoords, (size_t)N, (size_t)C);
+        if (i == 0 && stage) stage("sdec_l0", h.f(), cc.i(), (size_t)N, (size_t)C);
     }
 
     // the output: LN (no affine), the output layer to 7 channels
-    float* z = F((size_t)N * C);
-    sddev::layer_norm_plain(h, N, C, 1e-5f, z);
-    float* y = F((size_t)N * m.out_ch);
-    linear16(z, N, C, m.ow, m.ob, m.out_ch, y);
+    DevBuf y = floats((size_t)N * m.out_ch);
+    {
+        DevBuf z = floats((size_t)N * C);
+        sddev::layer_norm_plain(h.f(), N, C, 1e-5f, z.f());
+        h.reset();
+        linear16(z.f(), N, C, m.ow, m.ob, m.out_ch, y.f());
+    }
+    if (vcoords) {
+        vfeats->assign(y.f(), y.f() + (size_t)N * m.out_ch);
+        vcoords->assign(cc.i(), cc.i() + (size_t)N * 4);
+        return true;
+    }
     *out_m = N;  // the count, also when the buffer is too small (the caller retries with it)
     if (N > out_capacity) {
         error_ = "the output has more voxels than the buffer";
         return false;
     }
-    std::memcpy(out_feats, y, sizeof(float) * (size_t)N * m.out_ch);
-    std::memcpy(out_coords, ccoords, sizeof(int) * (size_t)N * 4);
+    std::memcpy(out_feats, y.f(), sizeof(float) * (size_t)N * m.out_ch);
+    std::memcpy(out_coords, cc.i(), sizeof(int) * (size_t)N * 4);
     *out_m = N;
     return true;
 }

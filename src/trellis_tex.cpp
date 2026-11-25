@@ -74,24 +74,13 @@ bool TexturePipeline::decode(const int32_t* coords, int n, const float* tex_slat
         return false;
     }
     auto t0 = std::chrono::steady_clock::now();
-    // the decoder's voxels: a buffer guess of 256 per input voxel; a too-small buffer is reported with its count, and the decoder runs once more
-    int cap = 256 * n, M = 0;
-    out.raw.resize((size_t)cap * kOut);
-    out.coords.resize((size_t)cap * 4);
-    bool ok = p_->dec->forward_guided(coords, n, tex_slat, subs, out.raw.data(), out.coords.data(), &M, cap);
-    if (!ok && M > cap) {
-        cap = M;
-        out.raw.resize((size_t)cap * kOut);
-        out.coords.resize((size_t)cap * 4);
-        ok = p_->dec->forward_guided(coords, n, tex_slat, subs, out.raw.data(), out.coords.data(), &M, cap);
-    }
-    if (!ok) {
+    // the decoder's voxels, sized to its result (one run)
+    if (!p_->dec->forward_guided(coords, n, tex_slat, subs, out.raw, out.coords)) {
         error_ = "texture decoder: " + p_->dec->error();
         return false;
     }
-    out.raw.resize((size_t)M * kOut);
-    out.coords.resize((size_t)M * 4);
-    out.out.resize((size_t)M * kOut);
+    const size_t M = out.coords.size() / 4;
+    out.out.resize(M * kOut);
     for (size_t i = 0; i < out.raw.size(); ++i) out.out[i] = out.raw[i] * 0.5f + 0.5f;
     out.seconds_dec = seconds_since(t0);
     return true;

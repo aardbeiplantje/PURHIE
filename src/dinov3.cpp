@@ -153,30 +153,31 @@ bool DinoV3::forward(const float* x, int S, float* out) {
 
     // 4. the blocks
     float* zeros = A(kC, true);  // the shift of the layer scales (none)
+    // the layer buffers: the same sizes in every layer, so allocated once and reused (not 24 layers' worth held to the end)
+    float* n1 = A((size_t)T * kC, false);
+    float* q = A((size_t)T * kC, false);
+    float* k = A((size_t)T * kC, false);
+    float* v = A((size_t)T * kC, false);
+    float* att = A((size_t)T * kC, false);
+    float* o = A((size_t)T * kC, false);
+    float* n2 = A((size_t)T * kC, false);
+    float* u = A((size_t)T * kFF, false);
+    float* dn = A((size_t)T * kC, false);
     for (int l = 0; l < kLayers; ++l) {
         const Impl::Block& b = m.blocks[l];
-        float* n1 = A((size_t)T * kC, false);
         sddev::audio_layer_norm_f32(X, T, kC, b.n1w, b.n1b, kEps, n1);
-        float* q = A((size_t)T * kC, false);
-        float* k = A((size_t)T * kC, false);
-        float* v = A((size_t)T * kC, false);
         sddev::linear_f32(n1, T, b.wq, kC, kC, b.bq, q);
         sddev::linear_f32(n1, T, b.wk, kC, kC, nullptr, k);  // the key projection has no bias
         sddev::linear_f32(n1, T, b.wv, kC, kC, b.bv, v);
         sddev::dino_rope(q, T, kPrefix, kC, kH, kD, cs, sn);
         sddev::dino_rope(k, T, kPrefix, kC, kH, kD, cs, sn);
-        float* att = A((size_t)T * kC, false);
         sddev::attention_f32_strided(q, kC, T, k, kC, v, kC, T, kC, kH, att);
-        float* o = A((size_t)T * kC, false);
         sddev::linear_f32(att, T, b.wo, kC, kC, b.bo, o);
         sddev::ss_affine(o, T, kC, b.ls1, zeros);  // the layer scale
         sddev::add(X, o, (size_t)T * kC);          // the residual
-        float* n2 = A((size_t)T * kC, false);
         sddev::audio_layer_norm_f32(X, T, kC, b.n2w, b.n2b, kEps, n2);
-        float* u = A((size_t)T * kFF, false);
         sddev::linear_f32(n2, T, b.wup, kC, kFF, b.bup, u);
         sddev::audio_gelu_erf(u, (size_t)T * kFF);
-        float* dn = A((size_t)T * kC, false);
         sddev::linear_f32(u, T, b.wdown, kFF, kC, b.bdown, dn);
         sddev::ss_affine(dn, T, kC, b.ls2, zeros);
         sddev::add(X, dn, (size_t)T * kC);

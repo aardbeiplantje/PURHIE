@@ -295,11 +295,21 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
     96k charts (9 s), unwrap 35 s, bake 2 s (coverage 0.37), GLB 1.5 s. Its stages ran alongside other GPU jobs (sparse structure
     341 s, shape SLAT 304 s, texture flow 91 s), so they are not comparable with the earlier runs. The user's ComfyUI run of the
     workflow took 1106.2 s.
-    Open: (a) the 1536 cascade: the 1024 decoder runs out of pinned memory (597 MB, after the allocator returns its cached blocks),
-    so the cascade does not finish at 1024, and 1536 needs the same fix; (b) RemeshMesh (udf, 768) before the decimation; (c) the
-    normal-map and AO bakes and their GLB inputs; (d) BiRefNet background removal and the crop to the mask; (e) UnwrapMesh's "pec"
-    segmenter (ours is CuMesh's charts); (f) python's to_glb clean-up; (g) the simplify stops below its target (667k for 700k), where
-    python's stops at it; (h) the host sorts and the bake run on the host, to move to the device if the timings call for it.
+    The 1024 cascade now runs end to end. Fixed on the way (2026-11-25): the shape decoder held every intermediate buffer until it
+    returned (about 75 GB at 1024; now each level keeps only its features and coordinates, and the 1024 decode peaks at 1.8 GB of
+    pinned memory); the allocator pools recorded a reused block under the request's size and so kept growing (they now keep each
+    block's true size, and cache at most 16 GiB each); the attention launches in the flows were fixed at 256 queries (now sized from the
+    key count, about 40 ms each); each decoder call ran twice after a too-small capacity guess (the decoder now returns its output
+    sized to the result). The vase the user supplied, prepared as the workflow does (`tools/bg_crop_birefnet.py`: BiRefNet in python
+    on the CPU, with the model code from Hugging Face and the ComfyUI weights, then the crop to the mask at 1024 with a 1.1 margin on
+    black): `vase_1024.glb`, 4.35M faces to 670k, about 814 s of stages (cascade 245 s, texture flow 140 s, the two decoders 90 s
+    each before the single-run fix, unwrap 74 s). The user found it about the same as the ComfyUI result, if anything sharper (the
+    workflow remeshes at 768 and smooths the normals). The ComfyUI run (1106.2 s) also generates the image and runs the 1536 cascade.
+    Open: (a) BiRefNet on the engine (a C++/HIP port, as DINOv3 was), so the background removal leaves python; (b) the 1536 cascade
+    (memory is no longer the limit; its time is); (c) the normal-map and AO bakes and their GLB inputs; (d) UnwrapMesh's "pec"
+    segmenter (ours is CuMesh's charts); (e) python's to_glb clean-up; (f) the simplify stops below its target (667k for 700k), where
+    python's stops at it; (g) the unwrap (74 s on the vase: xatlas per chart, single-threaded) and the host sorts, to move to the
+    device or threads; (h) RemeshMesh (udf, 768) only if wanted: the user prefers the sharper result without it.
 21. **Qwen-Image 2.1 image edit (next, after TRELLIS.2).** The 2.1 DiT, text encoder and VAE run on the engine (items above
     in the Qwen-Image status), but there is no reference-image input and no edit route: `src/qwenimage21_*.cpp` has no edit
     path, and the server has no image-edit endpoint. Needs: the edit conditioning in the 2.1 DiT (how the reference image enters,

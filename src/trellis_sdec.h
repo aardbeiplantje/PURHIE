@@ -46,13 +46,21 @@ public:
     // voxels of level i, which the decoder must have).
     bool forward_guided(const int32_t* coords, int n, const float* feats, const std::vector<Subdivision>& guide, float* out_feats,
                         int32_t* out_coords, int* out_m, int out_capacity);
+    // The same with the outputs sized to the result (no capacity to guess, so the decoder runs once): out_feats [M][out channels] (left
+    // empty with upsample_times > 0) and out_coords [M][4].
+    bool forward(const int32_t* coords, int n, const float* feats, std::vector<float>& out_feats, std::vector<int32_t>& out_coords,
+                 const StageFn& stage = nullptr, int upsample_times = 0, std::vector<Subdivision>* subs_out = nullptr);
+    bool forward_guided(const int32_t* coords, int n, const float* feats, const std::vector<Subdivision>& guide, std::vector<float>& out_feats,
+                        std::vector<int32_t>& out_coords);
 
     // progress (stderr): each decoder level as it finishes (off by default)
     void set_progress(bool on) { progress_ = on; }
 
 private:
+    // the outputs go to the pointers (up to out_capacity voxels) or, when vcoords is given, to the vectors (sized to the result)
     bool run(const int32_t* coords, int n, const float* feats, float* out_feats, int32_t* out_coords, int* out_m, int out_capacity,
-             const StageFn& stage, int upsample_times, const std::vector<Subdivision>* guide, std::vector<Subdivision>* subs_out);
+             const StageFn& stage, int upsample_times, const std::vector<Subdivision>* guide, std::vector<Subdivision>* subs_out,
+             std::vector<float>* vfeats = nullptr, std::vector<int32_t>* vcoords = nullptr);
     struct Impl;
     std::unique_ptr<Impl> p_;
     bool progress_ = false;

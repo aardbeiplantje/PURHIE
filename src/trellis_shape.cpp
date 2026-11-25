@@ -227,27 +227,13 @@ bool ShapePipeline::decode_mesh(const std::vector<int32_t>& coords, const std::v
     Impl& m = *p_;
     const int N = (int)(coords.size() / 4);
     auto t0 = std::chrono::steady_clock::now();
-    // the decoder's voxels: a buffer guess of 256 per input voxel; when it is too small the decoder reports its count and runs once more
-    int cap = 256 * N, M = 0;
-    out.dec_feats.resize((size_t)cap * 7);
-    out.dec_coords.resize((size_t)cap * 4);
+    // the decoder's voxels, sized to its result (one run)
     out.subs.clear();
-    bool dec_ok = m.shape_dec->forward(coords.data(), N, slat.data(), out.dec_feats.data(), out.dec_coords.data(), &M, cap, nullptr, 0,
-                                       &out.subs);
-    if (!dec_ok && M > cap) {
-        cap = M;
-        out.dec_feats.resize((size_t)cap * 7);
-        out.dec_coords.resize((size_t)cap * 4);
-        out.subs.clear();
-        dec_ok = m.shape_dec->forward(coords.data(), N, slat.data(), out.dec_feats.data(), out.dec_coords.data(), &M, cap, nullptr, 0,
-                                      &out.subs);
-    }
-    if (!dec_ok) {
+    if (!m.shape_dec->forward(coords.data(), N, slat.data(), out.dec_feats, out.dec_coords, nullptr, 0, &out.subs)) {
         error_ = "shape decoder: " + m.shape_dec->error();
         return false;
     }
-    out.dec_feats.resize((size_t)M * 7);
-    out.dec_coords.resize((size_t)M * 4);
+    const int M = (int)(out.dec_coords.size() / 4);
     out.seconds_dec = seconds_since(t0);
 
     t0 = std::chrono::steady_clock::now();
@@ -382,15 +368,8 @@ bool ShapePipeline::run_cascade(const float* cond_lr, int Lc_lr, const float* co
     // 3. the upsampled coordinates: the decoder's first four levels (the 512 grid), quantised to the 64^3 grid as python does
     //    ((c + 0.5) / 512 * 64, truncated), then the unique voxels in lexicographic order
     std::vector<int32_t> up;
-    int M512 = 0, cap = 64 * N;
-    up.resize((size_t)cap * 4);
-    bool up_ok = m.shape_dec->forward(out.coords.data(), N, out.slat.data(), nullptr, up.data(), &M512, cap, nullptr, 4);
-    if (!up_ok && M512 > cap) {
-        cap = M512;
-        up.resize((size_t)cap * 4);
-        up_ok = m.shape_dec->forward(out.coords.data(), N, out.slat.data(), nullptr, up.data(), &M512, cap, nullptr, 4);
-    }
-    if (!up_ok) {
+    std::vector<float> no_feats;  // the upsampling gives coordinates only
+    if (!m.shape_dec->forward(out.coords.data(), N, out.slat.data(), no_feats, up, nullptr, 4)) {
         error_ = "shape decoder (upsample): " + m.shape_dec->error();
         return false;
     }
