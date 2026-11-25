@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -1470,7 +1471,10 @@ void attention_f32_strided(const float* q, long ldq, int Tq, const float* k, lon
         const char* e = std::getenv("SD_ATTN_FLASH");
         return !(e && std::strcmp(e, "0") == 0);
     }();
-    if (flash && (D == 64 || D == 128)) {
+    // the kernel reads float4 along the rows: the pointers and the row strides must be 16-byte aligned, else the GEMM path runs
+    auto a16 = [](const void* p) { return (reinterpret_cast<std::uintptr_t>(p) & 15u) == 0; };
+    if (flash && (D == 64 || D == 128) && a16(q) && a16(k) && a16(v) && a16(out) && ldq % 4 == 0 && ldk % 4 == 0 && ldv % 4 == 0 &&
+        C % 4 == 0) {
         void* a[] = {(void*)&q, (void*)&ldq, (void*)&Tq, (void*)&k, (void*)&ldk, (void*)&v, (void*)&ldv, (void*)&Tk, (void*)&C, (void*)&heads,
                      (void*)&out, (void*)&scale};
         launch(D == 64 ? f_attn_flash64 : f_attn_flash128, dim3((unsigned)((Tq + 63) / 64), (unsigned)heads, 1), a);
