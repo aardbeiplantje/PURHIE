@@ -2,6 +2,7 @@
 // flexgemm's grid_sample_3d (trilinear over the neighbours that exist, their weights renormalised): a texel's position is in voxel
 // index units, (p + 0.5) * res, and voxel k is centred at k + 0.5.
 #include "trellis_bake.h"
+#include "trellis_charts.h"
 
 #include "xatlas.h"
 
@@ -160,6 +161,92 @@ bool unwrap_uv(const std::vector<float>& verts, const std::vector<int32_t>& face
     out.atlas_width = (int)atlas->width;
     out.atlas_height = (int)atlas->height;
     out.charts = (int)atlas->chartCount;
+    cumesh_xatlas::Destroy(atlas);
+    return true;
+}
+
+bool unwrap_uv_by_charts(const std::vector<float>& verts, const std::vector<int32_t>& faces, const std::vector<int32_t>& chart_ids,
+                         int texture_size, UvMesh& out, std::string& error) {
+    out = UvMesh();
+    const size_t F = faces.size() / 3, V = verts.size() / 3;
+    if (V == 0 || F == 0 || chart_ids.size() != F) {
+        error = "no mesh, or one chart id per face is needed";
+        return false;
+    }
+    int nc = 0;
+    for (int32_t c : chart_ids) nc = std::max(nc, c + 1);
+    // the faces of each chart, and the chart's vertices (global ids; local index by a map)
+    std::vector<std::vector<int32_t>> cfaces(nc);
+    for (size_t f = 0; f < F; ++f) cfaces[chart_ids[f]].push_back((int32_t)f);
+    std::vector<int32_t> local(V, -1);
+    std::vector<std::vector<int32_t>> cverts(nc), clocal(nc);  // the chart's global vertices, its faces in local indices
+    for (int c = 0; c < nc; ++c) {
+        if (cfaces[c].empty()) continue;
+        std::vector<int32_t> used;
+        for (int32_t f : cfaces[c])
+            for (int k = 0; k < 3; ++k) {
+                const int32_t v = faces[3 * f + k];
+                if (local[v] < 0) {
+                    local[v] = (int32_t)used.size();
+                    used.push_back(v);
+                }
+            }
+        for (int32_t f : cfaces[c])
+            for (int k = 0; k < 3; ++k) clocal[c].push_back(local[faces[3 * f + k]]);
+        for (int32_t v : used) local[v] = -1;
+        cverts[c] = std::move(used);
+    }
+    // the chart meshes: positions per chart (copied to the chart's own arrays for xatlas)
+    std::vector<std::vector<float>> cpos(nc);
+    cumesh_xatlas::Atlas* atlas = cumesh_xatlas::Create();
+    std::vector<int> mesh_chart;
+    for (int c = 0; c < nc; ++c) {
+        if (cfaces[c].empty()) continue;
+        cpos[c].resize(cverts[c].size() * 3);
+        for (size_t i = 0; i < cverts[c].size(); ++i)
+            for (int k = 0; k < 3; ++k) cpos[c][3 * i + k] = verts[3 * (size_t)cverts[c][i] + k];
+        cumesh_xatlas::MeshDecl decl;
+        decl.vertexPositionData = cpos[c].data();
+        decl.vertexPositionStride = sizeof(float) * 3;
+        decl.vertexCount = (uint32_t)cverts[c].size();
+        decl.indexData = clocal[c].data();
+        decl.indexCount = (uint32_t)clocal[c].size();
+        decl.indexFormat = cumesh_xatlas::IndexFormat::UInt32;
+        if (cumesh_xatlas::AddMesh(atlas, decl, 0) != cumesh_xatlas::AddMeshError::Success) {
+            error = "xatlas: a chart could not be added";
+            cumesh_xatlas::Destroy(atlas);
+            return false;
+        }
+        mesh_chart.push_back(c);
+    }
+    cumesh_xatlas::ComputeCharts(atlas, cumesh_xatlas::ChartOptions());
+    cumesh_xatlas::PackOptions pack;
+    pack.resolution = (uint32_t)texture_size;
+    pack.padding = 2;
+    cumesh_xatlas::PackCharts(atlas, pack);
+    if (atlas->meshCount == 0) {
+        error = "xatlas produced no meshes";
+        cumesh_xatlas::Destroy(atlas);
+        return false;
+    }
+    // gather: each chart's mesh (its vertices, faces and uvs) into one mesh with the original vertices
+    for (uint32_t mi = 0; mi < atlas->meshCount; ++mi) {
+        const cumesh_xatlas::Mesh& m = atlas->meshes[mi];
+        const int c = mesh_chart[mi];
+        const uint32_t base = (uint32_t)(out.positions.size() / 3);
+        for (uint32_t i = 0; i < m.vertexCount; ++i) {
+            const cumesh_xatlas::Vertex& vx = m.vertexArray[i];
+            const int32_t o = cverts[c][vx.xref];
+            out.xref.push_back(o);
+            for (int k = 0; k < 3; ++k) out.positions.push_back(verts[3 * (size_t)o + k]);
+            out.uvs.push_back(vx.uv[0] / (float)atlas->width);
+            out.uvs.push_back(vx.uv[1] / (float)atlas->height);
+        }
+        for (uint32_t i = 0; i < m.indexCount; ++i) out.faces.push_back((int32_t)(base + m.indexArray[i]));
+    }
+    out.atlas_width = (int)atlas->width;
+    out.atlas_height = (int)atlas->height;
+    out.charts = (int)mesh_chart.size();
     cumesh_xatlas::Destroy(atlas);
     return true;
 }
@@ -425,8 +512,12 @@ bool write_glb(const std::string& path, const UvMesh& uv, const std::vector<floa
 
 bool export_textured_glb(const std::vector<float>& verts, const std::vector<int32_t>& faces, const VoxelAttributes& attr, int texture_size,
                          const std::string& path, std::string& error) {
+    // the charts (CuMesh's clustering, on the device), then xatlas on each chart
+    std::vector<int32_t> chart_ids;
+    ChartStats cs;
+    if (!compute_charts(verts, faces, ChartConfig(), chart_ids, cs, error)) return false;
     UvMesh uv;
-    if (!unwrap_uv(verts, faces, texture_size, uv, error)) return false;
+    if (!unwrap_uv_by_charts(verts, faces, chart_ids, texture_size, uv, error)) return false;
     BakedTextures bt;
     if (!bake_textures(uv, attr, texture_size, bt, error)) return false;
     return write_glb(path, uv, vertex_normals(verts, faces), bt, error);

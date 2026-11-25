@@ -257,6 +257,36 @@ void mesh_edge_valid(const float* feats, int n, const int* look, int* valid);
 void mesh_quads(const int* valid, const int* pos, const int* look, int ne, int* quads);
 void mesh_triangles(const int* quads, int L, const float* feats, int* faces);
 
+// DINOv3's rotary embedding on the patch tokens (sd_gpu.hip dino_rope): x [T][C] with the heads of width D, the first `prefix` tokens
+// untouched; cs, sn [P][D] (P = T - prefix) are the cosines and sines of each patch's angles.
+void dino_rope(float* x, int T, int prefix, int C, int H, int D, const float* cs, const float* sn);
+
+// mesh simplification (sd_gpu.hip simp_*): the quadric of each vertex (qem [V][10]); the cost of each edge collapse (cost [E]); the
+// cheapest collapse around each face (prop [F], packed); the collapses under thresh (vkept [V], fkept [F] set to 0 for the removed); the
+// compaction by the maps of an exclusive scan of the kept flags (vmap [V+1], fmap [F+1]).
+void simp_qem(const float* v, const int* f, const int* v2f, const int* v2f_off, int V, float* qem);
+void simp_cost(const float* v, const int* f, const int* v2f, const int* v2f_off, const unsigned long long* edges, const unsigned char* vb,
+               const float* qem, int E, float lam_len, float lam_sk, float* cost);
+void simp_propagate(const unsigned long long* edges, const int* v2f, const int* v2f_off, const float* cost, int E, unsigned long long* prop);
+void simp_collapse(float* v, int* f, const unsigned long long* edges, const int* v2f, const int* v2f_off, const float* cost,
+                   const unsigned long long* prop, const unsigned char* vb, int E, float thresh, int* vkept, int* fkept);
+void simp_compress_v(const int* vmap, const float* oldv, int V, float* newv);
+void simp_compress_f(const int* fmap, const int* vmap, const int* oldf, int F, int* newf);
+
+// mesh charts (sd_gpu.hip chart_*; trellis_charts.cpp drives them): the face areas and normals; the cone of each chart (cn [C][4]: axis, half
+// angle) and area from its faces (coff, cface); the perimeter of each chart from its chart-graph edges (c2e_off, c2e); the cost of each
+// chart-graph edge (ek: min << 32 | max; elen its length); the cheapest edge of each chart (prop); the collapse (cmap, flag); the refinement.
+void chart_face_geom(const float* v, const int* f, int F, float* fn, float* fa);
+void chart_cones(const int* coff, const int* cface, const float* fn, const float* fa, int C, float* cn, float* carea);
+void chart_perims(const int* c2e_off, const int* c2e, const float* elen, int C, float* perim);
+void chart_costs(const unsigned long long* ek, const float* elen, const float* cn, const float* carea, const float* perim, float aw, float pw, int E,
+                 float* cost);
+void chart_propagate(const int* c2e_off, const int* c2e, const float* cost, int C, unsigned long long* prop);
+void chart_collapse(const unsigned long long* ek, const float* cost, const unsigned long long* prop, float thresh, int E, int* cmap, float* cn,
+                    int* flag);
+void chart_refine(const float* cn, const float* fn, const float* v, const unsigned long long* ek, const int* f2e, const int* e2f,
+                  const int* e2f_off, int F, float lam, const int* ids, int* out);
+
 }  // namespace sddev
 
 #endif  // SD_DEVICE_H

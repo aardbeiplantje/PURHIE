@@ -266,20 +266,26 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
     small-model test `t/71-model-config.t` (sidecar override, bad key) and the server, audio, image and models-dir tests pass
     (8 files, 211 tests). To add a rule or a key: a line in `@HOST_RULES` or `%MODEL_KEY_OK`.
 
-20. **TRELLIS.2 (image to 3D), in progress.** On the engine, each stage checked against its oracle: the sparse-structure flow and
-    its decoder (`src/trellis_ss.cpp`, `src/trellis_ss_dec.cpp`; `tests/trellis_ss_verify.cpp`, `tests/trellis_ss_dec_verify.cpp`),
-    the shape-SLAT flow (`src/trellis_slat.cpp`, `tests/trellis_slat_verify.cpp`), the shape decoder's sparse UNet
-    (`src/trellis_sdec.cpp`, `tests/sdec_verify.cpp`), and the mesh step (`src/trellis_mesh.cpp`, `tests/mesh_verify.cpp`). The attention
-    of both flows is FP32 on hipBLASLt (`attention_f32_strided`). `src/trellis_shape.cpp` chains the 512 pipeline's shape half
-    (`tests/shape_verify.cpp` against `tools/trellis_shape_oracle.py`, about 2 minutes) and the 1024 cascade (`run_cascade`:
-    `tests/cascade_verify.cpp` against `tools/trellis_cascade_oracle.py`, about 2.5 minutes). The cascade's upsampled 512 voxels
-    (123208) and its 64^3 voxels (1525) match python exactly. The end-to-end checks are smoke tests: the 12-step sampler amplifies the
-    bf16 rounding of the flows (the shipped bf16 model is 0.42 from fp32 over its steps), so the bounds are wide (count ratio 0.5 to 2,
-    IoU at least 0.5, Chamfer at most 0.1 box units; the cascade's Chamfer is 0.070). Texture (`src/trellis_tex.cpp`, `tests/tex_verify.cpp` against `tools/trellis_tex_oracle.py`): the texture flow (64 inputs: the noise and the normalised shape latent) and the guided texture decoder (the shape decoder's subdivisions; six outputs) match python: the flow's forward at 2.4e-3, the subdivisions exact with logits at 1e-6, the decoder's voxels exact with outputs at 7e-7, and the sampled texture latent at 1.0e-2 (guidance 1: no negative pass). Open: the image encoder, DINOv3 ViT-L/16
-    (`facebook/dinov3-vitl16-pretrain-lvd1689m`), is gated on Hugging Face and no token is set here, so the image features are an
-    input until its weights are on disk; the end-to-end textured run is `run_textured` (`tests/textured_verify.cpp`): shape, texture and a base colour per vertex (vertex i is decoder voxel i), written as a coloured PLY; about 2 minutes. Next: the 1024 texture flow, and the UV unwrap and baking (or keep per-vertex colour). `fill_holes` is ported (`src/trellis_fill.cpp`; `tests/fill_verify.cpp` matches CuMesh exactly on the shape mesh: 630 loops, 618 closed, the same vertices and triangles), and the mesh step applies it at the pipeline's 3e-2 perimeter. Done since: the 1024 texture pass (`TexturePipeline` with the 1024 flow; `run_textured_cascade`; `tests/tex1024_verify.cpp` against `tools/trellis_tex1024_oracle.py`: flow 2.6e-3, subdivisions exact, decoder on python's subdivisions exact, sampler 1.5e-2; one child logit at zero flips one voxel when the engine's own subdivisions are used). The textured output as a GLB (`src/trellis_bake.cpp`): UV unwrap by the vendored xatlas (`third_party/xatlas`, MIT; CuMesh's chart clustering before xatlas is not ported, so the UVs differ), the texture baked by rasterising the charts and sampling the voxel attributes trilinearly as flexgemm's grid_sample_3d does, the gaps dilated (not Telea), base colour with alpha and metallic-roughness textures, python's axes and uv flip; `tests/bake_verify.cpp`, `tests/textured_glb_verify.cpp` (512: 84410 vertices, 14 MB; 1024: 411024 vertices, 41 MB; both PASS, colours within 0.06 of python).
-    Oracles:
-    `tools/*_oracle.py` (outputs in `/data/trellis2/oracle_*`); weights: `/data/trellis2/`.
+20. **TRELLIS.2 (image to 3D), in progress: a real image to a textured GLB on the engine.** Each stage is checked against its python
+    oracle (`tests/*_verify.cpp`, `tools/*_oracle.py`, outputs in `/data/trellis2/oracle_*`): the sparse-structure flow and decoder,
+    the shape-SLAT flow, the shape decoder, the mesh step, `fill_holes` (exact on the shape mesh), the 512 and 1024 cascades, the
+    texture flow and decoder (512 and 1024), the DINOv3 ViT-L/16 image encoder (`src/dinov3.cpp`, 1.4e-6 against transformers; the
+    weights are ComfyUI's local copy, the Hugging Face repository is gated) and the image conditioning (`src/trellis_image.cpp`,
+    PIL-style Lanczos, 6.7e-4). The post-processing is on the device: `src/trellis_simplify.cpp` (CuMesh's simplify to 1,000,000
+    faces; `tests/simplify_verify.cpp`), `src/trellis_charts.cpp` (CuMesh's chart clustering, `tests/charts_verify.cpp`: 29,360 charts
+    on the 249k test mesh against CuMesh's 29,308 in 2.2 s against 0.6 s; 6.9% of faces lie in other charts, inside CuMesh's own
+    run-to-run spread of about 4%, since CuMesh's atomics make its output vary between runs), and the unwrap per chart
+    (`src/trellis_bake.cpp` `unwrap_uv_by_charts`: 4 s on the 249k mesh against 71 s for the whole-mesh xatlas call;
+    `tests/unwrap_charts_verify.cpp`). The bake and the GLB are as before (`tests/bake_verify.cpp`, `tests/textured_glb_verify.cpp`).
+    Last run, 512 on `comfy/example.png` (`tests/image_to_glb.cpp`): simplify 8.5 s (2.68M to 969k faces), charts 13.9 s (119,340
+    charts), unwrap 17.1 s, bake 0.3 s, GLB 0.1 s. Before the charts were ported the unwrap took 570 s on the same mesh. The shape and
+    texture stages of that run are not timed (the tool does not print them), so the whole-run time is unknown.
+    Open: (a) time the shape and texture stages in `image_to_glb` and record the whole run; (b) run the same image through ComfyUI for
+    the comparison (about 500 s there); (c) run the 1024 cascade on the real image (the code is in, not run yet); (d) port python's
+    to_glb clean-up (`remove_duplicate_faces`, `repair_non_manifold_edges`, `remove_small_connected_components`,
+    `unify_face_orientations`), which is not ported; (e) the chart pair and chart-face sorts and the bake run on the host, to move
+    to the device if the timings call for it; (f) check the texture coverage of the 512 run (0.082) against python's bake of the
+    same mesh.
 21. **Qwen-Image 2.1 image edit (next, after TRELLIS.2).** The 2.1 DiT, text encoder and VAE run on the engine (items above
     in the Qwen-Image status), but there is no reference-image input and no edit route: `src/qwenimage21_*.cpp` has no edit
     path, and the server has no image-edit endpoint. Needs: the edit conditioning in the 2.1 DiT (how the reference image enters,
@@ -354,6 +360,8 @@ From PLAN.md's notes, not re-tested for this summary. A blank means no open item
 
 ## Done in this round (kept short; details in git)
 
+- TRELLIS.2 image to textured GLB on the engine: the DINOv3 encoder and image conditioning, the device simplify to 1M faces,
+  CuMesh's chart clustering on the device, and the per-chart unwrap (570 s to 17 s on the 512 run's mesh; item 20).
 - Gemma-4 prefill keeps fp32: the WMMA matmul and flash attention are off for a Gemma prefill only. Prefill matches
   token-by-token decoding exactly (commit `08d968b`). The cost: 620 tok/s instead of 1840 on a 562-token prompt.
 - Quick regression: 47 of 47 (`b4b5b97`: `tests/regress.sh` puts `build/` on `LD_LIBRARY_PATH`).

@@ -2214,3 +2214,414 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) mesh_triangles(const in
         faces[l * 6 + 3] = q[3]; faces[l * 6 + 4] = q[1]; faces[l * 6 + 5] = q[2];
     }
 }
+
+// ---- DINOv3's rotary position embedding on the patch tokens (dinov3.cpp): x[t][h * D + d] for the tokens t >= prefix; the pair
+// (d, d + D / 2) is rotated together: out_a = a cos_a - b sin_a, out_b = b cos_b + a sin_b (rotate_half), with cos and sin [P][D].
+extern "C" __global__ void __launch_bounds__(SD_THREADS) dino_rope(float* x, int T, int prefix, int C, int H, int D, const float* cs,
+                                                                   const float* sn) {
+    const long n = (long)(T - prefix) * H * (D / 2);
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= n) return;
+    const int d = (int)(i % (D / 2));
+    const long th = i / (D / 2);
+    const int h = (int)(th % H);
+    const int t = prefix + (int)(th / H);
+    const int p = t - prefix;
+    float* row = x + (long)t * C + h * D;
+    const float a = row[d], b = row[d + D / 2];
+    row[d] = a * cs[p * D + d] - b * sn[p * D + d];
+    row[d + D / 2] = b * cs[p * D + d + D / 2] + a * sn[p * D + d + D / 2];
+}
+
+// ---- mesh simplification (trellis_simplify.cpp; CuMesh's simplify.cu in plain C): the quadric error of each vertex, the cost of each
+// edge collapse, the cheapest collapse of each face (packed cost and edge id, atomic minimum), then the collapses that are the cheapest
+// around both their ends, the vertices and faces compacted by an exclusive scan on the host driver. Layouts: vertices [V][3] floats,
+// faces [F][3] ints, edges as (min << 32 | max) with the sorted unique edges, vertex-face lists in CSR, QEM [V][10] (the upper triangle).
+__device__ __forceinline__ void simp_add_plane(float* e, float a, float b, float c, float d) {
+    e[0] += a * a;
+    e[1] += a * b;
+    e[2] += a * c;
+    e[3] += a * d;
+    e[4] += b * b;
+    e[5] += b * c;
+    e[6] += b * d;
+    e[7] += c * c;
+    e[8] += c * d;
+    e[9] += d * d;
+}
+
+__device__ __forceinline__ float simp_eval(const float* e, float x, float y, float z) {
+    const float w = 1.0f;
+    float res = 0.0f;
+    res += e[0] * x * x;
+    res += 2.0f * e[1] * x * y;
+    res += 2.0f * e[2] * x * z;
+    res += 2.0f * e[3] * x * w;
+    res += e[4] * y * y;
+    res += 2.0f * e[5] * y * z;
+    res += 2.0f * e[6] * y * w;
+    res += e[7] * z * z;
+    res += 2.0f * e[8] * z * w;
+    res += e[9] * w * w;
+    return res;
+}
+
+extern "C" __global__ void __launch_bounds__(SD_THREADS) simp_qem(const float* v, const int* f, const int* v2f, const int* v2f_off, int V,
+                                                                  float* qem) {
+    const int tid = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (tid >= V) return;
+    float e[10];
+    for (int i = 0; i < 10; ++i) e[i] = 0.0f;
+    for (int k = v2f_off[tid]; k < v2f_off[tid + 1]; ++k) {
+        const int fi = v2f[k];
+        const int a = f[3 * fi], b = f[3 * fi + 1], c = f[3 * fi + 2];
+        const float e1x = v[3 * b] - v[3 * a], e1y = v[3 * b + 1] - v[3 * a + 1], e1z = v[3 * b + 2] - v[3 * a + 2];
+        const float e2x = v[3 * c] - v[3 * a], e2y = v[3 * c + 1] - v[3 * a + 1], e2z = v[3 * c + 2] - v[3 * a + 2];
+        float nx = e1y * e2z - e1z * e2y, ny = e1z * e2x - e1x * e2z, nz = e1x * e2y - e1y * e2x;
+        const float inv = rsqrtf(nx * nx + ny * ny + nz * nz);
+        nx *= inv;
+        ny *= inv;
+        nz *= inv;
+        const float d = -(nx * v[3 * a] + ny * v[3 * a + 1] + nz * v[3 * a + 2]);
+        simp_add_plane(e, nx, ny, nz, d);
+    }
+    for (int i = 0; i < 10; ++i) qem[10 * tid + i] = e[i];
+}
+
+// the triangle's cost term when the vertex `keep` moves to vnew (the other vertex of the edge is removed): 0 when the triangle would
+// flip, 1 otherwise (its skinny term added to *skinny)
+__device__ __forceinline__ int simp_tri(int tri, int keep, int other, const float* v, const int* f, const float* vnew, float* skinny,
+                                        int* ntri) {
+    const int ia = f[3 * tri], ib = f[3 * tri + 1], ic = f[3 * tri + 2];
+    if (ia == other || ib == other || ic == other) return 1;
+    float a[3] = {v[3 * ia], v[3 * ia + 1], v[3 * ia + 2]};
+    float b[3] = {v[3 * ib], v[3 * ib + 1], v[3 * ib + 2]};
+    float c[3] = {v[3 * ic], v[3 * ic + 1], v[3 * ic + 2]};
+    const float* na = (ia == keep) ? vnew : a;
+    const float* nb = (ib == keep) ? vnew : b;
+    const float* nc = (ic == keep) ? vnew : c;
+    const float o1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+    const float o2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+    const float on[3] = {o1[1] * o2[2] - o1[2] * o2[1], o1[2] * o2[0] - o1[0] * o2[2], o1[0] * o2[1] - o1[1] * o2[0]};
+    const float e1[3] = {nb[0] - na[0], nb[1] - na[1], nb[2] - na[2]};
+    const float e2[3] = {nc[0] - na[0], nc[1] - na[1], nc[2] - na[2]};
+    const float nn[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+    const float new_area = 0.5f * sqrtf(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
+    if (on[0] * nn[0] + on[1] * nn[1] + on[2] * nn[2] < 0.0f) return 0;
+    const float e0v[3] = {nc[0] - nb[0], nc[1] - nb[1], nc[2] - nb[2]};
+    float denom = (e0v[0] * e0v[0] + e0v[1] * e0v[1] + e0v[2] * e0v[2]) + (e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]) +
+                  (e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]);
+    if (denom < 1e-12f) denom = 1e-12f;
+    const float shape = 4.0f * sqrtf(3.0f) * new_area / denom;
+    *skinny += 1.0f - fminf(fmaxf(shape, 0.0f), 1.0f);
+    *ntri += 1;
+    return 1;
+}
+
+extern "C" __global__ void __launch_bounds__(SD_THREADS) simp_cost(const float* v, const int* f, const int* v2f, const int* v2f_off,
+                                                                   const unsigned long long* edges, const unsigned char* vb, const float* qem,
+                                                                   int E, float lam_len, float lam_sk, float* cost) {
+    const int tid = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (tid >= E) return;
+    const unsigned long long ed = edges[tid];
+    const int e0 = (int)(ed >> 32), e1 = (int)(ed & 0xFFFFFFFFu);
+    float w0 = 0.5f;
+    if (vb[e0] && !vb[e1]) w0 = 1.0f;
+    else if (!vb[e0] && vb[e1]) w0 = 0.0f;
+    float vn[3];
+    for (int c = 0; c < 3; ++c) vn[c] = v[3 * e0 + c] * w0 + v[3 * e1 + c] * (1.0f - w0);
+    float q[10];
+    for (int i = 0; i < 10; ++i) q[i] = qem[10 * e0 + i] + qem[10 * e1 + i];
+    float c_total = simp_eval(q, vn[0], vn[1], vn[2]);
+    const float dx = v[3 * e1] - v[3 * e0], dy = v[3 * e1 + 1] - v[3 * e0 + 1], dz = v[3 * e1 + 2] - v[3 * e0 + 2];
+    const float len2 = dx * dx + dy * dy + dz * dz;
+    c_total += lam_len * len2;
+    float skinny = 0.0f;
+    int ntri = 0;
+    for (int k = v2f_off[e0]; k < v2f_off[e0 + 1]; ++k)
+        if (!simp_tri(v2f[k], e0, e1, v, f, vn, &skinny, &ntri)) {
+            cost[tid] = INFINITY;
+            return;
+        }
+    for (int k = v2f_off[e1]; k < v2f_off[e1 + 1]; ++k)
+        if (!simp_tri(v2f[k], e1, e0, v, f, vn, &skinny, &ntri)) {
+            cost[tid] = INFINITY;
+            return;
+        }
+    if (ntri > 0) skinny /= (float)ntri;
+    c_total += lam_sk * skinny * len2;
+    cost[tid] = c_total;
+}
+
+extern "C" __global__ void __launch_bounds__(SD_THREADS) simp_propagate(const unsigned long long* edges, const int* v2f, const int* v2f_off,
+                                                                        const float* cost, int E, unsigned long long* prop) {
+    const int tid = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (tid >= E) return;
+    const unsigned long long ed = edges[tid];
+    const int e0 = (int)(ed >> 32), e1 = (int)(ed & 0xFFFFFFFFu);
+    const unsigned long long packed = ((unsigned long long)__float_as_uint(cost[tid]) << 32) | (unsigned int)tid;
+    for (int k = v2f_off[e0]; k < v2f_off[e0 + 1]; ++k) atomicMin(&prop[v2f[k]], packed);
+    for (int k = v2f_off[e1]; k < v2f_off[e1 + 1]; ++k) atomicMin(&prop[v2f[k]], packed);
+}
+
+extern "C" __global__ void __launch_bounds__(SD_THREADS) simp_collapse(float* v, int* f, const unsigned long long* edges, const int* v2f,
+                                                                       const int* v2f_off, const float* cost,
+                                                                       const unsigned long long* prop, const unsigned char* vb, int E,
+                                                                       float thresh, int* vkept, int* fkept) {
+    const int tid = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (tid >= E) return;
+    const float c = cost[tid];
+    if (c > thresh) return;
+    const unsigned long long ed = edges[tid];
+    const int e0 = (int)(ed >> 32), e1 = (int)(ed & 0xFFFFFFFFu);
+    const unsigned long long packed = ((unsigned long long)__float_as_uint(c) << 32) | (unsigned int)tid;
+    // the edge is collapsed only when it is the cheapest around both its ends
+    for (int k = v2f_off[e0]; k < v2f_off[e0 + 1]; ++k)
+        if (prop[v2f[k]] != packed) return;
+    for (int k = v2f_off[e1]; k < v2f_off[e1 + 1]; ++k)
+        if (prop[v2f[k]] != packed) return;
+    float w0 = 0.5f;
+    if (vb[e0] && !vb[e1]) w0 = 1.0f;
+    else if (!vb[e0] && vb[e1]) w0 = 0.0f;
+    for (int c2 = 0; c2 < 3; ++c2) v[3 * e0 + c2] = v[3 * e0 + c2] * w0 + v[3 * e1 + c2] * (1.0f - w0);
+    vkept[e1] = 0;
+    for (int k = v2f_off[e0]; k < v2f_off[e0 + 1]; ++k) {
+        const int fid = v2f[k];
+        if (f[3 * fid] == e1 || f[3 * fid + 1] == e1 || f[3 * fid + 2] == e1) fkept[fid] = 0;
+    }
+    for (int k = v2f_off[e1]; k < v2f_off[e1 + 1]; ++k) {
+        const int fid = v2f[k];
+        if (f[3 * fid] == e1) f[3 * fid] = e0;
+        else if (f[3 * fid + 1] == e1) f[3 * fid + 1] = e0;
+        else if (f[3 * fid + 2] == e1) f[3 * fid + 2] = e0;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(SD_THREADS) simp_compress_v(const int* vmap, const float* oldv, int V, float* newv) {
+    const int tid = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (tid >= V) return;
+    const int nid = vmap[tid];
+    if (vmap[tid + 1] == nid + 1) {
+        newv[3 * nid] = oldv[3 * tid];
+        newv[3 * nid + 1] = oldv[3 * tid + 1];
+        newv[3 * nid + 2] = oldv[3 * tid + 2];
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(SD_THREADS) simp_compress_f(const int* fmap, const int* vmap, const int* oldf, int F, int* newf) {
+    const int tid = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (tid >= F) return;
+    const int nid = fmap[tid];
+    if (fmap[tid + 1] == nid + 1) {
+        newf[3 * nid] = vmap[oldf[3 * tid]];
+        newf[3 * nid + 1] = vmap[oldf[3 * tid + 1]];
+        newf[3 * nid + 2] = vmap[oldf[3 * tid + 2]];
+    }
+}
+
+// ---- TRELLIS.2 mesh charts (src/trellis_charts.cpp): CuMesh's compute_charts (cumesh-ssh/src/atlas.cu) as device steps, one thread per
+// face, edge or chart. The host drives the loops and builds the sorted chart pairs and the chart-face lists in CuMesh's order.
+// The cone of a chart: axis [4 floats: the axis and the half angle] (cn); its area (carea).
+
+extern "C" __global__ void __launch_bounds__(SD_THREADS) chart_face_geom(const float* v, const int* f, int F, float* fn, float* fa) {
+    const int t = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (t >= F) return;
+    const int a = f[3 * t], b = f[3 * t + 1], c = f[3 * t + 2];
+    const float e1x = v[3 * b] - v[3 * a], e1y = v[3 * b + 1] - v[3 * a + 1], e1z = v[3 * b + 2] - v[3 * a + 2];
+    const float e2x = v[3 * c] - v[3 * a], e2y = v[3 * c + 1] - v[3 * a + 1], e2z = v[3 * c + 2] - v[3 * a + 2];
+    const float nx = e1y * e2z - e1z * e2y, ny = e1z * e2x - e1x * e2z, nz = e1x * e2y - e1y * e2x;
+    const float s = nx * nx + ny * ny + nz * nz;
+    fa[t] = 0.5f * sqrtf(s);
+    const float inv = s > 0.0f ? rsqrtf(s) : 0.0f;  // a degenerate face has no normal (CuMesh's would be NaN; python removes them)
+    fn[3 * t] = nx * inv;
+    fn[3 * t + 1] = ny * inv;
+    fn[3 * t + 2] = nz * inv;
+}
+
+// the cone of each chart: the normalised sum of its face normals, and the largest angle from the axis to a face normal; the area
+extern "C" __global__ void __launch_bounds__(SD_THREADS) chart_cones(const int* coff, const int* cface, const float* fn, const float* fa, int C,
+                                                                     float* cn, float* carea) {
+    const int c = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (c >= C) return;
+    float area = 0.0f, sx = 0.0f, sy = 0.0f, sz = 0.0f;
+    for (int k = coff[c]; k < coff[c + 1]; ++k) {
+        const int f = cface[k];
+        area += fa[f];
+        sx += fn[3 * f];
+        sy += fn[3 * f + 1];
+        sz += fn[3 * f + 2];
+    }
+    const float norm = sqrtf(sx * sx + sy * sy + sz * sz);
+    if (norm > 0.0f) {
+        sx /= norm;
+        sy /= norm;
+        sz /= norm;
+    }
+    float half = 0.0f;
+    for (int k = coff[c]; k < coff[c + 1]; ++k) {
+        const int f = cface[k];
+        const float d = sx * fn[3 * f] + sy * fn[3 * f + 1] + sz * fn[3 * f + 2];
+        half = fmaxf(half, acosf(fmaxf(fminf(d, 1.0f), -1.0f)));
+    }
+    cn[4 * c] = sx;
+    cn[4 * c + 1] = sy;
+    cn[4 * c + 2] = sz;
+    cn[4 * c + 3] = half;
+    carea[c] = area;
+}
+
+// the perimeter of each chart: the lengths of its chart-graph edges
+extern "C" __global__ void __launch_bounds__(SD_THREADS) chart_perims(const int* c2e_off, const int* c2e, const float* elen, int C, float* perim) {
+    const int c = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (c >= C) return;
+    float s = 0.0f;
+    for (int k = c2e_off[c]; k < c2e_off[c + 1]; ++k) s += elen[c2e[k]];
+    perim[c] = s;
+}
+
+// the cost of each chart-graph edge: the half angle of the merged cone, plus the area and the perimeter-area penalties
+extern "C" __global__ void __launch_bounds__(SD_THREADS) chart_costs(const unsigned long long* ek, const float* elen, const float* cn,
+                                                                     const float* carea, const float* perim, float aw, float pw, int E,
+                                                                     float* cost) {
+    const int t = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (t >= E) return;
+    const unsigned long long key = ek[t];
+    const int c0 = (int)(key >> 32), c1 = (int)(key & 0xFFFFFFFFu);
+    const float a0x = cn[4 * c0], a0y = cn[4 * c0 + 1], a0z = cn[4 * c0 + 2], h0 = cn[4 * c0 + 3];
+    const float a1x = cn[4 * c1], a1y = cn[4 * c1 + 1], a1z = cn[4 * c1 + 2], h1 = cn[4 * c1 + 3];
+    const float cosA = a0x * a1x + a0y * a1y + a0z * a1z;
+    const float axisA = acosf(fmaxf(fminf(cosA, 1.0f), -1.0f));
+    const float low = fminf(-h0, axisA - h1), high = fmaxf(h0, axisA + h1);
+    float c = (high - low) * 0.5f;
+    const float newArea = carea[c0] + carea[c1];
+    c += aw * newArea;
+    const float newPerim = perim[c0] + perim[c1] - 2 * elen[t];
+    c += pw * (newPerim * newPerim / newArea);
+    cost[t] = c;
+}
+
+// the cheapest edge of each chart (by cost, then edge id), packed as (cost bits << 32 | edge id) for the collapse
+extern "C" __global__ void __launch_bounds__(SD_THREADS) chart_propagate(const int* c2e_off, const int* c2e, const float* cost, int C,
+                                                                        unsigned long long* prop) {
+    const int c = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (c >= C) return;
+    int min_e = -1;
+    float min_c = 3.402823466e+38f;
+    for (int k = c2e_off[c]; k < c2e_off[c + 1]; ++k) {
+        const int e = c2e[k];
+        const float v = cost[e];
+        if (v < min_c || (v == min_c && e < min_e)) {
+            min_e = e;
+            min_c = v;
+        }
+    }
+    prop[c] = ((unsigned long long)__float_as_uint(min_c) << 32) | (unsigned int)min_e;
+}
+
+// the chart-graph edges that are the cheapest at both their charts and under the threshold collapse: the second chart is mapped to the
+// first (cmap, the identity before), and the first chart's cone takes both cones
+extern "C" __global__ void __launch_bounds__(SD_THREADS) chart_collapse(const unsigned long long* ek, const float* cost,
+                                                                       const unsigned long long* prop, float thresh, int E, int* cmap,
+                                                                       float* cn, int* flag) {
+    const int t = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (t >= E) return;
+    const float c = cost[t];
+    if (c > thresh) return;
+    const unsigned long long key = ek[t];
+    const int c0 = (int)(key >> 32), c1 = (int)(key & 0xFFFFFFFFu);
+    const unsigned long long pack = ((unsigned long long)__float_as_uint(c) << 32) | (unsigned int)t;
+    if (prop[c0] < pack || prop[c1] < pack) return;
+    cmap[c1] = c0;
+    const float a0x = cn[4 * c0], a0y = cn[4 * c0 + 1], a0z = cn[4 * c0 + 2], h0 = cn[4 * c0 + 3];
+    const float a1x = cn[4 * c1], a1y = cn[4 * c1 + 1], a1z = cn[4 * c1 + 2], h1 = cn[4 * c1 + 3];
+    const float cosA = a0x * a1x + a0y * a1y + a0z * a1z;
+    const float axisA = acosf(fmaxf(fminf(cosA, 1.0f), -1.0f));
+    const float low = fminf(-h0, axisA - h1), high = fmaxf(h0, axisA + h1);
+    const float nh = (high - low) * 0.5f;
+    float nx = a0x, ny = a0y, nz = a0z;
+    if (axisA >= 1e-3f) {
+        const float ang = (high + low) * 0.5f;
+        float ux = a1x - a0x * cosA, uy = a1y - a0y * cosA, uz = a1z - a0z * cosA;
+        const float iu = rsqrtf(ux * ux + uy * uy + uz * uz);
+        ux *= iu;
+        uy *= iu;
+        uz *= iu;
+        const float cs = cosf(ang), sn = sinf(ang);
+        nx = a0x * cs + ux * sn;
+        ny = a0y * cs + uy * sn;
+        nz = a0z * cs + uz * sn;
+        const float in = rsqrtf(nx * nx + ny * ny + nz * nz);
+        nx *= in;
+        ny *= in;
+        nz *= in;
+    }
+    cn[4 * c0] = nx;
+    cn[4 * c0 + 1] = ny;
+    cn[4 * c0 + 2] = nz;
+    cn[4 * c0 + 3] = nh;
+    *flag = 0;  // not the end of the iteration
+}
+
+// the refinement: each face takes the chart of its neighbours (across its edges) whose cone holds its normal best, with the edge-length
+// weighted smoothness (CuMesh's refine_charts_kernel; at most four candidate charts per face)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) chart_refine(const float* cn, const float* fn, const float* v, const unsigned long long* ek,
+                                                                     const int* f2e, const int* e2f, const int* e2f_off, int F, float lam,
+                                                                     const int* ids, int* out) {
+    const int t = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (t >= F) return;
+    const int cur = ids[t];
+    const float nx = fn[3 * t], ny = fn[3 * t + 1], nz = fn[3 * t + 2];
+    int cand[4];
+    float score[4];
+    int num = 1;
+    cand[0] = cur;
+    score[0] = 0.0f;
+    for (int i = 0; i < 3; ++i) {
+        const int e = f2e[3 * t + i];
+        const unsigned long long key = ek[e];
+        const int a = (int)(key >> 32), b = (int)(key & 0xFFFFFFFFu);
+        const float dx = v[3 * b] - v[3 * a], dy = v[3 * b + 1] - v[3 * a + 1], dz = v[3 * b + 2] - v[3 * a + 2];
+        const float len = sqrtf(dx * dx + dy * dy + dz * dz);
+        for (int j = e2f_off[e]; j < e2f_off[e + 1]; ++j) {
+            const int nb = e2f[j];
+            if (nb == t) continue;
+            const int nc = ids[nb];
+            int idx = -1;
+            for (int k = 0; k < num; ++k)
+                if (cand[k] == nc) {
+                    idx = k;
+                    break;
+                }
+            if (idx == -1 && num < 4) {
+                idx = num++;
+                cand[idx] = nc;
+                score[idx] = 0.0f;
+            }
+            if (idx != -1) score[idx] += len;
+        }
+    }
+    int best_c = cur;
+    float best = -1e9f;
+    for (int i = 0; i < num; ++i) {
+        const int c = cand[i];
+        const float geo = cn[4 * c] * nx + cn[4 * c + 1] * ny + cn[4 * c + 2] * nz;
+        if (geo <= 0.0f) continue;
+        const float total = geo + score[i] * lam;
+        if (c == cur && best == -1e9f) {
+            best = total;
+            best_c = c;
+        }
+        const float diff = total - best;
+        const float eps = 1e-5f;
+        if (diff > eps) {
+            best = total;
+            best_c = c;
+        } else if (fabsf(diff) <= eps) {
+            if (c < best_c) {
+                best = total;
+                best_c = c;
+            }
+        }
+    }
+    out[t] = best_c;
+}

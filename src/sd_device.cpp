@@ -42,7 +42,8 @@ hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn
               f_layer_norm = nullptr, f_rms_norm = nullptr, f_zm_modulate = nullptr, f_zm_gate_add = nullptr, f_zm_swiglu = nullptr, f_zm_rope = nullptr, f_zm_ln_plain = nullptr, f_gn_f32 = nullptr, f_to_tok = nullptr, f_to_chw = nullptr, f_zq_rope = nullptr, f_zq_attn = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma256b = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
               f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr, f_qi_linear_f8 = nullptr, f_qi_rms_f8 = nullptr, f_qi_affine = nullptr, f_qi_gelu = nullptr, f_qv_rms = nullptr, f_qv_patch = nullptr, f_qv_bias = nullptr, f_qv_upsample = nullptr, f_qi_hadamard = nullptr, f_qi_linear_i8 = nullptr, f_qi21_zc = nullptr, f_qi21_gather = nullptr, f_qi21_mul = nullptr, f_qi21_gated = nullptr, f_qi21_attn = nullptr, f_qi21_lbf = nullptr, f_qi21_dupup = nullptr, f_gemm_af128 = nullptr, f_transpose_bf16 = nullptr, f_bias_cm = nullptr, f_zm_rms_mod_bf16 = nullptr, f_zm_swiglu_bf16 = nullptr, f_bf16_to_f32 = nullptr, f_round_bf16 = nullptr, f_gn_sum_part = nullptr, f_gn_var_part = nullptr, f_gn_apply_part = nullptr, f_im2col_bf16_tile = nullptr, f_hnr16 = nullptr, f_count_diff = nullptr, f_tp16 = nullptr, f_rga16 = nullptr, f_sw16 = nullptr;
 
-hipFunction_t f_ss_affine = nullptr, f_ss_gate_add = nullptr, f_ss_head_norm_rope = nullptr; hipFunction_t f_sp_hash_insert = nullptr, f_sp_neighbor_map = nullptr, f_sp_subm_conv_f16w = nullptr; hipFunction_t f_sp_c2s_mask = nullptr, f_sp_exclusive_scan_serial = nullptr, f_sp_c2s_fill = nullptr, f_sp_c2s_gather = nullptr; hipFunction_t f_mesh_vertices = nullptr, f_mesh_edge_queries = nullptr, f_sp_lookup = nullptr, f_mesh_edge_valid = nullptr, f_mesh_quads = nullptr, f_mesh_triangles = nullptr; hipFunction_t f_ss_im2col3 = nullptr, f_ss_gemm_f16w = nullptr, f_ss_pixel_shuffle3 = nullptr;
+hipFunction_t f_ss_affine = nullptr, f_ss_gate_add = nullptr, f_ss_head_norm_rope = nullptr; hipFunction_t f_sp_hash_insert = nullptr, f_sp_neighbor_map = nullptr, f_sp_subm_conv_f16w = nullptr; hipFunction_t f_sp_c2s_mask = nullptr, f_sp_exclusive_scan_serial = nullptr, f_sp_c2s_fill = nullptr, f_sp_c2s_gather = nullptr; hipFunction_t f_simp_qem = nullptr, f_simp_cost = nullptr, f_simp_propagate = nullptr, f_simp_collapse = nullptr, f_simp_compress_v = nullptr, f_simp_compress_f = nullptr; hipFunction_t f_chart_face_geom = nullptr, f_chart_cones = nullptr, f_chart_perims = nullptr, f_chart_costs = nullptr, f_chart_propagate = nullptr, f_chart_collapse = nullptr, f_chart_refine = nullptr;
+hipFunction_t f_dino_rope = nullptr; hipFunction_t f_mesh_vertices = nullptr, f_mesh_edge_queries = nullptr, f_sp_lookup = nullptr, f_mesh_edge_valid = nullptr, f_mesh_quads = nullptr, f_mesh_triangles = nullptr; hipFunction_t f_ss_im2col3 = nullptr, f_ss_gemm_f16w = nullptr, f_ss_pixel_shuffle3 = nullptr;
 constexpr int kThreads = 256;
 constexpr int kGroupSplit = 16;  // the group norm's partial sums per group
 constexpr size_t kColFloats = (size_t)1 << 25;  // the im2col chunk: at most 128 MB (a launch covers enough tiles to fill the GPU)
@@ -129,7 +130,7 @@ bool init() {
         {&f_ss_im2col3, "ss_im2col3"}, {&f_ss_gemm_f16w, "ss_gemm_f16w"}, {&f_ss_pixel_shuffle3, "ss_pixel_shuffle3"},
         {&f_sp_hash_insert, "sp_hash_insert"}, {&f_sp_neighbor_map, "sp_neighbor_map"}, {&f_sp_subm_conv_f16w, "sp_subm_conv_f16w"},
         {&f_sp_c2s_mask, "sp_c2s_mask"}, {&f_sp_exclusive_scan_serial, "sp_exclusive_scan_serial"}, {&f_sp_c2s_fill, "sp_c2s_fill"}, {&f_sp_c2s_gather, "sp_c2s_gather"},
-        {&f_mesh_vertices, "mesh_vertices"}, {&f_mesh_edge_queries, "mesh_edge_queries"}, {&f_sp_lookup, "sp_lookup"}, {&f_mesh_edge_valid, "mesh_edge_valid"}, {&f_mesh_quads, "mesh_quads"}, {&f_mesh_triangles, "mesh_triangles"},
+        {&f_simp_qem, "simp_qem"}, {&f_simp_cost, "simp_cost"}, {&f_simp_propagate, "simp_propagate"}, {&f_simp_collapse, "simp_collapse"}, {&f_simp_compress_v, "simp_compress_v"}, {&f_simp_compress_f, "simp_compress_f"}, {&f_chart_face_geom, "chart_face_geom"}, {&f_chart_cones, "chart_cones"}, {&f_chart_perims, "chart_perims"}, {&f_chart_costs, "chart_costs"}, {&f_chart_propagate, "chart_propagate"}, {&f_chart_collapse, "chart_collapse"}, {&f_chart_refine, "chart_refine"}, {&f_dino_rope, "dino_rope"}, {&f_mesh_vertices, "mesh_vertices"}, {&f_mesh_edge_queries, "mesh_edge_queries"}, {&f_sp_lookup, "sp_lookup"}, {&f_mesh_edge_valid, "mesh_edge_valid"}, {&f_mesh_quads, "mesh_quads"}, {&f_mesh_triangles, "mesh_triangles"},
     };
     for (const Entry& e : entries)
         if (hipModuleGetFunction(e.f, g_mod, e.name) != hipSuccess) return false;
@@ -1767,6 +1768,119 @@ void mesh_triangles(const int* quads, int L, const float* feats, int* faces) {
     int ll = L;
     void* a[] = {(void*)&quads, (void*)&ll, (void*)&feats, (void*)&faces};
     launch(f_mesh_triangles, dim3((unsigned)((L + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+// DINOv3's rotary embedding on the patch tokens (sd_gpu.hip dino_rope): x [T][C] with the heads of width D; cs, sn [P][D] for the P = T - prefix
+// patch tokens
+void dino_rope(float* x, int T, int prefix, int C, int H, int D, const float* cs, const float* sn) {
+    const long n = (long)(T - prefix) * H * (D / 2);
+    int tt = T, pf = prefix, cc = C, hh = H, dd = D;
+    const float* c = cs;
+    const float* sg = sn;
+    void* a[] = {(void*)&x, (void*)&tt, (void*)&pf, (void*)&cc, (void*)&hh, (void*)&dd, (void*)&c, (void*)&sg};
+    launch(f_dino_rope, dim3((unsigned)((n + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+// mesh simplification (sd_gpu.hip simp_*): one GPU step each over the faces, edges or vertices (trellis_simplify.cpp drives them)
+void simp_qem(const float* v, const int* f, const int* v2f, const int* v2f_off, int V, float* qem) {
+    int vv = V;
+    void* a[] = {(void*)&v, (void*)&f, (void*)&v2f, (void*)&v2f_off, (void*)&vv, (void*)&qem};
+    launch(f_simp_qem, dim3((unsigned)((V + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void simp_cost(const float* v, const int* f, const int* v2f, const int* v2f_off, const unsigned long long* edges, const unsigned char* vb,
+               const float* qem, int E, float lam_len, float lam_sk, float* cost) {
+    int ee = E;
+    void* a[] = {(void*)&v, (void*)&f, (void*)&v2f, (void*)&v2f_off, (void*)&edges, (void*)&vb, (void*)&qem, (void*)&ee, (void*)&lam_len,
+                 (void*)&lam_sk, (void*)&cost};
+    launch(f_simp_cost, dim3((unsigned)((E + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void simp_propagate(const unsigned long long* edges, const int* v2f, const int* v2f_off, const float* cost, int E, unsigned long long* prop) {
+    int ee = E;
+    void* a[] = {(void*)&edges, (void*)&v2f, (void*)&v2f_off, (void*)&cost, (void*)&ee, (void*)&prop};
+    launch(f_simp_propagate, dim3((unsigned)((E + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void simp_collapse(float* v, int* f, const unsigned long long* edges, const int* v2f, const int* v2f_off, const float* cost,
+                   const unsigned long long* prop, const unsigned char* vb, int E, float thresh, int* vkept, int* fkept) {
+    int ee = E;
+    void* a[] = {(void*)&v, (void*)&f, (void*)&edges, (void*)&v2f, (void*)&v2f_off, (void*)&cost, (void*)&prop, (void*)&vb, (void*)&ee,
+                 (void*)&thresh, (void*)&vkept, (void*)&fkept};
+    launch(f_simp_collapse, dim3((unsigned)((E + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void simp_compress_v(const int* vmap, const float* oldv, int V, float* newv) {
+    int vv = V;
+    void* a[] = {(void*)&vmap, (void*)&oldv, (void*)&vv, (void*)&newv};
+    launch(f_simp_compress_v, dim3((unsigned)((V + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void simp_compress_f(const int* fmap, const int* vmap, const int* oldf, int F, int* newf) {
+    int ff = F;
+    void* a[] = {(void*)&fmap, (void*)&vmap, (void*)&oldf, (void*)&ff, (void*)&newf};
+    launch(f_simp_compress_f, dim3((unsigned)((F + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+// mesh charts (sd_gpu.hip chart_*): one GPU step each over the faces, edges or charts (trellis_charts.cpp drives them)
+void chart_face_geom(const float* v, const int* f, int F, float* fn, float* fa) {
+    int ff = F;
+    void* a[] = {(void*)&v, (void*)&f, (void*)&ff, (void*)&fn, (void*)&fa};
+    launch(f_chart_face_geom, dim3((unsigned)((F + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void chart_cones(const int* coff, const int* cface, const float* fn, const float* fa, int C, float* cn, float* carea) {
+    int cc = C;
+    void* a[] = {(void*)&coff, (void*)&cface, (void*)&fn, (void*)&fa, (void*)&cc, (void*)&cn, (void*)&carea};
+    launch(f_chart_cones, dim3((unsigned)((C + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void chart_perims(const int* c2e_off, const int* c2e, const float* elen, int C, float* perim) {
+    int cc = C;
+    void* a[] = {(void*)&c2e_off, (void*)&c2e, (void*)&elen, (void*)&cc, (void*)&perim};
+    launch(f_chart_perims, dim3((unsigned)((C + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void chart_costs(const unsigned long long* ek, const float* elen, const float* cn, const float* carea, const float* perim, float aw, float pw,
+                 int E, float* cost) {
+    int ee = E;
+    void* a[] = {(void*)&ek, (void*)&elen, (void*)&cn, (void*)&carea, (void*)&perim, (void*)&aw, (void*)&pw, (void*)&ee, (void*)&cost};
+    launch(f_chart_costs, dim3((unsigned)((E + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void chart_propagate(const int* c2e_off, const int* c2e, const float* cost, int C, unsigned long long* prop) {
+    int cc = C;
+    void* a[] = {(void*)&c2e_off, (void*)&c2e, (void*)&cost, (void*)&cc, (void*)&prop};
+    launch(f_chart_propagate, dim3((unsigned)((C + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void chart_collapse(const unsigned long long* ek, const float* cost, const unsigned long long* prop, float thresh, int E, int* cmap, float* cn,
+                    int* flag) {
+    int ee = E;
+    void* a[] = {(void*)&ek, (void*)&cost, (void*)&prop, (void*)&thresh, (void*)&ee, (void*)&cmap, (void*)&cn, (void*)&flag};
+    launch(f_chart_collapse, dim3((unsigned)((E + kThreads - 1) / kThreads), 1, 1), a);
+    sync();
+}
+
+void chart_refine(const float* cn, const float* fn, const float* v, const unsigned long long* ek, const int* f2e, const int* e2f,
+                  const int* e2f_off, int F, float lam, const int* ids, int* out) {
+    int ff = F;
+    void* a[] = {(void*)&cn, (void*)&fn, (void*)&v, (void*)&ek, (void*)&f2e, (void*)&e2f, (void*)&e2f_off, (void*)&ff, (void*)&lam, (void*)&ids,
+                 (void*)&out};
+    launch(f_chart_refine, dim3((unsigned)((F + kThreads - 1) / kThreads), 1, 1), a);
     sync();
 }
 

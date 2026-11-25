@@ -2,8 +2,8 @@
 // The textured output of the TRELLIS.2 pipeline (o-voxel's postprocess.to_glb, the parts the engine has): the UV unwrap (xatlas, vendored
 // in third_party/xatlas), the texture baked from the voxel attributes (the texture flow's and decoder's channels: base colour 0 to 2,
 // metallic 3, roughness 4, alpha 5), the inpainting of the gaps around the charts, and a binary glTF with two PNG textures.
-// Not ported from the python path: CuMesh's chart clustering before xatlas (xatlas makes the charts itself, so the UVs differ), the
-// remeshing and simplification (off by default there), the Telea inpainting (here a dilation of the chart edges), and the BVH lookup
+// The charts are CuMesh's clustering (trellis_charts.h, on the device), then xatlas packs and parametrises each chart. Not ported from the
+// python path: the remeshing and simplification (off by default there), the Telea inpainting (here a dilation of the chart edges), and the BVH lookup
 // of the original mesh (the unwrap keeps the vertices, so each texel's position is the interpolation of its triangle's vertices).
 
 #include <cstdint>
@@ -24,6 +24,11 @@ struct UvMesh {
 
 // verts [V][3], faces [F][3]: the unwrap with xatlas's default charts, packed at texture_size texels.
 bool unwrap_uv(const std::vector<float>& verts, const std::vector<int32_t>& faces, int texture_size, UvMesh& out, std::string& error);
+
+// The same unwrap with the charts given (chart_ids [F]: the chart of each face, the clustering of the device): each chart is added to xatlas
+// as its own mesh (as CuMesh's uv_unwrap does), then the charts are parametrised, packed and gathered back to the original vertices.
+bool unwrap_uv_by_charts(const std::vector<float>& verts, const std::vector<int32_t>& faces, const std::vector<int32_t>& chart_ids,
+                         int texture_size, UvMesh& out, std::string& error);
 
 // The voxel attributes to bake: the voxels of the grid (coords [N][4], batch 0, indices in 0..res-1) and their channels (feats [N][C]).
 struct VoxelAttributes {
@@ -52,7 +57,8 @@ std::vector<uint8_t> encode_png(const std::vector<uint8_t>& pixels, int width, i
 // A binary glTF (.glb): the unwrapped mesh with the python path's axes (y and z swapped, y negated) and uv v flipped, the two PNG textures.
 bool write_glb(const std::string& path, const UvMesh& uv, const std::vector<float>& normals, const BakedTextures& tex, std::string& error);
 
-// The whole export: the unwrap of the mesh, the texture baked from the voxel attributes at texture_size texels, and the GLB at path.
+// The whole export: the charts (trellis_charts.h), the unwrap of each chart by xatlas, the texture baked from the voxel attributes at
+// texture_size texels, and the GLB at path.
 bool export_textured_glb(const std::vector<float>& verts, const std::vector<int32_t>& faces, const VoxelAttributes& attr, int texture_size,
                          const std::string& path, std::string& error);
 
