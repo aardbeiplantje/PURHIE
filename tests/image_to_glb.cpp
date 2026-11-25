@@ -126,6 +126,8 @@ int main(int argc, char** argv) {
     scfg.ss.on_step = step_log("sparse structure", 1);
     scfg.slat.on_step = step_log("shape SLAT", 32);
     tcfg.sampler.on_step = step_log("texture flow", 32);
+    scfg.progress = true;
+    tcfg.progress = true;
     std::mt19937 rng(seed);
     std::normal_distribution<float> gauss(0.0f, 1.0f);
     trellis::NoiseFn noise = [&](float* dst, size_t count) {

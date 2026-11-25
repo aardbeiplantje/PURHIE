@@ -128,6 +128,8 @@ DINOV3_VERIFY = $(BINDIR)/dinov3_verify  # the image encoder (DINOv3 ViT-L/16, C
 IMAGE_COND_VERIFY = $(BINDIR)/image_cond_verify  # the image conditioning (PNG, PIL-style Lanczos, normalisation, the encoder) against the python preprocessing (tests/image_cond_verify.cpp)
 IMAGE_TO_GLB = $(BINDIR)/image_to_glb  # a real image to a textured GLB on the engine (512 or the 1024 cascade)
 SIMPLIFY_VERIFY = $(BINDIR)/simplify_verify  # the device mesh simplification against CuMesh's simplify (/data/trellis2/oracle_simplify)
+FLASH_ATTN_BENCH = $(BINDIR)/flash_attn_bench  # the fused fp32 attention on random tokens: time and checksum (SD_ATTN_FLASH=0: the GEMM path)
+FLASH_ATTN_VERIFY = $(BINDIR)/flash_attn_verify  # the fused fp32 attention against a double-precision reference (sampled rows)
 CHARTS_VERIFY = $(BINDIR)/charts_verify  # the device chart clustering against CuMesh's chart ids (/data/trellis2/oracle_fill)
 UNWRAP_CHARTS_VERIFY = $(BINDIR)/unwrap_charts_verify  # the unwrap with CuMesh's charts against the xatlas default (/data/trellis2/oracle_fill)
 TEXTURED_GLB_VERIFY = $(BINDIR)/textured_glb_verify  # the end-to-end textured output (512 or 1024 cascade) as a GLB
@@ -734,6 +736,12 @@ $(IMAGE_COND_VERIFY): $(TESTSDIR)/image_cond_verify.cpp $(SRCDIR)/trellis_image.
 
 $(IMAGE_TO_GLB): $(TESTSDIR)/image_to_glb.cpp $(SRCDIR)/trellis_image.h $(SRCDIR)/trellis_tex.h $(SRCDIR)/trellis_shape.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
 	$(CLANG) $(CXXFLAGS) -I. -Ithird_party/xatlas $(TESTSDIR)/image_to_glb.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
+
+$(FLASH_ATTN_BENCH): $(TESTSDIR)/flash_attn_bench.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/flash_attn_bench.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
+
+$(FLASH_ATTN_VERIFY): $(TESTSDIR)/flash_attn_verify.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/flash_attn_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
 
 $(CHARTS_VERIFY): $(TESTSDIR)/charts_verify.cpp $(SRCDIR)/trellis_charts.cpp $(SRCDIR)/trellis_charts.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/charts_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@

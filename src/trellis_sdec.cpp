@@ -9,6 +9,8 @@
 #include "zimage_dit.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <utility>
@@ -254,6 +256,7 @@ bool ShapeDecoder::run(const int32_t* coords, int n, const float* feats, float* 
     linear16(fin, N, kLatent, m.lw, m.lb, kChans[0], h);
     int C = kChans[0];
 
+    const auto dec_t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < 5; ++i) {
         if (upsample_times > 0 && i == upsample_times) {  // the coordinates of this level, before its blocks (python's upsample)
             *out_m = N;  // the count, also when the buffer is too small (the caller retries with it)
@@ -280,6 +283,10 @@ bool ShapeDecoder::run(const int32_t* coords, int n, const float* feats, float* 
                 sddev::add(t3, h, (size_t)N * C);  // t3 += h
                 h = t3;
             }
+        }
+        if (progress_) {
+            std::fprintf(stderr, "    decoder level %d: %d voxels, %.1f s\n", i, N,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - dec_t0).count());
         }
         if (i == 4) break;  // the last level has no upsampling
         // the channel-to-spatial block (ResBlockC2S with the predicted subdivision)

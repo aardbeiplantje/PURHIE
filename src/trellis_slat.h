@@ -31,8 +31,12 @@ public:
     bool forward(const int32_t* coords, int n, const float* feats, float t, const float* cond, int Lc, float* out,
                  const std::function<void(const char*, const float*, size_t)>& stage = nullptr);
 
+    // progress (stderr): each block's time with its attention share, as the blocks finish (off by default)
+    void set_progress(bool on) { progress_ = on; }
+
 private:
     struct Impl;
+    bool progress_ = false;
     std::unique_ptr<Impl> p_;
     bool ok_ = false;
     std::string error_;

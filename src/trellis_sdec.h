@@ -47,11 +47,15 @@ public:
     bool forward_guided(const int32_t* coords, int n, const float* feats, const std::vector<Subdivision>& guide, float* out_feats,
                         int32_t* out_coords, int* out_m, int out_capacity);
 
+    // progress (stderr): each decoder level as it finishes (off by default)
+    void set_progress(bool on) { progress_ = on; }
+
 private:
     bool run(const int32_t* coords, int n, const float* feats, float* out_feats, int32_t* out_coords, int* out_m, int out_capacity,
              const StageFn& stage, int upsample_times, const std::vector<Subdivision>* guide, std::vector<Subdivision>* subs_out);
     struct Impl;
     std::unique_ptr<Impl> p_;
+    bool progress_ = false;
     bool ok_ = false;
     std::string error_;
 };

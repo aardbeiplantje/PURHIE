@@ -278,14 +278,19 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
     (`src/trellis_bake.cpp` `unwrap_uv_by_charts`: 4 s on the 249k mesh against 71 s for the whole-mesh xatlas call;
     `tests/unwrap_charts_verify.cpp`). The bake and the GLB are as before (`tests/bake_verify.cpp`, `tests/textured_glb_verify.cpp`).
     Last run, 512 on `comfy/example.png` (`tests/image_to_glb.cpp`): simplify 8.5 s (2.68M to 969k faces), charts 13.9 s (119,340
-    charts), unwrap 17.1 s, bake 0.3 s, GLB 0.1 s. Before the charts were ported the unwrap took 570 s on the same mesh. The shape and
-    texture stages of that run are not timed (the tool does not print them), so the whole-run time is unknown.
-    Open: (a) time the shape and texture stages in `image_to_glb` and record the whole run; (b) run the same image through ComfyUI for
-    the comparison (about 500 s there); (c) run the 1024 cascade on the real image (the code is in, not run yet); (d) port python's
-    to_glb clean-up (`remove_duplicate_faces`, `repair_non_manifold_edges`, `remove_small_connected_components`,
-    `unify_face_orientations`), which is not ported; (e) the chart pair and chart-face sorts and the bake run on the host, to move
-    to the device if the timings call for it; (f) check the texture coverage of the 512 run (0.082) against python's bake of the
-    same mesh.
+    charts), unwrap 17.1 s, bake 0.3 s, GLB 0.1 s. Before the charts were ported the unwrap took 570 s on the same mesh. The
+    whole run at 512 (stage times printed by `image_to_glb`): conditioning 1.3 s, sparse structure 115 s, shape SLAT 167 s, shape
+    decoder 65 s, mesh 1 s, texture flow 90 s, texture decoder 60 s, export 40 s: about 540 s in process, model loading not counted.
+    The attention of every flow is now the fused fp32 kernel (`sd_gpu.hip` `attn_flash_d128` and `attn_flash_d64`, on by default;
+    `SD_ATTN_FLASH=0` restores the GEMM path). One self-attention call at 23,660 tokens: 1.3 s against 10.0 s (`tests/flash_attn_bench.cpp`,
+    measured with the 1024 run sharing the GPU); 2e-6 relative against a double-precision reference (`tests/flash_attn_verify.cpp`).
+    The DINOv3, shape-SLAT and sparse-structure checks are unchanged with it (1.4e-6, PASS, PASS). The 1024 run in progress uses
+    the build from before the kernel.
+    Open: (a) the 1024 cascade on the real image: its time with the fused attention, and its GLB; (b) run the same image through
+    ComfyUI for the comparison (about 500 s there); (c) port python's to_glb clean-up (`remove_duplicate_faces`,
+    `repair_non_manifold_edges`, `remove_small_connected_components`, `unify_face_orientations`), which is not ported; (d) the chart
+    pair and chart-face sorts and the bake run on the host, to move to the device if the timings call for it; (e) check the texture
+    coverage of the 512 run (0.082) against python's bake of the same mesh.
 21. **Qwen-Image 2.1 image edit (next, after TRELLIS.2).** The 2.1 DiT, text encoder and VAE run on the engine (items above
     in the Qwen-Image status), but there is no reference-image input and no edit route: `src/qwenimage21_*.cpp` has no edit
     path, and the server has no image-edit endpoint. Needs: the edit conditioning in the 2.1 DiT (how the reference image enters,

@@ -8,6 +8,7 @@
 #include "zimage_dit.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -232,8 +233,11 @@ bool SlatFlow::forward(const int32_t* coords, int n, const float* feats, float t
     for (int j = 0; j < 6; ++j) vs[j] = S(kC);
     std::vector<float> ms(6 * kC);
 
+    const auto fwd_t0 = std::chrono::steady_clock::now();
     for (int b = 0; b < kBlocks; ++b) {
         const Impl::Block& k = m.blk[b];
+        const auto blk_t0 = std::chrono::steady_clock::now();
+        double att_s = 0;
         for (int j = 0; j < 6 * kC; ++j) ms[j] = k.mod[j] + mod[j];
         for (int j = 0; j < kC; ++j) {
             vs[0][j] = ms[j];
@@ -249,11 +253,13 @@ bool SlatFlow::forward(const int32_t* coords, int n, const float* feats, float t
         sddev::linear_bf16(A, n, k.wqkv, kC, 3 * kC, k.bqkv, QKV);
         sddev::ss_head_norm_rope(QKV, n, 3 * kC, kH, kD, k.gq, ph);
         sddev::ss_head_norm_rope(QKV + kC, n, 3 * kC, kH, kD, k.gk, ph);
+        const auto a0 = std::chrono::steady_clock::now();
         for (int c0 = 0; c0 < n; c0 += kQChunk) {
             const int qn = std::min(kQChunk, n - c0);
             sddev::attention_f32_strided(QKV + (size_t)c0 * 3 * kC, 3 * kC, qn, QKV + kC, 3 * kC, QKV + 2 * kC, 3 * kC, n, kC, kH,
                                          O + (size_t)c0 * kC);
         }
+        att_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - a0).count();
         sddev::linear_bf16(O, n, k.wso, kC, kC, k.bso, P);
         sddev::ss_gate_add(h, n, kC, vs[2], P);
         // cross-attention to the image features
@@ -264,10 +270,12 @@ bool SlatFlow::forward(const int32_t* coords, int n, const float* feats, float t
         sddev::linear_bf16(cd, Lc, k.wkv + (size_t)kC * kCond, kCond, kC, k.bkv + kC, Vc);
         sddev::ss_head_norm_rope(Qc, n, kC, kH, kD, k.gcq, nullptr);
         sddev::ss_head_norm_rope(Kc, Lc, kC, kH, kD, k.gck, nullptr);
+        const auto a1 = std::chrono::steady_clock::now();
         for (int c0 = 0; c0 < n; c0 += kQChunk) {
             const int qn = std::min(kQChunk, n - c0);
             sddev::attention_f32_strided(Qc + (size_t)c0 * kC, kC, qn, Kc, kC, Vc, kC, Lc, kC, kH, Oc + (size_t)c0 * kC);
         }
+        att_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - a1).count();
         sddev::linear_bf16(Oc, n, k.wco, kC, kC, k.bco, Pc);
         sddev::ss_gate_add(h, n, kC, ones, Pc);
         // MLP
@@ -277,6 +285,11 @@ bool SlatFlow::forward(const int32_t* coords, int n, const float* feats, float t
         sddev::gelu_tanh(F1, N * kF);
         sddev::linear_bf16(F1, n, k.wm2, kF, kC, k.bm2, P3);
         sddev::ss_gate_add(h, n, kC, vs[5], P3);
+        if (progress_) {
+            std::fprintf(stderr, "      block %2d/%d: %.1f s (attention %.1f s), %.1f s into the flow\n", b + 1, kBlocks,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - blk_t0).count(), att_s,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - fwd_t0).count());
+        }
         if (b == 0 || b == 1 || b == 14 || b == 28 || b == 29) {
             char name[24];
             std::snprintf(name, sizeof(name), "slat_block%02d", b);

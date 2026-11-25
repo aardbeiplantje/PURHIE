@@ -2625,3 +2625,115 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) chart_refine(const floa
     }
     out[t] = best_c;
 }
+
+// ---- TRELLIS.2 fused attention, fp32 (sd_device attention_f32_strided): one block per 64 queries of one head. The keys and the values
+// stream 16 at a time through LDS, and each row keeps a running max and sum (an online softmax), so the N x N scores are never written.
+// The thread (ty, tx) owns rows ty * 4 .. + 4 of the block and, for the scores, key tx of the tile; for the output, the columns
+// tx * DT .. + DT of the head. The row groups are the 16 lanes sharing ty (the shuffles stay inside them). The score tiles are row-major
+// and padded to D + 4 floats, so the scores read float4 along the head dimension.
+template <int D>
+__device__ __forceinline__ void attn_flash_body(const float* __restrict__ q, long ldq, int Tq, const float* __restrict__ k, long ldk,
+                                                const float* __restrict__ v, long ldv, int Tk, int C, float scale, float* __restrict__ out) {
+    constexpr int BQ = 64, BK = 16, NT = 256, DT = D / 16, LD = D + 4, D4 = D / 4;
+    static_assert(BK * D4 % NT == 0 && BQ * D4 % NT == 0, "the tiles load in whole rounds");
+    __shared__ float sQ[BQ][LD];  // the scaled queries: sQ[row][d]
+    __shared__ float sK[BK][LD];  // the key tile: sK[key][d]
+    __shared__ float sV[BK][D];   // the value tile: sV[key][d]
+    __shared__ float sP[BK][BQ];  // the tile's weights, transposed: sP[key][row]
+    const int tid = threadIdx.x, ty = tid / 16, tx = tid % 16;
+    const int r0 = blockIdx.x * BQ, hd = blockIdx.y;
+    for (int idx = tid; idx < BQ * D4; idx += NT) {
+        const int r = idx / D4, d4 = (idx % D4) * 4;
+        float4 qv = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (r0 + r < Tq) qv = *reinterpret_cast<const float4*>(q + (size_t)(r0 + r) * ldq + hd * D + d4);
+        *reinterpret_cast<float4*>(&sQ[r][d4]) = make_float4(qv.x * scale, qv.y * scale, qv.z * scale, qv.w * scale);
+    }
+    float o[4][DT];
+    float m[4], l[4];
+    for (int i = 0; i < 4; ++i) {
+        m[i] = -1e30f;
+        l[i] = 0.0f;
+        for (int c = 0; c < DT; ++c) o[i][c] = 0.0f;
+    }
+    for (int t0 = 0; t0 < Tk; t0 += BK) {
+        // the tile's loads are issued together (unrolled: the loads are independent, so they overlap)
+#pragma unroll
+        for (int u = 0; u < BK * D4 / NT; ++u) {
+            const int idx = tid + u * NT;
+            const int kk = idx / D4, d4 = (idx % D4) * 4;
+            float4 kv4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f), vv4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (t0 + kk < Tk) {
+                kv4 = *reinterpret_cast<const float4*>(k + (size_t)(t0 + kk) * ldk + hd * D + d4);
+                vv4 = *reinterpret_cast<const float4*>(v + (size_t)(t0 + kk) * ldv + hd * D + d4);
+            }
+            *reinterpret_cast<float4*>(&sK[kk][d4]) = kv4;
+            *reinterpret_cast<float4*>(&sV[kk][d4]) = vv4;
+        }
+        __syncthreads();
+        // the scores of rows ty * 4 + i against key tx of the tile
+        float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll 4
+        for (int d4 = 0; d4 < D; d4 += 4) {
+            const float4 kv = *reinterpret_cast<const float4*>(&sK[tx][d4]);
+            for (int i = 0; i < 4; ++i) {
+                const float4 qv = *reinterpret_cast<const float4*>(&sQ[ty * 4 + i][d4]);
+                s[i] += qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+            }
+        }
+        if (t0 + tx >= Tk)
+            for (int i = 0; i < 4; ++i) s[i] = -1e30f;
+        // the online softmax: the tile's row max joins the running max, the old sum and output are rescaled by the change. The four
+        // rows' reductions run interleaved (independent shuffles, not four dependent chains)
+        float mt[4] = {s[0], s[1], s[2], s[3]};
+        for (int off = 8; off >= 1; off >>= 1)
+            for (int i = 0; i < 4; ++i) mt[i] = fmaxf(mt[i], __shfl_xor(mt[i], off));
+        float alpha[4];
+        for (int i = 0; i < 4; ++i) {
+            const float mn = fmaxf(m[i], mt[i]);
+            alpha[i] = expf(m[i] - mn);
+            s[i] = expf(s[i] - mn);
+            m[i] = mn;
+        }
+        float ps[4] = {s[0], s[1], s[2], s[3]};
+        for (int off = 8; off >= 1; off >>= 1)
+            for (int i = 0; i < 4; ++i) ps[i] += __shfl_xor(ps[i], off);
+        for (int i = 0; i < 4; ++i) l[i] = l[i] * alpha[i] + ps[i];
+        for (int i = 0; i < 4; ++i)
+            for (int c = 0; c < DT; ++c) o[i][c] *= alpha[i];
+        *reinterpret_cast<float4*>(&sP[tx][ty * 4]) = make_float4(s[0], s[1], s[2], s[3]);
+        __syncthreads();
+        // the weighted values of the tile into this thread's output columns
+        for (int kk = 0; kk < BK; ++kk) {
+            const float4 pv = *reinterpret_cast<const float4*>(&sP[kk][ty * 4]);
+            const float p[4] = {pv.x, pv.y, pv.z, pv.w};
+            for (int c4 = 0; c4 < DT; c4 += 4) {
+                const float4 vv = *reinterpret_cast<const float4*>(&sV[kk][tx * DT + c4]);
+                const float vals[4] = {vv.x, vv.y, vv.z, vv.w};
+                for (int i = 0; i < 4; ++i)
+                    for (int c = 0; c < 4; ++c) o[i][c4 + c] += p[i] * vals[c];
+            }
+        }
+        __syncthreads();
+    }
+    for (int i = 0; i < 4; ++i) {
+        const int r = r0 + ty * 4 + i;
+        if (r >= Tq) continue;
+        const float inv = 1.0f / l[i];
+        float* orow = out + (size_t)r * C + hd * D + tx * DT;
+        for (int c = 0; c < DT; ++c) orow[c] = o[i][c] * inv;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(SD_THREADS) attn_flash_d128(const float* q, long ldq, int Tq, const float* k, long ldk,
+                                                                        const float* v, long ldv, int Tk, int C, int heads, float* out,
+                                                                        float scale) {
+    (void)heads;
+    attn_flash_body<128>(q, ldq, Tq, k, ldk, v, ldv, Tk, C, scale, out);
+}
+
+extern "C" __global__ void __launch_bounds__(SD_THREADS) attn_flash_d64(const float* q, long ldq, int Tq, const float* k, long ldk,
+                                                                       const float* v, long ldv, int Tk, int C, int heads, float* out,
+                                                                       float scale) {
+    (void)heads;
+    attn_flash_body<64>(q, ldq, Tq, k, ldk, v, ldv, Tk, C, scale, out);
+}

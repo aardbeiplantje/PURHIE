@@ -20,6 +20,7 @@ struct TexConfig {
     FlowSampler sampler;                             // tex_slat_sampler: 12 steps, guidance 1.0, rescale_t 3.0
     std::array<float, 32> shape_mean{}, shape_std{};  // shape_slat_normalization (the shape latent the flow is conditioned on)
     std::array<float, 32> tex_mean{}, tex_std{};      // tex_slat_normalization (the texture latent)
+    bool progress = false;  // stderr: the texture flow's blocks and the decoder's levels as they finish
 };
 
 struct TexResult {

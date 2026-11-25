@@ -100,6 +100,9 @@ bool TexturePipeline::decode(const int32_t* coords, int n, const float* tex_slat
 bool TexturePipeline::run(const int32_t* coords, int n, const float* shape_slat, const std::vector<Subdivision>& subs, const float* cond,
                           int Lc, const NoiseFn& noise, const TexConfig& cfg, TexResult& out, bool hr) {
     error_.clear();
+    if (p_->flow) p_->flow->set_progress(cfg.progress);
+    if (p_->flow_hr) p_->flow_hr->set_progress(cfg.progress);
+    if (p_->dec) p_->dec->set_progress(cfg.progress);
     if (!ok_) {
         error_ = "the texture pipeline is not open";
         return false;

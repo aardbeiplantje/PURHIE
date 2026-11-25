@@ -43,6 +43,7 @@ hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn
               f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr, f_qi_linear_f8 = nullptr, f_qi_rms_f8 = nullptr, f_qi_affine = nullptr, f_qi_gelu = nullptr, f_qv_rms = nullptr, f_qv_patch = nullptr, f_qv_bias = nullptr, f_qv_upsample = nullptr, f_qi_hadamard = nullptr, f_qi_linear_i8 = nullptr, f_qi21_zc = nullptr, f_qi21_gather = nullptr, f_qi21_mul = nullptr, f_qi21_gated = nullptr, f_qi21_attn = nullptr, f_qi21_lbf = nullptr, f_qi21_dupup = nullptr, f_gemm_af128 = nullptr, f_transpose_bf16 = nullptr, f_bias_cm = nullptr, f_zm_rms_mod_bf16 = nullptr, f_zm_swiglu_bf16 = nullptr, f_bf16_to_f32 = nullptr, f_round_bf16 = nullptr, f_gn_sum_part = nullptr, f_gn_var_part = nullptr, f_gn_apply_part = nullptr, f_im2col_bf16_tile = nullptr, f_hnr16 = nullptr, f_count_diff = nullptr, f_tp16 = nullptr, f_rga16 = nullptr, f_sw16 = nullptr;
 
 hipFunction_t f_ss_affine = nullptr, f_ss_gate_add = nullptr, f_ss_head_norm_rope = nullptr; hipFunction_t f_sp_hash_insert = nullptr, f_sp_neighbor_map = nullptr, f_sp_subm_conv_f16w = nullptr; hipFunction_t f_sp_c2s_mask = nullptr, f_sp_exclusive_scan_serial = nullptr, f_sp_c2s_fill = nullptr, f_sp_c2s_gather = nullptr; hipFunction_t f_simp_qem = nullptr, f_simp_cost = nullptr, f_simp_propagate = nullptr, f_simp_collapse = nullptr, f_simp_compress_v = nullptr, f_simp_compress_f = nullptr; hipFunction_t f_chart_face_geom = nullptr, f_chart_cones = nullptr, f_chart_perims = nullptr, f_chart_costs = nullptr, f_chart_propagate = nullptr, f_chart_collapse = nullptr, f_chart_refine = nullptr;
+hipFunction_t f_attn_flash128 = nullptr, f_attn_flash64 = nullptr;
 hipFunction_t f_dino_rope = nullptr; hipFunction_t f_mesh_vertices = nullptr, f_mesh_edge_queries = nullptr, f_sp_lookup = nullptr, f_mesh_edge_valid = nullptr, f_mesh_quads = nullptr, f_mesh_triangles = nullptr; hipFunction_t f_ss_im2col3 = nullptr, f_ss_gemm_f16w = nullptr, f_ss_pixel_shuffle3 = nullptr;
 constexpr int kThreads = 256;
 constexpr int kGroupSplit = 16;  // the group norm's partial sums per group
@@ -130,7 +131,7 @@ bool init() {
         {&f_ss_im2col3, "ss_im2col3"}, {&f_ss_gemm_f16w, "ss_gemm_f16w"}, {&f_ss_pixel_shuffle3, "ss_pixel_shuffle3"},
         {&f_sp_hash_insert, "sp_hash_insert"}, {&f_sp_neighbor_map, "sp_neighbor_map"}, {&f_sp_subm_conv_f16w, "sp_subm_conv_f16w"},
         {&f_sp_c2s_mask, "sp_c2s_mask"}, {&f_sp_exclusive_scan_serial, "sp_exclusive_scan_serial"}, {&f_sp_c2s_fill, "sp_c2s_fill"}, {&f_sp_c2s_gather, "sp_c2s_gather"},
-        {&f_simp_qem, "simp_qem"}, {&f_simp_cost, "simp_cost"}, {&f_simp_propagate, "simp_propagate"}, {&f_simp_collapse, "simp_collapse"}, {&f_simp_compress_v, "simp_compress_v"}, {&f_simp_compress_f, "simp_compress_f"}, {&f_chart_face_geom, "chart_face_geom"}, {&f_chart_cones, "chart_cones"}, {&f_chart_perims, "chart_perims"}, {&f_chart_costs, "chart_costs"}, {&f_chart_propagate, "chart_propagate"}, {&f_chart_collapse, "chart_collapse"}, {&f_chart_refine, "chart_refine"}, {&f_dino_rope, "dino_rope"}, {&f_mesh_vertices, "mesh_vertices"}, {&f_mesh_edge_queries, "mesh_edge_queries"}, {&f_sp_lookup, "sp_lookup"}, {&f_mesh_edge_valid, "mesh_edge_valid"}, {&f_mesh_quads, "mesh_quads"}, {&f_mesh_triangles, "mesh_triangles"},
+        {&f_simp_qem, "simp_qem"}, {&f_simp_cost, "simp_cost"}, {&f_simp_propagate, "simp_propagate"}, {&f_simp_collapse, "simp_collapse"}, {&f_simp_compress_v, "simp_compress_v"}, {&f_simp_compress_f, "simp_compress_f"}, {&f_chart_face_geom, "chart_face_geom"}, {&f_chart_cones, "chart_cones"}, {&f_chart_perims, "chart_perims"}, {&f_chart_costs, "chart_costs"}, {&f_chart_propagate, "chart_propagate"}, {&f_chart_collapse, "chart_collapse"}, {&f_chart_refine, "chart_refine"}, {&f_attn_flash128, "attn_flash_d128"}, {&f_attn_flash64, "attn_flash_d64"}, {&f_dino_rope, "dino_rope"}, {&f_mesh_vertices, "mesh_vertices"}, {&f_mesh_edge_queries, "mesh_edge_queries"}, {&f_sp_lookup, "sp_lookup"}, {&f_mesh_edge_valid, "mesh_edge_valid"}, {&f_mesh_quads, "mesh_quads"}, {&f_mesh_triangles, "mesh_triangles"},
     };
     for (const Entry& e : entries)
         if (hipModuleGetFunction(e.f, g_mod, e.name) != hipSuccess) return false;
@@ -1463,6 +1464,19 @@ void attention_f32_strided(const float* q, long ldq, int Tq, const float* k, lon
     const int D = C / heads;
     const float scale = 1.0f / std::sqrt((float)D);
     if (Tq <= 0 || Tk <= 0) return;
+    // the fused kernel (sd_gpu.hip attn_flash_*: no score matrix in memory), for the head sizes it is built for; SD_ATTN_FLASH=0 keeps
+    // the GEMM path below
+    static const bool flash = [] {
+        const char* e = std::getenv("SD_ATTN_FLASH");
+        return !(e && std::strcmp(e, "0") == 0);
+    }();
+    if (flash && (D == 64 || D == 128)) {
+        void* a[] = {(void*)&q, (void*)&ldq, (void*)&Tq, (void*)&k, (void*)&ldk, (void*)&v, (void*)&ldv, (void*)&Tk, (void*)&C, (void*)&heads,
+                     (void*)&out, (void*)&scale};
+        launch(D == 64 ? f_attn_flash64 : f_attn_flash128, dim3((unsigned)((Tq + 63) / 64), (unsigned)heads, 1), a);
+        sync();
+        return;
+    }
     const int R = std::max(1, std::min(Tq, (int)(kScoreFloats / (size_t)Tk)));
     float* S = static_cast<float*>(alloc(sizeof(float) * (size_t)R * Tk));
     for (int hd = 0; hd < heads; ++hd)

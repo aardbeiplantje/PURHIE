@@ -39,6 +39,7 @@ struct ShapeConfig {
     int mesh_grid = 512;                     // the decode's resolution (the 512 pipeline)
     float margin = 0.5f;                     // the dual vertex margin
     float hole_perimeter = 3e-2f;            // fill_holes: the boundary loops below this perimeter are closed (0 disables)
+    bool progress = false;                   // stderr: each sampler step, flow block and decoder level as it finishes
 };
 
 struct ShapeResult {

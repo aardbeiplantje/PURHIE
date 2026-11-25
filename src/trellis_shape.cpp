@@ -276,6 +276,8 @@ bool ShapePipeline::run(const float* cond, int Lc, const NoiseFn& noise, const S
         return false;
     }
     Impl& m = *p_;
+    if (m.slat) m.slat->set_progress(cfg.progress);
+    if (m.shape_dec) m.shape_dec->set_progress(cfg.progress);
     const std::vector<float> zeros((size_t)Lc * kCond, 0.0f);  // the negative condition (get_cond: zeros_like)
 
     // 1. the sparse-structure flow, sampled from its noise; 2. its decoder and the occupied voxels at 32^3
@@ -342,6 +344,9 @@ bool ShapePipeline::run_cascade(const float* cond_lr, int Lc_lr, const float* co
         return false;
     }
     Impl& m = *p_;
+    if (m.slat) m.slat->set_progress(cfg.progress);
+    if (m.slat_hr) m.slat_hr->set_progress(cfg.progress);
+    if (m.shape_dec) m.shape_dec->set_progress(cfg.progress);
     const std::vector<float> zeros_lr((size_t)Lc_lr * kCond, 0.0f), zeros_hr((size_t)Lc_hr * kCond, 0.0f);
 
     // 1. the sparse-structure flow and its occupied voxels at 32^3 (as run)
