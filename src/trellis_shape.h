@@ -34,6 +34,7 @@ struct FlowSampler {
 struct ShapeConfig {
     FlowSampler ss;                          // sparse_structure_sampler: 12 steps, 7.5, rescale 0.7, rescale_t 5.0
     FlowSampler slat;                        // shape_slat_sampler: 12 steps, 7.5, rescale 0.5, rescale_t 3.0
+    int slat_lr_steps = 0;                   // the cascade's 512 shape-SLAT steps (0: slat.steps; the ComfyUI workflow uses 20)
     std::array<float, 32> slat_mean{};       // shape_slat_normalization
     std::array<float, 32> slat_std{};
     int mesh_grid = 512;                     // the decode's resolution (the 512 pipeline)

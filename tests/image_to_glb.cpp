@@ -100,6 +100,9 @@ int main(int argc, char** argv) {
         scfg.slat_std[c] = snorm[32 + c];
     }
     scfg.mesh_grid = res;
+    // the ComfyUI workflow (193b0901...VAZE_PROMPT_to_GLB_3d_TRELLIS.json): the 512 shape-SLAT stage runs 20 steps; the decimation to
+    // 700,000 faces (DecimateMesh) and the bake at 4096 texels (BakeTextureFromVoxel, the UnwrapMesh resolution)
+    scfg.slat_lr_steps = 20;
     trellis::TexConfig tcfg;
     tcfg.sampler.steps = 12;
     tcfg.sampler.guidance = 1.0f;
@@ -154,13 +157,13 @@ int main(int argc, char** argv) {
     attr.feats = tm.tex.out;
     attr.channels = 6;
     attr.res = res;
-    // the export in its steps, each timed (stderr, unbuffered): the simplification to python's decimation target (1,000,000 faces), the
+    // the export in its steps, each timed (stderr, unbuffered): the simplification to the workflow's 700,000 faces, the
     // unwrap, the bake, the GLB
     std::vector<float> sv = tm.shape.verts;
     std::vector<int32_t> sf = tm.shape.faces;
     auto t1 = std::chrono::steady_clock::now();
     trellis::SimplifyStats sst;
-    if (!trellis::simplify_to_faces(sv, sf, 1000000, sst, error)) {
+    if (!trellis::simplify_to_faces(sv, sf, 700000, sst, error)) {
         std::fprintf(stderr, "simplify: %s\n", error.c_str());
         return 1;
     }
@@ -177,7 +180,7 @@ int main(int argc, char** argv) {
                  cst.charts, cst.collapse_passes);
     t1 = std::chrono::steady_clock::now();
     trellis::UvMesh uvm;
-    if (!trellis::unwrap_uv_by_charts(sv, sf, chart_ids, 1024, uvm, error)) {
+    if (!trellis::unwrap_uv_by_charts(sv, sf, chart_ids, 4096, uvm, error)) {
         std::fprintf(stderr, "unwrap: %s\n", error.c_str());
         return 1;
     }
@@ -186,7 +189,7 @@ int main(int argc, char** argv) {
                  uvm.charts);
     t1 = std::chrono::steady_clock::now();
     trellis::BakedTextures bt;
-    if (!trellis::bake_textures(uvm, attr, 1024, bt, error)) {
+    if (!trellis::bake_textures(uvm, attr, 4096, bt, error)) {
         std::fprintf(stderr, "bake: %s\n", error.c_str());
         return 1;
     }

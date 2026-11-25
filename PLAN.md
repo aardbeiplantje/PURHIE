@@ -286,11 +286,20 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
     measured with the 1024 run sharing the GPU); 2e-6 relative against a double-precision reference (`tests/flash_attn_verify.cpp`).
     The DINOv3, shape-SLAT and sparse-structure checks are unchanged with it (1.4e-6, PASS, PASS). The 1024 run in progress uses
     the build from before the kernel.
-    Open: (a) the 1024 cascade on the real image: its time with the fused attention, and its GLB; (b) run the same image through
-    ComfyUI for the comparison (about 500 s there); (c) port python's to_glb clean-up (`remove_duplicate_faces`,
-    `repair_non_manifold_edges`, `remove_small_connected_components`, `unify_face_orientations`), which is not ported; (d) the chart
-    pair and chart-face sorts and the bake run on the host, to move to the device if the timings call for it; (e) check the texture
-    coverage of the 512 run (0.082) against python's bake of the same mesh.
+    The ComfyUI workflow the user supplied (`193b0901-VAZE_PROMPT_to_GLB_3d_TRELLIS.json`) runs the 1536 cascade, a RemeshMesh (udf,
+    768) before a DecimateMesh to 700,000 faces, an UnwrapMesh ("pec", 4096), a 4096 texture, and normal-map and AO bakes. The engine
+    matches the workflow's step counts and guidance for the structure (12 steps, CFG 7.5, rescale 0.7, shift 5), the high-resolution
+    shape SLAT (12 steps, rescale 0.5) and the texture (12 steps, CFG 1), but at 1024, not 1536. `image_to_glb` now uses the
+    workflow's 20-step 512 shape-SLAT stage (`ShapeConfig::slat_lr_steps`, used by the cascade only), the 700,000-face decimation and
+    the 4096 bake. A 512 run with those export settings (`example_512_workflow.glb`, 150 MB): 2.38M faces to 667k (simplify 9 s),
+    96k charts (9 s), unwrap 35 s, bake 2 s (coverage 0.37), GLB 1.5 s. Its stages ran alongside other GPU jobs (sparse structure
+    341 s, shape SLAT 304 s, texture flow 91 s), so they are not comparable with the earlier runs. The user's ComfyUI run of the
+    workflow took 1106.2 s.
+    Open: (a) the 1536 cascade: the 1024 decoder runs out of pinned memory (597 MB, after the allocator returns its cached blocks),
+    so the cascade does not finish at 1024, and 1536 needs the same fix; (b) RemeshMesh (udf, 768) before the decimation; (c) the
+    normal-map and AO bakes and their GLB inputs; (d) BiRefNet background removal and the crop to the mask; (e) UnwrapMesh's "pec"
+    segmenter (ours is CuMesh's charts); (f) python's to_glb clean-up; (g) the simplify stops below its target (667k for 700k), where
+    python's stops at it; (h) the host sorts and the bake run on the host, to move to the device if the timings call for it.
 21. **Qwen-Image 2.1 image edit (next, after TRELLIS.2).** The 2.1 DiT, text encoder and VAE run on the engine (items above
     in the Qwen-Image status), but there is no reference-image input and no edit route: `src/qwenimage21_*.cpp` has no edit
     path, and the server has no image-edit endpoint. Needs: the edit conditioning in the 2.1 DiT (how the reference image enters,

@@ -368,7 +368,9 @@ bool ShapePipeline::run_cascade(const float* cond_lr, int Lc_lr, const float* co
         if (!ok) error_ = "shape-SLAT flow (512): " + m.slat->error();
         return ok;
     };
-    if (!flow_sample(cfg.slat, lr_count, lr_vel, s.data())) {
+    FlowSampler lr_sampler = cfg.slat;
+    if (cfg.slat_lr_steps > 0) lr_sampler.steps = cfg.slat_lr_steps;
+    if (!flow_sample(lr_sampler, lr_count, lr_vel, s.data())) {
         if (error_.empty()) error_ = "shape-SLAT sampler failed";
         return false;
     }

@@ -212,7 +212,17 @@ void* alloc(size_t bytes, bool zero) {
         }
     }
     void* p = nullptr;
-    if (hipHostMalloc(&p, need, hipHostMallocDefault) != hipSuccess) throw std::runtime_error("sd device: out of pinned memory");
+    if (hipHostMalloc(&p, need, hipHostMallocDefault) != hipSuccess) {
+        // the pool keeps every released block, and a request reuses only a block at least its size: the cached blocks go back to the
+        // system, and the request is made once more
+        {
+            std::lock_guard<std::mutex> lk(g_pool_mu);
+            for (const auto& b : g_free) hipHostFree(b.p);
+            g_free.clear();
+        }
+        if (hipHostMalloc(&p, need, hipHostMallocDefault) != hipSuccess)
+            throw std::runtime_error("sd device: out of pinned memory (" + std::to_string(need) + " bytes)");
+    }
     if (zero) std::memset(p, 0, need);
     return p;
 }
