@@ -23,7 +23,7 @@ HOST_SIMD := -mavx2 -mfma -mf16c -mavx512f -mavx512vl -mavx512bw -mavx512dq
 # Device/HIP kernel flags (with offloading)
 HIPFLAGS  := -Xarch_device -mno-wavefrontsize64 -isystem $(ROCM_PATH)/include --rocm-path=$(ROCM_PATH) -O3 --offload-arch=$(ARCH) --genco -D__HIP_PLATFORM_AMD__ -D__HIP_ENABLE_AMD_HSA__
 
-LDFLAGS   := -L$(ROCM_PATH)/lib -lamdhip64 -lhsa-runtime64 -lhipblaslt -Wl,-rpath,$(ROCM_PATH)/lib
+LDFLAGS   := -L$(ROCM_PATH)/lib -lamdhip64 -lhsa-runtime64 -lhipblaslt -lpthread -Wl,-rpath,$(ROCM_PATH)/lib
 
 # `all` is the default goal; its rule is at the end of the file, after every variable it names is defined
 .DEFAULT_GOAL := all
@@ -122,6 +122,9 @@ CASCADE_VERIFY = $(BINDIR)/cascade_verify  # the engine 1024 cascade against the
 TEX_VERIFY = $(BINDIR)/tex_verify  # the engine texture path (512) against the python pipeline (/data/trellis2/oracle_tex)
 TEXTURED_VERIFY = $(BINDIR)/textured_verify  # the end-to-end textured run (512) against the python shape and texture oracles
 FILL_VERIFY = $(BINDIR)/fill_verify  # the hole filling of the mesh against CuMesh's fill_holes (/data/trellis2/oracle_fill)
+TEX1024_VERIFY = $(BINDIR)/tex1024_verify  # the 1024 texture pass of the cascade against the python pipeline (/data/trellis2/oracle_tex1024)
+BAKE_VERIFY = $(BINDIR)/bake_verify  # the UV unwrap, the baked texture and the GLB on the python mesh and texture (/data/trellis2/oracle_fill)
+TEXTURED_GLB_VERIFY = $(BINDIR)/textured_glb_verify  # the end-to-end textured output (512 or 1024 cascade) as a GLB
 AUDIOLDM2_T5_VERIFY = $(BINDIR)/audioldm2_t5_verify  # the T5 encoder stage check (/data/audioldm2-stages)
 AUDIOLDM2_CLAP_VERIFY = $(BINDIR)/audioldm2_clap_verify  # the CLAP text encoder stage check (/data/audioldm2-stages)
 AUDIOLDM2_PROJECTION_VERIFY = $(BINDIR)/audioldm2_projection_verify  # the projection stage check (/data/audioldm2-stages)
@@ -391,7 +394,7 @@ uninstall:
 	rm -f $(INSTALL_PKGCONFIGDIR)/rocm-inference.pc
 
 # Phase 4: Qwen 3 model static library
-QWEN_SRCS = $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_ops.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/deltanet.cpp $(SRCDIR)/attention.cpp $(SRCDIR)/gpu_ops.cpp $(SRCDIR)/kernel_loader.cpp $(SRCDIR)/glm5_ref.cpp $(SRCDIR)/glm5_gpu.cpp $(SRCDIR)/expert_cpu.cpp $(SRCDIR)/vision.cpp $(SRCDIR)/image.cpp $(SRCDIR)/mrope.cpp $(SRCDIR)/whisper.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/audio.cpp $(SRCDIR)/sd.cpp $(SRCDIR)/sd_device.cpp $(SRCDIR)/minimax_vae.cpp $(SRCDIR)/minimax_dit.cpp $(SRCDIR)/minimax_pipe.cpp $(SRCDIR)/safetensors_mmap.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_speech.cpp $(SRCDIR)/zimage_dit.cpp $(SRCDIR)/zimage_vae.cpp $(SRCDIR)/zimage_text.cpp $(SRCDIR)/zimage_pipe.cpp $(SRCDIR)/audioldm2_gpt2.cpp $(SRCDIR)/audioldm2_projection.cpp $(SRCDIR)/audioldm2_clap.cpp $(SRCDIR)/audioldm2_t5.cpp $(SRCDIR)/audioldm2_unet.cpp $(SRCDIR)/audioldm2_vae.cpp $(SRCDIR)/audioldm2_vocoder.cpp $(SRCDIR)/audioldm2_pipeline.cpp $(SRCDIR)/audioldm2_tokenizer.cpp $(SRCDIR)/audioldm2_api.cpp $(SRCDIR)/qwenimage_text.cpp $(SRCDIR)/qwenimage_dit.cpp $(SRCDIR)/qwenimage_vae.cpp $(SRCDIR)/qwenimage_pipe.cpp $(SRCDIR)/qwenimage21_dit.cpp $(SRCDIR)/qwenimage21_text.cpp $(SRCDIR)/qwenimage21_vae.cpp $(SRCDIR)/trellis_ss.cpp $(SRCDIR)/trellis_ss_dec.cpp $(SRCDIR)/trellis_slat.cpp $(SRCDIR)/trellis_sdec.cpp $(SRCDIR)/trellis_mesh.cpp $(SRCDIR)/trellis_shape.cpp $(SRCDIR)/trellis_tex.cpp $(SRCDIR)/trellis_fill.cpp
+QWEN_SRCS = $(SRCDIR)/qwen_model.cpp $(SRCDIR)/qwen_ops.cpp $(SRCDIR)/qmatvec.cpp $(SRCDIR)/deltanet.cpp $(SRCDIR)/attention.cpp $(SRCDIR)/gpu_ops.cpp $(SRCDIR)/kernel_loader.cpp $(SRCDIR)/glm5_ref.cpp $(SRCDIR)/glm5_gpu.cpp $(SRCDIR)/expert_cpu.cpp $(SRCDIR)/vision.cpp $(SRCDIR)/image.cpp $(SRCDIR)/mrope.cpp $(SRCDIR)/whisper.cpp $(SRCDIR)/mel.cpp $(SRCDIR)/audio.cpp $(SRCDIR)/sd.cpp $(SRCDIR)/sd_device.cpp $(SRCDIR)/minimax_vae.cpp $(SRCDIR)/minimax_dit.cpp $(SRCDIR)/minimax_pipe.cpp $(SRCDIR)/safetensors_mmap.cpp $(SRCDIR)/qwen3tts.cpp $(SRCDIR)/qwen3tts_codec.cpp $(SRCDIR)/qwen3tts_speech.cpp $(SRCDIR)/zimage_dit.cpp $(SRCDIR)/zimage_vae.cpp $(SRCDIR)/zimage_text.cpp $(SRCDIR)/zimage_pipe.cpp $(SRCDIR)/audioldm2_gpt2.cpp $(SRCDIR)/audioldm2_projection.cpp $(SRCDIR)/audioldm2_clap.cpp $(SRCDIR)/audioldm2_t5.cpp $(SRCDIR)/audioldm2_unet.cpp $(SRCDIR)/audioldm2_vae.cpp $(SRCDIR)/audioldm2_vocoder.cpp $(SRCDIR)/audioldm2_pipeline.cpp $(SRCDIR)/audioldm2_tokenizer.cpp $(SRCDIR)/audioldm2_api.cpp $(SRCDIR)/qwenimage_text.cpp $(SRCDIR)/qwenimage_dit.cpp $(SRCDIR)/qwenimage_vae.cpp $(SRCDIR)/qwenimage_pipe.cpp $(SRCDIR)/qwenimage21_dit.cpp $(SRCDIR)/qwenimage21_text.cpp $(SRCDIR)/qwenimage21_vae.cpp $(SRCDIR)/trellis_ss.cpp $(SRCDIR)/trellis_ss_dec.cpp $(SRCDIR)/trellis_slat.cpp $(SRCDIR)/trellis_sdec.cpp $(SRCDIR)/trellis_mesh.cpp $(SRCDIR)/trellis_shape.cpp $(SRCDIR)/trellis_tex.cpp $(SRCDIR)/trellis_fill.cpp $(SRCDIR)/trellis_bake.cpp third_party/xatlas/xatlas.cpp
 QWEN_HDRS = $(SRCDIR)/whisper.h $(SRCDIR)/mel.h $(SRCDIR)/qwen3tts.h $(SRCDIR)/qwen3tts_codec.h $(SRCDIR)/qwen3tts_speech.h $(SRCDIR)/vision.h $(SRCDIR)/image.h $(SRCDIR)/mrope.h $(SRCDIR)/third_party/stb_image.h $(SRCDIR)/expert_pager.h $(SRCDIR)/expert_cpu.h $(SRCDIR)/qwen_model.h $(SRCDIR)/qwen_ops.h $(SRCDIR)/qmatvec.h $(SRCDIR)/deltanet.h $(SRCDIR)/attention.h $(SRCDIR)/gpu_ops.h $(SRCDIR)/inference_internal.h $(SRCDIR)/kernel_loader.h $(SRCDIR)/inference_log.h $(SRCDIR)/glm5_ref.h $(SRCDIR)/glm5_gpu.h
 # The engine's code objects, embedded in the library (kernels_embed.S, loaded by kernel_loader.cpp)
 ENGINE_COS = $(CODIR)/matvec_q.co $(CODIR)/gpu_ops.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/glm5_gpu.co $(CODIR)/talker_gpu.co $(CODIR)/sd_gpu.co $(CODIR)/minimax_vae.co $(CODIR)/codec_gpu.co
@@ -443,6 +446,8 @@ $(QWEN_MODEL_LIB): $(QWEN_SRCS) $(QWEN_HDRS) $(SRCDIR)/inference.h $(SRCDIR)/ggu
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/trellis_shape.cpp -o $(OBJDIR)/trellis_shape.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/trellis_tex.cpp -o $(OBJDIR)/trellis_tex.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/trellis_fill.cpp -o $(OBJDIR)/trellis_fill.o
+	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -Ithird_party/xatlas -fPIC -c $(SRCDIR)/trellis_bake.cpp -o $(OBJDIR)/trellis_bake.o
+	$(CLANG) $(CXXFLAGS) -O2 -pthread -fPIC -c third_party/xatlas/xatlas.cpp -o $(OBJDIR)/xatlas.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/zimage_pipe.cpp -o $(OBJDIR)/zimage_pipe.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/qwenimage_text.cpp -o $(OBJDIR)/qwenimage_text.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/qwenimage_dit.cpp -o $(OBJDIR)/qwenimage_dit.o
@@ -455,7 +460,7 @@ $(QWEN_MODEL_LIB): $(QWEN_SRCS) $(QWEN_HDRS) $(SRCDIR)/inference.h $(SRCDIR)/ggu
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/qwen3tts_codec.cpp -o $(OBJDIR)/qwen3tts_codec.o
 	$(CLANG) $(CXXFLAGS) $(HOST_SIMD) -fopenmp -I. -fPIC -c $(SRCDIR)/qwen3tts_speech.cpp -o $(OBJDIR)/qwen3tts_speech.o
 	rm -f $@
-	ar rcs $@ $(OBJDIR)/qwen_model.o $(OBJDIR)/qwen_ops.o $(OBJDIR)/qmatvec.o $(OBJDIR)/deltanet.o $(OBJDIR)/attention.o $(OBJDIR)/gpu_ops.o $(OBJDIR)/kernel_loader.o $(OBJDIR)/glm5_ref.o $(OBJDIR)/glm5_gpu.o $(OBJDIR)/expert_cpu.o $(OBJDIR)/vision.o $(OBJDIR)/image.o $(OBJDIR)/mrope.o $(OBJDIR)/whisper.o $(OBJDIR)/mel.o $(OBJDIR)/audio.o $(OBJDIR)/sd.o $(OBJDIR)/sd_device.o $(OBJDIR)/minimax_vae.o $(OBJDIR)/minimax_dit.o $(OBJDIR)/minimax_pipe.o $(OBJDIR)/safetensors_mmap.o $(OBJDIR)/qwen3tts.o $(OBJDIR)/qwen3tts_codec.o $(OBJDIR)/qwen3tts_speech.o $(OBJDIR)/kernels_embed.o $(OBJDIR)/zimage_dit.o $(OBJDIR)/zimage_vae.o $(OBJDIR)/zimage_text.o $(OBJDIR)/zimage_pipe.o $(OBJDIR)/audioldm2_gpt2.o $(OBJDIR)/audioldm2_projection.o $(OBJDIR)/audioldm2_clap.o $(OBJDIR)/audioldm2_t5.o $(OBJDIR)/audioldm2_unet.o $(OBJDIR)/audioldm2_vae.o $(OBJDIR)/audioldm2_vocoder.o $(OBJDIR)/audioldm2_pipeline.o $(OBJDIR)/audioldm2_tokenizer.o $(OBJDIR)/audioldm2_api.o $(OBJDIR)/qwenimage_text.o $(OBJDIR)/qwenimage_dit.o $(OBJDIR)/qwenimage_vae.o $(OBJDIR)/qwenimage_pipe.o $(OBJDIR)/qwenimage21_dit.o $(OBJDIR)/qwenimage21_text.o $(OBJDIR)/qwenimage21_vae.o $(OBJDIR)/trellis_ss.o $(OBJDIR)/trellis_ss_dec.o $(OBJDIR)/trellis_slat.o $(OBJDIR)/trellis_sdec.o $(OBJDIR)/trellis_mesh.o $(OBJDIR)/trellis_shape.o $(OBJDIR)/trellis_tex.o $(OBJDIR)/trellis_fill.o
+	ar rcs $@ $(OBJDIR)/qwen_model.o $(OBJDIR)/qwen_ops.o $(OBJDIR)/qmatvec.o $(OBJDIR)/deltanet.o $(OBJDIR)/attention.o $(OBJDIR)/gpu_ops.o $(OBJDIR)/kernel_loader.o $(OBJDIR)/glm5_ref.o $(OBJDIR)/glm5_gpu.o $(OBJDIR)/expert_cpu.o $(OBJDIR)/vision.o $(OBJDIR)/image.o $(OBJDIR)/mrope.o $(OBJDIR)/whisper.o $(OBJDIR)/mel.o $(OBJDIR)/audio.o $(OBJDIR)/sd.o $(OBJDIR)/sd_device.o $(OBJDIR)/minimax_vae.o $(OBJDIR)/minimax_dit.o $(OBJDIR)/minimax_pipe.o $(OBJDIR)/safetensors_mmap.o $(OBJDIR)/qwen3tts.o $(OBJDIR)/qwen3tts_codec.o $(OBJDIR)/qwen3tts_speech.o $(OBJDIR)/kernels_embed.o $(OBJDIR)/zimage_dit.o $(OBJDIR)/zimage_vae.o $(OBJDIR)/zimage_text.o $(OBJDIR)/zimage_pipe.o $(OBJDIR)/audioldm2_gpt2.o $(OBJDIR)/audioldm2_projection.o $(OBJDIR)/audioldm2_clap.o $(OBJDIR)/audioldm2_t5.o $(OBJDIR)/audioldm2_unet.o $(OBJDIR)/audioldm2_vae.o $(OBJDIR)/audioldm2_vocoder.o $(OBJDIR)/audioldm2_pipeline.o $(OBJDIR)/audioldm2_tokenizer.o $(OBJDIR)/audioldm2_api.o $(OBJDIR)/qwenimage_text.o $(OBJDIR)/qwenimage_dit.o $(OBJDIR)/qwenimage_vae.o $(OBJDIR)/qwenimage_pipe.o $(OBJDIR)/qwenimage21_dit.o $(OBJDIR)/qwenimage21_text.o $(OBJDIR)/qwenimage21_vae.o $(OBJDIR)/trellis_ss.o $(OBJDIR)/trellis_ss_dec.o $(OBJDIR)/trellis_slat.o $(OBJDIR)/trellis_sdec.o $(OBJDIR)/trellis_mesh.o $(OBJDIR)/trellis_shape.o $(OBJDIR)/trellis_tex.o $(OBJDIR)/trellis_fill.o $(OBJDIR)/trellis_bake.o $(OBJDIR)/xatlas.o
 
 # Phase 4: Qwen 3 demo binary
 $(QWEN_DEMO): $(SRCDIR)/demo_qwen.cpp $(QWEN_MODEL_LIB) $(INFERENCE_LIB) $(CODIR)/matvec_q.co $(CODIR)/deltanet.co $(CODIR)/attention.co $(CODIR)/gpu_ops.co
@@ -701,3 +706,12 @@ $(TEXTURED_VERIFY): $(TESTSDIR)/textured_verify.cpp $(SRCDIR)/trellis_tex.cpp $(
 
 $(FILL_VERIFY): $(TESTSDIR)/fill_verify.cpp $(SRCDIR)/trellis_fill.cpp $(SRCDIR)/trellis_fill.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
 	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/fill_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
+
+$(TEX1024_VERIFY): $(TESTSDIR)/tex1024_verify.cpp $(SRCDIR)/trellis_tex.cpp $(SRCDIR)/trellis_tex.h $(SRCDIR)/trellis_shape.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) -I. $(TESTSDIR)/tex1024_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
+
+$(BAKE_VERIFY): $(TESTSDIR)/bake_verify.cpp $(SRCDIR)/trellis_bake.cpp $(SRCDIR)/trellis_bake.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) -I. -Ithird_party/xatlas $(TESTSDIR)/bake_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@
+
+$(TEXTURED_GLB_VERIFY): $(TESTSDIR)/textured_glb_verify.cpp $(SRCDIR)/trellis_bake.h $(SRCDIR)/trellis_tex.h $(QWEN_MODEL_LIB) $(INFERENCE_LIB)
+	$(CLANG) $(CXXFLAGS) -I. -Ithird_party/xatlas $(TESTSDIR)/textured_glb_verify.cpp -Wl,--start-group $(QWEN_MODEL_LIB) $(INFERENCE_LIB) -Wl,--end-group $(LDFLAGS) -o $@

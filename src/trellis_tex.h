@@ -33,7 +33,8 @@ struct TexResult {
 class TexturePipeline {
 public:
     // tex_flow: the 512 texture flow (64 input channels); tex_dec: the texture decoder (6 outputs, guided).
-    TexturePipeline(const std::string& tex_flow, const std::string& tex_dec);
+    // tex_flow_hr: the 1024 texture flow (optional; the cascade's texture pass uses it with hr = true).
+    TexturePipeline(const std::string& tex_flow, const std::string& tex_dec, const std::string& tex_flow_hr = std::string());
     ~TexturePipeline();
     TexturePipeline(const TexturePipeline&) = delete;
     TexturePipeline& operator=(const TexturePipeline&) = delete;
@@ -42,7 +43,7 @@ public:
     const std::string& error() const { return error_; }
 
     // The texture flow's single forward (a stage check): x64 is [n][64] (noise | normalised shape latent), out [n][32].
-    bool flow_forward(const int32_t* coords, int n, const float* x64, const float* cond, int Lc, float t, float* out);
+    bool flow_forward(const int32_t* coords, int n, const float* x64, const float* cond, int Lc, float t, float* out, bool hr = false);
 
     // The texture decoder alone: tex_slat [n][32] (de-normalised) on the voxels coords, guided by the shape decoder's subdivisions.
     bool decode(const int32_t* coords, int n, const float* tex_slat, const std::vector<Subdivision>& subs, TexResult& out);
@@ -50,7 +51,7 @@ public:
     // The texture: coords [n][4] and shape_slat [n][32] (de-normalised) of the shape, its subdivisions subs (ShapeDecoder::forward's
     // subs_out), cond [Lc][1024] (the image features). The noise is drawn once: [n][32].
     bool run(const int32_t* coords, int n, const float* shape_slat, const std::vector<Subdivision>& subs, const float* cond, int Lc,
-             const NoiseFn& noise, const TexConfig& cfg, TexResult& out);
+             const NoiseFn& noise, const TexConfig& cfg, TexResult& out, bool hr = false);
 
 private:
     struct Impl;
@@ -72,5 +73,11 @@ struct TexturedMesh {
 // features, which the shape and the texture both take).
 bool run_textured(ShapePipeline& shape, TexturePipeline& tex, const float* cond, int Lc, const NoiseFn& noise, const ShapeConfig& scfg,
                   const TexConfig& tcfg, TexturedMesh& out, std::string& error);
+
+// The 1024 cascade with its texture pass: the cascade's shape (run_cascade), the 1024 texture flow on the 64^3 voxels (with the 1024
+// image features cond_hr [Lc_hr][1024]) and the decoder's subdivisions of the 1024 decode, then the colours. noise is called four times:
+// the sparse-structure latent, the 512 shape latent, the 1024 shape latent, the 1024 texture latent.
+bool run_textured_cascade(ShapePipeline& shape, TexturePipeline& tex, const float* cond_lr, int Lc_lr, const float* cond_hr, int Lc_hr,
+                          const NoiseFn& noise, const ShapeConfig& scfg, const TexConfig& tcfg, TexturedMesh& out, std::string& error);
 
 }  // namespace trellis

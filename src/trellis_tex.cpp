@@ -22,14 +22,22 @@ double seconds_since(std::chrono::steady_clock::time_point t0) {
 
 struct TexturePipeline::Impl {
     std::unique_ptr<SlatFlow> flow;
+    std::unique_ptr<SlatFlow> flow_hr;  // the 1024 texture flow (optional)
     std::unique_ptr<ShapeDecoder> dec;
 };
 
-TexturePipeline::TexturePipeline(const std::string& tex_flow, const std::string& tex_dec) : p_(new Impl) {
+TexturePipeline::TexturePipeline(const std::string& tex_flow, const std::string& tex_dec, const std::string& tex_flow_hr) : p_(new Impl) {
     p_->flow.reset(new SlatFlow(tex_flow, kIn));
     if (!p_->flow->ok()) {
         error_ = "texture flow: " + p_->flow->error();
         return;
+    }
+    if (!tex_flow_hr.empty()) {
+        p_->flow_hr.reset(new SlatFlow(tex_flow_hr, kIn));
+        if (!p_->flow_hr->ok()) {
+            error_ = "1024 texture flow: " + p_->flow_hr->error();
+            return;
+        }
     }
     p_->dec.reset(new ShapeDecoder(tex_dec, kOut, true));
     if (!p_->dec->ok()) {
@@ -41,14 +49,19 @@ TexturePipeline::TexturePipeline(const std::string& tex_flow, const std::string&
 
 TexturePipeline::~TexturePipeline() = default;
 
-bool TexturePipeline::flow_forward(const int32_t* coords, int n, const float* x64, const float* cond, int Lc, float t, float* out) {
+bool TexturePipeline::flow_forward(const int32_t* coords, int n, const float* x64, const float* cond, int Lc, float t, float* out, bool hr) {
     error_.clear();
     if (!ok_) {
         error_ = "the texture pipeline is not open";
         return false;
     }
-    if (!p_->flow->forward(coords, n, x64, t, cond, Lc, out)) {
-        error_ = "texture flow: " + p_->flow->error();
+    SlatFlow* fl = hr ? p_->flow_hr.get() : p_->flow.get();
+    if (!fl) {
+        error_ = "no 1024 texture flow was opened";
+        return false;
+    }
+    if (!fl->forward(coords, n, x64, t, cond, Lc, out)) {
+        error_ = "texture flow: " + fl->error();
         return false;
     }
     return true;
@@ -85,7 +98,7 @@ bool TexturePipeline::decode(const int32_t* coords, int n, const float* tex_slat
 }
 
 bool TexturePipeline::run(const int32_t* coords, int n, const float* shape_slat, const std::vector<Subdivision>& subs, const float* cond,
-                          int Lc, const NoiseFn& noise, const TexConfig& cfg, TexResult& out) {
+                          int Lc, const NoiseFn& noise, const TexConfig& cfg, TexResult& out, bool hr) {
     error_.clear();
     if (!ok_) {
         error_ = "the texture pipeline is not open";
@@ -93,6 +106,11 @@ bool TexturePipeline::run(const int32_t* coords, int n, const float* shape_slat,
     }
     if (n <= 0 || Lc <= 0) {
         error_ = "no voxels or no image features";
+        return false;
+    }
+    SlatFlow* fl = hr ? p_->flow_hr.get() : p_->flow.get();
+    if (!fl) {
+        error_ = "no 1024 texture flow was opened";
         return false;
     }
     const size_t cnt = (size_t)n * kLat;
@@ -112,8 +130,8 @@ bool TexturePipeline::run(const int32_t* coords, int n, const float* shape_slat,
             std::memcpy(&in64[(size_t)i * kIn], xx + (size_t)i * kLat, sizeof(float) * kLat);
             std::memcpy(&in64[(size_t)i * kIn + kLat], &shape_n[(size_t)i * kLat], sizeof(float) * kLat);
         }
-        const bool ok = p_->flow->forward(coords, n, in64.data(), t, cond, Lc, v);
-        if (!ok) error_ = "texture flow: " + p_->flow->error();
+        const bool ok = fl->forward(coords, n, in64.data(), t, cond, Lc, v);
+        if (!ok) error_ = "texture flow: " + fl->error();
         return ok;
     };
     auto t0 = std::chrono::steady_clock::now();
@@ -132,17 +150,8 @@ bool TexturePipeline::run(const int32_t* coords, int n, const float* shape_slat,
     return decode(coords, n, out.tex_slat.data(), subs, out);
 }
 
-bool run_textured(ShapePipeline& shape, TexturePipeline& tex, const float* cond, int Lc, const NoiseFn& noise, const ShapeConfig& scfg,
-                  const TexConfig& tcfg, TexturedMesh& out, std::string& error) {
-    if (!shape.run(cond, Lc, noise, scfg, out.shape)) {
-        error = "shape: " + shape.error();
-        return false;
-    }
-    const int N = (int)(out.shape.coords.size() / 4);
-    if (!tex.run(out.shape.coords.data(), N, out.shape.slat.data(), out.shape.subs, cond, Lc, noise, tcfg, out.tex)) {
-        error = "texture: " + tex.error();
-        return false;
-    }
+// The decoder's voxels and the mesh: the colours of the vertices from the texture rows.
+static bool colour_vertices(TexturedMesh& out, std::string& error) {
     const size_t M = out.shape.dec_coords.size() / 4;
     if (out.tex.coords != out.shape.dec_coords || out.tex.out.size() != M * 6 || out.shape.verts.size() < M * 3) {
         error = "the texture voxels or the vertices differ from the shape decoder's voxels";
@@ -173,6 +182,35 @@ bool run_textured(ShapePipeline& shape, TexturePipeline& tex, const float* cond,
         for (int c = 0; c < 3; ++c)
             out.colors[(M + nv) * 3 + c] = cnt[nv] > 0 ? (float)(acc[nv * 3 + c] / cnt[nv]) : 0.0f;
     return true;
+}
+
+bool run_textured(ShapePipeline& shape, TexturePipeline& tex, const float* cond, int Lc, const NoiseFn& noise, const ShapeConfig& scfg,
+                  const TexConfig& tcfg, TexturedMesh& out, std::string& error) {
+    if (!shape.run(cond, Lc, noise, scfg, out.shape)) {
+        error = "shape: " + shape.error();
+        return false;
+    }
+    const int N = (int)(out.shape.coords.size() / 4);
+    if (!tex.run(out.shape.coords.data(), N, out.shape.slat.data(), out.shape.subs, cond, Lc, noise, tcfg, out.tex)) {
+        error = "texture: " + tex.error();
+        return false;
+    }
+    return colour_vertices(out, error);
+}
+
+bool run_textured_cascade(ShapePipeline& shape, TexturePipeline& tex, const float* cond_lr, int Lc_lr, const float* cond_hr, int Lc_hr,
+                          const NoiseFn& noise, const ShapeConfig& scfg, const TexConfig& tcfg, TexturedMesh& out, std::string& error) {
+    if (!shape.run_cascade(cond_lr, Lc_lr, cond_hr, Lc_hr, noise, scfg, out.shape)) {
+        error = "cascade: " + shape.error();
+        return false;
+    }
+    // the 1024 texture pass: the 64^3 voxels, their 1024 shape latent and the 1024 decode's subdivisions, the 1024 image features
+    const int K = (int)(out.shape.hr_coords.size() / 4);
+    if (!tex.run(out.shape.hr_coords.data(), K, out.shape.hr_slat.data(), out.shape.subs, cond_hr, Lc_hr, noise, tcfg, out.tex, true)) {
+        error = "texture (1024): " + tex.error();
+        return false;
+    }
+    return colour_vertices(out, error);
 }
 
 }  // namespace trellis
