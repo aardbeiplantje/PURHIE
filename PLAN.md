@@ -326,7 +326,15 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
     (memory is no longer the limit; its time is); (c) the normal-map and AO bakes and their GLB inputs; (d) UnwrapMesh's "pec"
     segmenter (ours is CuMesh's charts); (e) python's to_glb clean-up; (f) the simplify stops below its target (667k for 700k), where
     python's stops at it; (g) the unwrap (74 s on the vase: xatlas per chart, single-threaded) and the host sorts, to move to the
-    device or threads; (h) RemeshMesh (udf, 768) only if wanted: the user prefers the sharper result without it.
+    device or threads; (h) RemeshMesh (udf, 768) only if wanted: the user prefers the sharper result without it; (i) access by
+    the harness's login (waits on the user: when this project joins the AI harness, `./aicli.git`, or its token is accepted by
+    purhie.aardbeiplantje.link). The harness's auth service (`aicli.git/auth.pl`) signs an RS256 JWT (cookie `aicli_jwt` or a
+    Bearer token; claims `sub`, `roles`, `acct`: the account's uuid, `sid`, `exp`, `aud` for API tokens) and its nginx checks it
+    with `auth_request` to `/auth/verify` (200 with `X-User`, `X-Roles`, `X-Account`). Then: this nginx checks the token the same
+    way (or with the harness's public key), sets `X-Remote-User` from `X-User` and drops the client's; the models go to
+    `/scratch/<acct>/<job>/model.glb`; `/rocm-files/<acct>/...` is served only to a token whose `acct` is that directory (the
+    login token names the directory, not the job). Until then: random job ids, jobs per `X-Remote-User`, the internal files
+    location (the identity is only as good as the proxy that sets the header).
 21. **Qwen-Image 2.1 image edit (next, after TRELLIS.2).** The 2.1 DiT, text encoder and VAE run on the engine (items above
     in the Qwen-Image status), but there is no reference-image input and no edit route: `src/qwenimage21_*.cpp` has no edit
     path, and the server has no image-edit endpoint. Needs: the edit conditioning in the 2.1 DiT (how the reference image enters,
