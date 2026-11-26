@@ -195,11 +195,20 @@ run alone on the machine.
       CAD-Coder (MIT; LLaVA-1.5 type; an image to CadQuery; GenCAD-Code, 163k pairs). Text to CadQuery fine-tunes up to 7B;
       CADFusion (Microsoft, research); STEP-LLM (text to STEP; code public, weights unclear). They know the datasets'
       mechanical parts (sketch and extrude, holes, fillets), not organic shapes (TRELLIS's).
+    - Blender Python (`bpy`, meshes rather than CAD: free-form and organic shapes, materials, scenes): BlenderLLM
+      (FreedomIntelligence; Qwen2.5-Coder-7B fine-tuned on BlendNet; weights' licence to check), MeshCoder (NeurIPS 2025;
+      a point cloud through a triplane tokenizer to a Llama-3.2-1B LoRA writing part-based Blender code; release not
+      confirmed), LL3M (no trained model: planner, Blender-doc retrieval, coder and a critic that renders and fixes, over
+      stock LLMs), and blender-mcp (MIT: an LLM drives Blender over MCP; it runs the generated code unguarded, so a sandbox
+      is needed). Fits the same harness tool shape as (a): Blender headless (`blender -b --python`) in the sandbox, the
+      render back to the vision model.
     - PCB: no open model designs a board. PCBSchemaGen (a frozen LLM writes SKiDL, benchmarks on GitHub), SchGen (fine-tuned,
       82% valid circuits; weights not confirmed), PCBRouteAgent (routing by agents; large boards still fail). Placement and
       routing: KiCad, Freerouting (open), Quilter and DeepPCB (commercial). Konnect: KiCad tools for an LLM over MCP.
+    - The user agrees with this analysis (2026-11-26).
     - Options: (a) tools in the harness (aicli, the user's to approve): a `cad` tool running OpenSCAD or CadQuery code in the
-      sandbox to STL/STEP plus a rendered view for the vision model to check, and SKiDL / kicad-cli / Freerouting for boards;
+      sandbox to STL/STEP plus a rendered view for the vision model to check, a `blender` tool the same way for meshes, and
+      SKiDL / kicad-cli / Freerouting for boards;
       the local chat models write the code (no new model on the engine). (b) cadrille on the engine (Qwen2-VL-2B and a point
       encoder): an image, or TRELLIS's mesh as points, to editable CadQuery. (c) CAD-Recode (non-commercial licence).
 
