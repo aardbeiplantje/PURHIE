@@ -778,7 +778,11 @@ my %IMAGE_INFO = (
             format => { type => 'string', default => 'glb', values => ['glb', 'stl'],
                         note => 'stl: a binary STL of the mesh (no texture), z up, for 3D printing' },
             size_mm => { type => 'number', default => 100, min => 0, max => 100000,
-                         note => "the STL's largest side in millimetres (0: the mesh's own units, a unit cube)" } },
+                         note => "the STL's largest side in millimetres (0: the mesh's own units, a unit cube)" },
+            hollow_mm => { type => 'number', default => 0, min => 0, max => 1000,
+                           note => 'stl: hollow, the walls this thick in millimetres (0: solid; cheaper to print)' },
+            drain_mm => { type => 'number', default => 3, min => 0, max => 1000,
+                          note => "with hollow_mm: each hollow's drain hole, this wide, from its lowest point down (0: none)" } },
     },
     'z-image-turbo' => {
         description => 'Text to image with Z-Image-Turbo (--zimage: the ComfyUI files). Nine steps, the default size 1024 x 1024.',
@@ -1716,9 +1720,15 @@ route::post '/v1/3d/generations' => sub {
     $texture = ($texture eq 'true' || $texture eq '1') && $fmt eq 'glb' ? 1 : 0;  # (an STL has none)
     my $size = $p->{size_mm} // 100;
     error(400, 'size_mm: a number from 0 to 100000') unless $size =~ /\A\d+(?:\.\d+)?\z/ && $size <= 100000;
+    my $hollow = $p->{hollow_mm} // 0;
+    error(400, 'hollow_mm: a number from 0 to 1000') unless $hollow =~ /\A\d+(?:\.\d+)?\z/ && $hollow <= 1000;
+    my $drain = $p->{drain_mm} // 3;
+    error(400, 'drain_mm: a number from 0 to 1000') unless $drain =~ /\A\d+(?:\.\d+)?\z/ && $drain <= 1000;
+    error(400, 'hollow_mm is for format stl, with size_mm above 0') if $hollow > 0 && ($fmt ne 'stl' || $size == 0);
     my %opts = (resolution => 0 + $res, seed => 0 + $seed, faces => 0 + $faces, texture_size => 0 + $tex,
                 remove_background => $rb eq 'auto' ? 'auto' : ($rb eq 'true' || $rb eq '1') ? 1 : 0,
-                texture => $texture, format => $fmt, ($fmt eq 'stl' ? (size_mm => 0 + $size) : ()));
+                texture => $texture, format => $fmt, ($fmt eq 'stl' ? (size_mm => 0 + $size) : ()),
+                ($hollow > 0 ? (hollow_mm => 0 + $hollow, drain_mm => 0 + $drain) : ()));
     my $T = eval { aux_get('trellis2') } or error(500, '3D model: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r), 'server_error');
     my $started = eval { $T->start($image, %opts) };
     if (!defined $started && $@ =~ /cannot be decoded/) {  # WebP and the other formats stb_image does not read: through ffmpeg, as PNG
@@ -1737,7 +1747,8 @@ route::post '/v1/3d/generations' => sub {
     $a->{used} = ++$stamp;
     $LOG->info('request', event => '3d', msg => sprintf('%s: started, %d bytes of image, resolution %d, seed %d, %d faces, %s, background %s',
                                                     $id, length $image, $res, $seed, $faces,
-                                                    $fmt eq 'stl' ? "STL of ${size} mm" : $texture ? "GLB with a $tex texture" : 'GLB of the mesh', $rb));
+                                                    $fmt eq 'stl' ? "STL of ${size} mm" . ($hollow > 0 ? ", hollow ($hollow mm walls, $drain mm drains)" : '')
+                                                                  : $texture ? "GLB with a $tex texture" : 'GLB of the mesh', $rb));
     return job3d_entry($JOB3D{$id});
 };
 
@@ -2603,10 +2614,14 @@ simplification's target), C<texture_size> (4096), C<remove_background> (C<auto>:
 one, else BiRefNet; C<true>; C<false>: the whole image), C<texture> (C<true>; C<false>: the mesh alone, without the texture
 flow, the unwrap and the bake, so faster), C<format> (C<glb>; C<stl>: a binary STL of the mesh, no texture, for 3D printing:
 z up, every face wound counter-clockwise from outside, centred on x and y and standing on z = 0) and C<size_mm> (the STL's
-largest side in millimetres, 100; 0 keeps the mesh's own units, a unit cube). Without texture (the mesh alone, the STL) the
-mesh is rebuilt as a closed solid first (src/trellis_solid.h): the mesher's surface has holes, faces turned inward and loose
-pieces; the solid's surface is closed, every edge shared by two faces, wound outward, on a grid of 512 cells across the object
-(holes in the mesh up to about 6% of its size are closed; a few seconds). A job takes minutes (about 3.5 at 512 on this machine), so the reply
+largest side in millimetres, 100; 0 keeps the mesh's own units, a unit cube), C<hollow_mm> (an STL: hollow, the walls this
+thick, 0 for solid, the default; cheaper and lighter to print) and C<drain_mm> (with C<hollow_mm>: each hollow gets a drain
+hole this wide, 3 by default, from its lowest point straight down through the bottom, so resin drains and air gets in; 0 for
+none). Without texture (the mesh alone, the STL) the mesh is rebuilt as a closed solid first (src/trellis_solid.h): the
+mesher's surface has holes, faces turned inward and loose pieces; the solid's surface is closed, every edge shared by two
+faces, wound outward, on a grid of 512 cells across the object (a few seconds). Openings wider than about 1.6% of the object's
+size stay open (a whistle's mouth, a vase's inside); narrower holes are closed, and wider ones only when the result would
+otherwise be a thin shell (the fill went in through a hole in the model: up to about 6%). A job takes minutes (about 3.5 at 512 on this machine), so the reply
 comes at once with the job's C<id>: C<GET /v1/3d/generations/{id}> is its state (C<in_progress> with the stage and its step,
 C<completed>, C<failed> with the error), C<GET /v1/3d/generations/{id}/content> is the model (C<model/gltf-binary>, or
 C<model/stl> for an STL: a file in

@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <limits>
 
 namespace trellis {
@@ -159,6 +160,102 @@ void drop_small_pieces(std::vector<float>& v, std::vector<int32_t>& f, double mi
     f.swap(nf);
     st.faces = (int)(f.size() / 3);
     st.verts = (int)(v.size() / 3);
+}
+
+// the hollow's depth in cells, as a distance to the outside: the outside (the fill) keeps close cells from the wall's points, the
+// outermost of which lie up to iso out from the mesh, where the surface is: so it is about close - iso from the surface (0 to half
+// a cell more where the grid does not line up), and the empty inside starts the wall further in (+ a quarter cell, the middle)
+float hollow_depth(const SolidConfig& cfg, const Grid& g) { return cfg.close - cfg.iso + cfg.wall / g.h + 0.25f; }
+
+// The hollows of a field (positive points the second fill did not reach as the outside: st != 2), 6-connected. Those under
+// min_piece of the largest are filled (made inside); each other one gets a drain hole of cfg.drain (a diameter) from its lowest
+// layer (the point nearest that layer's middle) straight down (-z) until the hole is through the solid below it (the outside, or
+// another hollow, is reached). The field and
+// the states are in host-visible memory (the device path's are mapped).
+void drain_holes(float* f, const uint8_t* st, const Grid& g, const SolidConfig& cfg, SolidStats& s) {
+    const long n = g.n(), gx = g.gx, gxy = (long)g.gx * g.gy;
+    std::vector<uint8_t> seen((size_t)(n / 8 + 1), 0);
+    auto is_void = [&](long i) { return f[i] > 0.0f && st[i] != 2; };
+    auto mark = [&](long i) { seen[i >> 3] |= (uint8_t)(1u << (i & 7)); };
+    auto marked = [&](long i) { return (seen[i >> 3] >> (i & 7)) & 1; };
+    struct Hollow {
+        long seed, size;
+        int x, y, z;  // the lowest point
+    };
+    std::vector<Hollow> hollows;
+    std::vector<int32_t> queue;
+    auto bfs = [&](long seed, const std::function<void(long)>& each) {
+        queue.clear();
+        queue.push_back((int32_t)seed);
+        for (size_t q = 0; q < queue.size(); ++q) {
+            const long p = queue[q];
+            each(p);
+            const int x = (int)(p % gx), y = (int)((p / gx) % g.gy), z = (int)(p / gxy);
+            const long nb[6] = {x > 0 ? p - 1 : -1, x < g.gx - 1 ? p + 1 : -1, y > 0 ? p - gx : -1, y < g.gy - 1 ? p + gx : -1,
+                                z > 0 ? p - gxy : -1, z < g.gz - 1 ? p + gxy : -1};
+            for (long q2 : nb)
+                if (q2 >= 0 && !marked(q2) && is_void(q2)) {
+                    mark(q2);
+                    queue.push_back((int32_t)q2);
+                }
+        }
+    };
+    for (long i = 0; i < n; ++i) {
+        if (marked(i) || !is_void(i)) continue;
+        mark(i);
+        Hollow h{i, 0, 0, 0, g.gz};
+        std::vector<int32_t> bottom;  // the points of the lowest layer
+        bfs(i, [&](long p) {
+            ++h.size;
+            const int z = (int)(p / gxy);
+            if (z < h.z) h.z = z, bottom.clear();
+            if (z == h.z) bottom.push_back((int32_t)p);
+        });
+        // the drain's place: the bottom point nearest the bottom's middle
+        double mx = 0, my = 0;
+        for (int32_t p : bottom) mx += p % gx, my += (p / gx) % g.gy;
+        mx /= (double)bottom.size(), my /= (double)bottom.size();
+        double best = 1e300;
+        for (int32_t p : bottom) {
+            const int x = (int)(p % gx), y = (int)((p / gx) % g.gy);
+            const double d = (x - mx) * (x - mx) + (y - my) * (y - my);
+            if (d < best) best = d, h.x = x, h.y = y;
+        }
+        hollows.push_back(h);
+    }
+    long largest = 0;
+    for (const Hollow& h : hollows) largest = std::max(largest, h.size);
+    s.hollows = (int)hollows.size();
+    const float r = 0.5f * cfg.drain / g.h;
+    const int R = (int)std::ceil(r) + 1;
+    for (const Hollow& h : hollows) {
+        if ((double)h.size < cfg.min_piece * (double)largest || h.size < 64) {  // a small hollow: filled
+            std::fill(seen.begin(), seen.end(), 0);
+            mark(h.seed);
+            std::vector<long> pts;
+            bfs(h.seed, [&](long p) { pts.push_back(p); });
+            for (long p : pts) f[p] = -1e-3f;
+            s.hollows_filled++;
+            continue;
+        }
+        if (!(r > 0.0f)) continue;
+        bool through_solid = false;
+        for (int z = h.z; z >= 0; --z) {
+            const long axis = h.x + gx * h.y + gxy * z;
+            const bool open = f[axis] > 0.0f;  // before this slab is drilled
+            if (!open) through_solid = true;
+            for (int dy = -R; dy <= R; ++dy)
+                for (int dx = -R; dx <= R; ++dx) {
+                    const int x = h.x + dx, y = h.y + dy;
+                    if (x < 0 || y < 0 || x >= g.gx || y >= g.gy) continue;
+                    float& v = f[x + gx * y + gxy * z];
+                    const float fv = std::fmax(v, r - std::sqrt((float)(dx * dx + dy * dy)));
+                    v = fv >= 0.0f ? std::fmax(fv, 1e-3f) : std::fmin(fv, -1e-3f);
+                }
+            if (through_solid && open) break;  // out of the solid below: the outside, or another hollow
+        }
+        s.drains++;
+    }
 }
 
 // ---- the host reference: the kernels' loops
@@ -444,10 +541,14 @@ bool run_device(const std::vector<float>& verts, const std::vector<int32_t>& fac
     // outside (no pocket behind a wall, no void)
     t0 = std::chrono::steady_clock::now();
     sddev::solid_field(udf, dd, n, cfg.iso, cfg.close + kPlug);
-    undev(dd, (size_t)n);
     sddev::solid_reach_init(udf, n, sv);
     st.flood_rounds += dev_flood(sv, g);
     sddev::solid_unreached(udf, sv, n);
+    if (cfg.wall > 0) {
+        sddev::solid_hollow(udf, dd, n, hollow_depth(cfg, g));
+        drain_holes(reinterpret_cast<float*>(udf), sv, g, cfg, st);
+    }
+    undev(dd, (size_t)n);
     undev(sv, (size_t)n);
     const float* f = reinterpret_cast<const float*>(udf);
     if (grids) grids->field.assign(f, f + n);
@@ -540,6 +641,7 @@ bool reference_once(const std::vector<float>& verts, const std::vector<int32_t>&
 template <typename Once>
 bool escalate(const SolidConfig& cfg, Once once, std::vector<float>& out_v, std::vector<int32_t>& out_f, SolidStats& st, std::string& error) {
     SolidConfig c = cfg;
+    c.wall = c.drain = 0;  // the close is chosen on the solid (a hollow's thin wall is not a leak)
     std::vector<float> first_v;
     std::vector<int32_t> first_f;
     SolidStats first_st;
@@ -575,6 +677,21 @@ bool escalate(const SolidConfig& cfg, Once once, std::vector<float>& out_v, std:
             have_first = true;
         }
         c.close *= 2.0f;
+    }
+    if (cfg.wall > 0) {  // the hollow, with the close chosen
+        SolidConfig h = cfg;
+        h.close = st.close;
+        std::vector<float> v;
+        std::vector<int32_t> f;
+        SolidStats s;
+        if (!once(h, v, f, s, error)) return false;
+        ++attempts;
+        seconds += s.seconds;
+        s.close = st.close;
+        s.thickness = st.thickness;  // the solid's
+        out_v.swap(v);
+        out_f.swap(f);
+        st = s;
     }
     st.attempts = attempts;
     st.seconds = seconds;
@@ -692,6 +809,14 @@ bool reference_once(const std::vector<float>& verts, const std::vector<int32_t>&
     st.flood_rounds += ref_flood(sv.data(), g);
     for (long i = 0; i < n; ++i)
         if (sv[i] == 1) fld[i] = -1e-3f;
+    if (cfg.wall > 0) {
+        const float depth = hollow_depth(cfg, g);
+        for (long i = 0; i < n; ++i) {
+            const float fv = std::fmax(fld[i], std::sqrt(dd[i]) - depth);
+            fld[i] = fv >= 0.0f ? std::fmax(fv, 1e-3f) : std::fmin(fv, -1e-3f);
+        }
+        drain_holes(fld.data(), sv.data(), g, cfg, st);
+    }
     if (grids) grids->field = fld;
     if (!ref_surface(fld.data(), g, out_verts, out_faces, error)) return false;
     drop_small_pieces(out_verts, out_faces, cfg.min_piece, st);

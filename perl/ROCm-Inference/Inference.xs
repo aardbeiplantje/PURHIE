@@ -1842,7 +1842,7 @@ _t2_has_background_removal(h)
     RETVAL
 
 int
-_t2_start(h, image, resolution, seed, faces, texture_size, remove_background, format, stl_size_mm)
+_t2_start(h, image, resolution, seed, faces, texture_size, remove_background, format, stl_size_mm, hollow_mm, drain_mm)
     IV h
     SV* image
     int resolution
@@ -1852,12 +1852,14 @@ _t2_start(h, image, resolution, seed, faces, texture_size, remove_background, fo
     int remove_background
     int format
     NV stl_size_mm
+    NV hollow_mm
+    NV drain_mm
   CODE:
     /* a job on a background thread: 0 started, 1 a job is running; an error croaks (the image, an option, no background removal) */
     STRLEN n;
     const char* bytes = SvPVbyte(image, n);
     int r = t2_start(INT2PTR(t2_pipe_t*, h), (const unsigned char*)bytes, (size_t)n, resolution, (unsigned long long)seed, faces,
-                     texture_size, remove_background, format, (double)stl_size_mm);
+                     texture_size, remove_background, format, (double)stl_size_mm, (double)hollow_mm, (double)drain_mm);
     if (r < 0) croak("ROCm::Inference: t2_start: %s", t2_last_error());
     RETVAL = r;
   OUTPUT:

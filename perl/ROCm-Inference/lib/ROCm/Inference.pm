@@ -995,11 +995,12 @@ sub new {
 sub has_background_removal { my ($t) = @_; ROCm::Inference::_t2_has_background_removal($t->{h}) }
 
 # $t->start($image_bytes, resolution => 1024, seed => 0, faces => 700000, texture_size => 4096, remove_background => 'auto',
-# texture => 1, format => 'glb', size_mm => 100): 1 when the job started, 0 when one is running already. The image: PNG, JPEG, BMP,
+# texture => 1, format => 'glb', size_mm => 100, hollow_mm => 0, drain_mm => 3): 1 when the job started, 0 when one is running already. The image: PNG, JPEG, BMP,
 # GIF or TGA bytes. remove_background: 'auto' (the alpha when the image has one, else BiRefNet), true (BiRefNet) or false (the whole
 # image). texture false: the mesh alone (faster). format 'stl': a binary STL of the mesh (no texture, for 3D printing), its largest
-# side size_mm millimetres (0: the mesh's units). Without texture the mesh is rebuilt as a closed solid (src/trellis_solid.h). Dies on
-# a bad image or option.
+# side size_mm millimetres (0: the mesh's units). Without texture the mesh is rebuilt as a closed solid (src/trellis_solid.h).
+# hollow_mm (an STL): hollow, the walls this thick (0: solid); drain_mm (3): each hollow's drain hole, from its lowest point down (0:
+# none). Dies on a bad image or option.
 sub start {
     my ($t, $image, %o) = @_;
     my $rb = $o{remove_background} // 'auto';
@@ -1008,7 +1009,7 @@ sub start {
     die "ROCm::Inference::Trellis2: format: glb or stl, not '$fmt'\n" unless $fmt =~ /\A(?:glb|stl)\z/;
     my $tex = (exists $o{texture} && !$o{texture}) ? 0 : $o{texture_size} // 4096;
     my $r = ROCm::Inference::_t2_start($t->{h}, $image, $o{resolution} // 1024, $o{seed} // 0, $o{faces} // 700000,
-                                        $tex, $rb, $fmt eq 'stl' ? 1 : 0, $o{size_mm} // 100);
+                                        $tex, $rb, $fmt eq 'stl' ? 1 : 0, $o{size_mm} // 100, $o{hollow_mm} // 0, $o{drain_mm} // 3);
     return $r == 0 ? 1 : 0;
 }
 

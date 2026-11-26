@@ -3241,3 +3241,13 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) solid_unreached(unsigne
     if (i >= n) return;
     if (st[i] == 1) uf[i] = __float_as_uint(-1e-3f);
 }
+
+// a hollow (the solid's wall option): the points further than depth cells from the outside (d2, squared) are emptied,
+// f = max(f, distance - depth), no value nearer 0 than 1e-3
+extern "C" __global__ void __launch_bounds__(SD_THREADS) solid_hollow(unsigned int* uf, const float* d2, long n, float depth) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= n) return;
+    float fv = fmaxf(__uint_as_float(uf[i]), sqrtf(d2[i]) - depth);
+    fv = fv >= 0.0f ? fmaxf(fv, 1e-3f) : fminf(fv, -1e-3f);
+    uf[i] = __float_as_uint(fv);
+}

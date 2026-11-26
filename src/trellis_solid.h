@@ -33,6 +33,11 @@ struct SolidConfig {
     float min_thickness = 3.0f; // ... a thin shell: a mean thickness (2 volume / area) under this many cells
     float band = 2.5f;     // the exact distance to the mesh is computed this far from each face, in cells
     double min_piece = 1e-3;  // pieces with less than this part of the largest piece's volume are dropped (specks, small voids)
+    // A hollow print (cheaper, lighter): the inside further than `wall` from the surface is empty, in the mesh's units (0: solid).
+    // `drain`: each hollow gets a hole this wide (the mesh's units; 0: none) from its lowest point straight down (-z, the STL's
+    // down) until it is out of the solid, so resin drains and air gets in. Hollows under min_piece of the largest are filled.
+    float wall = 0;
+    float drain = 0;
 };
 
 struct SolidStats {
@@ -48,12 +53,16 @@ struct SolidStats {
     double thickness = 0;      // its mean thickness, 2 volume / area, in cells
     float close = 0;           // the close of the result
     int attempts = 0;          // the runs (close doubled after a thin shell)
+    int hollows = 0;           // with a wall: the empty regions inside, and those filled for being small
+    int hollows_filled = 0;
+    int drains = 0;            // the drain holes made
     double seconds_distance = 0, seconds_transform = 0, seconds_fill = 0, seconds_surface = 0, seconds = 0;
 };
 
 // verts [V][3], faces [F][3] (any winding, any defects) to the closed surface out_verts, out_faces (outward winding). The device path.
 // A result thinner than min_thickness (on average) is a sign the fill went in through a hole wider than twice close: the run is
-// repeated with close doubled, up to close_max; the first thick enough result is kept, else the first one (a thin object).
+// repeated with close doubled, up to close_max; the first thick enough result is kept, else the first one (a thin object). The
+// choice is made on the solid; a wall then hollows it in one more run with that close.
 bool solidify(const std::vector<float>& verts, const std::vector<int32_t>& faces, const SolidConfig& cfg, std::vector<float>& out_verts,
               std::vector<int32_t>& out_faces, SolidStats& stats, std::string& error);
 

@@ -339,9 +339,14 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
     kernel; no zero-area face). `solid_verify`: six synthetic cases (turned faces, a small and a large hole, an inner wall, two
     boxes on an edge, a speck) and real meshes (device = host reference on a 96 grid: the grids equal, the same surface; the
     result closed). The vase: one closed piece, Euler number 2 (trimesh: watertight, consistent, a volume), 0.7 to 2 s for the
-    solid and 2 to 6 s for the simplification. Limits: a thin sheet of the model stays about 1.2 cells thick (too thin for FDM at
-    100 mm: a minimum wall option is open); crevices narrower than about 2 close are filled; the 1024 grid leaks (close is in
-    cells) and its 26M-face simplification is slow, so the grid is 512 for both resolutions.
+    solid and 2 to 6 s for the simplification. Hollow prints (`hollow_mm`, an STL): the inside further than the wall from the
+    outside is emptied (f = max(f, distance to the outside - (close - iso + wall + 0.25)), decided after the close is chosen on
+    the solid), each hollow gets a drain hole (`drain_mm`, 3 by default) from the middle of its lowest layer straight down (-z)
+    through the solid, hollows under min_piece filled. The vase at 2 mm: one surface (Euler 2), 31% of the solid's material;
+    the hollow box within 0.6% of its exact volume. Openings wider than about 2 close (1.6% of the size) stay open (a
+    whistle's mouth); the user: hollow is cheaper and sometimes needed. Limits: a thin sheet of the model stays about 1.2 cells
+    thick (too thin for FDM at 100 mm: a minimum wall option is open); crevices narrower than about 2 close are filled; the
+    1024 grid leaks (close is in cells) and its 26M-face simplification is slow, so the grid is 512 for both resolutions.
     Open: (b) the 1536 cascade
     (memory is no longer the limit; its time is); (c) the normal-map and AO bakes and their GLB inputs; (d) UnwrapMesh's "pec"
     segmenter (ours is CuMesh's charts); (e) a minimum wall thickness for the solid (thin sheets thickened for printing); (f) the simplify stops below its target (667k for 700k), where

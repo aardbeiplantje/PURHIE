@@ -201,6 +201,14 @@ bool ImageTo3D::generate(const uint8_t* rgba, int w, int h, bool has_alpha, cons
         m.error = "the STL's size: 0 to 100000 millimetres";
         return false;
     }
+    if (!(opt.hollow_mm >= 0) || opt.hollow_mm > 1000 || !(opt.drain_mm >= 0) || opt.drain_mm > 1000) {
+        m.error = "hollow_mm and drain_mm: 0 to 1000 millimetres";
+        return false;
+    }
+    if (opt.hollow_mm > 0 && (opt.format != ImageTo3DOptions::Format::Stl || !(opt.stl_size_mm > 0) || !opt.solid)) {
+        m.error = "a hollow (hollow_mm) is for an STL with its size in millimetres";
+        return false;
+    }
     auto report = [&](const char* stage, int step, int steps) {
         if (progress) progress(stage, step, steps);
     };
@@ -318,7 +326,19 @@ bool ImageTo3D::generate(const uint8_t* rgba, int w, int h, bool has_alpha, cons
             std::vector<float> ov;
             std::vector<int32_t> of;
             SolidStats sost;
-            if (!solidify(sv, sf, SolidConfig(), ov, of, sost, err)) {
+            SolidConfig scfg;
+            if (opt.hollow_mm > 0) {
+                // millimetres to the mesh's units: encode_stl makes the largest side stl_size_mm
+                float lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
+                for (size_t i = 0; i < sv.size(); ++i) {
+                    lo[i % 3] = std::min(lo[i % 3], sv[i]);
+                    hi[i % 3] = std::max(hi[i % 3], sv[i]);
+                }
+                const double side = std::max(hi[0] - lo[0], std::max(hi[1] - lo[1], hi[2] - lo[2]));
+                scfg.wall = (float)(opt.hollow_mm * side / opt.stl_size_mm);
+                scfg.drain = (float)(opt.drain_mm * side / opt.stl_size_mm);
+            }
+            if (!solidify(sv, sf, scfg, ov, of, sost, err)) {
                 m.error = "solid: " + err;
                 return false;
             }
@@ -466,7 +486,7 @@ const char* t2_last_error(void) { return g_t2_error.c_str(); }
 int t2_has_background_removal(t2_pipe_t* p) { return p && p->model->has_background_removal() ? 1 : 0; }
 
 int t2_start(t2_pipe_t* p, const unsigned char* image, size_t n, int resolution, unsigned long long seed, int faces, int texture_size,
-             int remove_background, int format, double stl_size_mm) {
+             int remove_background, int format, double stl_size_mm, double hollow_mm, double drain_mm) {
     if (!p) {
         g_t2_error = "t2_start: no pipeline";
         return -1;
@@ -500,6 +520,14 @@ int t2_start(t2_pipe_t* p, const unsigned char* image, size_t n, int resolution,
         g_t2_error = "remove_background: -1 (auto), 0 or 1";
         return -1;
     }
+    if (!(hollow_mm >= 0) || hollow_mm > 1000 || !(drain_mm >= 0) || drain_mm > 1000) {
+        g_t2_error = "hollow_mm and drain_mm: 0 to 1000 millimetres";
+        return -1;
+    }
+    if (hollow_mm > 0 && (format != 1 || !(stl_size_mm > 0))) {
+        g_t2_error = "a hollow (hollow_mm) is for an STL with its size in millimetres";
+        return -1;
+    }
     unsigned char* px = nullptr;
     int w = 0, h = 0, has_alpha = 0;
     if (image_decode_rgba(image, n, &px, &w, &h, &has_alpha) != 0) {
@@ -528,6 +556,8 @@ int t2_start(t2_pipe_t* p, const unsigned char* image, size_t n, int resolution,
     o.remove_background = remove_background;
     o.format = format == 1 ? trellis::ImageTo3DOptions::Format::Stl : trellis::ImageTo3DOptions::Format::Glb;
     o.stl_size_mm = stl_size_mm;
+    o.hollow_mm = hollow_mm;
+    o.drain_mm = drain_mm;
     {
         std::lock_guard<std::mutex> lk(p->mu);
         p->status = 0;

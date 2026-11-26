@@ -167,6 +167,8 @@ static void synthetic() {
         int pieces;
         double volume;     // expected (0: not checked)
         double tolerance;  // relative
+        float wall = 0, drain = 0;  // a hollow
+        int hollows = 0, drains = 0;
     };
     std::vector<Case> cases;
     const float lo[3] = {-0.5f, -0.4f, -0.3f}, hi[3] = {0.5f, 0.4f, 0.3f};
@@ -227,15 +229,43 @@ static void synthetic() {
         add_box(c.m, s0, s1, 1);
         cases.push_back(std::move(c));
     }
+    {
+        // hollow, walls of 0.1 (12.8 cells), no drain: the outer surface and the hollow's (two pieces); the volume the box grown by
+        // iso less the hollow, a box 0.1 in from that
+        Case c{"a hollow box", {}, 2, 0, 0.05};
+        add_box(c.m, lo, hi, 8);
+        c.wall = 0.1f;
+        c.hollows = 1;
+        double in = 1;
+        for (int k = 0; k < 3; ++k) in *= hi[k] - lo[k] + 2 * grow - 2 * c.wall;
+        c.volume = box_volume(lo, hi, grow) - in;
+        cases.push_back(std::move(c));
+    }
+    {
+        // the same with a drain hole 0.04 wide: one surface (the hollow open to the outside through the bottom)
+        Case c{"a hollow box with a drain", {}, 1, 0, 0.05};
+        add_box(c.m, lo, hi, 8);
+        c.wall = 0.1f;
+        c.drain = 0.04f;
+        c.hollows = 1;
+        c.drains = 1;
+        double in = 1;
+        for (int k = 0; k < 3; ++k) in *= hi[k] - lo[k] + 2 * grow - 2 * c.wall;
+        c.volume = box_volume(lo, hi, grow) - in;
+        cases.push_back(std::move(c));
+    }
     for (Case& c : cases) {
         std::printf("%s (%zu faces in)\n", c.name, c.m.f.size() / 3);
         Mesh out, ref;
         SolidStats st, rst;
         std::string err;
-        const bool ok = solidify(c.m.v, c.m.f, cfg, out.v, out.f, st, err);
+        SolidConfig ccfg = cfg;
+        ccfg.wall = c.wall;
+        ccfg.drain = c.drain;
+        const bool ok = solidify(c.m.v, c.m.f, ccfg, out.v, out.f, st, err);
         CHECK(ok, "%s: %s", c.name, err.c_str());
         if (!ok) continue;
-        const bool rok = solidify_reference(c.m.v, c.m.f, cfg, ref.v, ref.f, rst, err);
+        const bool rok = solidify_reference(c.m.v, c.m.f, ccfg, ref.v, ref.f, rst, err);
         CHECK(rok, "%s: the reference: %s", c.name, err.c_str());
         MeshCheck mc;
         check_mesh(out.v, out.f, mc);
@@ -244,8 +274,13 @@ static void synthetic() {
                     st.dims[0], st.dims[1], st.dims[2], st.flood_rounds, st.pieces, st.pieces_dropped, st.close, st.attempts, st.thickness,
                     st.seconds);
         const bool thin = std::strstr(c.name, "large hole") != nullptr;
-        CHECK(thin ? (st.attempts == 3 && st.close == cfg.close) : (st.attempts == 1 && st.close == cfg.close),
+        CHECK(thin ? (st.attempts == 3 && st.close == cfg.close) : (st.attempts == 1 + (c.wall > 0) && st.close == cfg.close),
               "%s: close %g after %d runs", c.name, st.close, st.attempts);
+        if (c.wall > 0) {
+            std::printf("  %d hollows (%d filled), %d drains\n", st.hollows, st.hollows_filled, st.drains);
+            CHECK(st.hollows - st.hollows_filled == c.hollows && st.drains == c.drains, "%s: %d hollows (%d filled) and %d drains", c.name,
+                  st.hollows, st.hollows_filled, st.drains);
+        }
         CHECK(mc.closed(), "%s: not closed (boundary %ld, non-manifold %ld, misoriented %ld)", c.name, mc.boundary, mc.nonmanifold, mc.misoriented);
         CHECK(mc.volume > 0, "%s: wound inward (volume %g)", c.name, mc.volume);
         CHECK(mc.pieces == c.pieces, "%s: %d pieces, %d expected", c.name, mc.pieces, c.pieces);

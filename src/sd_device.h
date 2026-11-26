@@ -284,6 +284,7 @@ void solid_flood_init(const float* d1, int gx, int gy, int gz, float r2, unsigne
 void solid_flood_sweep(unsigned char* st, int gx, int gy, int gz, int axis, long line0, int nlines, int* changed);
 void solid_field(unsigned int* uf, const float* d2, long n, float iso, float rc);
 void solid_reach_init(const unsigned int* uf, long n, unsigned char* st);
+void solid_hollow(unsigned int* uf, const float* d2, long n, float depth);
 void solid_unreached(unsigned int* uf, const unsigned char* st, long n);
 void solid_row_cells(const float* f, int gx, int gy, long row0, int nrows, int write, int* cnt, const int* off, int* cells);
 void solid_cell_edges(const float* f, int gx, int gy, const int* cx, const int* crow, int na, unsigned char* emask, int* ecnt);
