@@ -135,7 +135,7 @@ bool compute_charts(const std::vector<float>& verts, const std::vector<int32_t>&
     }
 
     const Structure S = build_structure(verts, faces);
-    const size_t E0 = S.ek.size(), M = S.plen.size();
+    const size_t M = S.plen.size();
     Scope st;
     float* dv = st.upload(verts);
     int* df = st.upload(faces);

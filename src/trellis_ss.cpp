@@ -231,7 +231,6 @@ bool SsFlow::forward(const float* x, float t, const float* cond, int Lc, const f
     for (int j = 0; j < 6; ++j) vs[j] = S(kC);
     std::vector<float> ms(6 * kC);
 
-    const float scale = 1.0f / std::sqrt((float)kD);
     for (int b = 0; b < kBlocks; ++b) {
         const Impl::Block& k = m.blk[b];
         const bool dbg = (b == 0);  // block 0 taps for the stage check (emitted only when a stage callback is set)

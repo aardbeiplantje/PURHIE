@@ -7,7 +7,11 @@
 #include "blt_calib.h"
 
 #include <hip/hip_runtime.h>
+// (ROCm's hipBLASLt headers set variables they never read: their warnings are not this code's)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-but-set-variable"
 #include <hipblaslt/hipblaslt.h>
+#pragma clang diagnostic pop
 
 #include <algorithm>
 #include <array>
@@ -730,7 +734,7 @@ void* device_scratch(size_t bytes) {
     static void* buf = nullptr;
     static size_t cap = 0;
     if (bytes > cap) {
-        if (buf) hipFree(buf);
+        if (buf) (void)hipFree(buf);
         buf = nullptr;
         cap = 0;
         if (hipMalloc(&buf, bytes) != hipSuccess) throw std::runtime_error("sd device: out of device memory");
@@ -764,7 +768,7 @@ size_t g_ws_cap = 0;
 
 bool ensure_workspace(size_t bytes) {
     if (bytes <= g_ws_cap) return true;
-    if (g_ws) hipFree(g_ws);
+    if (g_ws) (void)hipFree(g_ws);
     g_ws = nullptr;
     g_ws_cap = 0;
     if (hipMalloc(&g_ws, bytes) != hipSuccess) return false;  // device-only: the host never touches it
@@ -776,14 +780,14 @@ bool ensure_workspace(size_t bytes) {
 unsigned diff_words(const void* a, const void* b, size_t bytes) {
     unsigned* cnt = static_cast<unsigned*>(dalloc(sizeof(unsigned)));
     unsigned zero = 0;
-    hipMemcpy(cnt, &zero, sizeof(unsigned), hipMemcpyHostToDevice);
+    (void)hipMemcpy(cnt, &zero, sizeof(unsigned), hipMemcpyHostToDevice);
     const long n = (long)(bytes / 4);
     const void* ap = a;
     const void* bp = b;
     void* args[] = {(void*)&ap, (void*)&bp, (void*)&n, (void*)&cnt};
     launch(f_count_diff, dim3((unsigned)((n + kThreads - 1) / kThreads), 1, 1), args);
     unsigned host = 0;
-    hipMemcpy(&host, cnt, sizeof(unsigned), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(&host, cnt, sizeof(unsigned), hipMemcpyDeviceToHost);
     drelease(cnt, sizeof(unsigned));
     return host;
 }
@@ -805,7 +809,7 @@ bool run_once(const Plan& p, const hipblasLtMatmulAlgo_t& algo, const uint16_t* 
     const bool ok = hipblasLtMatmul(g_handle, p.desc, &alpha, W, p.la, xb, p.lb, &beta, y, p.lc, y, p.lc, &algo, g_ws, p.ws, nullptr) ==
                     HIPBLAS_STATUS_SUCCESS;
     if (g_time_on) {  /* SD_TIME: the products' wall time (synchronous), in the same table as the kernels' */
-        hipStreamSynchronize(nullptr);
+        (void)hipStreamSynchronize(nullptr);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         std::lock_guard<std::mutex> lk(g_time_mu);
         TimeStat& st = g_time_stats["hipblaslt_gemm"];
@@ -876,10 +880,10 @@ Plan* plan_for(int out, int T, int in, bool has_bias, bool out16, const uint16_t
          * already well behind the best is not timed again (the tuning is a one-time cost of the first call) */
         const auto w0 = std::chrono::steady_clock::now();
         if (!run_once(p, heur[i].algo, W, xb, y, bias_ptr, has_bias)) continue;
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
         double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
         if (!have_ref) {
-            hipMemcpy(ref, y, nbytes, hipMemcpyDeviceToDevice);
+            (void)hipMemcpy(ref, y, nbytes, hipMemcpyDeviceToDevice);
             have_ref = true;
         } else if (diff_words(y, ref, nbytes) != 0) {
             if (std::getenv("SD_BLT_LOG"))
@@ -896,7 +900,7 @@ Plan* plan_for(int out, int T, int in, bool has_bias, bool out16, const uint16_t
         {
             const auto t0 = std::chrono::steady_clock::now();
             run_once(p, heur[i].algo, W, xb, y, bias_ptr, has_bias);
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
             t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         }
         if (std::getenv("SD_BLT_LOG"))
@@ -1014,16 +1018,16 @@ bool gemm_impl(bool bf16, int M, int N, int K, const void* A, long lda, const vo
             int best_i = -1;
             for (int i = 0; i < n; ++i) {
                 if (!run(heur[i].algo, heur[i].workspaceSize)) continue;
-                hipDeviceSynchronize();
+                (void)hipDeviceSynchronize();
                 if (!have_ref) {
-                    hipMemcpy(ref, C, span, hipMemcpyDeviceToDevice);
+                    (void)hipMemcpy(ref, C, span, hipMemcpyDeviceToDevice);
                     have_ref = true;
                 } else if (!calib_mode && diff_words(C, ref, span) != 0) {
                     continue;
                 }
                 const auto t0 = std::chrono::steady_clock::now();
                 run(heur[i].algo, heur[i].workspaceSize);
-                hipDeviceSynchronize();
+                (void)hipDeviceSynchronize();
                 const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                 if (calib_mode) {
                     std::fprintf(stderr, "calib: M %ld N %ld K %ld lda %ld ldb %ld opN %d cs_m %ld bf16 %d candidate %d: %.3f ms algo ",
@@ -1056,7 +1060,7 @@ bool gemm_impl(bool bf16, int M, int N, int K, const void* A, long lda, const vo
         return false;
     }
     if (g_time_on) {  /* SD_TIME: the convolutions' and attention's products, synchronous, in the table */
-        hipStreamSynchronize(nullptr);
+        (void)hipStreamSynchronize(nullptr);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
         std::lock_guard<std::mutex> lk(g_time_mu);
         TimeStat& st = g_time_stats["blt_product"];
