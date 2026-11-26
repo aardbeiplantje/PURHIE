@@ -51,6 +51,7 @@ hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn
 hipFunction_t f_ss_affine = nullptr, f_ss_gate_add = nullptr, f_ss_head_norm_rope = nullptr; hipFunction_t f_sp_hash_insert = nullptr, f_sp_neighbor_map = nullptr, f_sp_subm_conv_f16w = nullptr; hipFunction_t f_sp_c2s_mask = nullptr, f_sp_exclusive_scan_serial = nullptr, f_sp_c2s_fill = nullptr, f_sp_c2s_gather = nullptr; hipFunction_t f_simp_qem = nullptr, f_simp_cost = nullptr, f_simp_propagate = nullptr, f_simp_collapse = nullptr, f_simp_compress_v = nullptr, f_simp_compress_f = nullptr; hipFunction_t f_chart_face_geom = nullptr, f_chart_cones = nullptr, f_chart_perims = nullptr, f_chart_costs = nullptr, f_chart_propagate = nullptr, f_chart_collapse = nullptr, f_chart_refine = nullptr;
 hipFunction_t f_attn_flash128 = nullptr, f_attn_flash64 = nullptr;
 hipFunction_t f_bir_window_gather = nullptr, f_bir_window_scatter_add = nullptr, f_bir_window_attn = nullptr, f_bir_patch_merge = nullptr, f_bir_resize_ac = nullptr, f_bir_bn_act = nullptr, f_bir_channel_mean = nullptr, f_bir_fill_channels = nullptr, f_bir_gate = nullptr, f_bir_patches = nullptr, f_bir_deform_cols = nullptr;
+hipFunction_t f_solid_reach_init = nullptr, f_solid_unreached = nullptr, f_solid_fill_u32 = nullptr, f_solid_udf = nullptr, f_solid_sources = nullptr, f_solid_edt = nullptr, f_solid_flood_init = nullptr, f_solid_flood_sweep = nullptr, f_solid_field = nullptr, f_solid_row_cells = nullptr, f_solid_cell_edges = nullptr, f_solid_edge_verts = nullptr, f_solid_cell_tris = nullptr;
 hipFunction_t f_dino_rope = nullptr; hipFunction_t f_mesh_vertices = nullptr, f_mesh_edge_queries = nullptr, f_sp_lookup = nullptr, f_mesh_edge_valid = nullptr, f_mesh_quads = nullptr, f_mesh_triangles = nullptr; hipFunction_t f_ss_im2col3 = nullptr, f_ss_gemm_f16w = nullptr, f_ss_pixel_shuffle3 = nullptr;
 constexpr int kThreads = 256;
 constexpr int kGroupSplit = 16;  // the group norm's partial sums per group
@@ -139,6 +140,7 @@ bool init() {
         {&f_sp_hash_insert, "sp_hash_insert"}, {&f_sp_neighbor_map, "sp_neighbor_map"}, {&f_sp_subm_conv_f16w, "sp_subm_conv_f16w"},
         {&f_sp_c2s_mask, "sp_c2s_mask"}, {&f_sp_exclusive_scan_serial, "sp_exclusive_scan_serial"}, {&f_sp_c2s_fill, "sp_c2s_fill"}, {&f_sp_c2s_gather, "sp_c2s_gather"},
         {&f_simp_qem, "simp_qem"}, {&f_simp_cost, "simp_cost"}, {&f_simp_propagate, "simp_propagate"}, {&f_simp_collapse, "simp_collapse"}, {&f_simp_compress_v, "simp_compress_v"}, {&f_simp_compress_f, "simp_compress_f"}, {&f_chart_face_geom, "chart_face_geom"}, {&f_chart_cones, "chart_cones"}, {&f_chart_perims, "chart_perims"}, {&f_chart_costs, "chart_costs"}, {&f_chart_propagate, "chart_propagate"}, {&f_chart_collapse, "chart_collapse"}, {&f_chart_refine, "chart_refine"}, {&f_bir_window_gather, "bir_window_gather"}, {&f_bir_window_scatter_add, "bir_window_scatter_add"}, {&f_bir_window_attn, "bir_window_attn"}, {&f_bir_patch_merge, "bir_patch_merge"}, {&f_bir_resize_ac, "bir_resize_ac"}, {&f_bir_bn_act, "bir_bn_act"}, {&f_bir_channel_mean, "bir_channel_mean"}, {&f_bir_fill_channels, "bir_fill_channels"}, {&f_bir_gate, "bir_gate"}, {&f_bir_patches, "bir_patches"}, {&f_bir_deform_cols, "bir_deform_cols"}, {&f_attn_flash128, "attn_flash_d128"}, {&f_attn_flash64, "attn_flash_d64"}, {&f_dino_rope, "dino_rope"}, {&f_mesh_vertices, "mesh_vertices"}, {&f_mesh_edge_queries, "mesh_edge_queries"}, {&f_sp_lookup, "sp_lookup"}, {&f_mesh_edge_valid, "mesh_edge_valid"}, {&f_mesh_quads, "mesh_quads"}, {&f_mesh_triangles, "mesh_triangles"},
+        {&f_solid_reach_init, "solid_reach_init"}, {&f_solid_unreached, "solid_unreached"}, {&f_solid_fill_u32, "solid_fill_u32"}, {&f_solid_udf, "solid_udf"}, {&f_solid_sources, "solid_sources"}, {&f_solid_edt, "solid_edt"}, {&f_solid_flood_init, "solid_flood_init"}, {&f_solid_flood_sweep, "solid_flood_sweep"}, {&f_solid_field, "solid_field"}, {&f_solid_row_cells, "solid_row_cells"}, {&f_solid_cell_edges, "solid_cell_edges"}, {&f_solid_edge_verts, "solid_edge_verts"}, {&f_solid_cell_tris, "solid_cell_tris"},
     };
     for (const Entry& e : entries)
         if (hipModuleGetFunction(e.f, g_mod, e.name) != hipSuccess) return false;
@@ -1878,6 +1880,114 @@ void mesh_quads(const int* valid, const int* pos, const int* look, int ne, int* 
     sync();
 }
 
+// the solid rebuild (sd_gpu.hip solid_*, src/trellis_solid.cpp): see sd_device.h
+static dim3 solid_blocks(long n) { return dim3((unsigned)((n + kThreads - 1) / kThreads), 1, 1); }
+
+void solid_fill_u32(unsigned int* p, long n, unsigned int val) {
+    long nn = n;
+    unsigned int vv = val;
+    void* a[] = {(void*)&p, (void*)&nn, (void*)&vv};
+    launch(f_solid_fill_u32, solid_blocks(n), a);
+    sync();
+}
+
+void solid_udf(const float* v, const int* f, int f0, int nf, int gx, int gy, int gz, float band, unsigned int* udf) {
+    int a0 = f0, an = nf, x = gx, y = gy, z = gz;
+    float b = band;
+    void* a[] = {(void*)&v, (void*)&f, (void*)&a0, (void*)&an, (void*)&x, (void*)&y, (void*)&z, (void*)&b, (void*)&udf};
+    launch(f_solid_udf, solid_blocks(nf), a);
+    sync();
+}
+
+void solid_sources(const unsigned int* udf, const unsigned char* st, long n, float iso, int mode, float* d) {
+    long nn = n;
+    float is = iso;
+    int md = mode;
+    void* a[] = {(void*)&udf, (void*)&st, (void*)&nn, (void*)&is, (void*)&md, (void*)&d};
+    launch(f_solid_sources, solid_blocks(n), a);
+    sync();
+}
+
+void solid_edt(float* d, int gx, int gy, int gz, int axis, long line0, int nlines, float* scr) {
+    int x = gx, y = gy, z = gz, ax = axis, nl = nlines;
+    long l0 = line0;
+    void* a[] = {(void*)&d, (void*)&x, (void*)&y, (void*)&z, (void*)&ax, (void*)&l0, (void*)&nl, (void*)&scr};
+    launch(f_solid_edt, solid_blocks(nlines), a);
+    sync();
+}
+
+void solid_flood_init(const float* d1, int gx, int gy, int gz, float r2, unsigned char* st) {
+    int x = gx, y = gy, z = gz;
+    float rr = r2;
+    void* a[] = {(void*)&d1, (void*)&x, (void*)&y, (void*)&z, (void*)&rr, (void*)&st};
+    launch(f_solid_flood_init, solid_blocks((long)gx * gy * gz), a);
+    sync();
+}
+
+void solid_flood_sweep(unsigned char* st, int gx, int gy, int gz, int axis, long line0, int nlines, int* changed) {
+    int x = gx, y = gy, z = gz, ax = axis, nl = nlines;
+    long l0 = line0;
+    void* a[] = {(void*)&st, (void*)&x, (void*)&y, (void*)&z, (void*)&ax, (void*)&l0, (void*)&nl, (void*)&changed};
+    launch(f_solid_flood_sweep, solid_blocks(nlines), a);
+    sync();
+}
+
+void solid_field(unsigned int* uf, const float* d2, long n, float iso, float rc) {
+    long nn = n;
+    float is = iso, r = rc;
+    void* a[] = {(void*)&uf, (void*)&d2, (void*)&nn, (void*)&is, (void*)&r};
+    launch(f_solid_field, solid_blocks(n), a);
+    sync();
+}
+
+void solid_reach_init(const unsigned int* uf, long n, unsigned char* st) {
+    long nn = n;
+    void* a[] = {(void*)&uf, (void*)&nn, (void*)&st};
+    launch(f_solid_reach_init, solid_blocks(n), a);
+    sync();
+}
+
+void solid_unreached(unsigned int* uf, const unsigned char* st, long n) {
+    long nn = n;
+    void* a[] = {(void*)&uf, (void*)&st, (void*)&nn};
+    launch(f_solid_unreached, solid_blocks(n), a);
+    sync();
+}
+
+void solid_row_cells(const float* f, int gx, int gy, long row0, int nrows, int write, int* cnt, const int* off, int* cells) {
+    int x = gx, y = gy, nr = nrows, w = write;
+    long r0 = row0;
+    void* a[] = {(void*)&f, (void*)&x, (void*)&y, (void*)&r0, (void*)&nr, (void*)&w, (void*)&cnt, (void*)&off, (void*)&cells};
+    launch(f_solid_row_cells, solid_blocks(nrows), a);
+    sync();
+}
+
+void solid_cell_edges(const float* f, int gx, int gy, const int* cx, const int* crow, int na, unsigned char* emask, int* ecnt) {
+    int x = gx, y = gy, n = na;
+    void* a[] = {(void*)&f, (void*)&x, (void*)&y, (void*)&cx, (void*)&crow, (void*)&n, (void*)&emask, (void*)&ecnt};
+    launch(f_solid_cell_edges, solid_blocks(na), a);
+    sync();
+}
+
+void solid_edge_verts(const float* f, int gx, int gy, const int* cx, const int* crow, const unsigned char* emask, const int* vbase, int na,
+                      float ox, float oy, float oz, float h, float* out) {
+    int x = gx, y = gy, n = na;
+    float o0 = ox, o1 = oy, o2 = oz, hh = h;
+    void* a[] = {(void*)&f, (void*)&x, (void*)&y, (void*)&cx, (void*)&crow, (void*)&emask, (void*)&vbase, (void*)&n,
+                 (void*)&o0, (void*)&o1, (void*)&o2, (void*)&hh, (void*)&out};
+    launch(f_solid_edge_verts, solid_blocks(na), a);
+    sync();
+}
+
+void solid_cell_tris(const float* f, int gx, int gy, const int* cx, const int* crow, const int* row_off, const unsigned char* emask,
+                     const int* vbase, const int* tbase, int na, int write, int* tcnt, int* faces) {
+    int x = gx, y = gy, n = na, w = write;
+    void* a[] = {(void*)&f, (void*)&x, (void*)&y, (void*)&cx, (void*)&crow, (void*)&row_off, (void*)&emask, (void*)&vbase,
+                 (void*)&tbase, (void*)&n, (void*)&w, (void*)&tcnt, (void*)&faces};
+    launch(f_solid_cell_tris, solid_blocks(na), a);
+    sync();
+}
+
 void mesh_triangles(const int* quads, int L, const float* feats, int* faces) {
     int ll = L;
     void* a[] = {(void*)&quads, (void*)&ll, (void*)&feats, (void*)&faces};
@@ -1906,10 +2016,10 @@ void simp_qem(const float* v, const int* f, const int* v2f, const int* v2f_off, 
 }
 
 void simp_cost(const float* v, const int* f, const int* v2f, const int* v2f_off, const unsigned long long* edges, const unsigned char* vb,
-               const float* qem, int E, float lam_len, float lam_sk, float* cost) {
-    int ee = E;
+               const float* qem, int E, float lam_len, float lam_sk, float* cost, bool manifold) {
+    int ee = E, mf = manifold ? 1 : 0;
     void* a[] = {(void*)&v, (void*)&f, (void*)&v2f, (void*)&v2f_off, (void*)&edges, (void*)&vb, (void*)&qem, (void*)&ee, (void*)&lam_len,
-                 (void*)&lam_sk, (void*)&cost};
+                 (void*)&lam_sk, (void*)&cost, (void*)&mf};
     launch(f_simp_cost, dim3((unsigned)((E + kThreads - 1) / kThreads), 1, 1), a);
     sync();
 }

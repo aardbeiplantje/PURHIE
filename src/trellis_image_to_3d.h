@@ -30,6 +30,7 @@ struct ImageTo3DOptions {
     bool texture = true;         // false: the mesh alone (no texture flow, unwrap or bake: faster)
     enum class Format { Glb, Stl } format = Format::Glb;  // Stl: a binary STL of the mesh (no texture), for 3D printing
     double stl_size_mm = 100;    // the STL's largest side in millimetres (0: the mesh's own units, a unit cube)
+    bool solid = true;           // without texture (the mesh alone, the STL): rebuilt as a closed solid for 3D printing (trellis_solid.h)
 };
 
 // the progress: the stage and its step (step, steps; 0, 0 for a stage without steps)

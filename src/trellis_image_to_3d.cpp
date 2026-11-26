@@ -12,6 +12,7 @@
 #include "trellis_image.h"
 #include "trellis_shape.h"
 #include "trellis_simplify.h"
+#include "trellis_solid.h"
 #include "trellis_tex.h"
 
 #include <algorithm>
@@ -310,10 +311,25 @@ bool ImageTo3D::generate(const uint8_t* rgba, int w, int h, bool has_alpha, cons
         m.timings.push_back({"mesh", sr.seconds_mesh});
         std::vector<float> sv = std::move(sr.verts);
         std::vector<int32_t> sf = std::move(sr.faces);
+        if (opt.solid) {
+            // the closed solid a slicer needs (trellis_solid.h): the mesher's surface has holes, turned faces and loose pieces
+            t0 = std::chrono::steady_clock::now();
+            report("solid", 0, 0);
+            std::vector<float> ov;
+            std::vector<int32_t> of;
+            SolidStats sost;
+            if (!solidify(sv, sf, SolidConfig(), ov, of, sost, err)) {
+                m.error = "solid: " + err;
+                return false;
+            }
+            sv.swap(ov);
+            sf.swap(of);
+            m.timings.push_back({"solid", seconds_since(t0)});
+        }
         t0 = std::chrono::steady_clock::now();
         report("simplify", 0, 0);
         SimplifyStats sst;
-        if (!simplify_to_faces(sv, sf, opt.faces, sst, err)) {
+        if (!simplify_to_faces(sv, sf, opt.faces, sst, err, opt.solid)) {
             m.error = "simplify: " + err;
             return false;
         }

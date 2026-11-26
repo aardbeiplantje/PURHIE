@@ -2291,7 +2291,7 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) simp_qem(const float* v
 // the triangle's cost term when the vertex `keep` moves to vnew (the other vertex of the edge is removed): 0 when the triangle would
 // flip, 1 otherwise (its skinny term added to *skinny)
 __device__ __forceinline__ int simp_tri(int tri, int keep, int other, const float* v, const int* f, const float* vnew, float* skinny,
-                                        int* ntri) {
+                                        int* ntri, int manifold = 0) {
     const int ia = f[3 * tri], ib = f[3 * tri + 1], ic = f[3 * tri + 2];
     if (ia == other || ib == other || ic == other) return 1;
     float a[3] = {v[3 * ia], v[3 * ia + 1], v[3 * ia + 2]};
@@ -2308,6 +2308,7 @@ __device__ __forceinline__ int simp_tri(int tri, int keep, int other, const floa
     const float nn[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
     const float new_area = 0.5f * sqrtf(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
     if (on[0] * nn[0] + on[1] * nn[1] + on[2] * nn[2] < 0.0f) return 0;
+    if (manifold && new_area == 0.0f) return 0;  // the solid's surface: no face of no area (a slicer's zero normal)
     const float e0v[3] = {nc[0] - nb[0], nc[1] - nb[1], nc[2] - nb[2]};
     float denom = (e0v[0] * e0v[0] + e0v[1] * e0v[1] + e0v[2] * e0v[2]) + (e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]) +
                   (e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]);
@@ -2318,13 +2319,44 @@ __device__ __forceinline__ int simp_tri(int tri, int keep, int other, const floa
     return 1;
 }
 
+// a closed manifold stays one (the solid's surface, the simplifier's manifold mode): the link condition (the vertices next to both
+// ends of the edge are exactly the two opposite it), those two keep four or more faces even when a neighbouring collapse of the
+// same pass takes one of theirs (the fans are the pass's), and the merged vertex keeps three
+__device__ bool simp_manifold_ok(int e0, int e1, const int* f, const int* v2f, const int* v2f_off) {
+    int common = 0, cv0 = -1, cv1 = -1;
+    for (int k = v2f_off[e0]; k < v2f_off[e0 + 1]; ++k) {
+        const int fid = v2f[k];
+        for (int j = 0; j < 3; ++j) {
+            const int u = f[3 * fid + j];
+            if (u == e0 || u == e1 || u == cv0 || u == cv1) continue;
+            bool adj = false;
+            for (int m = v2f_off[e1]; m < v2f_off[e1 + 1] && !adj; ++m) {
+                const int g = v2f[m];
+                adj = f[3 * g] == u || f[3 * g + 1] == u || f[3 * g + 2] == u;
+            }
+            if (!adj) continue;
+            if (common == 0) cv0 = u;
+            else if (common == 1) cv1 = u;
+            if (++common > 2) return false;
+        }
+    }
+    if (common != 2) return false;
+    if (v2f_off[cv0 + 1] - v2f_off[cv0] < 5 || v2f_off[cv1 + 1] - v2f_off[cv1] < 5) return false;
+    return (v2f_off[e0 + 1] - v2f_off[e0]) + (v2f_off[e1 + 1] - v2f_off[e1]) - 4 >= 3;
+}
+
 extern "C" __global__ void __launch_bounds__(SD_THREADS) simp_cost(const float* v, const int* f, const int* v2f, const int* v2f_off,
                                                                    const unsigned long long* edges, const unsigned char* vb, const float* qem,
-                                                                   int E, float lam_len, float lam_sk, float* cost) {
+                                                                   int E, float lam_len, float lam_sk, float* cost, int manifold) {
     const int tid = blockIdx.x * SD_THREADS + threadIdx.x;
     if (tid >= E) return;
     const unsigned long long ed = edges[tid];
     const int e0 = (int)(ed >> 32), e1 = (int)(ed & 0xFFFFFFFFu);
+    // an edge the manifold mode does not allow is out of the pass (not the cheapest around its ends, so the next one can be)
+    if (manifold && !simp_manifold_ok(e0, e1, f, v2f, v2f_off)) {
+        cost[tid] = INFINITY;
+        return;
+    }
     float w0 = 0.5f;
     if (vb[e0] && !vb[e1]) w0 = 1.0f;
     else if (!vb[e0] && vb[e1]) w0 = 0.0f;
@@ -2339,12 +2371,12 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) simp_cost(const float* 
     float skinny = 0.0f;
     int ntri = 0;
     for (int k = v2f_off[e0]; k < v2f_off[e0 + 1]; ++k)
-        if (!simp_tri(v2f[k], e0, e1, v, f, vn, &skinny, &ntri)) {
+        if (!simp_tri(v2f[k], e0, e1, v, f, vn, &skinny, &ntri, manifold)) {
             cost[tid] = INFINITY;
             return;
         }
     for (int k = v2f_off[e1]; k < v2f_off[e1 + 1]; ++k)
-        if (!simp_tri(v2f[k], e1, e0, v, f, vn, &skinny, &ntri)) {
+        if (!simp_tri(v2f[k], e1, e0, v, f, vn, &skinny, &ntri, manifold)) {
             cost[tid] = INFINITY;
             return;
         }
@@ -2926,4 +2958,286 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) bir_deform_cols(const f
         v = hy * hx * v1 + hy * lx * v2 + ly * hx * v3 + ly * lx * v4;
     }
     cols[idx] = mval * v;
+}
+
+// ---- the solid rebuild (src/trellis_solid.cpp, trellis_solid.h): grids of gx * gy * gz points, x fastest, the distances in cells.
+// The point-triangle distance and the Kuhn tetrahedra are trellis_solid_math.h's, shared with the host reference.
+#include "trellis_solid_math.h"
+
+extern "C" __global__ void __launch_bounds__(SD_THREADS) solid_fill_u32(unsigned int* p, long n, unsigned int val) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i < n) p[i] = val;
+}
+
+// the distance to the mesh near faces f0 .. f0 + nf (v [V][3] in grid units): each point within band of the face's box gets the
+// smaller of its distance (as float bits: the order of non-negative floats is their bits' order) and what it has
+extern "C" __global__ void __launch_bounds__(SD_THREADS) solid_udf(const float* v, const int* f, int f0, int nf, int gx, int gy, int gz,
+                                                                   float band, unsigned int* udf) {
+    const int t = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (t >= nf) return;
+    const int fi = f0 + t;
+    const float* a = v + 3 * f[3 * fi];
+    const float* b = v + 3 * f[3 * fi + 1];
+    const float* c = v + 3 * f[3 * fi + 2];
+    int lo[3], hi[3];
+    const int dims[3] = {gx, gy, gz};
+    for (int k = 0; k < 3; ++k) {
+        const float mn = fminf(a[k], fminf(b[k], c[k])) - band, mx = fmaxf(a[k], fmaxf(b[k], c[k])) + band;
+        lo[k] = max(0, (int)ceilf(mn));
+        hi[k] = min(dims[k] - 1, (int)floorf(mx));
+    }
+    const float b2 = band * band;
+    for (int z = lo[2]; z <= hi[2]; ++z)
+        for (int y = lo[1]; y <= hi[1]; ++y)
+            for (int x = lo[0]; x <= hi[0]; ++x) {
+                const float d2 = solid_tri_dist2((float)x, (float)y, (float)z, a, b, c);
+                if (!(d2 < b2)) continue;
+                const unsigned int u = __float_as_uint(sqrtf(d2));
+                const long idx = (long)x + (long)gx * ((long)y + (long)gy * z);
+                if (u < udf[idx]) atomicMin(&udf[idx], u);
+            }
+}
+
+// the sources of a distance transform, 0 at a source and +inf elsewhere: mode 0 the wall (the points within iso of the mesh),
+// mode 1 the outside (state 2)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) solid_sources(const unsigned int* udf, const unsigned char* st, long n, float iso,
+                                                                       int mode, float* d) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= n) return;
+    const bool src = mode == 0 ? __uint_as_float(udf[i]) < iso : st[i] == 2;
+    d[i] = src ? 0.0f : INFINITY;
+}
+
+// a line of the grid along axis: its first point and stride
+__device__ __forceinline__ void solid_line(int gx, int gy, int gz, int axis, long line, long& start, long& stride, int& n) {
+    if (axis == 0) {
+        start = line * gx, stride = 1, n = gx;
+    } else if (axis == 1) {
+        const long x = line % gx, z = line / gx;
+        start = x + (long)gx * gy * z, stride = gx, n = gy;
+    } else {
+        start = line, stride = (long)gx * gy, n = gz;
+    }
+}
+
+// one pass of the exact squared Euclidean distance transform (Felzenszwalb and Huttenlocher's lower envelope of parabolas) along
+// axis, for the lines line0 .. line0 + nlines, in place. scr: (3 n + 1) floats per line, interleaved by line (the copy of the line,
+// the envelope's parabolas, its boundaries). The values are whole numbers (squared distances between grid points): exact in floats.
+extern "C" __global__ void __launch_bounds__(SD_THREADS) solid_edt(float* d, int gx, int gy, int gz, int axis, long line0, int nlines, float* scr) {
+    const int t = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (t >= nlines) return;
+    long start, stride;
+    int n;
+    solid_line(gx, gy, gz, axis, line0 + t, start, stride, n);
+    const long L = nlines;
+    float* g = scr;
+    int* vv = reinterpret_cast<int*>(scr + (long)n * L);
+    float* zz = scr + 2L * n * L;
+    int k = -1;
+    for (int q = 0; q < n; ++q) {
+        const float gq = d[start + q * stride];
+        g[q * L + t] = gq;
+        if (isinf(gq)) continue;
+        if (k < 0) {
+            k = 0;
+            vv[t] = q;
+            zz[t] = -INFINITY;
+            zz[L + t] = INFINITY;
+            continue;
+        }
+        float s;
+        for (;;) {
+            const int vk = vv[k * L + t];
+            s = ((gq + (float)q * q) - (g[vk * L + t] + (float)vk * vk)) / (2.0f * (float)(q - vk));
+            if (s <= zz[k * L + t]) --k;
+            else break;
+        }
+        ++k;
+        vv[k * L + t] = q;
+        zz[k * L + t] = s;
+        zz[(k + 1) * L + t] = INFINITY;
+    }
+    if (k < 0) return;  // no source on the line: it stays +inf
+    k = 0;
+    for (int q = 0; q < n; ++q) {
+        while (zz[(k + 1) * L + t] < (float)q) ++k;
+        const int vk = vv[k * L + t];
+        d[start + q * stride] = (float)(q - vk) * (float)(q - vk) + g[vk * L + t];
+    }
+}
+
+// the fill's start: 1 where the point is at least sqrt(r2) cells from the wall (d1, squared), 0 elsewhere; 2 for those on the border
+extern "C" __global__ void __launch_bounds__(SD_THREADS) solid_flood_init(const float* d1, int gx, int gy, int gz, float r2, unsigned char* st) {
+    const long n = (long)gx * gy * gz;
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= n) return;
+    const int x = (int)(i % gx), y = (int)((i / gx) % gy), z = (int)(i / ((long)gx * gy));
+    unsigned char s = d1[i] >= r2 ? 1 : 0;
+    if (s && (x == 0 || y == 0 || z == 0 || x == gx - 1 || y == gy - 1 || z == gz - 1)) s = 2;
+    st[i] = s;
+}
+
+// one sweep of the fill along axis, both ways, for the lines line0 .. line0 + nlines: a point that can be filled (1) next to a
+// filled one (2) on the line is filled; *changed is set when any was
+extern "C" __global__ void __launch_bounds__(SD_THREADS) solid_flood_sweep(unsigned char* st, int gx, int gy, int gz, int axis, long line0,
+                                                                           int nlines, int* changed) {
+    const int t = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (t >= nlines) return;
+    long start, stride;
+    int n;
+    solid_line(gx, gy, gz, axis, line0 + t, start, stride, n);
+    bool carry = false, ch = false;
+    for (int q = 0; q < n; ++q) {
+        const long p = start + q * stride;
+        unsigned char s = st[p];
+        if (s == 1 && carry) st[p] = s = 2, ch = true;
+        carry = s == 2;
+    }
+    carry = false;
+    for (int q = n - 1; q >= 0; --q) {
+        const long p = start + q * stride;
+        unsigned char s = st[p];
+        if (s == 1 && carry) st[p] = s = 2, ch = true;
+        carry = s == 2;
+    }
+    if (ch) *changed = 1;
+}
+
+// the field in place of the distance: f = min(udf - iso, rc - sqrt(d2)) (d2: the squared distance to the outside), negative
+// inside; no value is nearer 0 than 1e-3 (no vertex of the surface on a grid point, where rounding would join vertices)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) solid_field(unsigned int* uf, const float* d2, long n, float iso, float rc) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= n) return;
+    const float u = __uint_as_float(uf[i]);
+    const float t1 = isinf(u) ? INFINITY : u - iso;
+    float fv = fminf(t1, rc - sqrtf(d2[i]));
+    fv = fv >= 0.0f ? fmaxf(fv, 1e-3f) : fminf(fv, -1e-3f);
+    uf[i] = __float_as_uint(fv);
+}
+
+// the eight corner values of the cell whose corner 0 is the point base (corner c = dx | dy << 1 | dz << 2)
+__device__ __forceinline__ void solid_corners(const float* f, long base, long gx, long gxy, float* fc) {
+    fc[0] = f[base], fc[1] = f[base + 1], fc[2] = f[base + gx], fc[3] = f[base + gx + 1];
+    fc[4] = f[base + gxy], fc[5] = f[base + gxy + 1], fc[6] = f[base + gxy + gx], fc[7] = f[base + gxy + gx + 1];
+}
+
+// the cells the surface crosses (corners of both signs), by rows of cells (row = y + (gy - 1) z, the rows row0 .. row0 + nrows):
+// write 0 counts them per row (cnt), write 1 lists their x from off[row] (cells)
+extern "C" __global__ void __launch_bounds__(SD_THREADS) solid_row_cells(const float* f, int gx, int gy, long row0, int nrows, int write,
+                                                                         int* cnt, const int* off, int* cells) {
+    const int t = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (t >= nrows) return;
+    const long row = row0 + t;
+    const long y = row % (gy - 1), z = row / (gy - 1);
+    const long gxy = (long)gx * gy;
+    int c = 0, w = write ? off[row] : 0;
+    for (int x = 0; x < gx - 1; ++x) {
+        float fc[8];
+        solid_corners(f, x + gx * y + gxy * z, gx, gxy, fc);
+        int neg = 0;
+        for (int k = 0; k < 8; ++k) neg += fc[k] < 0.0f;
+        if (neg == 0 || neg == 8) continue;
+        if (write) cells[w++] = x;
+        else ++c;
+    }
+    if (!write) cnt[row] = c;
+}
+
+// the edges a crossed cell owns, from its corner 0 to corner c (c = 1 .. 7: the axes, the face diagonals, the main diagonal), that
+// the surface crosses: emask (bit c - 1) and their count
+extern "C" __global__ void __launch_bounds__(SD_THREADS) solid_cell_edges(const float* f, int gx, int gy, const int* cx, const int* crow, int na,
+                                                                          unsigned char* emask, int* ecnt) {
+    const int i = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= na) return;
+    const long gxy = (long)gx * gy;
+    const long y = crow[i] % (gy - 1), z = crow[i] / (gy - 1);
+    const long base = cx[i] + gx * y + gxy * z;
+    float fc[8];
+    solid_corners(f, base, gx, gxy, fc);
+    unsigned int m = 0;
+    for (int c = 1; c < 8; ++c)
+        if ((fc[0] < 0.0f) != (fc[c] < 0.0f)) m |= 1u << (c - 1);
+    emask[i] = (unsigned char)m;
+    ecnt[i] = __popc(m);
+}
+
+// the vertices of those edges, from vbase[i] in the order of the bits: where the field is 0 along the edge, in the mesh's units
+extern "C" __global__ void __launch_bounds__(SD_THREADS) solid_edge_verts(const float* f, int gx, int gy, const int* cx, const int* crow,
+                                                                          const unsigned char* emask, const int* vbase, int na, float ox,
+                                                                          float oy, float oz, float h, float* out) {
+    const int i = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= na) return;
+    const long gxy = (long)gx * gy;
+    const long y = crow[i] % (gy - 1), z = crow[i] / (gy - 1), x = cx[i];
+    const long base = x + gx * y + gxy * z;
+    float fc[8];
+    solid_corners(f, base, gx, gxy, fc);
+    int w = vbase[i];
+    for (int c = 1; c < 8; ++c) {
+        if (!(emask[i] >> (c - 1) & 1)) continue;
+        const float tt = fc[0] / (fc[0] - fc[c]);
+        out[3 * w] = ox + h * ((float)x + tt * (float)(c & 1));
+        out[3 * w + 1] = oy + h * ((float)y + tt * (float)(c >> 1 & 1));
+        out[3 * w + 2] = oz + h * ((float)z + tt * (float)(c >> 2 & 1));
+        ++w;
+    }
+}
+
+// the crossed cell of the point (x, y, z) as its corner 0: its index in the list (the row's cells are in x order), or -1
+__device__ __forceinline__ int solid_find(const int* cx, const int* row_off, long row, int x) {
+    int lo = row_off[row], hi = row_off[row + 1] - 1;
+    while (lo <= hi) {
+        const int mid = (lo + hi) >> 1;
+        if (cx[mid] < x) lo = mid + 1;
+        else if (cx[mid] > x) hi = mid - 1;
+        else return mid;
+    }
+    return -1;
+}
+
+// the triangles of the crossed cells (trellis_solid_math.h's tetrahedra): write 0 counts them (tcnt), write 1 writes them from
+// tbase[i] with the vertices of the edges (an edge belongs to the cell of its lower corner); a missing vertex is written as -1
+extern "C" __global__ void __launch_bounds__(SD_THREADS) solid_cell_tris(const float* f, int gx, int gy, const int* cx, const int* crow,
+                                                                         const int* row_off, const unsigned char* emask, const int* vbase,
+                                                                         const int* tbase, int na, int write, int* tcnt, int* faces) {
+    const int i = blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= na) return;
+    const long gxy = (long)gx * gy;
+    const int cy = gy - 1;
+    const int y = crow[i] % cy, z = crow[i] / cy, x = cx[i];
+    float fc[8];
+    solid_corners(f, x + gx * (long)y + gxy * z, gx, gxy, fc);
+    if (!write) {
+        tcnt[i] = solid_cell_triangles(fc, [](int, int, int, int, int, int) {});
+        return;
+    }
+    auto vid = [&](int lo, int hi) -> int {
+        const int qx = x + (lo & 1), qy = y + (lo >> 1 & 1), qz = z + (lo >> 2 & 1);
+        const int j = solid_find(cx, row_off, (long)qy + (long)cy * qz, qx);
+        if (j < 0) return -1;
+        const int code = lo ^ hi;
+        return vbase[j] + __popc((unsigned int)emask[j] & ((1u << (code - 1)) - 1u));
+    };
+    int w = tbase[i];
+    solid_cell_triangles(fc, [&](int a0, int a1, int b0, int b1, int c0, int c1) {
+        faces[3 * w] = vid(a0, a1);
+        faces[3 * w + 1] = vid(b0, b1);
+        faces[3 * w + 2] = vid(c0, c1);
+        ++w;
+    });
+}
+
+// the second fill's start (after the field): the outside stays 2, a point of positive field becomes 1 (to be reached), the rest 0
+extern "C" __global__ void __launch_bounds__(SD_THREADS) solid_reach_init(const unsigned int* uf, long n, unsigned char* st) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= n) return;
+    if (st[i] != 2) st[i] = __uint_as_float(uf[i]) > 0.0f ? 1 : 0;
+}
+
+// a positive point the second fill did not reach (a pocket the outside does not connect to: a void, or a layer behind the wall)
+// is made inside
+extern "C" __global__ void __launch_bounds__(SD_THREADS) solid_unreached(unsigned int* uf, const unsigned char* st, long n) {
+    const long i = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (i >= n) return;
+    if (st[i] == 1) uf[i] = __float_as_uint(-1e-3f);
 }

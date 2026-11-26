@@ -2603,7 +2603,10 @@ simplification's target), C<texture_size> (4096), C<remove_background> (C<auto>:
 one, else BiRefNet; C<true>; C<false>: the whole image), C<texture> (C<true>; C<false>: the mesh alone, without the texture
 flow, the unwrap and the bake, so faster), C<format> (C<glb>; C<stl>: a binary STL of the mesh, no texture, for 3D printing:
 z up, every face wound counter-clockwise from outside, centred on x and y and standing on z = 0) and C<size_mm> (the STL's
-largest side in millimetres, 100; 0 keeps the mesh's own units, a unit cube). A job takes minutes (about 3.5 at 512 on this machine), so the reply
+largest side in millimetres, 100; 0 keeps the mesh's own units, a unit cube). Without texture (the mesh alone, the STL) the
+mesh is rebuilt as a closed solid first (src/trellis_solid.h): the mesher's surface has holes, faces turned inward and loose
+pieces; the solid's surface is closed, every edge shared by two faces, wound outward, on a grid of 512 cells across the object
+(holes in the mesh up to about 6% of its size are closed; a few seconds). A job takes minutes (about 3.5 at 512 on this machine), so the reply
 comes at once with the job's C<id>: C<GET /v1/3d/generations/{id}> is its state (C<in_progress> with the stage and its step,
 C<completed>, C<failed> with the error), C<GET /v1/3d/generations/{id}/content> is the model (C<model/gltf-binary>, or
 C<model/stl> for an STL: a file in

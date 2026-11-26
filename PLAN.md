@@ -325,15 +325,26 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
     The mesh alone and STL (2026-11-26): `texture: false` skips the texture flow, the unwrap and the bake (a GLB of the mesh,
     `encode_glb_mesh`); `format: stl` writes a binary STL (`encode_stl`: z up, centred, on z = 0, the largest side `size_mm`,
     100 mm by default; faces turned when the signed volume is negative). `stl_verify` checks both on a cube; `t/72` runs an STL
-    job (44 checks). The vase at 512: 131 s for the STL against about 200 s textured. Not print-clean yet: the vase's mesh before
-    the simplification (1.1M faces) has 14,689 boundary edges, 22,858 non-manifold ones, 17% of its manifold edges join faces wound
-    opposite ways, and 6,971 pieces (the 200k simplified one the same in proportion). It comes from the mesher (the flexible dual
-    grid keeps which edges are crossed, not the inside), not the simplifier; the textured GLB hides it (drawn double-sided). (e)
-    is the fix.
+    job (44 checks). The vase at 512: 131 s for the STL against about 200 s textured. The mesher's surface is not printable (the
+    vase's 1.1M faces: 14,689 boundary edges, 22,858 non-manifold ones, 17% of the manifold edges join faces wound opposite ways,
+    6,971 pieces; the flexible dual grid keeps which edges are crossed, not the inside; the textured GLB hides it, drawn
+    double-sided), so without texture it is rebuilt as a closed solid (2026-11-26, `src/trellis_solid.{h,cpp}`, sd_gpu.hip
+    `solid_*`, shared math in `trellis_solid_math.h`): on a grid of 512 cells across the object, the exact distance to the mesh
+    near it, an exact distance transform to the wall (points within 0.6 cells), a fill from the border through the points at
+    least `close` cells from the wall, the field min(distance - 0.6, close + 0.5 - distance to the outside), a second fill that
+    makes every positive pocket the outside does not reach inside, marching tetrahedra (the Kuhn split: a closed 2-manifold wound
+    outward by construction), small pieces dropped. `close` starts at 4 and doubles to 16 while the result is a thin shell (mean
+    thickness 2 V / A under 3 cells: the fill went in through a wider hole; the seed-1 vase has a 10-cell gap in its cup's floor).
+    Then the simplifier's manifold mode (edges taken from the faces, no sort; the link condition and the degrees in the cost
+    kernel; no zero-area face). `solid_verify`: six synthetic cases (turned faces, a small and a large hole, an inner wall, two
+    boxes on an edge, a speck) and real meshes (device = host reference on a 96 grid: the grids equal, the same surface; the
+    result closed). The vase: one closed piece, Euler number 2 (trimesh: watertight, consistent, a volume), 0.7 to 2 s for the
+    solid and 2 to 6 s for the simplification. Limits: a thin sheet of the model stays about 1.2 cells thick (too thin for FDM at
+    100 mm: a minimum wall option is open); crevices narrower than about 2 close are filled; the 1024 grid leaks (close is in
+    cells) and its 26M-face simplification is slow, so the grid is 512 for both resolutions.
     Open: (b) the 1536 cascade
     (memory is no longer the limit; its time is); (c) the normal-map and AO bakes and their GLB inputs; (d) UnwrapMesh's "pec"
-    segmenter (ours is CuMesh's charts); (e) python's to_glb clean-up (needed for a printable STL: the face orientations made consistent, duplicate faces, non-manifold
-    edges and small pieces removed, the holes filled; or the workflow's RemeshMesh for a watertight mesh); (f) the simplify stops below its target (667k for 700k), where
+    segmenter (ours is CuMesh's charts); (e) a minimum wall thickness for the solid (thin sheets thickened for printing); (f) the simplify stops below its target (667k for 700k), where
     python's stops at it; (g) the unwrap (74 s on the vase: xatlas per chart, single-threaded) and the host sorts, to move to the
     device or threads; (h) RemeshMesh (udf, 768) only if wanted: the user prefers the sharper result without it; (i) access by
     the harness's login (waits on the user: when this project joins the AI harness, `./aicli.git`, or its token is accepted by

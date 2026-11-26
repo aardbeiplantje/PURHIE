@@ -267,9 +267,31 @@ void dino_rope(float* x, int T, int prefix, int C, int H, int D, const float* cs
 // cheapest collapse around each face (prop [F], packed); the collapses under thresh (vkept [V], fkept [F] set to 0 for the removed); the
 // compaction by the maps of an exclusive scan of the kept flags (vmap [V+1], fmap [F+1]).
 void simp_qem(const float* v, const int* f, const int* v2f, const int* v2f_off, int V, float* qem);
+// manifold: an edge whose collapse would not keep a closed manifold one (the link condition, the degrees) costs +inf (the solid's
+// surface; off: CuMesh's costs as they are)
 void simp_cost(const float* v, const int* f, const int* v2f, const int* v2f_off, const unsigned long long* edges, const unsigned char* vb,
-               const float* qem, int E, float lam_len, float lam_sk, float* cost);
+               const float* qem, int E, float lam_len, float lam_sk, float* cost, bool manifold = false);
 void simp_propagate(const unsigned long long* edges, const int* v2f, const int* v2f_off, const float* cost, int E, unsigned long long* prop);
+// the solid rebuild (sd_gpu.hip solid_*; trellis_solid.cpp drives them, trellis_solid.h says what each step is). Grids of
+// gx * gy * gz points, x fastest, distances in cells. The line kernels (edt, flood_sweep) take the lines line0 .. line0 + nlines
+// along axis (0 x, 1 y, 2 z); edt's scr holds (3 n + 1) floats per line (n the line's points). The cell kernels take the crossed
+// cells as their x (cx) and row (crow = y + (gy - 1) z), the list in row order and x order within a row (row_off: each row's first).
+void solid_fill_u32(unsigned int* p, long n, unsigned int val);
+void solid_udf(const float* v, const int* f, int f0, int nf, int gx, int gy, int gz, float band, unsigned int* udf);
+void solid_sources(const unsigned int* udf, const unsigned char* st, long n, float iso, int mode, float* d);
+void solid_edt(float* d, int gx, int gy, int gz, int axis, long line0, int nlines, float* scr);
+void solid_flood_init(const float* d1, int gx, int gy, int gz, float r2, unsigned char* st);
+void solid_flood_sweep(unsigned char* st, int gx, int gy, int gz, int axis, long line0, int nlines, int* changed);
+void solid_field(unsigned int* uf, const float* d2, long n, float iso, float rc);
+void solid_reach_init(const unsigned int* uf, long n, unsigned char* st);
+void solid_unreached(unsigned int* uf, const unsigned char* st, long n);
+void solid_row_cells(const float* f, int gx, int gy, long row0, int nrows, int write, int* cnt, const int* off, int* cells);
+void solid_cell_edges(const float* f, int gx, int gy, const int* cx, const int* crow, int na, unsigned char* emask, int* ecnt);
+void solid_edge_verts(const float* f, int gx, int gy, const int* cx, const int* crow, const unsigned char* emask, const int* vbase, int na,
+                      float ox, float oy, float oz, float h, float* out);
+void solid_cell_tris(const float* f, int gx, int gy, const int* cx, const int* crow, const int* row_off, const unsigned char* emask,
+                     const int* vbase, const int* tbase, int na, int write, int* tcnt, int* faces);
+
 void simp_collapse(float* v, int* f, const unsigned long long* edges, const int* v2f, const int* v2f_off, const float* cost,
                    const unsigned long long* prop, const unsigned char* vb, int E, float thresh, int* vkept, int* fkept);
 void simp_compress_v(const int* vmap, const float* oldv, int V, float* newv);

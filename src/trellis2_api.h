@@ -24,6 +24,7 @@ int t2_has_background_removal(t2_pipe_t* p);
  * faces after the simplification, the texture size (texels per side; 0: no texture, the mesh alone, which is faster), remove_background
  * (-1: the alpha when the image has one, else BiRefNet; 0: the whole image; 1: BiRefNet), the format (0: a binary glTF; 1: a binary STL
  * of the mesh, always without texture, for 3D printing) and the STL's largest side in millimetres (0: the mesh's own units).
+ * Without texture (the mesh alone, the STL) the mesh is rebuilt as a closed solid first (trellis_solid.h).
  * 0: started; 1: a job is running (none started); -1: an error (t2_last_error: the image, an option, or no background removal for an
  * image without alpha). */
 int t2_start(t2_pipe_t* p, const unsigned char* image, size_t n, int resolution, unsigned long long seed, int faces, int texture_size,
