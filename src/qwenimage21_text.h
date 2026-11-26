@@ -9,7 +9,7 @@
 
 namespace qwenimage21 {
 
-/* ids [T] (1 to 64 tokens) -> out [T][4096] (host memory). Returns false on an error. */
+/* ids [T] (1 to 1024 tokens) -> out [T][4096] (host memory). Returns false on an error. */
 bool dev_text21_encode(const zimage::SafeTensors& st, const int* ids, int T, float* out);
 
 }  // namespace qwenimage21

@@ -158,8 +158,17 @@ run alone on the machine.
 
 16. **Qwen-Image (1 and 2.1) and the 2.1 image edit.** All stages of both run on the device and pass their oracles (see
     "ComfyUI"); neither is served. Qwen-Image 1: the server path and the CFG (true CFG 4 needs a negative prompt; the
-    default pipeline run has none). Qwen-Image 2.1: the sampler (the ComfyUI workflow: 25 steps, `simple`, CFG 1, no shift
-    node: the shift to use is open) and the server path (▶ Next 1). Then the edit: no reference-image input and no edit
+    default pipeline run has none). Qwen-Image 2.1, the pipeline (2026-11-26, `src/qwenimage21_pipe.{h,cpp}`, the C API
+    `qi21_*`): the t2i template with its system turn (14 tokens dropped), the Qwen tokenizer (identical to Qwen3's), the
+    schedule of the model's scheduler_config.json (Qwen/Qwen-Image-2.1 on Hugging Face: the same as Qwen-Image 1's; no
+    author sigmas, so linspace; the pipeline's 40 steps, no guidance), torch's noise for the seed, the DiT and the VAE at any
+    size (multiples of 32 from 256 to 2048), RGBA out. `tests/qwenimage21_pipe_verify.cpp` against
+    `tools/qwenimage21_oracle.py` (diffusers 0.43.0 in FP32 on the dequantised ComfyUI files; outputs in
+    `/data/zimage-ref/qwenimage2/pipe`: 512 x 512, 8 steps, seed 0, "a red cube on a wooden table, soft studio light"): the
+    ids exact, the embeddings 3e-5, the sigmas 6e-8, the noise 5e-7, the first velocity 7.5e-4, the final latent 1.6%, the
+    decoder 6e-7; the image against diffusers' PSNR 47.6 dB (mean 0.33 levels). Open: the speed (7.4 s a step at 512 x 512:
+    the int8 ConvRot linears run at about 2 TFLOPS; 40 steps at 1024 would take about 20 minutes); the server route
+    (▶ Next 1). The ComfyUI workflow runs 25 steps with `simple` and CFG 1 (its own sigmas: not checked). Then the edit: no reference-image input and no edit
     route exist; needs the edit conditioning in the 2.1 DiT (how the reference image enters, confirmed against the
     reference edit pipeline), a stage check against its python oracle, and a server route. The ComfyUI edit workflow is in
     the uploads (`image_qwen_image_2_1_image_edit`), with the Edit Lightning LoRA.

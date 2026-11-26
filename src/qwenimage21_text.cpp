@@ -1,6 +1,6 @@
 /* Qwen-Image 2.1's text encoder on the device: see qwenimage21_text.h. The embedding rows are dequantised and rotated on the host (a
  * lookup of T rows); everything else is on the device: the ConvRot linears, the RMS norms (BF16 weights), rotate-half RoPE, causal
- * grouped-query attention (T <= 64), SwiGLU. */
+ * grouped-query attention (one score per key in shared memory: T <= 1024), SwiGLU. */
 #include "qwenimage21_text.h"
 
 #include "sd_device.h"
@@ -78,7 +78,7 @@ bool bf(const zimage::SafeTensors& st, const std::string& name, size_t count, co
 
 bool dev_text21_encode(const zimage::SafeTensors& st, const int* ids, int T, float* out) {
     if (!sddev::enabled()) { fprintf(stderr, "qwenimage21 text: no device\n"); return false; }
-    if (T < 1 || T > 64) { fprintf(stderr, "qwenimage21 text: %d tokens (1 to 64)\n", T); return false; }
+    if (T < 1 || T > 1024) { fprintf(stderr, "qwenimage21 text: %d tokens (1 to 1024)\n", T); return false; }
 
     /* the Hadamard of 256 (the same as the DiT's ConvRot layers) */
     static const double H4[4][4] = {{1, 1, 1, -1}, {1, 1, -1, 1}, {1, -1, 1, 1}, {-1, 1, 1, 1}};

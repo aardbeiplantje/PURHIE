@@ -8,6 +8,7 @@
 #include "sd_device.h"
 
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -96,6 +97,9 @@ bool dev_dit21_forward(const zimage::SafeTensors& st, const float* packed, int g
     if (!sddev::enabled()) { fprintf(stderr, "qwenimage21 dit: no device\n"); return false; }
     if (gh < 1 || gw < 1 || L < 1) { fprintf(stderr, "qwenimage21 dit: bad grid or text length\n"); return false; }
     const int N = gh * gw, J = L + N;
+    /* the image rows' attention in launches of about 6M query-key pairs (about 40 ms at 32 heads on the fused kernel: AGENTS.md, GPU
+     * use), in whole 64-query blocks */
+    const int qrows = (int)std::min<long>(N, std::max<long>(256, ((6L << 20) / J) / 64 * 64));
     if (N % 4 != 0) { fprintf(stderr, "qwenimage21 dit: the grid must hold whole 2 x 2 slots\n"); return false; }
 
     /* the weights (in place) */
@@ -221,7 +225,9 @@ bool dev_dit21_forward(const zimage::SafeTensors& st, const float* packed, int g
         sddev::rope(k.get(), J, HEADS, frd.get());
         /* the text rows: causal among the text; the image rows: every token (the FP32 attention, no mask) */
         sddev::attn21_text(q.get(), k.get(), v.get(), J, L, HEADS, att.get());
-        sddev::attention_f32(q.get() + (size_t)L * D, N, k.get(), v.get(), J, D, HEADS, att.get() + (size_t)L * D);
+        for (int r0 = 0; r0 < N; r0 += qrows)
+            sddev::attention_f32(q.get() + (size_t)(L + r0) * D, std::min(qrows, N - r0), k.get(), v.get(), J, D, HEADS,
+                                 att.get() + (size_t)(L + r0) * D);
         lin_q(wo, att.get(), J, Hd.get(), xr.get(), 0, D, o.get());
         sddev::gated_add(X.get(), gt1.get(), o.get(), (size_t)J * D);
         /* the SwiGLU MLP: gate_layer rows [0, 12288) and proj rows [12288, 24576) of the fused weight, then out(silu(gate) * proj) */

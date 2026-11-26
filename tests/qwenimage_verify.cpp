@@ -300,7 +300,7 @@ int main(int argc, char** argv) {
             printf("[FAIL] the 2.1 VAE oracle files (run ref_vae21_fp32.py)\n");
             return 1;
         }
-        if (!vae21_file().ok() || !qwenimage21::dev_vae21_decode(vae21_file(), lat.data(), out.data())) {
+        if (!vae21_file().ok() || !qwenimage21::dev_vae21_decode(vae21_file(), lat.data(), 16, 16, out.data())) {
             printf("[FAIL] dev_vae21_decode\n");
             return 1;
         }

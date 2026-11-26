@@ -151,12 +151,13 @@ bool attention_block(const zimage::SafeTensors& st, const std::string& p, const 
 
 }  // namespace
 
-bool dev_vae21_decode(const zimage::SafeTensors& st, const float* latent, float* out) {
+bool dev_vae21_decode(const zimage::SafeTensors& st, const float* latent, int gh, int gw, float* out) {
     if (!sddev::enabled()) { fprintf(stderr, "qwenimage21 vae: no device\n"); return false; }
-    const int C0 = 64, H0 = 16, W0 = 16;
+    if (gh < 1 || gw < 1) { fprintf(stderr, "qwenimage21 vae: bad latent size\n"); return false; }
+    const int C0 = 64, H0 = gh, W0 = gw;
     DevBuf zeros(1152, true);
 
-    /* the input: the latent normalised (z * std + mean) and written token-major (the small host step: 64 x 256 values) */
+    /* the input: the latent normalised (z * std + mean) and written token-major (the small host step: 64 x gh x gw values) */
     DevBuf z((size_t)H0 * W0 * C0);
     for (int c = 0; c < C0; ++c)
         for (int p = 0; p < H0 * W0; ++p) z.get()[(size_t)p * C0 + c] = latent[(size_t)c * H0 * W0 + p] * kStd[c] + kMean[c];
@@ -170,7 +171,7 @@ bool dev_vae21_decode(const zimage::SafeTensors& st, const float* latent, float*
     DevBuf x((size_t)H * W * 1152);
     conv(y.get(), H, W, cin_conv, zeros, x.get());
 
-    /* the middle: resnet, attention, resnet (16 x 16, 1152 channels) */
+    /* the middle: resnet, attention, resnet (gh x gw, 1152 channels) */
     DevBuf r1, a1, r2;
     if (!resnet(st, "decoder.middle.0", x.get(), H, W, 1152, 1152, zeros, r1)) return false;
     if (!attention_block(st, "decoder.middle.1", r1.get(), H, W, 1152, zeros, a1)) return false;
@@ -213,11 +214,11 @@ bool dev_vae21_decode(const zimage::SafeTensors& st, const float* latent, float*
     }
 
     /* the head: RMS norm (144), SiLU, the 3 x 3 conv to 4 channels */
-    const uint16_t* gh = nullptr;
+    const uint16_t* gamma = nullptr;
     Conv head;
-    if (!bf(st, "decoder.head.0.gamma", 144, gh) || !load_conv(st, "decoder.head.2", 144, 4, 1, head)) return false;
+    if (!bf(st, "decoder.head.0.gamma", 144, gamma) || !load_conv(st, "decoder.head.2", 144, 4, 1, head)) return false;
     DevBuf hn((size_t)H * W * 144);
-    sddev::rms_tok(x.get(), H * W, 144, gh, hn.get());
+    sddev::rms_tok(x.get(), H * W, 144, gamma, hn.get());
     sddev::silu(hn.get(), (size_t)H * W * 144);
     DevBuf o((size_t)H * W * 4);
     conv(hn.get(), H, W, head, zeros, o.get());
@@ -227,7 +228,7 @@ bool dev_vae21_decode(const zimage::SafeTensors& st, const float* latent, float*
     std::memcpy(tok.data(), o.get(), sizeof(float) * tok.size());
     for (int c = 0; c < 4; ++c)
         for (int p = 0; p < H * W; ++p) out[(size_t)c * H * W + p] = std::min(1.0f, std::max(-1.0f, tok[(size_t)p * 4 + c]));
-    return H == 256 && W == 256;
+    return H == 16 * H0 && W == 16 * W0;
 }
 
 }  // namespace qwenimage21
