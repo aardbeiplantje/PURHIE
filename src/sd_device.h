@@ -133,6 +133,10 @@ void linear_bf16_xb(const uint16_t* xb, int T, const uint16_t* W, int in, int ou
 // the same with the output in BF16 (hipBLASLt's BF16 output, the bias as its epilogue): false when the device path does not take
 // the shape (out >= 256, T >= 1024, in % 64 == 0, hipBLASLt on): the caller takes the FP32 path
 bool linear_bf16_out16(const uint16_t* xb, int T, const uint16_t* W, int in, int out, const float* b, uint16_t* y);
+// FP32 in and out through hipBLASLt's BF16 product with a BF16 output, widened back (for the large shapes: the first candidate of the
+// BF16 output is a fast algorithm, the FP32 output's about four times slower, and the tuner keeps the first candidate's numerics);
+// the output is BF16-rounded. Other shapes: linear_bf16.
+void linear_bf16_via16(const float* x, int T, const uint16_t* W, int in, int out, const float* b, float* y);
 // the same with the output always BF16 (the FP32 product rounded when hipBLASLt does not take the shape)
 bool linear_bf16_xb16(const uint16_t* xb, int T, const uint16_t* W, int in, int out, const float* b, uint16_t* y16);
 // the DiT's BF16 chain: rows of 128 (per token and head): y = rope(rms(x) w), BF16 in and out (y may be x)

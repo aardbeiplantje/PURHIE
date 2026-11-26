@@ -1136,6 +1136,32 @@ bool linear_bf16_out16(const uint16_t* xb, int T, const uint16_t* W, int in, int
 
 /* the linear with BF16 output, whatever the shape: hipBLASLt's BF16 output when it takes the shape, else the FP32 product
  * rounded to BF16 */
+void linear_bf16_via16(const float* x, int T, const uint16_t* W, int in, int out, const float* b, float* y) {
+    if (out <= 0 || T <= 0) return;
+    if (!(in % 64 == 0 && out >= 256 && T >= 1024)) {
+        linear_bf16(x, T, W, in, out, b, y);
+        return;
+    }
+    const size_t nx = (size_t)T * in, ny = (size_t)T * out;
+    uint16_t* xb = static_cast<uint16_t*>(dalloc(sizeof(uint16_t) * nx));
+    uint16_t* yb = static_cast<uint16_t*>(dalloc(sizeof(uint16_t) * ny));
+    long n1 = (long)nx;
+    const float* xp = x;
+    void* a1[] = {(void*)&xp, (void*)&xb, (void*)&n1};
+    launch(f_to_bf16, dim3(blocks(nx)), a1);
+    if (linear_bf16_out16(xb, T, W, in, out, b, yb)) {
+        long n2 = (long)ny;
+        const uint16_t* yp = yb;
+        void* a2[] = {(void*)&yp, (void*)&y, (void*)&n2};
+        launch(f_bf16_to_f32, dim3(blocks(ny)), a2);
+        sync();
+    } else {
+        linear_bf16_xb(xb, T, W, in, out, b, y);
+    }
+    drelease(xb, sizeof(uint16_t) * nx);
+    drelease(yb, sizeof(uint16_t) * ny);
+}
+
 bool linear_bf16_xb16(const uint16_t* xb, int T, const uint16_t* W, int in, int out, const float* b, uint16_t* y16) {
     if (linear_bf16_out16(xb, T, W, in, out, b, y16)) return true;
     float* tmp = static_cast<float*>(dalloc(sizeof(float) * (size_t)T * out));

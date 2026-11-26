@@ -6,12 +6,18 @@
 #include "qwenimage21_text.h"
 #include "qwenimage21_vae.h"
 #include "qwenimage_pipe.h"
+#include "sd_device.h"
 #include "torch_randn.h"
+#include "trellis_bake.h"
 
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -85,8 +91,37 @@ bool decode(const zimage::SafeTensors& vae, const float* latent, int gh, int gw,
 struct qi21_pipe {
     zimage::SafeTensors dit, vae, te;
     tokenizer_t* tok = nullptr;
+    /* the background job (qi21_start) */
+    std::mutex mu;
+    std::thread th;
+    int status = 2;  /* 0 running, 1 done, -1 failed, 2 none */
+    int step = 0, steps = 0;
+    std::string error;
+    std::vector<uint8_t> png;
+    std::chrono::steady_clock::time_point t0, t1;
     qi21_pipe(const std::string& d, const std::string& v, const std::string& t) : dit(d), vae(v), te(t) {}
 };
+
+namespace {
+
+/* the options' check, shared by the two ways in */
+bool check_options(qi21_pipe_t* pipe, const char* prompt, int height, int width, int steps) {
+    if (!pipe || !prompt) {
+        g_error = "qwen-image 2.1: a pipeline and a prompt are needed";
+        return false;
+    }
+    if (height < 256 || width < 256 || height > 2048 || width > 2048 || height % 32 || width % 32) {
+        g_error = "qwen-image 2.1: height and width: multiples of 32 from 256 to 2048";
+        return false;
+    }
+    if (steps < 1 || steps > 100) {
+        g_error = "qwen-image 2.1: steps 1 to 100";
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
 
 extern "C" {
 
@@ -115,6 +150,7 @@ qi21_pipe_t* qi21_open(const char* dit_path, const char* vae_path, const char* t
 
 void qi21_close(qi21_pipe_t* pipe) {
     if (!pipe) return;
+    if (pipe->th.joinable()) pipe->th.join();
     if (pipe->tok) tokenizer_free(pipe->tok);
     delete pipe;
 }
@@ -124,16 +160,9 @@ const char* qi21_last_error(void) { return g_error.c_str(); }
 int qi21_generate(qi21_pipe_t* pipe, const char* prompt, int height, int width, int steps, unsigned long long seed, unsigned char* rgba,
                   void (*progress)(int step, int steps, void* user), void* user) {
     g_error.clear();
-    if (!pipe || !prompt || !rgba) {
-        g_error = "qwen-image 2.1: a pipeline, a prompt and an output are needed";
-        return -1;
-    }
-    if (height < 256 || width < 256 || height > 2048 || width > 2048 || height % 32 || width % 32) {
-        g_error = "qwen-image 2.1: height and width: multiples of 32 from 256 to 2048";
-        return -1;
-    }
-    if (steps < 1 || steps > 100) {
-        g_error = "qwen-image 2.1: steps 1 to 100";
+    if (!check_options(pipe, prompt, height, width, steps)) return -1;
+    if (!rgba) {
+        g_error = "qwen-image 2.1: no output";
         return -1;
     }
     try {
@@ -171,5 +200,101 @@ int qi21_generate(qi21_pipe_t* pipe, const char* prompt, int height, int width, 
     }
     return 0;
 }
+
+int qi21_start(qi21_pipe_t* pipe, const char* prompt, int height, int width, int steps, unsigned long long seed) {
+    g_error.clear();
+    if (!check_options(pipe, prompt, height, width, steps)) return -1;
+    {
+        std::lock_guard<std::mutex> lk(pipe->mu);
+        if (pipe->status == 0) return 1;
+    }
+    if (pipe->th.joinable()) pipe->th.join();
+    {
+        std::lock_guard<std::mutex> lk(pipe->mu);
+        pipe->status = 0;
+        pipe->step = 0;
+        pipe->steps = steps;
+        pipe->error.clear();
+        pipe->png.clear();
+        pipe->t0 = pipe->t1 = std::chrono::steady_clock::now();
+    }
+    pipe->th = std::thread([pipe, text = std::string(prompt), height, width, steps, seed]() {
+        std::vector<unsigned char> rgba((size_t)height * width * 4);
+        std::vector<uint8_t> png;
+        std::string err;
+        int rc = -1;
+        {
+            /* the device's other users (the image and audio generators, the 3D jobs) wait while the image is made */
+            std::lock_guard<std::recursive_mutex> dev(sddev::run_mutex());
+            auto progress = [](int step, int, void* user) {
+                qi21_pipe_t* p = static_cast<qi21_pipe_t*>(user);
+                std::lock_guard<std::mutex> lk(p->mu);
+                p->step = step;
+            };
+            rc = qi21_generate(pipe, text.c_str(), height, width, steps, seed, rgba.data(), progress, pipe);
+            if (rc != 0) err = qi21_last_error();
+        }
+        if (rc == 0) {
+            png = trellis::encode_png(std::vector<uint8_t>(rgba.begin(), rgba.end()), width, height, 4);
+            if (png.empty()) {
+                rc = -1;
+                err = "qwen-image 2.1: the PNG encoder failed";
+            }
+        }
+        std::lock_guard<std::mutex> lk(pipe->mu);
+        pipe->t1 = std::chrono::steady_clock::now();
+        if (rc == 0) {
+            pipe->png = std::move(png);
+            pipe->status = 1;
+        } else {
+            pipe->error = err.empty() ? "qwen-image 2.1: the job failed" : err;
+            pipe->status = -1;
+        }
+    });
+    return 0;
+}
+
+int qi21_poll(qi21_pipe_t* pipe, int* step, int* steps, double* seconds) {
+    if (!pipe) return 2;
+    std::lock_guard<std::mutex> lk(pipe->mu);
+    if (step) *step = pipe->step;
+    if (steps) *steps = pipe->steps;
+    if (seconds)
+        *seconds = pipe->status == 2 ? 0.0
+                                     : std::chrono::duration<double>((pipe->status == 0 ? std::chrono::steady_clock::now() : pipe->t1) -
+                                                                     pipe->t0).count();
+    return pipe->status;
+}
+
+int qi21_take(qi21_pipe_t* pipe, unsigned char** png, size_t* n) {
+    if (!pipe || !png || !n) {
+        g_error = "qi21_take: no pipeline or output";
+        return -1;
+    }
+    std::lock_guard<std::mutex> lk(pipe->mu);
+    if (pipe->status == -1) {
+        g_error = pipe->error;
+        pipe->status = 2;
+        return -1;
+    }
+    if (pipe->status != 1) {
+        g_error = pipe->status == 0 ? "qwen-image 2.1: the image is not done" : "qwen-image 2.1: no image";
+        return -1;
+    }
+    unsigned char* out = static_cast<unsigned char*>(std::malloc(pipe->png.size() ? pipe->png.size() : 1));
+    if (!out) {
+        g_error = "out of memory";
+        return -1;
+    }
+    std::memcpy(out, pipe->png.data(), pipe->png.size());
+    *png = out;
+    *n = pipe->png.size();
+    pipe->png.clear();
+    pipe->png.shrink_to_fit();
+    pipe->status = 2;
+    return 0;
+}
+
+void qi21_free(void* ptr) { std::free(ptr); }
 
 }  // extern "C"

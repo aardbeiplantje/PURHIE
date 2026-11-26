@@ -25,6 +25,7 @@ done
 
 # Now run
 # ZIMAGE_DIR set: the Z-Image files are mounted at /zimage and the server gets --zimage /zimage (unless ROCM_ARGS has one)
+# (a ComfyUI models directory: Qwen-Image 2.1's files there are served too, as qwen-image-2.1)
 if [ -n "${ZIMAGE_DIR:-}" ] && [[ " ${ROCM_ARGS:-} " != *" --zimage "* ]]; then
     ROCM_ARGS="${ROCM_ARGS:-} --zimage /zimage"
 fi

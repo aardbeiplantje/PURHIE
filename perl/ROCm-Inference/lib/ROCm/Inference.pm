@@ -944,6 +944,84 @@ sub DESTROY {
     $img->{h} = 0;
 }
 
+# Qwen-Image 2.1 (text to image, RGBA PNG) from a ComfyUI models directory, read in place: the diffusion model
+# (diffusion_models/qwen_image_2.1_bf16.safetensors, else qwen_image_2.1_int8_convrot.safetensors: the BF16 one runs about ten times
+# faster on the device), the text encoder (text_encoders/qwen3vl_8b_int8_convrot.safetensors), the VAE
+# (vae/qwen_image_2.1_vae_bf16.safetensors) and the Qwen tokenizer.json beside the text encoders (text_encoders/tokenizer.json, the one
+# Z-Image reads). The pipeline is engine code (src/qwenimage21_pipe.h); an image is made on a background thread, one at a time, so the
+# caller polls it.
+package ROCm::Inference::QwenImage21;
+
+# the files of DIR: { dit, te, vae, tokenizer, bytes (the three models' sizes) }; dies when one is missing
+sub files {
+    my ($class, $dir, %o) = @_;
+    my ($dit) = grep { -f } map { "$dir/diffusion_models/qwen_image_2.1_$_.safetensors" } qw(bf16 int8_convrot);
+    my %f = (dit => $o{dit} // $dit, te => "$dir/text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+             vae => "$dir/vae/qwen_image_2.1_vae_bf16.safetensors", tokenizer => $o{tokenizer} // "$dir/text_encoders/tokenizer.json");
+    die "qwen-image 2.1: no diffusion_models/qwen_image_2.1_bf16.safetensors (or _int8_convrot) in $dir\n" unless defined $f{dit};
+    for my $k (qw(dit te vae tokenizer)) { die "qwen-image 2.1: no file $f{$k}\n" unless -f $f{$k} }
+    $f{bytes} = 0;
+    $f{bytes} += -s $f{$_} for qw(dit te vae);
+    return \%f;
+}
+
+sub new {
+    my ($class, $dir, %o) = @_;
+    my $f = $class->files($dir, %o);
+    my ($vocab, $merges) = ROCm::Inference::ZImage::_tokenizer($f->{tokenizer});
+    my $h = ROCm::Inference::_qi21_open(@$f{qw(dit vae te)}, $vocab, $merges);
+    return bless { h => $h, dir => $dir, files => $f }, $class;
+}
+
+# the size WIDTHxHEIGHT (multiples of 32 from 256 to 2048; 1024x1024 by default) as (width, height); dies on another
+sub size {
+    my ($class, $size) = @_;
+    my ($w, $h) = (1024, 1024);
+    if (defined $size) {
+        ($w, $h) = $size =~ /\A(\d+)x(\d+)\z/ or die "size: WIDTHxHEIGHT, not '$size'\n";
+    }
+    die "size: multiples of 32 from 256 to 2048, not ${w}x$h\n"
+        unless $w >= 256 && $h >= 256 && $w <= 2048 && $h <= 2048 && $w % 32 == 0 && $h % 32 == 0;
+    return ($w, $h);
+}
+
+# $q->start($prompt, size => 'WIDTHxHEIGHT', steps => N, seed => N): 1 when the image is started, 0 when one is being made already.
+# steps: 1 to 100 (the pipeline's 40); the seed draws torch's randn (diffusers' noise for the seed). Dies on a bad option.
+sub start {
+    my ($q, $prompt, %o) = @_;
+    my ($w, $h) = ROCm::Inference::QwenImage21->size($o{size});
+    my $steps = $o{steps} // 40;
+    die "steps: 1 to 100, not '$steps'\n" unless $steps =~ /\A\d+\z/ && $steps >= 1 && $steps <= 100;
+    my $seed = $o{seed} // 0;
+    die "seed: a whole number, not '$seed'\n" unless $seed =~ /\A\d+\z/;
+    return ROCm::Inference::_qi21_start($q->{h}, $prompt, $h, $w, $steps, $seed) == 0 ? 1 : 0;
+}
+
+# the image: { status => running | done | failed | none, step, steps, seconds }
+sub poll {
+    my ($q) = @_;
+    my ($st, $step, $steps, $secs) = ROCm::Inference::_qi21_poll($q->{h});
+    my %name = (0 => 'running', 1 => 'done', -1 => 'failed', 2 => 'none');
+    return { status => $name{$st} // 'none', step => $step, steps => $steps, seconds => $secs };
+}
+
+# the finished image's PNG bytes (the job is cleared); dies with the error of a failed one
+sub take { my ($q) = @_; ROCm::Inference::_qi21_take($q->{h}) }
+
+# the whole image, waiting for it (scripts and tests; the server polls instead): PNG bytes
+sub generate {
+    my ($q, $prompt, %o) = @_;
+    $q->start($prompt, %o) or die "qwen-image 2.1: an image is being made\n";
+    select undef, undef, undef, 0.2 while $q->poll->{status} eq 'running';
+    return $q->take;
+}
+
+sub DESTROY {
+    my ($q) = @_;
+    ROCm::Inference::_qi21_close($q->{h}) if $q->{h};
+    $q->{h} = 0;
+}
+
 # TRELLIS.2 (an image to a textured 3D model, binary glTF): the files of a directory, read in place: the TRELLIS.2-4B checkpoints
 # (DIR/TRELLIS.2-4B/ or DIR itself: pipeline.json and ckpts/), TRELLIS-image-large's sparse-structure decoder
 # (DIR/TRELLIS-image-large/ckpts/, DIR/ckpts/ or DIR: ss_dec_conv3d_16l8_fp16.safetensors), DINOv3 (DIR or DIR/clip_vision:

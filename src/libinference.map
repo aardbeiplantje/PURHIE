@@ -19,6 +19,7 @@ LIBINFERENCE_1 {
         zi_*;
         aud_*;
         t2_*;
+        qi21_*;
     local:
         *;
 };

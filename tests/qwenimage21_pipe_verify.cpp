@@ -5,7 +5,8 @@
  * embeddings), the decoder (the reference's latent); then the whole chain from the prompt and the seed (qi21_generate) against the
  * reference's image, and the engine's image written as DIR/engine.png. The vocabulary and merges are the Qwen3 tokenizer's dump
  * (/data/zimage-ref/te/vocab.txt, merges.txt: the same tokenizer as Qwen3-VL's). Run from build/co (the kernels).
- * Usage: qwenimage21_pipe_verify [DIR] [PROMPT] [WIDTH] [HEIGHT] [STEPS] [SEED]  (the oracle's defaults: 512 x 512, 8 steps, seed 0) */
+ * Usage: qwenimage21_pipe_verify [DIR] [PROMPT] [WIDTH] [HEIGHT] [STEPS] [SEED] [DIT]  (the oracle's defaults: 512 x 512, 8 steps,
+ * seed 0; DIT the diffusion model's file, the int8 ConvRot one by default, the BF16 one with the oracle's --dit) */
 #include "qwenimage21_pipe.h"
 
 #include "image.h"
@@ -77,7 +78,7 @@ int main(int argc, char** argv) {
     const int W = argc > 3 ? atoi(argv[3]) : 512, H = argc > 4 ? atoi(argv[4]) : 512;
     const int steps = argc > 5 ? atoi(argv[5]) : 8;
     const unsigned long long seed = argc > 6 ? strtoull(argv[6], nullptr, 10) : 0;
-    const char* dit = "/comfyui/diffusion_models/qwen_image_2.1_int8_convrot.safetensors";
+    const char* dit = argc > 7 ? argv[7] : "/comfyui/diffusion_models/qwen_image_2.1_int8_convrot.safetensors";
     const char* vae = "/comfyui/vae/qwen_image_2.1_vae_bf16.safetensors";
     const char* te = "/comfyui/text_encoders/qwen3vl_8b_int8_convrot.safetensors";
     const int gh = H / 16, gw = W / 16, N = gh * gw;
@@ -168,8 +169,10 @@ int main(int argc, char** argv) {
     }
     printf("       the sampler: %d steps at %d x %d in %.2f s\n", steps, W, H, secs(t0));
     compare("the first step's velocity", v0.data(), ref_v0.data(), v0.size(), 64, 2e-2, 0.999);
-    compare("the latent after the first step", x1.data(), ref_x1.data(), x1.size(), 64, 2e-3, 0.99999);
-    compare("the final latent", lat.data(), ref_lat.data(), lat.size(), 64, 5e-2, 0.99);
+    /* the DiT is a BF16 chain where it counts, as Z-Image's: the linears' outputs (the BF16 file) and the image attention's q, k and v
+     * rounded to BF16. After 8 steps about 3% (the worst latent row's cosine about 0.97); the image is the gate below */
+    compare("the latent after the first step", x1.data(), ref_x1.data(), x1.size(), 64, 2e-3, 0.9999);
+    compare("the final latent", lat.data(), ref_lat.data(), lat.size(), 64, 5e-2, 0.95);
 
     /* 7. the decoder (the reference's latent) */
     std::vector<float> ref_dec, dec((size_t)4 * H * W);
@@ -208,7 +211,7 @@ int main(int argc, char** argv) {
                 within3 += std::abs(d) <= 3;
             }
             const double mse = se / rgba.size(), psnr = mse > 0 ? 10 * std::log10(255.0 * 255.0 / mse) : 99;
-            const bool ok = psnr >= 25;
+            const bool ok = psnr >= 35;
             printf("[%s] the image against the reference's: PSNR %.2f dB, mean %.2f levels, %.1f%% within 3\n", ok ? "PASS" : "FAIL", psnr,
                    ae / rgba.size(), 100.0 * within3 / rgba.size());
             g_fail += !ok;

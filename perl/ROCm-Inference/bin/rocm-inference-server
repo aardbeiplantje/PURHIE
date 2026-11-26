@@ -28,14 +28,14 @@ GetOptions(\%o, 'model=s', 'models-dir=s', 'models-max=i', 'models-margin=f', 'k
            'name=s', 'draft=s', 'store=s', 'max_tokens=i', 'swa-ring=i', 'stage=s', 'recache', 'kv-type=s',
            'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'preserve-thinking!', 'log!', 'log-level=s', 'log-format=s', 'log-color=s',
            'thinking-low=i', 'thinking-medium=i', 'thinking-high=i',
-           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'mmproj=s', 'whisper=s', 'tts=s', 'tts-codec=s', 'voices=s', 'sd=s', 'minimax=s', 'zimage=s', 'audioldm2=s', 'trellis2=s', 'ffmpeg=s', 'files=s', 'help')
+           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'mmproj=s', 'whisper=s', 'tts=s', 'tts-codec=s', 'voices=s', 'sd=s', 'minimax=s', 'zimage=s', 'qwen-image=s', 'audioldm2=s', 'trellis2=s', 'ffmpeg=s', 'files=s', 'help')
     or pod2usage(2);
 # The log: --nolog is level none; --log-level, --log-format, --log-color are checked by the formatter
 our $LOG = eval { ROCm::Inference::Log->new(level => ($o{log} // 1) ? ($o{'log-level'} // 'info') : 'none',
                                               format => $o{'log-format'} // 'text', color => $o{'log-color'} // 'auto') }
     or die "--log-level, --log-format, --log-color: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n";
 pod2usage(-verbose => 2, -exitval => 0) if $o{help};
-pod2usage("--model, --models-dir, --whisper, --tts, --sd, --minimax, --zimage, --audioldm2 or --trellis2 is required\n") unless $o{model} || $o{'models-dir'} || $o{whisper} || $o{tts} || $o{sd} || $o{minimax} || $o{zimage} || $o{audioldm2} || $o{trellis2};
+pod2usage("--model, --models-dir, --whisper, --tts, --sd, --minimax, --zimage, --qwen-image, --audioldm2 or --trellis2 is required\n") unless $o{model} || $o{'models-dir'} || $o{whisper} || $o{tts} || $o{sd} || $o{minimax} || $o{zimage} || $o{'qwen-image'} || $o{audioldm2} || $o{trellis2};
 ROCm::Inference::_require_minijinja()
     or die "rocm-inference-server needs the Minijinja module $ROCm::Inference::MINIJINJA_VERSION\n";
 my $no_draft = ($o{draft} // '') eq 'none';  # (no draft head, not even a model's own MTP block)
@@ -65,11 +65,12 @@ die "--tts-codec: no file $o{'tts-codec'}\n" if $o{'tts-codec'} && !-f $o{'tts-c
 die "--voices: no directory $o{voices}\n" if $o{voices} && !-d $o{voices};
 die "--sd: no file $o{sd}\n" if $o{sd} && !-f $o{sd};
 my (%AUX, %AUX_FLAG);  # kind (whisper, tts, sd) -> its record; the kinds given by flags
+my %QI21;  # the image of qwen-image-2.1 being made (see qi21_request)
 # The kinds of the models in GET /v1/models and the endpoints each one is served at (the client routes by these)
 my %ENDPOINTS = (chat => ["/v1/chat/completions", "/v1/completions"], embedding => ["/v1/embeddings"],
                  transcription => ["/v1/audio/transcriptions"], speech => ["/v1/audio/speech", "/v1/audio/voices"],
                  image => ["/v1/images/generations"], audio => ["/v1/audio/generations"], '3d' => ["/v1/3d/generations"]);
-my %AUX_KIND = (whisper => "transcription", tts => "speech", sd => "image", trellis2 => "3d");
+my %AUX_KIND = (whisper => "transcription", tts => "speech", sd => "image", trellis2 => "3d", qwenimage21 => "image");
 my ($AUDIO_DIR_SIG);   # the last signature of --models-dir's GGUF files
 # a record: id (the name a request gives), path, codec (tts), info {bytes} (its files), m (the model when loaded), used
 # (for the least recently used), queue / running (no job on it: idle), and dir (it is a unit of the memory policy)
@@ -101,6 +102,7 @@ sub aux_load {
         $kind eq 'whisper' ? whisper_load($a->{path})
       : $kind eq 'tts'     ? speech_load($a->{path}, $a->{codec})
       : $kind eq 'trellis2' ? ROCm::Inference::Trellis2->new($a->{path}, comfyui => $o{zimage})
+      : $kind eq 'qwenimage21' ? ROCm::Inference::QwenImage21->new($a->{path})
       :                      sd_load($a->{path});
     };
     if (!$m) {
@@ -330,6 +332,18 @@ if ($o{trellis2}) {
     die "--trellis2 $o{trellis2}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" unless defined $bytes;
     $AUX{trellis2} = { id => 'trellis-2', aux => 'trellis2', path => $o{trellis2}, info => { bytes => $bytes }, dir => 1, m => undef,
                        used => 0, queue => [], running => [] };
+}
+# Qwen-Image 2.1 (--qwen-image DIR, else the --zimage directory when it has the files: a ComfyUI models directory, see
+# ROCm::Inference::QwenImage21): text to image, an RGBA PNG; its name is "qwen-image-2.1". A unit of the memory policy (about 24 GB
+# of files, registered for the device when it is loaded): loaded by its first request, unloaded when another model needs the room
+# and no image is being made. The image is made on a background thread: the request's answer waits for it (a pull response) while
+# the server serves the other requests; the device layer's other generators answer 503 meanwhile.
+die "--qwen-image $o{'qwen-image'}: not a directory\n" if $o{'qwen-image'} && !-d $o{'qwen-image'};
+for my $dir (grep { defined } $o{'qwen-image'} // $o{zimage}) {
+    my $f = eval { ROCm::Inference::QwenImage21->files($dir) };
+    die "--qwen-image $dir: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" if !$f && $o{'qwen-image'};  # (--zimage alone: only when the files are there)
+    $AUX{qwenimage21} = { id => 'qwen-image-2.1', aux => 'qwenimage21', path => $dir, info => { bytes => $f->{bytes} }, dir => 1, m => undef,
+                          used => 0, queue => [], running => [] } if $f;
 }
 
 my $kv_type = $o{'kv-type'} // 'auto';
@@ -791,6 +805,16 @@ my %IMAGE_INFO = (
             size => { type => 'string', default => '1024x1024', note => 'WIDTHxHEIGHT, multiples of 16 from 64 to 1024' },
             steps => { type => 'integer', default => 9, min => 1, max => 50 },
             seed => { type => 'integer', default => 0, min => 0, note => 'the same prompt, size, steps and seed give the same image' } },
+    },
+    'qwen-image-2.1' => {
+        description => 'Text to image with Qwen-Image 2.1 (--qwen-image DIR, or the --zimage directory: the ComfyUI files), an RGBA PNG (the '
+                     . 'model draws an alpha channel). 40 steps by default, no guidance; up to 2048 x 2048. Slow: about a minute or more an image; '
+                     . 'the answer waits for it while the server serves the other requests; one image at a time (429 while one is made).',
+        usage => 'POST /v1/images/generations {"model":"qwen-image-2.1","prompt":"a red cube on a wooden table","size":"1024x1024","steps":40,"seed":0}',
+        parameters => { %IMAGE_COMMON,
+            size => { type => 'string', default => '1024x1024', note => 'WIDTHxHEIGHT, multiples of 32 from 256 to 2048' },
+            steps => { type => 'integer', default => 40, min => 1, max => 100 },
+            seed => { type => 'integer', default => 0, min => 0, note => "torch's randn for the seed: the same prompt, size, steps and seed give the same image" } },
     },
     'sd' => {
         description => 'Text to image with sd-turbo (--sd, or a file in --models-dir): one step, quick drafts at 512 x 512.',
@@ -1544,19 +1568,21 @@ route::get '/v1/audio/voices' => sub {
 # minute at 512 x 512 with sd-turbo's one step).
 route::post '/v1/images/generations' => sub {
     my ($req) = @_;
-    job3d_busy($req);
     my $p = $req->{json};
     ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
     my $sd_name = $AUX{sd} ? $AUX{sd}{id} : undef;
     # the model: minimax-h3-image (--minimax) or the sd-turbo file's name (--sd, or in --models-dir); with no model given, the first one started
-    my $model = $p->{model} // ($MINIMAX ? 'minimax-h3-image' : $sd_name // ($ZIMAGE ? 'z-image-turbo' : undef));
+    my $model = $p->{model} // ($MINIMAX ? 'minimax-h3-image' : $sd_name // ($ZIMAGE ? 'z-image-turbo' : $AUX{qwenimage21} ? 'qwen-image-2.1' : undef));
+    # (qwen-image-2.1 has its own busy answers: 429 while it makes an image, 503 while a 3D job runs)
+    return qi21_request($req, $p) if $AUX{qwenimage21} && defined $model && $model eq 'qwen-image-2.1';
+    job3d_busy($req);
     my $backend;
     if ($MINIMAX && $model eq 'minimax-h3-image') { $backend = $MINIMAX; $model = 'minimax-h3-image' }
     elsif ($ZIMAGE && $model eq 'z-image-turbo') { $backend = $ZIMAGE }
     elsif ($AUX{sd} && $model eq $sd_name)     { $backend = eval { aux_get('sd') } or error(500, 'image model: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r)) }
     else {
-        error(503, 'no image model: start the server with --sd FILE.gguf, --minimax DIR or --zimage DIR', 'server_error') unless $AUX{sd} || $MINIMAX || $ZIMAGE;
-        error(400, "model: '$model' is not served (this server has " . join(' and ', grep { defined } ($sd_name, $MINIMAX ? 'minimax-h3-image' : undef, $ZIMAGE ? 'z-image-turbo' : undef)) . ')');
+        error(503, 'no image model: start the server with --sd FILE.gguf, --minimax DIR, --zimage DIR or --qwen-image DIR', 'server_error') unless $AUX{sd} || $MINIMAX || $ZIMAGE || $AUX{qwenimage21};
+        error(400, "model: '$model' is not served (this server has " . join(' and ', grep { defined } ($sd_name, $MINIMAX ? 'minimax-h3-image' : undef, $ZIMAGE ? 'z-image-turbo' : undef, $AUX{qwenimage21} ? 'qwen-image-2.1' : undef)) . ')');
     }
     my $prompt = $p->{prompt};
     error(400, "'prompt' is required") unless defined $prompt && !ref $prompt && length $prompt;
@@ -1647,11 +1673,77 @@ sub job3d_reap {  # the running job's state; a finished job's model (or error) i
         file_drop($old->{file}) if $old;
     }
 }
-sub job3d_busy {  # a running 3D job holds the device layer: the image and audio generators answer 503 meanwhile
+sub job3d_busy {  # a running 3D job, or an image of qwen-image-2.1, holds the device layer: the image and audio generators answer 503 meanwhile
     my ($req) = @_;
     job3d_reap();
-    return unless defined $JOB3D_RUN;
-    error(503, 'the device is busy with a 3D generation' . job3d_running_note($req) . ': try again when it completes', 'server_error');
+    error(503, 'the device is busy with a 3D generation' . job3d_running_note($req) . ': try again when it completes', 'server_error')
+        if defined $JOB3D_RUN;
+    qi21_reap();
+    error(503, 'the device is busy with an image of qwen-image-2.1: try again when it is done', 'server_error') if $QI21{running};
+}
+
+# ---- Qwen-Image 2.1: one image at a time on the pipeline's background thread; the request's answer is a pull response that waits for
+# it (the loop keeps serving the others). %QI21 (declared with %AUX): running (an image is being made), gone (its client left: the
+# image is dropped when it is done), t0.
+sub qi21_reap {  # an image whose client left: taken and dropped when it is done, so the next one can start
+    return unless $QI21{running} && $QI21{gone};
+    my $Q = $AUX{qwenimage21} && $AUX{qwenimage21}{m} or return;
+    return if $Q->poll->{status} eq 'running';
+    eval { $Q->take };
+    %QI21 = ();
+    $AUX{qwenimage21}{busy} = 0;
+}
+sub qi21_request {
+    my ($req, $p) = @_;
+    my $prompt = $p->{prompt};
+    error(400, "'prompt' is required") unless defined $prompt && !ref $prompt && length $prompt;
+    error(400, 'prompt: at most 1000 characters') if length $prompt > 1000;
+    my $n = $p->{n} // 1;
+    error(400, 'n: 1 (one image per request)') unless $n =~ /\A1\z/;
+    my $size = $p->{size} // '1024x1024';
+    eval { ROCm::Inference::QwenImage21->size($size); 1 } or error(400, $@ =~ s/\n\z//r);
+    my $steps = $p->{steps} // 40;
+    error(400, 'steps: a whole number from 1 to 100') unless $steps =~ /\A\d+\z/ && $steps >= 1 && $steps <= 100;
+    my $seed = $p->{seed} // 0;
+    error(400, 'seed: a whole number') unless $seed =~ /\A\d+\z/;
+    my $fmt = $p->{response_format} // 'b64_json';
+    error(400, "response_format: b64_json or png, not '$fmt'") unless $fmt =~ /\A(?:b64_json|png)\z/;
+    job3d_reap();
+    error(503, 'the device is busy with a 3D generation' . job3d_running_note($req) . ': try again when it completes', 'server_error')
+        if defined $JOB3D_RUN;
+    qi21_reap();
+    error(429, 'an image of qwen-image-2.1 is being made: try again when it is done', 'rate_limit_error') if $QI21{running};
+    my $a = $AUX{qwenimage21};
+    my $Q = eval { aux_get('qwenimage21') } or error(500, 'qwen-image-2.1: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r), 'server_error');
+    my $started = eval { $Q->start($prompt, size => $size, steps => $steps, seed => $seed) };
+    error(400, ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) =~ s/\AROCm::Inference: qi21_start: //r) unless defined $started;
+    error(429, 'an image of qwen-image-2.1 is being made: try again when it is done', 'rate_limit_error') unless $started;
+    %QI21 = (running => 1, t0 => Time::HiRes::time());
+    $a->{busy} = 1;
+    $a->{used} = ++$stamp;
+    $LOG->info('request', event => 'image', msg => sprintf('qwen-image-2.1: started, %s, %d steps, seed %d', $size, $steps, $seed));
+    my $done = 0;
+    return pull(200, ['Content-Type' => $fmt eq 'png' ? 'image/png' : 'application/json'], sub {
+        return undef if $done;
+        return '' if $Q->poll->{status} eq 'running';
+        $done = 1;
+        my $png = eval { $Q->take };
+        my $why = $@;
+        my $secs = Time::HiRes::time() - $QI21{t0};
+        %QI21 = ();
+        $a->{busy} = 0;
+        $a->{used} = ++$stamp;
+        if (!defined $png) {  # (the status was sent: the error comes as the body)
+            $why =~ s/ at \S+ line \d+\.?\n?\z//;
+            $LOG->error(event => 'image', msg => "qwen-image-2.1: $why");
+            return \($J->encode({ error => { message => $why, type => 'server_error' } }));
+        }
+        $LOG->info('request', event => 'image', msg => sprintf('qwen-image-2.1: %s, %d steps, seed %d, %.1f s, %d bytes of PNG', $size, $steps, $seed,
+                                                               $secs, length $png));
+        return \$png if $fmt eq 'png';
+        require MIME::Base64;
+        return \($J->encode({ created => time, data => [{ b64_json => MIME::Base64::encode_base64($png, '') }] }));
+    }, on_close => sub { $QI21{gone} = 1 if $QI21{running} });
 }
 sub job3d_entry {
     my ($j) = @_;
@@ -1680,6 +1772,8 @@ route::post '/v1/3d/generations' => sub {
     my ($req) = @_;
     my $a = $AUX{trellis2} or error(503, 'no 3D model: start the server with --trellis2 DIR', 'server_error');
     job3d_reap();
+    qi21_reap();
+    error(503, 'the device is busy with an image of qwen-image-2.1: try again when it is done', 'server_error') if $QI21{running};
     error(429, 'a 3D generation is running' . job3d_running_note($req) . ': try again when it completes', 'rate_limit_error')
         if defined $JOB3D_RUN;
     my $ct = $req->{headers}{'content-type'} // '';
@@ -2456,6 +2550,20 @@ With C<--zimage> (a ComfyUI models directory), its F<clip_vision> and F<backgrou
 need not be copied next to TRELLIS.2.
 The files are checked at the start; the model is loaded by its first request (about 16 GB, registered for the device) and is
 a unit of the memory policy, as a chat model is (never unloaded while a job runs).
+
+=item --qwen-image F<dir>
+
+Qwen-Image 2.1, text to image (an RGBA PNG: the model draws an alpha channel), for C</v1/images/generations>; its name is
+C<qwen-image-2.1>. F<dir> is a ComfyUI models directory with F<diffusion_models/qwen_image_2.1_bf16.safetensors> (else the
+int8 ConvRot one, exact but about eight times slower), F<text_encoders/qwen3vl_8b_int8_convrot.safetensors>,
+F<text_encoders/tokenizer.json> (the Qwen tokenizer Z-Image reads) and F<vae/qwen_image_2.1_vae_bf16.safetensors>. Without
+the option, the C<--zimage> directory is used when it has these files. The model is loaded by its first request (about 24 GB,
+registered for the device) and is a unit of the memory policy (never unloaded while it makes an image). A request takes
+C<size> (C<WIDTHxHEIGHT>, multiples of 32 from 256 to 2048; 1024x1024 by default), C<steps> (40, the pipeline's; 1 to 100)
+and C<seed> (torch's randn for it, as diffusers draws it). The image is made on a background thread and the answer waits
+for it (a minute or more at 1024: about 156 s for 40 steps on this machine) while the server serves the other requests; a
+second image meanwhile is refused (429), and the device layer's other generators answer 503. A failure after the start
+comes as a JSON error body (the status line was sent).
 
 =item --ffmpeg F<ffmpeg>
 

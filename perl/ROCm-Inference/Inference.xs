@@ -28,6 +28,7 @@
 #include "zimage_pipe.h"
 #include "audioldm2_api.h"
 #include "trellis2_api.h"
+#include "qwenimage21_pipe.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -1772,6 +1773,89 @@ _zi_generate_png(h, prompt, seed, width, height, steps)
     free(rgb);
     RETVAL = newSVpvn((const char*)png, (STRLEN)n);
     sd_free_png(png);
+  OUTPUT:
+    RETVAL
+
+IV
+_qi21_open(dit, vae, te, vocab, merges)
+    const char* dit
+    const char* vae
+    const char* te
+    SV* vocab
+    SV* merges
+  CODE:
+    /* the Qwen-Image 2.1 pipeline (qwenimage21_pipe.h): the vocabulary and the merges are arrays of strings (the Qwen tokenizer.json) */
+    AV* va;
+    AV* ma;
+    SSize_t nv, nm, i;
+    const char** vp;
+    const char** mp;
+    qi21_pipe_t* p;
+    if (!SvROK(vocab) || SvTYPE(SvRV(vocab)) != SVt_PVAV || !SvROK(merges) || SvTYPE(SvRV(merges)) != SVt_PVAV)
+        croak("ROCm::Inference: _qi21_open: the vocabulary and the merges are array references");
+    va = (AV*)SvRV(vocab);
+    ma = (AV*)SvRV(merges);
+    nv = av_len(va) + 1;
+    nm = av_len(ma) + 1;
+    vp = (const char**)malloc(sizeof(char*) * (size_t)(nv ? nv : 1));
+    mp = (const char**)malloc(sizeof(char*) * (size_t)(nm ? nm : 1));
+    if (!vp || !mp) croak("ROCm::Inference: out of memory");
+    for (i = 0; i < nv; ++i) vp[i] = SvPV_nolen(*av_fetch(va, i, 0));
+    for (i = 0; i < nm; ++i) mp[i] = SvPV_nolen(*av_fetch(ma, i, 0));
+    p = qi21_open(dit, vae, te, vp, (size_t)nv, mp, (size_t)nm);
+    free(vp);
+    free(mp);
+    if (!p) croak("ROCm::Inference: qi21_open: %s", qi21_last_error());
+    RETVAL = PTR2IV(p);
+  OUTPUT:
+    RETVAL
+
+void
+_qi21_close(h)
+    IV h
+  CODE:
+    qi21_close(INT2PTR(qi21_pipe_t*, h));
+
+int
+_qi21_start(h, prompt, height, width, steps, seed)
+    IV h
+    SV* prompt
+    int height
+    int width
+    int steps
+    UV seed
+  CODE:
+    /* an image on a background thread: 0 started, 1 an image is being made; an error croaks (an option) */
+    int r = qi21_start(INT2PTR(qi21_pipe_t*, h), SvPV_nolen(prompt), height, width, steps, (unsigned long long)seed);
+    if (r < 0) croak("ROCm::Inference: qi21_start: %s", qi21_last_error());
+    RETVAL = r;
+  OUTPUT:
+    RETVAL
+
+void
+_qi21_poll(h)
+    IV h
+  PPCODE:
+    /* (status, step, steps, seconds): status 0 running, 1 done, -1 failed, 2 no job */
+    int step = 0, steps = 0;
+    double seconds = 0;
+    int st = qi21_poll(INT2PTR(qi21_pipe_t*, h), &step, &steps, &seconds);
+    EXTEND(SP, 4);
+    mPUSHi(st);
+    mPUSHi(step);
+    mPUSHi(steps);
+    mPUSHn(seconds);
+
+SV*
+_qi21_take(h)
+    IV h
+  CODE:
+    /* the finished image as RGBA PNG bytes (the job is cleared); a failed job croaks with its error */
+    unsigned char* png = NULL;
+    size_t n = 0;
+    if (qi21_take(INT2PTR(qi21_pipe_t*, h), &png, &n) != 0) croak("ROCm::Inference: %s", qi21_last_error());
+    RETVAL = newSVpvn((const char*)png, (STRLEN)n);
+    qi21_free(png);
   OUTPUT:
     RETVAL
 

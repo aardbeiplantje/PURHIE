@@ -45,18 +45,25 @@ private:
     size_t n_ = 0;
 };
 
-/* a ConvRot linear: int8 weights [out][in] in place, the row scales [out] */
+/* a block's linear [out][in] in place: the ComfyUI int8 file's ConvRot weights with their row scales [out], or the BF16 file's
+ * weights (the same names; hipBLASLt's BF16 products, about ten times the int8 kernel's speed) */
 struct QLin {
     const int8_t* W = nullptr;
     const float* s = nullptr;
+    const uint16_t* Wb = nullptr;
     int in = 0, out = 0;
 };
 
 bool load_q(const zimage::SafeTensors& st, const std::string& base, int in, int out, QLin& L) {
     std::vector<size_t> sw, ss;
-    if (!st.i8_in_place(base + ".weight", L.W, sw) || sw != std::vector<size_t>{(size_t)out, (size_t)in} ||
-        !st.f32_in_place(base + ".weight_scale", L.s, ss) || ss.size() != 2 || ss[0] != (size_t)out) {
-        fprintf(stderr, "qwenimage21 dit: %s (int8 ConvRot %dx%d) missing or of the wrong shape\n", base.c_str(), out, in);
+    const std::vector<size_t> want{(size_t)out, (size_t)in};
+    bool ok = false;
+    if (st.i8_in_place(base + ".weight", L.W, sw))
+        ok = sw == want && st.f32_in_place(base + ".weight_scale", L.s, ss) && ss.size() == 2 && ss[0] == (size_t)out;
+    else if (st.bf16_in_place(base + ".weight", L.Wb, sw))
+        ok = sw == want;
+    if (!ok) {
+        fprintf(stderr, "qwenimage21 dit: %s (int8 ConvRot or BF16, %dx%d) missing or of the wrong shape\n", base.c_str(), out, in);
         return false;
     }
     L.in = in;
@@ -86,9 +93,21 @@ void lin_bf(const float* x, int T, const uint16_t* W, int in, int out, const Dev
     sddev::linear_bf16_f32(x, T, W, in, out, y);  /* FP32 activations (linear_bf16 rounds them to BF16) */
 }
 
-/* the ConvRot linear on rows: rotate x into xr, then the int8 GEMM over the rows [row0, row0 + out) of the weight */
+/* the block's linear over the weight's rows [row0, row0 + out): the BF16 product, or the ConvRot one (rotate x into xr, then the int8
+ * GEMM); the tokens in pieces, so each launch stays short (AGENTS.md: the int8 kernel at about 2 TFLOPS gets about 40 ms of work,
+ * hipBLASLt at most 8192 tokens, about 40 ms), split evenly (no small remainder: it would read the whole weight again) */
 void lin_q(const QLin& L, const float* x, int T, const float* H, float* xr, int row0, int out, float* y) {
-    sddev::linear_convrot(x, T, L.W + (size_t)row0 * L.in, L.s + row0, H, L.in, out, xr, y);
+    const int most = L.Wb ? 8192 : std::max(64, (int)(4e10 / ((double)out * L.in)) / 64 * 64);
+    const int pieces = (T + most - 1) / most;
+    const int rows = (T + pieces - 1) / pieces;
+    for (int r0 = 0; r0 < T; r0 += rows) {
+        const int n = std::min(rows, T - r0);
+        if (L.Wb)
+            sddev::linear_bf16_via16(x + (size_t)r0 * L.in, n, L.Wb + (size_t)row0 * L.in, L.in, out, nullptr, y + (size_t)r0 * out);
+        else
+            sddev::linear_convrot(x + (size_t)r0 * L.in, n, L.W + (size_t)row0 * L.in, L.s + row0, H, L.in, out, xr,
+                                  y + (size_t)r0 * out);
+    }
 }
 
 }  // namespace
@@ -97,9 +116,25 @@ bool dev_dit21_forward(const zimage::SafeTensors& st, const float* packed, int g
     if (!sddev::enabled()) { fprintf(stderr, "qwenimage21 dit: no device\n"); return false; }
     if (gh < 1 || gw < 1 || L < 1) { fprintf(stderr, "qwenimage21 dit: bad grid or text length\n"); return false; }
     const int N = gh * gw, J = L + N;
-    /* the image rows' attention in launches of about 6M query-key pairs (about 40 ms at 32 heads on the fused kernel: AGENTS.md, GPU
-     * use), in whole 64-query blocks */
-    const int qrows = (int)std::min<long>(N, std::max<long>(256, ((6L << 20) / J) / 64 * 64));
+    /* the image rows' attention: with the BF16 file's weights a BF16 chain, as Z-Image's DiT (the BF16 flash kernel, q, k and v rounded
+     * to BF16, the output FP32), in launches of about 32M query-key pairs (about 30 ms at 32 heads: AGENTS.md, GPU use); with the int8
+     * file's, the FP32 fused kernel (the exact path: 47.6 dB against the FP32 reference, against 33.7 with BF16 attention) in launches
+     * of about 6M pairs (about 40 ms) */
+    bool bf16_chain = false;
+    {
+        const uint16_t* w = nullptr;
+        std::vector<size_t> sh;
+        bf16_chain = st.bf16_in_place("transformer_blocks.0.attn.to_q.weight", w, sh);
+    }
+    const int qrows = bf16_chain ? (int)std::min<long>(N, std::max<long>(128, ((32L << 20) / J) / 128 * 128))
+                                 : (int)std::min<long>(N, std::max<long>(256, ((6L << 20) / J) / 64 * 64));
+    struct Bf16Buf {
+        uint16_t* p;
+        size_t n;
+        explicit Bf16Buf(size_t count) : p(static_cast<uint16_t*>(sddev::dalloc(sizeof(uint16_t) * count))), n(count) {}
+        ~Bf16Buf() { sddev::drelease(p, sizeof(uint16_t) * n); }
+    };
+    Bf16Buf qb(bf16_chain ? (size_t)N * D : 1), kb(bf16_chain ? (size_t)J * D : 1), vb(bf16_chain ? (size_t)J * D : 1);
     if (N % 4 != 0) { fprintf(stderr, "qwenimage21 dit: the grid must hold whole 2 x 2 slots\n"); return false; }
 
     /* the weights (in place) */
@@ -225,9 +260,17 @@ bool dev_dit21_forward(const zimage::SafeTensors& st, const float* packed, int g
         sddev::rope(k.get(), J, HEADS, frd.get());
         /* the text rows: causal among the text; the image rows: every token (the FP32 attention, no mask) */
         sddev::attn21_text(q.get(), k.get(), v.get(), J, L, HEADS, att.get());
-        for (int r0 = 0; r0 < N; r0 += qrows)
-            sddev::attention_f32(q.get() + (size_t)(L + r0) * D, std::min(qrows, N - r0), k.get(), v.get(), J, D, HEADS,
-                                 att.get() + (size_t)(L + r0) * D);
+        if (bf16_chain) {
+            sddev::to_bf16(q.get() + (size_t)L * D, qb.p, (size_t)N * D);
+            sddev::to_bf16(k.get(), kb.p, (size_t)J * D);
+            sddev::to_bf16(v.get(), vb.p, (size_t)J * D);
+            for (int r0 = 0; r0 < N; r0 += qrows)
+                sddev::attention_bf16(qb.p + (size_t)r0 * D, std::min(qrows, N - r0), kb.p, vb.p, J, D, HEADS, att.get() + (size_t)(L + r0) * D);
+        } else {
+            for (int r0 = 0; r0 < N; r0 += qrows)
+                sddev::attention_f32(q.get() + (size_t)(L + r0) * D, std::min(qrows, N - r0), k.get(), v.get(), J, D, HEADS,
+                                     att.get() + (size_t)(L + r0) * D);
+        }
         lin_q(wo, att.get(), J, Hd.get(), xr.get(), 0, D, o.get());
         sddev::gated_add(X.get(), gt1.get(), o.get(), (size_t)J * D);
         /* the SwiGLU MLP: gate_layer rows [0, 12288) and proj rows [12288, 24576) of the fused weight, then out(silu(gate) * proj) */

@@ -136,16 +136,13 @@ with safe_open(args.dit, 'pt', device='cpu') as f:
         if k.endswith(('.weight_scale', '.comfy_quant')):
             continue
         t = f.get_tensor(k)
-        if t.dtype == torch.int8:
-            W = deq(f, k)
+        W = deq(f, k) if t.dtype == torch.int8 else t.float()  # the int8 file dequantised, or the BF16 file as it is
+        if k.endswith('img_mlp.gate_up.weight'):
             base = k[:-len('.weight')]
-            if base.endswith('img_mlp.gate_up'):
-                put(base.replace('gate_up', 'gate_layer') + '.weight', W[:12288])
-                put(base.replace('gate_up', 'proj') + '.weight', W[12288:])
-            else:
-                put(k, W)
+            put(base.replace('gate_up', 'gate_layer') + '.weight', W[:12288])
+            put(base.replace('gate_up', 'proj') + '.weight', W[12288:])
         else:
-            put(k, t.float())
+            put(k, W)
 print('transformer: loaded', len(loaded), 'of', len(sd), flush=True)
 m.eval()
 

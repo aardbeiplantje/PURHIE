@@ -10,8 +10,8 @@ run alone on the machine.
 
 ## ▶ Next
 
-1. **Qwen-Image 2.1, served** (item 16): the sampler (the ComfyUI workflow: 25 steps, `simple`, CFG 1; the shift is open)
-   and the server route, then the image edit (the reference image's conditioning, its oracle, an edit route).
+1. **Qwen-Image 2.1: the image edit** (item 16; the text-to-image model is served since 2026-11-26): the reference image's
+   conditioning, its oracle, an edit route. Also open there: the speed (a BF16 chain).
 2. **Waiting on the user:** the deployed service check (item 1); the design and the row format of the GLM prefill
    snapshots (item 2).
 
@@ -20,9 +20,9 @@ run alone on the machine.
 - **Engine:** runs qwen2, qwen3, qwen3moe, qwen35 / qwen35moe, qwen4exp (Qwen3.8-Flash-Next), gemma4, gemma-embedding,
   nemotron_h_moe, llama and glm5-next (GLM-5.3-Flash, experts paged from disk) from zero-copy GGUF mappings on the UMA.
 - **Images, audio, 3D on the engine:** sd-turbo; Z-Image-Turbo (1024 x 1024, nine steps in about 24 s of DiT and VAE;
-  item 17); MiniMax-H3-Image; AudioLDM 2; Qwen3-TTS (speech) and Whisper tiny (transcription); vision towers for chat
+  item 17); Qwen-Image 2.1 (RGBA, 1024 x 1024 at 40 steps in about 156 s; item 16); MiniMax-H3-Image; AudioLDM 2; Qwen3-TTS (speech) and Whisper tiny (transcription); vision towers for chat
   models; TRELLIS.2 image to 3D (textured GLB, the mesh alone, STL for printing, solid or hollow) with BiRefNet for
-  background removal. On the engine but not served: Qwen-Image 1 and 2.1 (item 16).
+  background removal. On the engine but not served: Qwen-Image 1 (item 16).
 - **Surfaces:** the C API (`libinference.so`), the Perl XS module ROCm::Inference (Minijinja templates),
   `rocm-inference-server` (OpenAI-compatible: chat, raw completions, embeddings, audio, images, 3D jobs, `--models-dir`,
   `--parallel`), and `bin/rocm-convert`. The AI harness (`./aicli.git`, its own repository) has tools for each generator.
@@ -166,9 +166,20 @@ run alone on the machine.
     `tools/qwenimage21_oracle.py` (diffusers 0.43.0 in FP32 on the dequantised ComfyUI files; outputs in
     `/data/zimage-ref/qwenimage2/pipe`: 512 x 512, 8 steps, seed 0, "a red cube on a wooden table, soft studio light"): the
     ids exact, the embeddings 3e-5, the sigmas 6e-8, the noise 5e-7, the first velocity 7.5e-4, the final latent 1.6%, the
-    decoder 6e-7; the image against diffusers' PSNR 47.6 dB (mean 0.33 levels). Open: the speed (7.4 s a step at 512 x 512:
-    the int8 ConvRot linears run at about 2 TFLOPS; 40 steps at 1024 would take about 20 minutes); the server route
-    (▶ Next 1). The ComfyUI workflow runs 25 steps with `simple` and CFG 1 (its own sigmas: not checked). Then the edit: no reference-image input and no edit
+    decoder 6e-7; the image against diffusers' PSNR 47.6 dB (mean 0.33 levels). The BF16 file (the same names) runs a BF16
+    chain as Z-Image's DiT: hipBLASLt with BF16 outputs (`sddev::linear_bf16_via16`: the FP32-output plan's first candidate is
+    a slow algorithm, about 5.5 TFLOPS, and the tuner keeps the first candidate's numerics; the BF16 output's is fast, 22-26
+    TFLOPS with the conversions) and the BF16 flash attention; against its own FP32 reference (`pipe_bf16`) 40.1 dB. The int8
+    file keeps the FP32 attention (47.6 dB; BF16 attention gave 33.7). Speed: 1024 x 1024, 40 steps, 156 s (3.9 s a step:
+    the linears about 3.0 s, the attention 0.6; the decoder about 6 s once); 512 x 512, 8 steps, 7.2 s. Served (2026-11-26):
+    `qwen-image-2.1` on `/v1/images/generations` (`--qwen-image DIR`, else the `--zimage` directory when it has the files;
+    a unit of the memory policy, about 24 GB, loaded by its first request), the image made on a background thread (`qi21_start`,
+    `qi21_poll`, `qi21_take`) while the answer waits in a pull response; 429 for a second image, 503 for the other device
+    generators meanwhile; `t/73-qwenimage21.t` (17 checks). Open: the speed (a BF16 chain between the ops, as Z-Image's,
+    saves the conversions; the text tokens' keys and values could be computed once, `causal_condition`); the hipBLASLt plan is
+    tuned per token count (each new prompt length tunes once, about a second); the ComfyUI workflow runs 25 steps with `simple`
+    and CFG 1 (its own sigmas: not checked); the harness's `generate_image` names no model (the server's default image model
+    is the first started). Then the edit: no reference-image input and no edit
     route exist; needs the edit conditioning in the 2.1 DiT (how the reference image enters, confirmed against the
     reference edit pipeline), a stage check against its python oracle, and a server route. The ComfyUI edit workflow is in
     the uploads (`image_qwen_image_2_1_image_edit`), with the Edit Lightning LoRA.
@@ -279,6 +290,10 @@ Speed:
   one; attn_k and attn_v as two launches (about 1%).
 - Small F16 matrices (1024 to 2048 rows) are latency-bound at 55 to 76 GB/s; BF16 FFN down (K 17408) is the slowest shape
   (23 TFLOPS). MoE experts in F16 or BF16 run `matmul_f_id` (no model here has them).
+- hipBLASLt's FP32-output plans (2026-11-26): the first candidate (the tuner's numerics) is a slow algorithm, about 5.5 TFLOPS on
+  the DiT shapes, where the faster ones have other numerics; `sd_gemm_bench` measures this path (5.5 TFLOPS now, 25 when the
+  timing chose). Z-Image's DiT and Qwen-Image 2.1's BF16 file use BF16 outputs; any other FP32-output large product (the VAEs'
+  convolutions are calibrated, `blt_calib.h`) is worth checking.
 - Z-Image's MLP-down shape: its weights have a 20 KB row stride (read in place, fixed); the activation copy is ours to lay
   out. The engine's own `sd_gemm_wmma256b` reached 19-20 TFLOPS on QKV and MLP-up and 9-13 on MLP-down (58-63% of the wave
   cycles waiting on vector memory, L2 hit rate 3%); hipBLASLt runs these now.

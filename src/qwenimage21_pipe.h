@@ -29,6 +29,18 @@ const char* qi21_last_error(void);
 int qi21_generate(qi21_pipe_t* pipe, const char* prompt, int height, int width, int steps, unsigned long long seed, unsigned char* rgba,
                   void (*progress)(int step, int steps, void* user), void* user);
 
+/* For the server: one image at a time on a background thread, so the caller's loop keeps serving (an image takes a minute or more). The
+ * job holds the device's run mutex (sd_device.h) while it runs: the other models of the device layer must not run meanwhile.
+ * qi21_start: the options as qi21_generate's; 0 started, 1 a job is running (none started), -1 an error (qi21_last_error).
+ * qi21_poll: 0 running, 1 done (its PNG waits for qi21_take), -1 failed (qi21_take gives its error), 2 no job; step / steps: the
+ * sampler's (the text encoder and the decoder count as step 0 and the last); seconds: since the start (to the end when done).
+ * qi21_take: the finished job's image as RGBA PNG bytes (*png malloc'ed: qi21_free), and the job is cleared; 0, or -1 when it failed
+ * (qi21_last_error: its error; the job is cleared) or no job is done. qi21_close waits for a running job. */
+int qi21_start(qi21_pipe_t* pipe, const char* prompt, int height, int width, int steps, unsigned long long seed);
+int qi21_poll(qi21_pipe_t* pipe, int* step, int* steps, double* seconds);
+int qi21_take(qi21_pipe_t* pipe, unsigned char** png, size_t* n);
+void qi21_free(void* ptr);
+
 #ifdef __cplusplus
 }
 
