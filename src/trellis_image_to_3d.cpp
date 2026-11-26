@@ -205,6 +205,10 @@ bool ImageTo3D::generate(const uint8_t* rgba, int w, int h, bool has_alpha, cons
         m.error = "hollow_mm and drain_mm: 0 to 1000 millimetres";
         return false;
     }
+    if (opt.hollow_mm > 0 && opt.hollow_mm < 2) {
+        m.error = "hollow_mm: 0 (solid), or walls of at least 2 millimetres";
+        return false;
+    }
     if (opt.hollow_mm > 0 && (opt.format != ImageTo3DOptions::Format::Stl || !(opt.stl_size_mm > 0) || !opt.solid)) {
         m.error = "a hollow (hollow_mm) is for an STL with its size in millimetres";
         return false;
@@ -522,6 +526,10 @@ int t2_start(t2_pipe_t* p, const unsigned char* image, size_t n, int resolution,
     }
     if (!(hollow_mm >= 0) || hollow_mm > 1000 || !(drain_mm >= 0) || drain_mm > 1000) {
         g_t2_error = "hollow_mm and drain_mm: 0 to 1000 millimetres";
+        return -1;
+    }
+    if (hollow_mm > 0 && hollow_mm < 2) {
+        g_t2_error = "hollow_mm: 0 (solid), or walls of at least 2 millimetres";
         return -1;
     }
     if (hollow_mm > 0 && (format != 1 || !(stl_size_mm > 0))) {

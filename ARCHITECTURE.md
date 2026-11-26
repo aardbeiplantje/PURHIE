@@ -398,8 +398,10 @@ is the model). The stages, each checked against its python oracle (`tests/*_veri
   the mesh on a grid of 512 cells across the object, a fill from the border that keeps `close` cells from the mesh (so it
   cannot go through narrow holes), a field whose zero set is the surface `iso` out from the mesh plus plugs over the sealed
   holes, and marching tetrahedra on the Kuhn split (a closed 2-manifold, wound outward, by construction). `close` doubles
-  from 4 to 16 when the result is a thin shell (a leak through a wider hole). Hollow prints empty the inside beyond a wall
-  thickness and drill a drain hole per hollow. The simplifier's manifold mode keeps the surface closed (the link
+  from 4 to 16 when the result is a thin shell (a leak through a wider hole). The mesh says nothing of its inside, so a
+  sealed region the fill did not reach is decided by counting walls: rays from it to the grid's border mostly cross an
+  even number of walls (the model's own hollow, kept as air) or an odd number (the inside of a solid, filled). Hollow prints
+  (walls of at least 2 mm) empty the inside beyond the wall thickness and drill a drain hole per hollow. The simplifier's manifold mode keeps the surface closed (the link
   condition in its cost kernel). `tests/solid_verify.cpp` checks the device against a host reference and the topology.
 - **Files:** the finished models are files in a scratch tmpfs (`--files`), sent by nginx (`X-Accel-Redirect`); a job
   belongs to its user (`X-Remote-User`) and has a random 128-bit id.

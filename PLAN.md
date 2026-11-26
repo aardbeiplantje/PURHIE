@@ -12,9 +12,7 @@ run alone on the machine.
 
 1. **Qwen-Image 2.1, served** (item 16): the sampler (the ComfyUI workflow: 25 steps, `simple`, CFG 1; the shift is open)
    and the server route, then the image edit (the reference image's conditioning, its oracle, an edit route).
-2. **3D printing: a minimum wall thickness** (item 15 e): a thin sheet of the model comes out about 1.2 grid cells thick
-   (0.2 mm at 100 mm), too thin for FDM; thicken it to a printable wall.
-3. **Waiting on the user:** the deployed service check (item 1); the design and the row format of the GLM prefill
+2. **Waiting on the user:** the deployed service check (item 1); the design and the row format of the GLM prefill
    snapshots (item 2).
 
 ## Status in brief
@@ -135,9 +133,11 @@ run alone on the machine.
     - (b) the 1536 cascade the ComfyUI workflow runs (memory is no longer the limit; its time is).
     - (c) the normal-map and AO bakes and their GLB inputs.
     - (d) UnwrapMesh's "pec" segmenter (ours is CuMesh's charts).
-    - (e) a minimum wall thickness for printing (▶ Next 2). Also: crevices narrower than about 1.6% of the object's size
-      are filled by the solid rebuild; openings wider than that stay open (a whistle's mouth; the user: hollow prints are
-      cheaper and some objects only work hollow).
+    - (e) printing, as the user decided (2026-11-26): a solid request stays solid (the model's own thin sheets are not
+      thickened: about 1.2 grid cells, 0.2 mm at 100 mm); a hollow request has walls of at least 2 mm; the model's own
+      hollows are kept (open ones through openings wider than about 1.6% of the size, sealed ones by the even wall count;
+      tiny ones under min_piece are filled). Crevices narrower than about 1.6% of the size are filled. Not checked on a
+      real model with a designed cavity (a whistle): the example's 12 sealed hollows were all tiny.
     - (f) the simplification stops below its target (667k for 700k; python's stops at it).
     - (g) the unwrap (74 s on the vase: xatlas per chart, single-threaded) and the host sorts, to move to the device or
       threads.
@@ -308,8 +308,9 @@ choice; FP8 sources stay FP8 in the engine's FP8 operand path.
 
 ## Decisions by the user
 
-- 2026-11-26: 3D printing: hollow prints are wanted (cheaper, and some objects only work hollow); the STL is a closed solid
-  by default. Access to the 3D files by the harness's login waits for the projects to join (item 15 i).
+- 2026-11-26: 3D printing: hollow prints are wanted (cheaper, and some objects only work hollow), with walls of at least
+  2 mm; a solid request stays solid; a model's own hollows (a whistle's) are kept. The STL is a closed solid by default.
+  Access to the 3D files by the harness's login waits for the projects to join (item 15 i).
 - 2026-11-25: TRELLIS.2 without RemeshMesh (the sharper result).
 - 2026-11-22: hipBLASLt as a dependency; BF16 outputs for the DiT's large linears.
 - 2026-11-16: the speech pieces keep their own prosody. ffmpeg is in the image. The Q8_0 predictor is an option (BF16 default).

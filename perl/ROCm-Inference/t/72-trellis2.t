@@ -157,6 +157,9 @@ ok($vol > 0, "wound outward (volume $vol mm3)");
 ($st, $body) = http(POST => '/v1/3d/generations', { image => encode_base64($png, ''), format => 'glb', hollow_mm => 2 }, @alice);
 is($st, 400, 'a hollow GLB: 400');
 like($body // '', qr/hollow_mm is for format stl/, 'with the reason');
+($st, $body) = http(POST => '/v1/3d/generations', { image => encode_base64($png, ''), format => 'stl', hollow_mm => 1 }, @alice);
+is($st, 400, 'walls under 2 mm: 400');
+like($body // '', qr/at least 2 millimetres/, 'with the reason');
 ($st, $body) = http(POST => '/v1/3d/generations', { image => encode_base64($png, ''), resolution => 512, seed => 1, format => 'stl',
                                                     faces => 200000, size_mm => 80, hollow_mm => 2, drain_mm => 3 }, @alice);
 is($st, 200, 'a hollow STL job starts') or diag substr($body, 0, 300);

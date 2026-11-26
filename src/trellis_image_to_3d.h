@@ -31,7 +31,7 @@ struct ImageTo3DOptions {
     enum class Format { Glb, Stl } format = Format::Glb;  // Stl: a binary STL of the mesh (no texture), for 3D printing
     double stl_size_mm = 100;    // the STL's largest side in millimetres (0: the mesh's own units, a unit cube)
     bool solid = true;           // without texture (the mesh alone, the STL): rebuilt as a closed solid for 3D printing (trellis_solid.h)
-    double hollow_mm = 0;        // the STL: hollow, with walls this thick in millimetres (0: solid; cheaper and lighter to print)
+    double hollow_mm = 0;        // the STL: hollow, with walls this thick in millimetres, at least 2 (0: solid; cheaper to print)
     double drain_mm = 3;         // with hollow_mm: each hollow's drain hole, this wide, from its lowest point down (0: none)
 };
 

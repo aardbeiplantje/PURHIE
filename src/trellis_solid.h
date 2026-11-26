@@ -7,7 +7,10 @@
 //   2. the points nearer than `iso` cells are the wall; the distance of every point to the wall (an exact Euclidean distance
 //      transform, three passes of Felzenszwalb and Huttenlocher's lower envelope);
 //   3. the outside: a flood fill from the grid's border through the points at least `close` cells from the wall, so it can not
-//      go through a hole or a gap narrower than about twice that; the distance of every point to that outside (a second transform);
+//      go through a hole or a gap narrower than about twice that. A sealed region the fill did not reach is the model's own
+//      hollow (a whistle's chamber) when rays from it to the border cross an even number of walls (most of them: a hole or a
+//      doubled sheet on one ray does not decide), and is kept as outside; with an odd count it is the inside of a solid,
+//      filled. Then the distance of every point to that outside (a second transform);
 //   4. the field f = min(distance to the mesh - iso, close + 0.5 - distance to the outside), negative inside: the surface is `iso`
 //      cells out from the mesh where the outside reaches it, and a plug over the holes and gaps the fill did not go through; a
 //      second fill from the outside through the positive points, and those it does not reach (a pocket behind the wall, a void
@@ -56,6 +59,8 @@ struct SolidStats {
     int hollows = 0;           // with a wall: the empty regions inside, and those filled for being small
     int hollows_filled = 0;
     int drains = 0;            // the drain holes made
+    int cavities = 0;          // sealed free regions kept as the model's own hollows (air: an even count of walls to the outside)
+    int interiors = 0;         // sealed free regions filled (the inside of a solid: an odd count)
     double seconds_distance = 0, seconds_transform = 0, seconds_fill = 0, seconds_surface = 0, seconds = 0;
 };
 

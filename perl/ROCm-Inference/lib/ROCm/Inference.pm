@@ -999,7 +999,7 @@ sub has_background_removal { my ($t) = @_; ROCm::Inference::_t2_has_background_r
 # GIF or TGA bytes. remove_background: 'auto' (the alpha when the image has one, else BiRefNet), true (BiRefNet) or false (the whole
 # image). texture false: the mesh alone (faster). format 'stl': a binary STL of the mesh (no texture, for 3D printing), its largest
 # side size_mm millimetres (0: the mesh's units). Without texture the mesh is rebuilt as a closed solid (src/trellis_solid.h).
-# hollow_mm (an STL): hollow, the walls this thick (0: solid); drain_mm (3): each hollow's drain hole, from its lowest point down (0:
+# hollow_mm (an STL): hollow, the walls this thick, at least 2 (0: solid); drain_mm (3): each hollow's drain hole, from its lowest point down (0:
 # none). Dies on a bad image or option.
 sub start {
     my ($t, $image, %o) = @_;

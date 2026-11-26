@@ -169,12 +169,14 @@ static void synthetic() {
         double tolerance;  // relative
         float wall = 0, drain = 0;  // a hollow
         int hollows = 0, drains = 0;
+        int cavities = -1;  // the model's own sealed hollows kept (-1: not checked)
     };
     std::vector<Case> cases;
     const float lo[3] = {-0.5f, -0.4f, -0.3f}, hi[3] = {0.5f, 0.4f, 0.3f};
     const float h = 1.0f / cfg.grid, grow = cfg.iso * h;
     {
         Case c{"a box, half its faces turned", {}, 1, box_volume(lo, hi, grow), 0.01};
+        c.cavities = 0;  // its sealed inside is a solid's (one wall to the outside): filled
         add_box(c.m, lo, hi, 24);
         std::mt19937 rng(1);
         for (size_t t = 0; t < c.m.f.size() / 3; ++t)
@@ -230,6 +232,19 @@ static void synthetic() {
         cases.push_back(std::move(c));
     }
     {
+        // the model's own sealed hollow (a box inside a box, 0.1 apart: two walls to the outside): kept, as air. The outer
+        // surface iso out, the hollow's iso in from the inner box
+        Case c{"a box with a sealed hollow of its own", {}, 2, 0, 0.02};
+        add_box(c.m, lo, hi, 12);
+        const float ilo[3] = {lo[0] + 0.1f, lo[1] + 0.1f, lo[2] + 0.1f}, ihi[3] = {hi[0] - 0.1f, hi[1] - 0.1f, hi[2] - 0.1f};
+        add_box(c.m, ilo, ihi, 12);
+        c.cavities = 1;
+        double in = 1;
+        for (int k = 0; k < 3; ++k) in *= ihi[k] - ilo[k] - 2 * grow;
+        c.volume = box_volume(lo, hi, grow) - in;
+        cases.push_back(std::move(c));
+    }
+    {
         // hollow, walls of 0.1 (12.8 cells), no drain: the outer surface and the hollow's (two pieces); the volume the box grown by
         // iso less the hollow, a box 0.1 in from that
         Case c{"a hollow box", {}, 2, 0, 0.05};
@@ -276,6 +291,8 @@ static void synthetic() {
         const bool thin = std::strstr(c.name, "large hole") != nullptr;
         CHECK(thin ? (st.attempts == 3 && st.close == cfg.close) : (st.attempts == 1 + (c.wall > 0) && st.close == cfg.close),
               "%s: close %g after %d runs", c.name, st.close, st.attempts);
+        std::printf("  sealed regions: %d kept as the model's hollows, %d filled\n", st.cavities, st.interiors);
+        if (c.cavities >= 0) CHECK(st.cavities == c.cavities, "%s: %d sealed hollows kept, %d expected", c.name, st.cavities, c.cavities);
         if (c.wall > 0) {
             std::printf("  %d hollows (%d filled), %d drains\n", st.hollows, st.hollows_filled, st.drains);
             CHECK(st.hollows - st.hollows_filled == c.hollows && st.drains == c.drains, "%s: %d hollows (%d filled) and %d drains", c.name,
@@ -384,8 +401,9 @@ static void real(const std::string& path, const std::string& out_path, int grid,
         return;
     }
     std::printf("grid %d: %d x %d x %d points, cell %.4g; %d fill rounds, %ld outside; %d pieces, %d dropped; volume %.6g; close %g after "
-                "%d runs, mean thickness %.1f cells\n", grid, st.dims[0], st.dims[1], st.dims[2], st.cell, st.flood_rounds, st.outside, st.pieces,
-                st.pieces_dropped, st.volume, st.close, st.attempts, st.thickness);
+                "%d runs, mean thickness %.1f cells; sealed regions: %d kept as hollows, %d filled\n", grid, st.dims[0], st.dims[1], st.dims[2],
+                st.cell, st.flood_rounds, st.outside, st.pieces, st.pieces_dropped, st.volume, st.close, st.attempts, st.thickness, st.cavities,
+                st.interiors);
     std::printf("  seconds: distance %.2f, transform %.2f, fill %.2f, surface %.2f; all %.2f\n", st.seconds_distance, st.seconds_transform,
                 st.seconds_fill, st.seconds_surface, st.seconds);
     MeshCheck c;

@@ -162,6 +162,64 @@ void drop_small_pieces(std::vector<float>& v, std::vector<int32_t>& f, double mi
     st.verts = (int)(v.size() / 3);
 }
 
+// The model's own hollows (trellis_solid.h, step 3): each sealed free region (state 1 after the fill, 6-connected) casts rays
+// from up to 16 of its points along the six axis directions to the grid's border and counts the walls each crosses (runs of
+// points within iso of the mesh). Most counts even: air, a hollow of the model, made outside (state 2); odd: the inside of a
+// solid, left to be filled. udf is the distance to the mesh in cells (+inf beyond the band), in host-visible memory.
+void keep_cavities(uint8_t* st, const float* udf, const Grid& g, float iso, SolidStats& s) {
+    const long n = g.n(), gx = g.gx, gxy = (long)g.gx * g.gy;
+    std::vector<uint8_t> seen((size_t)(n / 8 + 1), 0);
+    auto mark = [&](long i) { seen[i >> 3] |= (uint8_t)(1u << (i & 7)); };
+    auto marked = [&](long i) { return (seen[i >> 3] >> (i & 7)) & 1; };
+    std::vector<int32_t> region;
+    const long step[6] = {1, -1, gx, -gx, gxy, -gxy};
+    for (long i = 0; i < n; ++i) {
+        if (st[i] != 1 || marked(i)) continue;
+        region.clear();
+        region.push_back((int32_t)i);
+        mark(i);
+        for (size_t q = 0; q < region.size(); ++q) {
+            const long p = region[q];
+            const int x = (int)(p % gx), y = (int)((p / gx) % g.gy), z = (int)(p / gxy);
+            const bool ok[6] = {x < g.gx - 1, x > 0, y < g.gy - 1, y > 0, z < g.gz - 1, z > 0};
+            for (int d = 0; d < 6; ++d) {
+                if (!ok[d]) continue;
+                const long q2 = p + step[d];
+                if (st[q2] == 1 && !marked(q2)) {
+                    mark(q2);
+                    region.push_back((int32_t)q2);
+                }
+            }
+        }
+        int even = 0, odd = 0;
+        const size_t samples = std::min<size_t>(16, region.size());
+        for (size_t k = 0; k < samples; ++k) {
+            const long p0 = region[k * region.size() / samples];
+            const int c0[3] = {(int)(p0 % gx), (int)((p0 / gx) % g.gy), (int)(p0 / gxy)};
+            const int dims[3] = {g.gx, g.gy, g.gz};
+            for (int d = 0; d < 6; ++d) {
+                const int axis = d / 2, dir = d % 2 ? -1 : 1;
+                int walls = 0;
+                bool in_wall = false;
+                long p = p0;
+                for (int c = c0[axis] + dir; c >= 0 && c < dims[axis]; c += dir) {
+                    p += step[d];
+                    const bool w = udf[p] < iso;
+                    walls += w && !in_wall;
+                    in_wall = w;
+                }
+                (walls % 2 ? odd : even)++;
+            }
+        }
+        if (even > odd) {
+            for (int32_t p : region) st[p] = 2;
+            s.cavities++;
+        } else {
+            s.interiors++;
+        }
+    }
+}
+
 // the hollow's depth in cells, as a distance to the outside: the outside (the fill) keeps close cells from the wall's points, the
 // outermost of which lie up to iso out from the mesh, where the surface is: so it is about close - iso from the surface (0 to half
 // a cell more where the grid does not line up), and the empty inside starts the wall further in (+ a quarter cell, the middle)
@@ -526,6 +584,7 @@ bool run_device(const std::vector<float>& verts, const std::vector<int32_t>& fac
     uint8_t* sv = dev<uint8_t>((size_t)n);
     sddev::solid_flood_init(dd, g.gx, g.gy, g.gz, cfg.close * cfg.close, sv);
     st.flood_rounds = dev_flood(sv, g);
+    keep_cavities(sv, reinterpret_cast<const float*>(udf), g, cfg.iso, st);
     for (long i = 0; i < n; ++i) st.outside += sv[i] == 2;
     if (grids) {
         grids->udf.resize(n);
@@ -786,6 +845,7 @@ bool reference_once(const std::vector<float>& verts, const std::vector<int32_t>&
         sv[i] = s;
     }
     st.flood_rounds = ref_flood(sv.data(), g);
+    keep_cavities(sv.data(), udf.data(), g, cfg.iso, st);
     for (long i = 0; i < n; ++i) st.outside += sv[i] == 2;
     if (grids) {
         grids->udf = udf;
