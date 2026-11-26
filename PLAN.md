@@ -186,6 +186,23 @@ run alone on the machine.
     python oracle, and a server route. The oracle needs a diffusers build with Flux.2 (0.35.2 has none) or ComfyUI on CPU.
     Open: the sampler's steps and the LoRA's role.
 
+19. **CAD and PCB design (investigated 2026-11-26, not started; the user's question after the whistle case).** A working
+    object (a whistle: a windway, a chamber, an edge) is CAD, not a generated mesh. The field's 2026 answer: a model writes
+    CAD code (CadQuery or build123d Python, OpenSCAD) that a CAD kernel (OpenCascade) runs into an exact, editable B-rep, then
+    STEP or STL; for boards, circuit code (SKiDL, atopile, tscircuit) into KiCad, with placement and routing by tools.
+    - Open-weight CAD models: cadrille (ICLR 2026, Apache-2.0; Qwen2-VL-2B; a point cloud, views or text to CadQuery;
+      `maksimko123/cadrille`, `-rl`), CAD-Recode (ICCV 2025; Qwen2-1.5B + a point projector; points to CadQuery; CC BY-NC),
+      CAD-Coder (MIT; LLaVA-1.5 type; an image to CadQuery; GenCAD-Code, 163k pairs). Text to CadQuery fine-tunes up to 7B;
+      CADFusion (Microsoft, research); STEP-LLM (text to STEP; code public, weights unclear). They know the datasets'
+      mechanical parts (sketch and extrude, holes, fillets), not organic shapes (TRELLIS's).
+    - PCB: no open model designs a board. PCBSchemaGen (a frozen LLM writes SKiDL, benchmarks on GitHub), SchGen (fine-tuned,
+      82% valid circuits; weights not confirmed), PCBRouteAgent (routing by agents; large boards still fail). Placement and
+      routing: KiCad, Freerouting (open), Quilter and DeepPCB (commercial). Konnect: KiCad tools for an LLM over MCP.
+    - Options: (a) tools in the harness (aicli, the user's to approve): a `cad` tool running OpenSCAD or CadQuery code in the
+      sandbox to STL/STEP plus a rendered view for the vision model to check, and SKiDL / kicad-cli / Freerouting for boards;
+      the local chat models write the code (no new model on the engine). (b) cadrille on the engine (Qwen2-VL-2B and a point
+      encoder): an image, or TRELLIS's mesh as points, to editable CadQuery. (c) CAD-Recode (non-commercial licence).
+
 ## Audio, vision and image: what is open per feature
 
 | Feature | Open |
