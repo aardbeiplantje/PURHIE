@@ -2557,7 +2557,7 @@ from it), C<negative_prompt> (optional), C<seconds> (1 to 10, 5 by default), C<s
 C<guidance_scale> (3.5 by default) and C<seed> (0 by default). The reply is the clip as a WAV file (mono, 16 kHz, 16 bit).
 
 C<POST /v1/3d/generations> (with C<--trellis2>): an image to a textured 3D model. A JSON body with the C<image> in base64
-(PNG, JPEG; WebP and the rest through ffmpeg) or as a data URL, or C<multipart/form-data> with the image file in the part
+(PNG, JPEG, their EXIF orientation applied; WebP and the rest through ffmpeg) or as a data URL, or C<multipart/form-data> with the image file in the part
 C<image>; the options C<resolution> (512, or 1024: the cascade; 1024 by default), C<seed> (0), C<faces> (700000: the
 simplification's target), C<texture_size> (4096) and C<remove_background> (C<auto>: the alpha channel when the image has
 one, else BiRefNet; C<true>; C<false>: the whole image). A job takes minutes (about 3.5 at 512 on this machine), so the reply

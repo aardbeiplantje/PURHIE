@@ -318,7 +318,8 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
     The finished models are files in a scratch tmpfs (2026-11-26: `--files DIR`; the image's `/scratch`, mounted by `run.sh`), not
     in the server's memory, and nginx sends the downloads (`X-Sendfile-Type` / `X-Accel-Mapping` from nginx, `X-Accel-Redirect`
     from the server to the internal `/rocm-files/`): 55 MB in 0.02 s through nginx 1.24, the server's part 1 ms; direct clients
-    get the bytes.
+    get the bytes. The image decoder applies a JPEG's or PNG's EXIF orientation (a phone photo stored on its side), as PIL's
+    `exif_transpose` does for ComfyUI (`src/image.cpp`; `image_orient_verify`: 8 orientations, both byte orders, against PIL).
     Open: (b) the 1536 cascade
     (memory is no longer the limit; its time is); (c) the normal-map and AO bakes and their GLB inputs; (d) UnwrapMesh's "pec"
     segmenter (ours is CuMesh's charts); (e) python's to_glb clean-up; (f) the simplify stops below its target (667k for 700k), where

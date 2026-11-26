@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -110,6 +111,106 @@ bool smart_size(int h, int w, int factor, long long min_pixels, long long max_pi
     return true;
 }
 
+// The EXIF orientation: phones store the pixels as the sensor read them and a tag (0x0112 in the TIFF structure's first
+// directory) says how to show them, 1 to 8. A JPEG carries it in an APP1 segment that starts "Exif\0\0", a PNG in its eXIf
+// chunk. 1 (as stored) when there is none, or it cannot be read.
+uint32_t tiff_read(const unsigned char* p, int bytes, bool le) {
+    uint32_t v = 0;
+    for (int i = 0; i < bytes; ++i) v |= (uint32_t)p[le ? i : bytes - 1 - i] << (8 * i);
+    return v;
+}
+
+int tiff_orientation(const unsigned char* t, size_t n) {
+    if (n < 8) return 1;
+    bool le;
+    if (t[0] == 'I' && t[1] == 'I') le = true;
+    else if (t[0] == 'M' && t[1] == 'M') le = false;
+    else return 1;
+    if (tiff_read(t + 2, 2, le) != 42) return 1;
+    const size_t ifd = tiff_read(t + 4, 4, le);
+    if (ifd < 8 || ifd + 2 > n) return 1;
+    const size_t count = tiff_read(t + ifd, 2, le);
+    for (size_t i = 0; i < count; ++i) {
+        const size_t e = ifd + 2 + i * 12;
+        if (e + 12 > n) break;
+        if (tiff_read(t + e, 2, le) != 0x0112) continue;
+        if (tiff_read(t + e + 2, 2, le) != 3 || tiff_read(t + e + 4, 4, le) < 1) return 1;  // (a SHORT)
+        const uint32_t v = tiff_read(t + e + 8, 2, le);  // (the value, at the start of the entry's 4 bytes)
+        return v >= 1 && v <= 8 ? (int)v : 1;
+    }
+    return 1;
+}
+
+int exif_orientation(const unsigned char* d, size_t n) {
+    if (n >= 4 && d[0] == 0xFF && d[1] == 0xD8) {  // JPEG: the segments before the scan
+        size_t i = 2;
+        while (i + 4 <= n) {
+            if (d[i] != 0xFF) return 1;
+            const unsigned char m = d[i + 1];
+            if (m == 0xFF) {  // (a fill byte)
+                ++i;
+                continue;
+            }
+            if (m == 0x01 || (m >= 0xD0 && m <= 0xD8)) {  // (the markers without a length)
+                i += 2;
+                continue;
+            }
+            if (m == 0xDA || m == 0xD9) return 1;  // the scan, or the end: no Exif before them
+            const size_t len = ((size_t)d[i + 2] << 8) | d[i + 3];
+            if (len < 2 || i + 2 + len > n) return 1;
+            if (m == 0xE1 && len >= 8 && std::memcmp(d + i + 4, "Exif\0\0", 6) == 0) return tiff_orientation(d + i + 10, len - 8);
+            i += 2 + len;
+        }
+        return 1;
+    }
+    static const unsigned char png[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    if (n >= 8 && std::memcmp(d, png, 8) == 0) {  // PNG: the chunks up to IEND
+        size_t i = 8;
+        while (i + 12 <= n) {
+            const size_t len = tiff_read(d + i, 4, false);
+            if (len > n - i - 12) return 1;
+            if (std::memcmp(d + i + 4, "eXIf", 4) == 0) return tiff_orientation(d + i + 8, len);
+            if (std::memcmp(d + i + 4, "IEND", 4) == 0) return 1;
+            i += 12 + len;
+        }
+    }
+    return 1;
+}
+
+// The pixels (w x h, ch bytes each; stb's allocation) as they are shown: turned and mirrored as the orientation says (2: mirrored
+// left to right; 3: turned 180 degrees; 4: mirrored top to bottom; 5: transposed; 6: turned 90 degrees clockwise; 7: transposed
+// across the other diagonal; 8: turned 90 degrees counter-clockwise), w and h swapped for 5 to 8. The old buffer is released;
+// null when the new one cannot be allocated.
+unsigned char* apply_orientation(unsigned char* px, int* w, int* h, int ch, int o) {
+    if (o <= 1 || o > 8) return px;
+    const int W = *w, H = *h;
+    const bool swap = o >= 5;
+    const int ow = swap ? H : W, oh = swap ? W : H;
+    unsigned char* out = static_cast<unsigned char*>(STBI_MALLOC((size_t)ow * oh * ch));
+    if (!out) {
+        stbi_image_free(px);
+        return nullptr;
+    }
+    for (int y = 0; y < oh; ++y)
+        for (int x = 0; x < ow; ++x) {
+            int sx = x, sy = y;
+            switch (o) {
+            case 2: sx = W - 1 - x; break;
+            case 3: sx = W - 1 - x; sy = H - 1 - y; break;
+            case 4: sy = H - 1 - y; break;
+            case 5: sx = y; sy = x; break;
+            case 6: sx = y; sy = H - 1 - x; break;
+            case 7: sx = W - 1 - y; sy = H - 1 - x; break;
+            case 8: sx = W - 1 - y; sy = x; break;
+            }
+            std::memcpy(out + ((size_t)y * ow + x) * ch, px + ((size_t)sy * W + sx) * ch, (size_t)ch);
+        }
+    stbi_image_free(px);
+    *w = ow;
+    *h = oh;
+    return out;
+}
+
 }  // namespace
 
 extern "C" {
@@ -122,6 +223,8 @@ int image_decode_rgba(const unsigned char* data, size_t n, unsigned char** rgba_
         if (px) stbi_image_free(px);
         return -1;
     }
+    px = apply_orientation(px, &w, &h, 4, exif_orientation(data, n));
+    if (!px) return -1;
     *rgba_out = px;  // (stb's allocation: image_free releases it)
     *w_out = w;
     *h_out = h;
@@ -137,6 +240,8 @@ int image_decode_rgb(const unsigned char* data, size_t n, unsigned char** rgb_ou
         if (px) stbi_image_free(px);
         return -1;
     }
+    px = apply_orientation(px, &w, &h, 3, exif_orientation(data, n));
+    if (!px) return -1;
     *rgb_out = px;  // (stb's allocation: image_free releases it)
     *w_out = w;
     *h_out = h;
