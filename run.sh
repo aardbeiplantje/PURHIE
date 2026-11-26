@@ -32,6 +32,12 @@ fi
 if [ -n "${AUDIOLDM2_DIR:-}" ] && [[ " ${ROCM_ARGS:-} " != *" --audioldm2 "* ]]; then
     ROCM_ARGS="${ROCM_ARGS:-} --audioldm2 /audioldm2"
 fi
+# TRELLIS2_DIR set: the TRELLIS.2 directory (TRELLIS.2-4B/, TRELLIS-image-large/ckpts/) is mounted at /trellis2 and the server
+# gets --trellis2 /trellis2 (unless ROCM_ARGS has one); DINOv3 and BiRefNet are found there or in ZIMAGE_DIR's clip_vision and
+# background_removal (a ComfyUI models directory)
+if [ -n "${TRELLIS2_DIR:-}" ] && [[ " ${ROCM_ARGS:-} " != *" --trellis2 "* ]]; then
+    ROCM_ARGS="${ROCM_ARGS:-} --trellis2 /trellis2"
+fi
 exec docker run \
     --restart=always \
     --name $D \
@@ -57,6 +63,7 @@ exec docker run \
     $([ -n "$HF_HOME" ] && echo "-v $HF_HOME:/hf:rw") \
     $([ -n "$ZIMAGE_DIR" ] && echo "-v $ZIMAGE_DIR:/zimage:ro") \
     $([ -n "$AUDIOLDM2_DIR" ] && echo "-v $AUDIOLDM2_DIR:/audioldm2:ro") \
+    $([ -n "$TRELLIS2_DIR" ] && echo "-v $TRELLIS2_DIR:/trellis2:ro") \
     -e XDG_CACHE_HOME=${XDG_CACHE_HOME:-/dev/shm} \
     -e HF_HOME=${HF_HOME:-/hf} \
     -e HF_TOKEN=${HF_TOKEN:-} \

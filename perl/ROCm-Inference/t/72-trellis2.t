@@ -13,7 +13,8 @@ use Time::HiRes qw(sleep);
 # model); GET /v1/3d/generations/ID polls it, GET .../content gives the binary glTF. Checked: the listing (kind 3d), the errors
 # (no image, an image that cannot be decoded), a 512 job, the busy answers while it runs (429 for a second job, 503 for the image
 # generator), the model's header, its file in --files and the download as nginx asks for it (X-Accel-Redirect, no body), the file's
-# removal at exit. Needs the TRELLIS.2 files (ROCM_INFERENCE_TEST_TRELLIS2=DIR, as --trellis2 takes them) and an image
+# removal at exit; the job is its user's (X-Remote-User): its random id, another user's 404s and listing, the busy answers that
+# name it only to its user. Needs the TRELLIS.2 files (ROCM_INFERENCE_TEST_TRELLIS2=DIR, as --trellis2 takes them) and an image
 # (ROCM_INFERENCE_TEST_TRELLIS2_IMAGE: a PNG with the object cut out by its alpha channel, or, when DIR holds birefnet.safetensors, a
 # photo that BiRefNet cuts out); about four minutes at 512.
 my $dirt = $ENV{ROCM_INFERENCE_TEST_TRELLIS2};
@@ -62,28 +63,48 @@ is($st, 400, 'a resolution other than 512 or 1024: refused') or diag $body;
 
 open my $fh, '<:raw', $img or die "$img: $!";
 my $png = do { local $/; <$fh> };
-($st, $body) = http(POST => '/v1/3d/generations', { model => 'trellis-2', image => encode_base64($png, ''), resolution => 512, seed => 1 });
+# the job is alice's (nginx's X-Remote-User); bob is another user
+my @alice = ('X-Remote-User: alice');
+my @bob = ('X-Remote-User: bob');
+($st, $body) = http(POST => '/v1/3d/generations', { model => 'trellis-2', image => encode_base64($png, ''), resolution => 512, seed => 1 },
+                    @alice);
 is($st, 200, 'a job starts') or diag substr($body, 0, 300);
 my $job = eval { $J->decode($body) } // {};
 is($job->{status}, 'in_progress', 'the job is in progress');
 my $id = $job->{id} // '';
+like($id, qr/\A3d_[0-9a-f]{32}\z/, 'its id is random (128 bits)');
 
-($st, $body) = http(POST => '/v1/3d/generations', { image => encode_base64($png, ''), resolution => 512 });
+($st, $body) = http(POST => '/v1/3d/generations', { image => encode_base64($png, ''), resolution => 512 }, @alice);
 is($st, 429, 'a second job while one runs: 429') or diag $body;
-($st, $body) = http(POST => '/v1/images/generations', { prompt => 'a fox' });
+like($body, qr/\Q$id\E/, 'which names the running job to its user');
+($st, $body) = http(POST => '/v1/3d/generations', { image => encode_base64($png, ''), resolution => 512 }, @bob);
+is($st, 429, 'another user\'s job: 429 too');
+unlike($body, qr/\Q$id\E/, 'which does not name the running job');
+($st, $body) = http(POST => '/v1/images/generations', { prompt => 'a fox' }, @bob);
 is($st, 503, 'the image generator while a job runs: 503') or diag $body;
+unlike($body, qr/\Q$id\E/, 'without the running job\'s id for another user');
 ($st, $body) = http(GET => '/v1/models');
 is($st, 200, 'the server answers while a job runs');
+($st, $body) = http(GET => "/v1/3d/generations/$id", undef, @bob);
+is($st, 404, 'another user does not see the job');
+($st, $body) = http(GET => '/v1/3d/generations', undef, @bob);
+is_deeply((eval { $J->decode($body) } // {})->{data}, [], 'nor list it');
+($st, $body) = http(GET => '/v1/3d/generations');
+is_deeply((eval { $J->decode($body) } // {})->{data}, [], 'nor does a request with no user');
+($st, $body) = http(GET => '/v1/3d/generations', undef, @alice);
+is(scalar @{ (eval { $J->decode($body) } // {})->{data} // [] }, 1, 'its user lists it');
 
 my $state = {};
 for (1 .. 2400) {  # at most 20 minutes
-    ($st, $body) = http(GET => "/v1/3d/generations/$id");
+    ($st, $body) = http(GET => "/v1/3d/generations/$id", undef, @alice);
     $state = eval { $J->decode($body) } // {};
     last unless ($state->{status} // '') eq 'in_progress';
     sleep 0.5;
 }
 is($state->{status}, 'completed', 'the job completes') or diag substr($body, 0, 400);
-($st, $body) = http(GET => "/v1/3d/generations/$id/content");
+($st, $body) = http(GET => "/v1/3d/generations/$id/content", undef, @bob);
+is($st, 404, 'another user cannot download it');
+($st, $body) = http(GET => "/v1/3d/generations/$id/content", undef, @alice);
 is($st, 200, 'the model downloads');
 is(substr($body // '', 0, 4), 'glTF', 'the model is a binary glTF');
 is(length($body // ''), $state->{bytes}, 'its length is the one the job gave');
@@ -91,7 +112,7 @@ my $glb = $body // '';
 my $file = "$files/rocm-$pid-$id.glb";
 is(-s $file, $state->{bytes}, 'the model is a file in --files, of that length');
 my $head;
-($st, $body, $head) = http(GET => "/v1/3d/generations/$id/content", undef, 'X-Sendfile-Type: X-Accel-Redirect',
+($st, $body, $head) = http(GET => "/v1/3d/generations/$id/content", undef, @alice, 'X-Sendfile-Type: X-Accel-Redirect',
                            "X-Accel-Mapping: $files/=/rocm-files/");
 is($st, 200, 'the download as nginx asks for it');
 my ($xa) = ($head // '') =~ /^X-Accel-Redirect: (\S+)/mi;

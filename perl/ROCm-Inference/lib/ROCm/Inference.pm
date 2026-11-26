@@ -956,9 +956,11 @@ my @T2_CKPTS = qw(ss_flow_img_dit_1_3B_64_bf16 slat_flow_img2shape_dit_1_3B_512_
                   shape_dec_next_dc_f16c32_fp16 slat_flow_imgshape2tex_dit_1_3B_512_bf16 slat_flow_imgshape2tex_dit_1_3B_1024_bf16
                   tex_dec_next_dc_f16c32_fp16);
 
-# the files of DIR: { trellis2_dir, ss_dec, dinov3, birefnet (undef: none), all => [every file] }; dies when one is missing
+# the files of DIR: { trellis2_dir, ss_dec, dinov3, birefnet (undef: none), all => [every file] }; dies when one is missing.
+# comfyui => MODELS: a ComfyUI models directory searched too for DINOv3 (clip_vision/) and BiRefNet (background_removal/)
 sub files {
     my ($class, $dir, %o) = @_;
+    my @comfy = grep { defined && length } $o{comfyui};
     my ($first) = sub { (grep { -f } @_)[0] };
     my ($t2) = grep { -f "$_/pipeline.json" && -d "$_/ckpts" } ("$dir/TRELLIS.2-4B", $dir);
     die "trellis2: no TRELLIS.2-4B directory (pipeline.json and ckpts/) in $dir\n" unless $t2;
@@ -966,9 +968,10 @@ sub files {
     for my $f (@ck) { die "trellis2: no file $f\n" unless -f $f }
     my $ss = $o{ss_dec} // $first->(map { "$_/ss_dec_conv3d_16l8_fp16.safetensors" } "$dir/TRELLIS-image-large/ckpts", "$dir/ckpts", $dir);
     die "trellis2: no ss_dec_conv3d_16l8_fp16.safetensors (TRELLIS-image-large's ckpts) in $dir\n" unless $ss && -f $ss;
-    my $dino = $o{dinov3} // $first->(map { "$_/dino_v3_L_naf_fp32.safetensors" } $dir, "$dir/clip_vision");
-    die "trellis2: no dino_v3_L_naf_fp32.safetensors in $dir or $dir/clip_vision\n" unless $dino && -f $dino;
-    my $bir = $o{birefnet} // $first->(map { "$_/birefnet.safetensors" } $dir, "$dir/background_removal");
+    my @dd = ($dir, "$dir/clip_vision", map { "$_/clip_vision" } @comfy);
+    my $dino = $o{dinov3} // $first->(map { "$_/dino_v3_L_naf_fp32.safetensors" } @dd);
+    die "trellis2: no dino_v3_L_naf_fp32.safetensors in " . join(', ', @dd) . "\n" unless $dino && -f $dino;
+    my $bir = $o{birefnet} // $first->(map { "$_/birefnet.safetensors" } $dir, "$dir/background_removal", map { "$_/background_removal" } @comfy);
     return { trellis2_dir => $t2, ss_dec => $ss, dinov3 => $dino, birefnet => $bir,
              all => [ "$t2/pipeline.json", @ck, $ss, $dino, grep { defined } $bir ] };
 }

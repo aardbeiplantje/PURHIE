@@ -100,7 +100,7 @@ sub aux_load {
     my $m = eval {
         $kind eq 'whisper' ? whisper_load($a->{path})
       : $kind eq 'tts'     ? speech_load($a->{path}, $a->{codec})
-      : $kind eq 'trellis2' ? ROCm::Inference::Trellis2->new($a->{path})
+      : $kind eq 'trellis2' ? ROCm::Inference::Trellis2->new($a->{path}, comfyui => $o{zimage})
       :                      sd_load($a->{path});
     };
     if (!$m) {
@@ -326,7 +326,7 @@ die "--audioldm2 $o{audioldm2}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n"
 # first request, unloaded when another model needs the room and no job runs. The files are checked at the start.
 die "--trellis2 $o{trellis2}: not a directory\n" if $o{trellis2} && !-d $o{trellis2};
 if ($o{trellis2}) {
-    my $bytes = eval { ROCm::Inference::Trellis2->bytes($o{trellis2}) };
+    my $bytes = eval { ROCm::Inference::Trellis2->bytes($o{trellis2}, comfyui => $o{zimage}) };
     die "--trellis2 $o{trellis2}: " . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) . "\n" unless defined $bytes;
     $AUX{trellis2} = { id => 'trellis-2', aux => 'trellis2', path => $o{trellis2}, info => { bytes => $bytes }, dir => 1, m => undef,
                        used => 0, queue => [], running => [] };
@@ -1534,7 +1534,7 @@ route::get '/v1/audio/voices' => sub {
 # minute at 512 x 512 with sd-turbo's one step).
 route::post '/v1/images/generations' => sub {
     my ($req) = @_;
-    job3d_busy();
+    job3d_busy($req);
     my $p = $req->{json};
     ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
     my $sd_name = $AUX{sd} ? $AUX{sd}{id} : undef;
@@ -1583,10 +1583,29 @@ route::post '/v1/images/generations' => sub {
 # 1024 by default), seed (0), faces (700000: the simplification's target), texture_size (4096), remove_background (auto: the alpha
 # channel when the image has one, else BiRefNet; true; false: the whole image). One job at a time (429 while one runs); the image and
 # audio generators answer 503 meanwhile (the job holds the device layer). The last few finished jobs keep their models for downloads,
-# as files in $FILES (through nginx, nginx sends them).
+# as files in $FILES (through nginx, nginx sends them). A job is its user's (nginx's X-Remote-User; without one, every request is
+# the same user): another user's requests do not see it (404, as for an id that does not exist; not in the listing; not named in
+# the busy answers), and its id is random (128 bits), so it cannot be guessed.
 my (%JOB3D, @JOB3D_ORDER, $JOB3D_RUN);
-my $job3d_seq = 0;
 my $JOB3D_KEEP = 4;
+sub job3d_new_id {
+    my $bytes = '';
+    if (open my $r, '<:raw', '/dev/urandom') { read $r, $bytes, 16 }
+    $bytes = join '', map { chr int rand 256 } 1 .. 16 unless length $bytes == 16;
+    return '3d_' . unpack('H*', $bytes);
+}
+sub job3d_user { my ($req) = @_; return $req->{headers}{'x-remote-user'} // '' }
+sub job3d_of {  # the job of the request's id when it is the request's user's, else 404
+    my ($req) = @_;
+    my $j = $JOB3D{ $req->{params}{id} };
+    error(404, "no 3D generation '$req->{params}{id}'", 'not_found_error') unless $j && $j->{user} eq job3d_user($req);
+    return $j;
+}
+sub job3d_running_note {  # the running job's id for its own user's busy answers; nothing for another user's
+    my ($req) = @_;
+    my $j = defined $JOB3D_RUN ? $JOB3D{$JOB3D_RUN} : undef;
+    return $j && $j->{user} eq job3d_user($req) ? " ($JOB3D_RUN: GET /v1/3d/generations/$JOB3D_RUN)" : '';
+}
 sub job3d_reap {  # the running job's state; a finished job's model (or error) into its record
     return unless defined $JOB3D_RUN;
     my $j = $JOB3D{$JOB3D_RUN};
@@ -1619,10 +1638,10 @@ sub job3d_reap {  # the running job's state; a finished job's model (or error) i
     }
 }
 sub job3d_busy {  # a running 3D job holds the device layer: the image and audio generators answer 503 meanwhile
+    my ($req) = @_;
     job3d_reap();
     return unless defined $JOB3D_RUN;
-    error(503, "the device is busy with a 3D generation ($JOB3D_RUN): try again when it completes (GET /v1/3d/generations/$JOB3D_RUN)",
-          'server_error');
+    error(503, 'the device is busy with a 3D generation' . job3d_running_note($req) . ': try again when it completes', 'server_error');
 }
 sub job3d_entry {
     my ($j) = @_;
@@ -1651,7 +1670,7 @@ route::post '/v1/3d/generations' => sub {
     my ($req) = @_;
     my $a = $AUX{trellis2} or error(503, 'no 3D model: start the server with --trellis2 DIR', 'server_error');
     job3d_reap();
-    error(429, "a 3D generation is running ($JOB3D_RUN): poll GET /v1/3d/generations/$JOB3D_RUN, then try again", 'rate_limit_error')
+    error(429, 'a 3D generation is running' . job3d_running_note($req) . ': try again when it completes', 'rate_limit_error')
         if defined $JOB3D_RUN;
     my $ct = $req->{headers}{'content-type'} // '';
     my ($p, $image);
@@ -1693,9 +1712,9 @@ route::post '/v1/3d/generations' => sub {
     }
     error(400, ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) =~ s/\AROCm::Inference: t2_start: //r) unless defined $started;
     error(429, 'a 3D generation is running: try again when it completes', 'rate_limit_error') unless $started;
-    my $id = sprintf('3d_%d_%d', time, ++$job3d_seq);
-    $JOB3D{$id} = { id => $id, created => time, status => 'in_progress', options => { %opts, remove_background => $rb },
-                    stage => 'starting', step => 0, steps => 0, seconds => 0 };
+    my $id = job3d_new_id();
+    $JOB3D{$id} = { id => $id, user => job3d_user($req), created => time, status => 'in_progress',
+                    options => { %opts, remove_background => $rb }, stage => 'starting', step => 0, steps => 0, seconds => 0 };
     push @JOB3D_ORDER, $id;
     $JOB3D_RUN = $id;
     $a->{busy} = 1;
@@ -1706,21 +1725,22 @@ route::post '/v1/3d/generations' => sub {
 };
 
 route::get '/v1/3d/generations' => sub {
+    my ($req) = @_;
     job3d_reap();
-    return { object => 'list', data => [ map { job3d_entry($JOB3D{$_}) } reverse @JOB3D_ORDER ] };
+    my $u = job3d_user($req);
+    return { object => 'list', data => [ map { job3d_entry($JOB3D{$_}) } grep { $JOB3D{$_}{user} eq $u } reverse @JOB3D_ORDER ] };
 };
 
 route::get '/v1/3d/generations/:id' => sub {
     my ($req) = @_;
     job3d_reap();
-    my $j = $JOB3D{ $req->{params}{id} } or error(404, "no 3D generation '$req->{params}{id}'", 'not_found_error');
-    return job3d_entry($j);
+    return job3d_entry(job3d_of($req));
 };
 
 route::get '/v1/3d/generations/:id/content' => sub {
     my ($req) = @_;
     job3d_reap();
-    my $j = $JOB3D{ $req->{params}{id} } or error(404, "no 3D generation '$req->{params}{id}'", 'not_found_error');
+    my $j = job3d_of($req);
     error(409, "the 3D generation is $j->{status}" . ($j->{error} ? ": $j->{error}" : '')) unless $j->{status} eq 'completed';
     my @h = ('Content-Type' => 'model/gltf-binary', 'Content-Disposition' => "attachment; filename=\"$j->{id}.glb\"");
     return file_response($req, $j->{file}, @h) if $j->{file};
@@ -1733,7 +1753,7 @@ route::get '/v1/3d/generations/:id/content' => sub {
 # 5 s at 100 steps).
 route::post '/v1/audio/generations' => sub {
     my ($req) = @_;
-    job3d_busy();
+    job3d_busy($req);
     my $p = $req->{json};
     ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
     error(503, 'no audio model: start the server with --audioldm2 DIR', 'server_error') unless $AUDIOLDM2;
@@ -2402,6 +2422,8 @@ directory holds the TRELLIS.2-4B checkpoints (F<dir/TRELLIS.2-4B> or F<dir> itse
 TRELLIS-image-large's sparse-structure decoder (F<ss_dec_conv3d_16l8_fp16.safetensors> in F<dir/TRELLIS-image-large/ckpts>,
 F<dir/ckpts> or F<dir>), DINOv3 (F<dino_v3_L_naf_fp32.safetensors> in F<dir> or F<dir/clip_vision>) and, optional, BiRefNet
 (F<birefnet.safetensors> in F<dir> or F<dir/background_removal>: without it only images with an alpha channel are cut out).
+With C<--zimage> (a ComfyUI models directory), its F<clip_vision> and F<background_removal> are searched too, so the two
+need not be copied next to TRELLIS.2.
 The files are checked at the start; the model is loaded by its first request (about 16 GB, registered for the device) and is
 a unit of the memory policy, as a chat model is (never unloaded while a job runs).
 
@@ -2563,7 +2585,9 @@ simplification's target), C<texture_size> (4096) and C<remove_background> (C<aut
 one, else BiRefNet; C<true>; C<false>: the whole image). A job takes minutes (about 3.5 at 512 on this machine), so the reply
 comes at once with the job's C<id>: C<GET /v1/3d/generations/{id}> is its state (C<in_progress> with the stage and its step,
 C<completed>, C<failed> with the error), C<GET /v1/3d/generations/{id}/content> is the model (C<model/gltf-binary>: a file in
-C<--files>, sent by nginx when nginx says it can) and C<GET /v1/3d/generations> lists the jobs kept (the last four). One job at a time (429 while one runs); the image and audio
+C<--files>, sent by nginx when nginx says it can) and C<GET /v1/3d/generations> lists the jobs kept (the last four). A job
+is its user's (nginx's C<X-Remote-User>; without one every request is the same user): another user's requests get 404 for
+it, do not list it and are not told its id; the id is random (128 bits). One job at a time (429 while one runs); the image and audio
 generators answer 503 meanwhile (the job holds the device layer); chat, embeddings and speech go on.
 
 C<GET /v1/models> lists every model; C<GET /v1/models?kind=image> lists the image models alone. An image (or 3D) model's entry has its
