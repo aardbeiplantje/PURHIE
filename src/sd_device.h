@@ -114,6 +114,15 @@ void rms_tok(const float* x, int HW, int C, const uint16_t* g, float* y);
 void patches(const float* x, int H, int W, int C, int mode, int p0, int n, float* P);
 void bias_tok(float* y, long rows, int C, const uint16_t* b);
 void upsample2_tok(const float* x, int H, int W, int C, float* y);
+// the BF16 route of those convolutions (Qwen-Image 2.1's VAE; BF16 buffers in device memory): the RMS norm (then SiLU when silu)
+// rounded to BF16; the mode 1 patches P16 [n][9C] of a BF16 input (C even; up2: the input is the (H / 2) x (W / 2) grid, read
+// through the nearest 2x upsampling); y = y16 + b (+ res, when given: another buffer than y) widened to FP32 (rows x C, b BF16);
+// and hipBLASLt's BF16 product with a BF16 output for any shape the library takes (xb: T x in, rows 16-byte aligned: in % 8 == 0;
+// no bias): false when it does not take it (or hipBLASLt is off), the caller's FP32 path then
+void rms_tok_bf16(const float* x, int HW, int C, const uint16_t* g, bool silu, uint16_t* y);
+void patches_bf16(const uint16_t* x16, int H, int W, int C, bool up2, int p0, int n, uint16_t* P16);
+void from16_bias_tok(const uint16_t* y16, long rows, int C, const uint16_t* b, const float* res, float* y);
+bool linear_blt16(const uint16_t* xb, int T, const uint16_t* W, int in, int out, uint16_t* y);
 // Qwen-Image 2.1's ConvRot linear (sd_gpu.hip qi_hadamard256 and qi_linear_i8): int8 weights W [out][in] in place with per-row
 // scales, the input rotated by H (the regular Hadamard of 256, normalised) per block; xr: T * in floats of scratch (sddev::alloc)
 void linear_convrot(const float* x, int T, const int8_t* W, const float* wscale, const float* H, int in, int out, float* xr, float* y);

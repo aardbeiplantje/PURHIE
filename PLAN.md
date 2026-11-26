@@ -20,7 +20,7 @@ run alone on the machine.
 - **Engine:** runs qwen2, qwen3, qwen3moe, qwen35 / qwen35moe, qwen4exp (Qwen3.8-Flash-Next), gemma4, gemma-embedding,
   nemotron_h_moe, llama and glm5-next (GLM-5.3-Flash, experts paged from disk) from zero-copy GGUF mappings on the UMA.
 - **Images, audio, 3D on the engine:** sd-turbo; Z-Image-Turbo (1024 x 1024, nine steps in about 24 s of DiT and VAE;
-  item 17); Qwen-Image 2.1 (RGBA, 1024 x 1024 at 40 steps in about 130 s; item 16); MiniMax-H3-Image; AudioLDM 2; Qwen3-TTS (speech) and Whisper tiny (transcription); vision towers for chat
+  item 17); Qwen-Image 2.1 (RGBA, 1024 x 1024 at 40 steps in about 127 s; item 16); MiniMax-H3-Image; AudioLDM 2; Qwen3-TTS (speech) and Whisper tiny (transcription); vision towers for chat
   models; TRELLIS.2 image to 3D (textured GLB, the mesh alone, STL for printing, solid or hollow) with BiRefNet for
   background removal. On the engine but not served: Qwen-Image 1 (item 16).
 - **Surfaces:** the C API (`libinference.so`), the Perl XS module ROCm::Inference (Minijinja templates),
@@ -166,7 +166,7 @@ run alone on the machine.
     `tools/qwenimage21_oracle.py` (diffusers 0.43.0 in FP32 on the dequantised ComfyUI files; outputs in
     `/data/zimage-ref/qwenimage2/pipe`: 512 x 512, 8 steps, seed 0, "a red cube on a wooden table, soft studio light"): the
     ids exact, the embeddings 3e-5, the sigmas 6e-8, the noise 5e-7, the first velocity 7.5e-4, the final latent 1.6%, the
-    decoder 6e-7; the image against diffusers' PSNR 47.6 dB (mean 0.33 levels). The BF16 file (the same names) runs a BF16
+    decoder 2.3e-3 (its BF16 route, below; 6e-7 in FP32); the image against diffusers' PSNR 47.3 dB (mean 0.40 levels). The BF16 file (the same names) runs a BF16
     chain as Z-Image's DiT: hipBLASLt with BF16 outputs (`sddev::linear_bf16_via16`: the FP32-output plan's first candidate is
     a slow algorithm, about 5.5 TFLOPS, and the tuner keeps the first candidate's numerics; the BF16 output's is fast, 22-26
     TFLOPS with the conversions) and the BF16 flash attention; against its own FP32 reference (`pipe_bf16`) 40.1 dB. The int8
@@ -178,7 +178,14 @@ run alone on the machine.
     Speed: 1024 x 1024, 40 steps, 130 s (was 287 with FP32 outputs and attention, 156 with BF16 outputs alone; another
     process held the GPU at about 16% in that run): about 3.0 s a step, the linears about 2.0 s at hipBLASLt's best (25 to
     30 TFLOPS: every BF16-output candidate has the same numerics, so the tuner picks the fastest), the attention 0.6; the
-    decoder about 7 s and the text encoder 1.2 s once; 512 x 512, 8 steps, 6.3 s. Served (2026-11-26):
+    text encoder 1.2 s once; 512 x 512, 8 steps, 6.3 s. The decoder's BF16 route (2026-11-26): the residual stream FP32, the
+    convolutions' inputs BF16 (`qv_rms16`: the RMS norm and SiLU rounded once, bit-identical to the FP32 ops then the rounding),
+    the 3 x 3 patches built in BF16 through shared memory (`qv_patch16`, the upsampler's nearest 2x read through, never written),
+    hipBLASLt's BF16 products with BF16 outputs for any shape it takes (`sddev::linear_blt16`: the 144- and 288-channel layers
+    too), widened with the bias and the residual (`qv_from16_bias`); the rows per product fixed by the patch width (64 M values,
+    the last product overlapping its neighbour), so the larger layers keep one tuned shape at every image size. 1024 x 1024:
+    1.36 s (was 7.1 s; the first decode tunes about 3 s more); 40 steps end to end 127 s. Against the reference 46.6 dB (BF16
+    file) and 47.3 dB (int8). Served (2026-11-26):
     `qwen-image-2.1` on `/v1/images/generations` (`--qwen-image DIR`, else the `--zimage` directory when it has the files;
     a unit of the memory policy, about 24 GB, loaded by its first request), the image made on a background thread (`qi21_start`,
     `qi21_poll`, `qi21_take`) while the answer waits in a pull response; 429 for a second image, 503 for the other device
@@ -300,6 +307,10 @@ Speed:
   the DiT shapes, where the faster ones have other numerics; `sd_gemm_bench` measures this path (5.5 TFLOPS now, 25 when the
   timing chose). Z-Image's DiT and Qwen-Image 2.1's BF16 file use BF16 outputs; any other FP32-output large product (the VAEs'
   convolutions are calibrated, `blt_calib.h`) is worth checking.
+- Qwen-Image 2.1's decoder (1.36 s at 1024): the products about 0.6 s (about 25 TFLOPS), the BF16 patches 0.38 s (about 49 GB
+  written and read again at 1024), the norms 0.16, the widening 0.13. An implicit-GEMM convolution (the taps read from the
+  activations, no patch matrix) would save most of the patches' share. Qwen-Image 1's VAE (`src/qwenimage_vae.cpp`) still
+  takes the FP32 route (`qi21_linear_bf16`, about 3 TFLOPS); the same BF16 route applies when it is served.
 - Z-Image's MLP-down shape: its weights have a 20 KB row stride (read in place, fixed); the activation copy is ours to lay
   out. The engine's own `sd_gemm_wmma256b` reached 19-20 TFLOPS on QKV and MLP-up and 9-13 on MLP-down (58-63% of the wave
   cycles waiting on vector memory, L2 hit rate 3%); hipBLASLt runs these now.

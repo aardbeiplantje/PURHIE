@@ -1463,6 +1463,64 @@ qv_patch(const float* x, int H, int W, int C, int mode, int p0, int n, float* P)
     P[e] = v;
 }
 
+// The BF16 route of Qwen-Image 2.1's VAE convolutions (token-major activations). qv_rms16: qv_rms_tok's norm, then SiLU when silu
+// is set (sd_silu's formula), rounded to BF16 once: the values of rms_tok, silu and a BF16 rounding, in one pass.
+extern "C" __global__ void __launch_bounds__(SD_THREADS) qv_rms16(const float* x, int C, const uint16_t* g, int silu, uint16_t* y) {
+    __shared__ float red[SD_THREADS];
+    const float* xr = x + (long)blockIdx.x * C;
+    uint16_t* yr = y + (long)blockIdx.x * C;
+    float q = 0.0f;
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) q += xr[i] * xr[i];
+    const float nrm = sqrtf(block_sum(q, red));
+    const float s = sqrtf((float)C) / fmaxf(nrm, 1e-12f);
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) {
+        float v = xr[i] * s * bf2f(g[i]);
+        if (silu) v = v / (1.0f + expf(-v));
+        yr[i] = f2bf(v);
+    }
+}
+
+// The patches of the 3 x 3 convolution (qv_patch's mode 1: row p0 + r of the H x W output grid, index c * 9 + kh * 3 + kw, zero
+// outside the image) from a BF16 input; up2: the input is the (H / 2) x (W / 2) grid and the taps read it through the nearest 2x
+// upsampling (qv_upsample2_tok's mapping), so the upsampled grid is never written. One block per row: the nine taps' channel rows
+// read (coalesced, two channels per 4-byte load) into shared memory (18 C bytes, dynamic), then the 9 C values written in order,
+// two per 4-byte store. C even.
+extern "C" __global__ void __launch_bounds__(SD_THREADS)
+qv_patch16(const uint16_t* x, int H, int W, int C, int up2, int p0, int n, uint16_t* P) {
+    extern __shared__ uint32_t s2[];  /* 9 C BF16 values, as pairs */
+    const uint16_t* s = reinterpret_cast<const uint16_t*>(s2);
+    const int r = blockIdx.x;
+    if (r >= n) return;
+    const int p = p0 + r, h = p / W, w = p % W, Wi = W >> up2, C2 = C / 2;
+#pragma unroll
+    for (int t = 0; t < 9; ++t) {
+        const int ih = h + t / 3 - 1, iw = w + t % 3 - 1;
+        const bool in = ih >= 0 && ih < H && iw >= 0 && iw < W;
+        const uint32_t* xr = reinterpret_cast<const uint32_t*>(x + (in ? ((long)(ih >> up2) * Wi + (iw >> up2)) * C : 0));
+        for (int c = threadIdx.x; c < C2; c += SD_THREADS) {
+            const uint32_t v = xr[c];
+            s2[t * C2 + c] = in ? v : 0u;
+        }
+    }
+    __syncthreads();
+    uint32_t* o = reinterpret_cast<uint32_t*>(P + (long)r * 9 * C);
+    const int half = 9 * C2;
+    for (int q = threadIdx.x; q < half; q += SD_THREADS) {
+        const int j = 2 * q, c0 = j / 9, t0 = j % 9, c1 = (j + 1) / 9, t1 = (j + 1) % 9;
+        o[q] = (uint32_t)s[t0 * C + c0] | ((uint32_t)s[t1 * C + c1] << 16);
+    }
+}
+
+// y[r][c] = y16[r][c] + b[c] (+ res[r][c]): the BF16 product back in FP32 with the BF16 bias and, when res is given, the residual
+// (another buffer than y: the result depends only on the inputs, so a row written twice gets the same values), rows x C
+extern "C" __global__ void __launch_bounds__(SD_THREADS)
+qv_from16_bias(const uint16_t* y16, const uint16_t* b, const float* res, int C, long n, float* y) {
+    const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (e >= n) return;
+    const float v = bf2f(y16[e]) + bf2f(b[e % C]);
+    y[e] = res ? v + res[e] : v;
+}
+
 // y[r][c] += b[c] (BF16 bias), rows x C
 extern "C" __global__ void __launch_bounds__(SD_THREADS) qv_bias_tok(float* y, const uint16_t* b, int C, long n) {
     const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
