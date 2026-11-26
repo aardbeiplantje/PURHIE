@@ -191,8 +191,13 @@ bool ImageTo3D::generate(const uint8_t* rgba, int w, int h, bool has_alpha, cons
         m.error = "resolution: 512 or 1024";
         return false;
     }
-    if (opt.faces < 1000 || opt.texture_size < 256 || opt.texture_size > 8192) {
+    const bool textured = opt.texture && opt.format == ImageTo3DOptions::Format::Glb;
+    if (opt.faces < 1000 || (textured && (opt.texture_size < 256 || opt.texture_size > 8192))) {
         m.error = "faces: at least 1000; texture size: 256 to 8192";
+        return false;
+    }
+    if (opt.format == ImageTo3DOptions::Format::Stl && (!(opt.stl_size_mm >= 0) || opt.stl_size_mm > 100000)) {
+        m.error = "the STL's size: 0 to 100000 millimetres";
         return false;
     }
     auto report = [&](const char* stage, int step, int steps) {
@@ -287,8 +292,43 @@ bool ImageTo3D::generate(const uint8_t* rgba, int w, int h, bool has_alpha, cons
     NoiseFn noise = [&](float* dst, size_t count) {
         for (size_t i = 0; i < count; ++i) dst[i] = gauss(rng);
     };
-    TexturedMesh tm;
     std::string err;
+    if (!textured) {
+        // the mesh alone: the shape (and its cascade), the simplification, the GLB or STL; no texture flow, unwrap or bake
+        ShapeResult sr;
+        const bool shape_ok = cascade ? m.shape->run_cascade(cond_lr.data(), (int)(cond_lr.size() / 1024), cond_hr.data(),
+                                                             (int)(cond_hr.size() / 1024), noise, scfg, sr)
+                                      : m.shape->run(cond_lr.data(), (int)(cond_lr.size() / 1024), noise, scfg, sr);
+        if (!shape_ok) {
+            m.error = (cascade ? "cascade: " : "shape: ") + m.shape->error();
+            return false;
+        }
+        m.timings.push_back({"sparse structure", sr.seconds_ss});
+        m.timings.push_back({"shape SLAT (512)", sr.seconds_slat});
+        if (cascade) m.timings.push_back({"cascade (1024)", sr.seconds_hr});
+        m.timings.push_back({"shape decoder", sr.seconds_dec});
+        m.timings.push_back({"mesh", sr.seconds_mesh});
+        std::vector<float> sv = std::move(sr.verts);
+        std::vector<int32_t> sf = std::move(sr.faces);
+        t0 = std::chrono::steady_clock::now();
+        report("simplify", 0, 0);
+        SimplifyStats sst;
+        if (!simplify_to_faces(sv, sf, opt.faces, sst, err)) {
+            m.error = "simplify: " + err;
+            return false;
+        }
+        m.timings.push_back({"simplify", seconds_since(t0)});
+        t0 = std::chrono::steady_clock::now();
+        const bool stl = opt.format == ImageTo3DOptions::Format::Stl;
+        report(stl ? "stl" : "glb", 0, 0);
+        if (!(stl ? encode_stl(sv, sf, opt.stl_size_mm, glb, err) : encode_glb_mesh(sv, sf, glb, err))) {
+            m.error = std::string(stl ? "stl: " : "glb: ") + err;
+            return false;
+        }
+        m.timings.push_back({stl ? "stl" : "glb", seconds_since(t0)});
+        return true;
+    }
+    TexturedMesh tm;
     const bool run_ok = cascade ? run_textured_cascade(*m.shape, *m.tex, cond_lr.data(), (int)(cond_lr.size() / 1024), cond_hr.data(),
                                                        (int)(cond_hr.size() / 1024), noise, scfg, tcfg, tm, err)
                                 : run_textured(*m.shape, *m.tex, cond_lr.data(), (int)(cond_lr.size() / 1024), noise, scfg, tcfg, tm, err);
@@ -410,7 +450,7 @@ const char* t2_last_error(void) { return g_t2_error.c_str(); }
 int t2_has_background_removal(t2_pipe_t* p) { return p && p->model->has_background_removal() ? 1 : 0; }
 
 int t2_start(t2_pipe_t* p, const unsigned char* image, size_t n, int resolution, unsigned long long seed, int faces, int texture_size,
-             int remove_background) {
+             int remove_background, int format, double stl_size_mm) {
     if (!p) {
         g_t2_error = "t2_start: no pipeline";
         return -1;
@@ -428,8 +468,16 @@ int t2_start(t2_pipe_t* p, const unsigned char* image, size_t n, int resolution,
         g_t2_error = "faces: from 1000 to 10000000";
         return -1;
     }
-    if (texture_size < 256 || texture_size > 8192) {
-        g_t2_error = "texture_size: from 256 to 8192";
+    if (texture_size != 0 && (texture_size < 256 || texture_size > 8192)) {
+        g_t2_error = "texture_size: from 256 to 8192, or 0 for none";
+        return -1;
+    }
+    if (format != 0 && format != 1) {
+        g_t2_error = "format: 0 (GLB) or 1 (STL)";
+        return -1;
+    }
+    if (!(stl_size_mm >= 0) || stl_size_mm > 100000) {
+        g_t2_error = "the STL's size: 0 to 100000 millimetres";
         return -1;
     }
     if (remove_background < -1 || remove_background > 1) {
@@ -459,8 +507,11 @@ int t2_start(t2_pipe_t* p, const unsigned char* image, size_t n, int resolution,
     o.resolution = resolution;
     o.seed = seed;
     o.faces = faces;
-    o.texture_size = texture_size;
+    o.texture = texture_size != 0;
+    o.texture_size = texture_size != 0 ? texture_size : 4096;
     o.remove_background = remove_background;
+    o.format = format == 1 ? trellis::ImageTo3DOptions::Format::Stl : trellis::ImageTo3DOptions::Format::Glb;
+    o.stl_size_mm = stl_size_mm;
     {
         std::lock_guard<std::mutex> lk(p->mu);
         p->status = 0;

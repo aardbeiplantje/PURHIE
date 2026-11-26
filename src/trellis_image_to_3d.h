@@ -27,6 +27,9 @@ struct ImageTo3DOptions {
     int texture_size = 4096;     // the UV atlas and the bake, texels per side (the workflow's 4096)
     int remove_background = -1;  // -1: the alpha when the image has one, else BiRefNet; 0: the whole image; 1: BiRefNet always
     int slat_lr_steps = 20;      // the cascade's 512 shape-SLAT steps (the workflow's 20)
+    bool texture = true;         // false: the mesh alone (no texture flow, unwrap or bake: faster)
+    enum class Format { Glb, Stl } format = Format::Glb;  // Stl: a binary STL of the mesh (no texture), for 3D printing
+    double stl_size_mm = 100;    // the STL's largest side in millimetres (0: the mesh's own units, a unit cube)
 };
 
 // the progress: the stage and its step (step, steps; 0, 0 for a stage without steps)
@@ -43,7 +46,8 @@ public:
     const std::string& error() const;
     bool has_background_removal() const;
 
-    // rgba [h][w][4] (has_alpha false: the image had no alpha channel, its alpha is 255). glb: the binary glTF.
+    // rgba [h][w][4] (has_alpha false: the image had no alpha channel, its alpha is 255). glb: the model, a binary glTF (textured, or
+    // the mesh alone) or a binary STL (opt.format)
     bool generate(const uint8_t* rgba, int w, int h, bool has_alpha, const ImageTo3DOptions& opt, std::vector<uint8_t>& glb,
                   const ImageTo3DProgress& progress = nullptr);
 

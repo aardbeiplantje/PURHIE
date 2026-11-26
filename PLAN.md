@@ -322,9 +322,18 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
     answers that name the job only to its user. The image: `TRELLIS2_DIR` in `run.sh` (mounted at /trellis2; DINOv3 and BiRefNet
     also found in the `--zimage` ComfyUI directory). The image decoder applies a JPEG's or PNG's EXIF orientation (a phone photo stored on its side), as PIL's
     `exif_transpose` does for ComfyUI (`src/image.cpp`; `image_orient_verify`: 8 orientations, both byte orders, against PIL).
+    The mesh alone and STL (2026-11-26): `texture: false` skips the texture flow, the unwrap and the bake (a GLB of the mesh,
+    `encode_glb_mesh`); `format: stl` writes a binary STL (`encode_stl`: z up, centred, on z = 0, the largest side `size_mm`,
+    100 mm by default; faces turned when the signed volume is negative). `stl_verify` checks both on a cube; `t/72` runs an STL
+    job (44 checks). The vase at 512: 131 s for the STL against about 200 s textured. Not print-clean yet: the vase's mesh before
+    the simplification (1.1M faces) has 14,689 boundary edges, 22,858 non-manifold ones, 17% of its manifold edges join faces wound
+    opposite ways, and 6,971 pieces (the 200k simplified one the same in proportion). It comes from the mesher (the flexible dual
+    grid keeps which edges are crossed, not the inside), not the simplifier; the textured GLB hides it (drawn double-sided). (e)
+    is the fix.
     Open: (b) the 1536 cascade
     (memory is no longer the limit; its time is); (c) the normal-map and AO bakes and their GLB inputs; (d) UnwrapMesh's "pec"
-    segmenter (ours is CuMesh's charts); (e) python's to_glb clean-up; (f) the simplify stops below its target (667k for 700k), where
+    segmenter (ours is CuMesh's charts); (e) python's to_glb clean-up (needed for a printable STL: the face orientations made consistent, duplicate faces, non-manifold
+    edges and small pieces removed, the holes filled; or the workflow's RemeshMesh for a watertight mesh); (f) the simplify stops below its target (667k for 700k), where
     python's stops at it; (g) the unwrap (74 s on the vase: xatlas per chart, single-threaded) and the host sorts, to move to the
     device or threads; (h) RemeshMesh (udf, 768) only if wanted: the user prefers the sharper result without it; (i) access by
     the harness's login (waits on the user: when this project joins the AI harness, `./aicli.git`, or its token is accepted by

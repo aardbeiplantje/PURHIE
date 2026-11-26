@@ -59,6 +59,16 @@ bool write_glb(const std::string& path, const UvMesh& uv, const std::vector<floa
 // The same GLB in memory (the server's reply).
 bool encode_glb(const UvMesh& uv, const std::vector<float>& normals, const BakedTextures& tex, std::vector<uint8_t>& glb, std::string& error);
 
+// A GLB of the mesh alone (verts [V][3], faces [F][3] in the mesh's frame, z up): the positions and vertex normals with the GLB's axes
+// (as encode_glb), the faces, a plain grey material; no texture coordinates, no images.
+bool encode_glb_mesh(const std::vector<float>& verts, const std::vector<int32_t>& faces, std::vector<uint8_t>& glb, std::string& error);
+
+// A binary STL of the mesh (for 3D printing): z up as the mesh is; every face wound counter-clockwise seen from outside (when the
+// mesh's signed volume is negative all are turned), its normal from that winding; scaled so the largest side of the bounding box is
+// size_mm millimetres (0: the mesh's own units), centred on x and y, standing on z = 0. *flipped: the faces were turned.
+bool encode_stl(const std::vector<float>& verts, const std::vector<int32_t>& faces, double size_mm, std::vector<uint8_t>& stl, std::string& error,
+                bool* flipped = nullptr);
+
 // The whole export: the charts (trellis_charts.h), the unwrap of each chart by xatlas, the texture baked from the voxel attributes at
 // texture_size texels, and the GLB at path.
 bool export_textured_glb(const std::vector<float>& verts, const std::vector<int32_t>& faces, const VoxelAttributes& attr, int texture_size,

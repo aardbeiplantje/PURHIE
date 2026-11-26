@@ -761,7 +761,8 @@ my %IMAGE_INFO = (
     'trellis-2' => {
         description => 'An image to a textured 3D model (binary glTF) with TRELLIS.2 (--trellis2 DIR). The object is cut out (the image\'s '
                      . 'alpha channel, or BiRefNet) and cropped as the ComfyUI workflow does; 512, or the 1024 cascade; simplified to 700,000 '
-                     . 'faces with a 4096 texture. A job takes minutes: POST starts it, GET polls it, GET .../content gives the GLB.',
+                     . 'faces with a 4096 texture; or the mesh alone (texture false), or a binary STL of it for 3D printing (format stl). '
+                     . 'A job takes minutes: POST starts it, GET polls it, GET .../content gives the model.',
         usage => 'POST /v1/3d/generations {"model":"trellis-2","image":"<base64 PNG>","resolution":1024,"seed":0}; then '
                . 'GET /v1/3d/generations/<id> until its status is completed; then GET /v1/3d/generations/<id>/content',
         parameters => {
@@ -772,7 +773,12 @@ my %IMAGE_INFO = (
             faces => { type => 'integer', default => 700000, min => 1000, max => 10000000, note => 'the faces after the simplification' },
             texture_size => { type => 'integer', default => 4096, values => [512, 1024, 2048, 4096] },
             remove_background => { type => 'string', default => 'auto', values => ['auto', 'true', 'false'],
-                                   note => 'auto: the alpha channel when the image has one, else BiRefNet' } },
+                                   note => 'auto: the alpha channel when the image has one, else BiRefNet' },
+            texture => { type => 'boolean', default => 'true', note => 'false: the mesh alone, no texture (faster: no texture flow, unwrap or bake)' },
+            format => { type => 'string', default => 'glb', values => ['glb', 'stl'],
+                        note => 'stl: a binary STL of the mesh (no texture), z up, for 3D printing' },
+            size_mm => { type => 'number', default => 100, min => 0, max => 100000,
+                         note => "the STL's largest side in millimetres (0: the mesh's own units, a unit cube)" } },
     },
     'z-image-turbo' => {
         description => 'Text to image with Z-Image-Turbo (--zimage: the ComfyUI files). Nine steps, the default size 1024 x 1024.',
@@ -1621,14 +1627,14 @@ sub job3d_reap {  # the running job's state; a finished job's model (or error) i
     my $glb = eval { $a->{m}->take };
     if (defined $glb) {
         @$j{qw(status bytes)} = ('completed', length $glb);
-        my $path = file_put("$j->{id}.glb", $glb);  # (kept in memory only when the file cannot be written)
+        my $path = file_put("$j->{id}." . ($j->{options}{format} // 'glb'), $glb);  # (kept in memory only when the file cannot be written)
         if (defined $path) { $j->{file} = $path } else { $j->{glb} = $glb }
     } else {
         $j->{status} = 'failed';
         $j->{error} = ($@ || 'the job ended without a model') =~ s/ at \S+ line \d+\.?\n?\z//r =~ s/\AROCm::Inference: t2_take: //r;
     }
     $LOG->info('request', event => '3d', msg => sprintf('%s: %s, %.1f s%s', $j->{id}, $j->{status}, $j->{seconds} // 0,
-        $j->{status} eq 'completed' ? ", $j->{bytes} bytes of GLB" : ": $j->{error}"));
+        $j->{status} eq 'completed' ? ", $j->{bytes} bytes of " . uc($j->{options}{format} // 'glb') : ": $j->{error}"));
     undef $JOB3D_RUN;
     $a->{busy} = 0;
     $a->{used} = ++$stamp;
@@ -1702,8 +1708,17 @@ route::post '/v1/3d/generations' => sub {
     my $rb = $p->{remove_background} // 'auto';
     $rb = $rb ? 'true' : 'false' if ref $rb;  # a JSON boolean
     error(400, "remove_background: auto, true or false, not '$rb'") unless $rb =~ /\A(?:auto|true|false|1|0)\z/;
+    my $fmt = lc($p->{format} // 'glb');
+    error(400, "format: glb or stl, not '$fmt'") unless $fmt =~ /\A(?:glb|stl)\z/;
+    my $texture = $p->{texture} // 'true';
+    $texture = $texture ? 'true' : 'false' if ref $texture;  # a JSON boolean
+    error(400, "texture: true or false, not '$texture'") unless $texture =~ /\A(?:true|false|1|0)\z/;
+    $texture = ($texture eq 'true' || $texture eq '1') && $fmt eq 'glb' ? 1 : 0;  # (an STL has none)
+    my $size = $p->{size_mm} // 100;
+    error(400, 'size_mm: a number from 0 to 100000') unless $size =~ /\A\d+(?:\.\d+)?\z/ && $size <= 100000;
     my %opts = (resolution => 0 + $res, seed => 0 + $seed, faces => 0 + $faces, texture_size => 0 + $tex,
-                remove_background => $rb eq 'auto' ? 'auto' : ($rb eq 'true' || $rb eq '1') ? 1 : 0);
+                remove_background => $rb eq 'auto' ? 'auto' : ($rb eq 'true' || $rb eq '1') ? 1 : 0,
+                texture => $texture, format => $fmt, ($fmt eq 'stl' ? (size_mm => 0 + $size) : ()));
     my $T = eval { aux_get('trellis2') } or error(500, '3D model: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r), 'server_error');
     my $started = eval { $T->start($image, %opts) };
     if (!defined $started && $@ =~ /cannot be decoded/) {  # WebP and the other formats stb_image does not read: through ffmpeg, as PNG
@@ -1714,13 +1729,15 @@ route::post '/v1/3d/generations' => sub {
     error(429, 'a 3D generation is running: try again when it completes', 'rate_limit_error') unless $started;
     my $id = job3d_new_id();
     $JOB3D{$id} = { id => $id, user => job3d_user($req), created => time, status => 'in_progress',
-                    options => { %opts, remove_background => $rb }, stage => 'starting', step => 0, steps => 0, seconds => 0 };
+                    options => { %opts, remove_background => $rb, texture => $opts{texture} ? JSON::PP::true : JSON::PP::false },
+                    stage => 'starting', step => 0, steps => 0, seconds => 0 };
     push @JOB3D_ORDER, $id;
     $JOB3D_RUN = $id;
     $a->{busy} = 1;
     $a->{used} = ++$stamp;
-    $LOG->info('request', event => '3d', msg => sprintf('%s: started, %d bytes of image, resolution %d, seed %d, %d faces, texture %d, background %s',
-                                                    $id, length $image, $res, $seed, $faces, $tex, $rb));
+    $LOG->info('request', event => '3d', msg => sprintf('%s: started, %d bytes of image, resolution %d, seed %d, %d faces, %s, background %s',
+                                                    $id, length $image, $res, $seed, $faces,
+                                                    $fmt eq 'stl' ? "STL of ${size} mm" : $texture ? "GLB with a $tex texture" : 'GLB of the mesh', $rb));
     return job3d_entry($JOB3D{$id});
 };
 
@@ -1742,7 +1759,8 @@ route::get '/v1/3d/generations/:id/content' => sub {
     job3d_reap();
     my $j = job3d_of($req);
     error(409, "the 3D generation is $j->{status}" . ($j->{error} ? ": $j->{error}" : '')) unless $j->{status} eq 'completed';
-    my @h = ('Content-Type' => 'model/gltf-binary', 'Content-Disposition' => "attachment; filename=\"$j->{id}.glb\"");
+    my $ext = $j->{options}{format} // 'glb';
+    my @h = ('Content-Type' => $ext eq 'stl' ? 'model/stl' : 'model/gltf-binary', 'Content-Disposition' => "attachment; filename=\"$j->{id}.$ext\"");
     return file_response($req, $j->{file}, @h) if $j->{file};
     return [200, \@h, $j->{glb}];
 };
@@ -2581,10 +2599,14 @@ C<guidance_scale> (3.5 by default) and C<seed> (0 by default). The reply is the 
 C<POST /v1/3d/generations> (with C<--trellis2>): an image to a textured 3D model. A JSON body with the C<image> in base64
 (PNG, JPEG, their EXIF orientation applied; WebP and the rest through ffmpeg) or as a data URL, or C<multipart/form-data> with the image file in the part
 C<image>; the options C<resolution> (512, or 1024: the cascade; 1024 by default), C<seed> (0), C<faces> (700000: the
-simplification's target), C<texture_size> (4096) and C<remove_background> (C<auto>: the alpha channel when the image has
-one, else BiRefNet; C<true>; C<false>: the whole image). A job takes minutes (about 3.5 at 512 on this machine), so the reply
+simplification's target), C<texture_size> (4096), C<remove_background> (C<auto>: the alpha channel when the image has
+one, else BiRefNet; C<true>; C<false>: the whole image), C<texture> (C<true>; C<false>: the mesh alone, without the texture
+flow, the unwrap and the bake, so faster), C<format> (C<glb>; C<stl>: a binary STL of the mesh, no texture, for 3D printing:
+z up, every face wound counter-clockwise from outside, centred on x and y and standing on z = 0) and C<size_mm> (the STL's
+largest side in millimetres, 100; 0 keeps the mesh's own units, a unit cube). A job takes minutes (about 3.5 at 512 on this machine), so the reply
 comes at once with the job's C<id>: C<GET /v1/3d/generations/{id}> is its state (C<in_progress> with the stage and its step,
-C<completed>, C<failed> with the error), C<GET /v1/3d/generations/{id}/content> is the model (C<model/gltf-binary>: a file in
+C<completed>, C<failed> with the error), C<GET /v1/3d/generations/{id}/content> is the model (C<model/gltf-binary>, or
+C<model/stl> for an STL: a file in
 C<--files>, sent by nginx when nginx says it can) and C<GET /v1/3d/generations> lists the jobs kept (the last four). A job
 is its user's (nginx's C<X-Remote-User>; without one every request is the same user): another user's requests get 404 for
 it, do not list it and are not told its id; the id is random (128 bits). One job at a time (429 while one runs); the image and audio

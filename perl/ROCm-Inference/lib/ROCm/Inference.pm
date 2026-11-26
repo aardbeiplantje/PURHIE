@@ -994,15 +994,20 @@ sub new {
 
 sub has_background_removal { my ($t) = @_; ROCm::Inference::_t2_has_background_removal($t->{h}) }
 
-# $t->start($image_bytes, resolution => 1024, seed => 0, faces => 700000, texture_size => 4096, remove_background => 'auto'):
-# 1 when the job started, 0 when one is running already. The image: PNG, JPEG, BMP, GIF or TGA bytes. remove_background: 'auto' (the
-# alpha when the image has one, else BiRefNet), true (BiRefNet) or false (the whole image). Dies on a bad image or option.
+# $t->start($image_bytes, resolution => 1024, seed => 0, faces => 700000, texture_size => 4096, remove_background => 'auto',
+# texture => 1, format => 'glb', size_mm => 100): 1 when the job started, 0 when one is running already. The image: PNG, JPEG, BMP,
+# GIF or TGA bytes. remove_background: 'auto' (the alpha when the image has one, else BiRefNet), true (BiRefNet) or false (the whole
+# image). texture false: the mesh alone (faster). format 'stl': a binary STL of the mesh (no texture, for 3D printing), its largest
+# side size_mm millimetres (0: the mesh's units). Dies on a bad image or option.
 sub start {
     my ($t, $image, %o) = @_;
     my $rb = $o{remove_background} // 'auto';
     $rb = $rb eq 'auto' ? -1 : $rb ? 1 : 0;
+    my $fmt = $o{format} // 'glb';
+    die "ROCm::Inference::Trellis2: format: glb or stl, not '$fmt'\n" unless $fmt =~ /\A(?:glb|stl)\z/;
+    my $tex = (exists $o{texture} && !$o{texture}) ? 0 : $o{texture_size} // 4096;
     my $r = ROCm::Inference::_t2_start($t->{h}, $image, $o{resolution} // 1024, $o{seed} // 0, $o{faces} // 700000,
-                                        $o{texture_size} // 4096, $rb);
+                                        $tex, $rb, $fmt eq 'stl' ? 1 : 0, $o{size_mm} // 100);
     return $r == 0 ? 1 : 0;
 }
 

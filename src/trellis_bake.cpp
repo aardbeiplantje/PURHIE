@@ -486,6 +486,133 @@ bool encode_glb(const UvMesh& uv, const std::vector<float>& normals, const Baked
     return true;
 }
 
+bool encode_glb_mesh(const std::vector<float>& verts, const std::vector<int32_t>& faces, std::vector<uint8_t>& glb, std::string& error) {
+    const size_t V = verts.size() / 3, F = faces.size() / 3;
+    if (V == 0 || F == 0) {
+        error = "nothing to write";
+        return false;
+    }
+    for (int32_t i : faces)
+        if (i < 0 || (size_t)i >= V) {
+            error = "a face names a vertex the mesh does not have";
+            return false;
+        }
+    // the axes of encode_glb: (x, y, z) -> (x, z, -y)
+    const std::vector<float> normals = vertex_normals(verts, faces);
+    std::vector<float> pos(V * 3), nrm(V * 3);
+    float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+    for (size_t i = 0; i < V; ++i) {
+        const float p[3] = {verts[3 * i], verts[3 * i + 2], -verts[3 * i + 1]};
+        const float nn[3] = {normals[3 * i], normals[3 * i + 2], -normals[3 * i + 1]};
+        for (int c = 0; c < 3; ++c) {
+            pos[3 * i + c] = p[c];
+            nrm[3 * i + c] = nn[c];
+            lo[c] = std::min(lo[c], p[c]);
+            hi[c] = std::max(hi[c], p[c]);
+        }
+    }
+    std::vector<uint8_t> bin(pos.size() * 4 + nrm.size() * 4 + F * 3 * 4);
+    const size_t off_nrm = pos.size() * 4, off_idx = off_nrm + nrm.size() * 4;
+    std::memcpy(&bin[0], pos.data(), pos.size() * 4);
+    std::memcpy(&bin[off_nrm], nrm.data(), nrm.size() * 4);
+    std::memcpy(&bin[off_idx], faces.data(), F * 3 * 4);  // (indices: non-negative int32, the same bits as uint32)
+    char json[2048];
+    std::snprintf(json, sizeof json,
+                  "{\"asset\":{\"version\":\"2.0\",\"generator\":\"rocm-inference trellis_bake\"},"
+                  "\"scene\":0,\"scenes\":[{\"nodes\":[0]}],\"nodes\":[{\"mesh\":0}],"
+                  "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1},\"indices\":2,\"material\":0}]}],"
+                  "\"materials\":[{\"doubleSided\":true,\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.8,0.8,0.8,1],"
+                  "\"metallicFactor\":0,\"roughnessFactor\":0.8}}],"
+                  "\"accessors\":["
+                  "{\"bufferView\":0,\"componentType\":5126,\"count\":%zu,\"type\":\"VEC3\",\"min\":[%.7g,%.7g,%.7g],\"max\":[%.7g,%.7g,%.7g]},"
+                  "{\"bufferView\":1,\"componentType\":5126,\"count\":%zu,\"type\":\"VEC3\"},"
+                  "{\"bufferView\":2,\"componentType\":5125,\"count\":%zu,\"type\":\"SCALAR\"}],"
+                  "\"bufferViews\":["
+                  "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":%zu,\"target\":34962},"
+                  "{\"buffer\":0,\"byteOffset\":%zu,\"byteLength\":%zu,\"target\":34962},"
+                  "{\"buffer\":0,\"byteOffset\":%zu,\"byteLength\":%zu,\"target\":34963}],"
+                  "\"buffers\":[{\"byteLength\":%zu}]}",
+                  V, (double)lo[0], (double)lo[1], (double)lo[2], (double)hi[0], (double)hi[1], (double)hi[2], V, F * 3, pos.size() * 4,
+                  off_nrm, nrm.size() * 4, off_idx, F * 3 * 4, bin.size());
+    std::string js(json);
+    while (js.size() % 4) js.push_back(' ');
+    glb.clear();
+    const uint32_t total = (uint32_t)(12 + 8 + js.size() + 8 + bin.size());
+    glb.insert(glb.end(), {'g', 'l', 'T', 'F'});
+    put_le32(glb, 2);
+    put_le32(glb, total);
+    put_le32(glb, (uint32_t)js.size());
+    glb.insert(glb.end(), {'J', 'S', 'O', 'N'});
+    glb.insert(glb.end(), js.begin(), js.end());
+    put_le32(glb, (uint32_t)bin.size());
+    glb.insert(glb.end(), {'B', 'I', 'N', 0});
+    glb.insert(glb.end(), bin.begin(), bin.end());
+    return true;
+}
+
+bool encode_stl(const std::vector<float>& verts, const std::vector<int32_t>& faces, double size_mm, std::vector<uint8_t>& stl, std::string& error,
+                bool* flipped) {
+    const size_t V = verts.size() / 3, F = faces.size() / 3;
+    if (V == 0 || F == 0) {
+        error = "nothing to write";
+        return false;
+    }
+    if (F > 0xffffffffu) {
+        error = "too many faces for an STL file";
+        return false;
+    }
+    for (int32_t i : faces)
+        if (i < 0 || (size_t)i >= V) {
+            error = "a face names a vertex the mesh does not have";
+            return false;
+        }
+    // the bounding box, and the scale: the largest side is size_mm
+    double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+    for (size_t i = 0; i < V; ++i)
+        for (int c = 0; c < 3; ++c) {
+            lo[c] = std::min(lo[c], (double)verts[3 * i + c]);
+            hi[c] = std::max(hi[c], (double)verts[3 * i + c]);
+        }
+    const double side = std::max(hi[0] - lo[0], std::max(hi[1] - lo[1], hi[2] - lo[2]));
+    const double s = size_mm > 0 && side > 0 ? size_mm / side : 1.0;
+    const double off[3] = {-(lo[0] + hi[0]) / 2, -(lo[1] + hi[1]) / 2, -lo[2]};  // centred on x and y, on z = 0
+    auto at = [&](int32_t v, int c) { return (verts[3 * (size_t)v + c] + off[c]) * s; };
+    // the winding: the signed volume (the sum of the tetrahedra to the origin) is positive for faces counter-clockwise from outside
+    double vol = 0;
+    for (size_t f = 0; f < F; ++f) {
+        const int32_t a = faces[3 * f], b = faces[3 * f + 1], c = faces[3 * f + 2];
+        const double ax = at(a, 0), ay = at(a, 1), az = at(a, 2), bx = at(b, 0), by = at(b, 1), bz = at(b, 2);
+        const double cx = at(c, 0), cy = at(c, 1), cz = at(c, 2);
+        vol += ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx) + az * (bx * cy - by * cx);
+    }
+    const bool flip = vol < 0;
+    if (flipped) *flipped = flip;
+    stl.assign(84 + 50 * F, 0);
+    const char head[] = "binary STL, rocm-inference trellis_bake (TRELLIS.2), millimetres, z up";
+    std::memcpy(stl.data(), head, std::min(sizeof head - 1, (size_t)80));
+    const uint32_t n = (uint32_t)F;
+    std::memcpy(&stl[80], &n, 4);  // (little-endian: the host's order on gfx1151 machines)
+    uint8_t* p = &stl[84];
+    for (size_t f = 0; f < F; ++f, p += 50) {
+        const int32_t a = faces[3 * f], b = faces[3 * f + (flip ? 2 : 1)], c = faces[3 * f + (flip ? 1 : 2)];
+        float v[3][3];
+        for (int k = 0; k < 3; ++k) {
+            v[0][k] = (float)at(a, k);
+            v[1][k] = (float)at(b, k);
+            v[2][k] = (float)at(c, k);
+        }
+        const double e1[3] = {(double)v[1][0] - v[0][0], (double)v[1][1] - v[0][1], (double)v[1][2] - v[0][2]};
+        const double e2[3] = {(double)v[2][0] - v[0][0], (double)v[2][1] - v[0][1], (double)v[2][2] - v[0][2]};
+        double nn[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+        const double len = std::sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
+        const float fn[3] = {len > 0 ? (float)(nn[0] / len) : 0.0f, len > 0 ? (float)(nn[1] / len) : 0.0f,
+                             len > 0 ? (float)(nn[2] / len) : 0.0f};
+        std::memcpy(p, fn, 12);
+        std::memcpy(p + 12, v, 36);  // (the attribute bytes stay 0)
+    }
+    return true;
+}
+
 bool write_glb(const std::string& path, const UvMesh& uv, const std::vector<float>& normals, const BakedTextures& tex, std::string& error) {
     std::vector<uint8_t> glb;
     if (!encode_glb(uv, normals, tex, glb, error)) return false;

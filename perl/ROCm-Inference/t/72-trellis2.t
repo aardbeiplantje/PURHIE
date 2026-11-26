@@ -122,6 +122,34 @@ like($head // '', qr{^Content-Type: model/gltf-binary}mi, 'and the model\'s Cont
 ($st, $body) = http(GET => '/v1/3d/generations/no-such-job');
 is($st, 404, 'an unknown job: 404');
 
+# the mesh alone as an STL (for 3D printing): no texture, its own content type, 84 bytes and 50 a face; ROCM_INFERENCE_TEST_TRELLIS2_OUT
+# (a directory) keeps both models for a look
+my $out = $ENV{ROCM_INFERENCE_TEST_TRELLIS2_OUT};
+if ($out && -d $out) { open my $o, '>:raw', "$out/72-trellis2.glb" or die "$out: $!"; print $o $glb; close $o }
+($st, $body) = http(POST => '/v1/3d/generations', { image => encode_base64($png, ''), resolution => 512, seed => 1, format => 'stl',
+                                                    faces => 200000, size_mm => 80 }, @alice);
+is($st, 200, 'an STL job starts') or diag substr($body, 0, 300);
+my $sjob = eval { $J->decode($body) } // {};
+is($sjob->{options}{format}, 'stl', 'its format is stl');
+ok(!$sjob->{options}{texture}, 'and it has no texture');
+for (1 .. 2400) {
+    ($st, $body) = http(GET => "/v1/3d/generations/$sjob->{id}", undef, @alice);
+    $state = eval { $J->decode($body) } // {};
+    last unless ($state->{status} // '') eq 'in_progress';
+    sleep 0.5;
+}
+is($state->{status}, 'completed', 'the STL job completes') or diag substr($body, 0, 400);
+my $shead;
+($st, $body, $shead) = http(GET => "/v1/3d/generations/$sjob->{id}/content", undef, @alice);
+is($st, 200, 'the STL downloads');
+like($shead // '', qr{^Content-Type: model/stl}mi, 'as model/stl');
+like($shead // '', qr{filename="\Q$sjob->{id}\E\.stl"}m, 'named .stl');
+my $nf = length($body // '') >= 84 ? unpack('V', substr($body, 80, 4)) : -1;
+ok($nf > 1000 && $nf <= 200000, "its faces: $nf, at most the 200000 asked");
+is(length($body // ''), 84 + 50 * $nf, 'a binary STL: 84 bytes, then 50 a face');
+ok(-s "$files/rocm-$pid-$sjob->{id}.stl", 'the STL is a file in --files');
+if ($out && -d $out) { open my $o, '>:raw', "$out/72-trellis2.stl" or die "$out: $!"; print $o $body; close $o }
+
 kill TERM => $pid;
 close $srv;
 ok(!-e $file, 'the server removes its file at exit');

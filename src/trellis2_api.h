@@ -21,15 +21,17 @@ const char* t2_last_error(void);
 int t2_has_background_removal(t2_pipe_t* p);
 
 /* Starts a job: an encoded image (PNG, JPEG, BMP, GIF or TGA: stb_image), the resolution (512, or 1024: the cascade), the seed, the
- * faces after the simplification, the texture size (texels per side), remove_background (-1: the alpha when the image has one, else
- * BiRefNet; 0: the whole image; 1: BiRefNet). 0: started; 1: a job is running (none started); -1: an error (t2_last_error: the image,
- * an option, or no background removal for an image without alpha). */
+ * faces after the simplification, the texture size (texels per side; 0: no texture, the mesh alone, which is faster), remove_background
+ * (-1: the alpha when the image has one, else BiRefNet; 0: the whole image; 1: BiRefNet), the format (0: a binary glTF; 1: a binary STL
+ * of the mesh, always without texture, for 3D printing) and the STL's largest side in millimetres (0: the mesh's own units).
+ * 0: started; 1: a job is running (none started); -1: an error (t2_last_error: the image, an option, or no background removal for an
+ * image without alpha). */
 int t2_start(t2_pipe_t* p, const unsigned char* image, size_t n, int resolution, unsigned long long seed, int faces, int texture_size,
-             int remove_background);
+             int remove_background, int format, double stl_size_mm);
 /* The job: 0 running, 1 done (its GLB waits for t2_take), -1 failed (t2_take gives its error), 2 no job. stage: copied (at most
  * stage_len bytes with the NUL); step / steps: the stage's (0, 0 when it has none); seconds: since the start (to the end when done). */
 int t2_poll(t2_pipe_t* p, char* stage, size_t stage_len, int* step, int* steps, double* seconds);
-/* The finished job's GLB (*glb malloc'ed: t2_free), and the job is cleared. 0; -1 when it failed (t2_last_error: its error, and the
+/* The finished job's model, GLB or STL (*glb malloc'ed: t2_free), and the job is cleared. 0; -1 when it failed (t2_last_error: its error, and the
  * job is cleared) or no job is done. */
 int t2_take(t2_pipe_t* p, unsigned char** glb, size_t* n);
 void t2_free(void* ptr);
