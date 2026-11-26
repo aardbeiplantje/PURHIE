@@ -110,6 +110,17 @@ void lin_q(const QLin& L, const float* x, int T, const float* H, float* xr, int 
     }
 }
 
+/* the BF16 chain's product over the weight's rows [row0, row0 + out): BF16 in and out (hipBLASLt's BF16 output; the FP32 product
+ * rounded where it does not take the shape), the tokens (a multiple of 64) split evenly into pieces of at most 8192, in 64s */
+void lin16(const QLin& L, const uint16_t* x, int T, int row0, int out, uint16_t* y) {
+    const int pieces = (T + 8191) / 8192;
+    const int rows = ((T + pieces - 1) / pieces + 63) / 64 * 64;
+    for (int r0 = 0; r0 < T; r0 += rows) {
+        const int n = std::min(rows, T - r0);
+        sddev::linear_bf16_xb16(x + (size_t)r0 * L.in, n, L.Wb + (size_t)row0 * L.in, L.in, out, nullptr, y + (size_t)r0 * out);
+    }
+}
+
 }  // namespace
 
 bool dev_dit21_forward(const zimage::SafeTensors& st, const float* packed, int gh, int gw, const float* enc, int L, float t, float* out) {
@@ -134,7 +145,14 @@ bool dev_dit21_forward(const zimage::SafeTensors& st, const float* packed, int g
         explicit Bf16Buf(size_t count) : p(static_cast<uint16_t*>(sddev::dalloc(sizeof(uint16_t) * count))), n(count) {}
         ~Bf16Buf() { sddev::drelease(p, sizeof(uint16_t) * n); }
     };
-    Bf16Buf qb(bf16_chain ? (size_t)N * D : 1), kb(bf16_chain ? (size_t)J * D : 1), vb(bf16_chain ? (size_t)J * D : 1);
+    /* the BF16 chain's buffers: the normed input, q, k, v (BF16 from the products, normed and rotated in place), the attention's
+     * output, a product's output, the MLP's gate and projection. Their rows are J rounded up to a multiple of 64 (Jp): the products
+     * run on Jp rows, so prompt lengths within 64 tokens share hipBLASLt's plans (a new token count tunes about 100 candidates, about
+     * 2.5 s at 1024 x 1024; 256 would cost more in rows than it saves: 6% of the products at 1024); the rows past J are never read as
+     * keys, normed or added, and a product's rows are independent */
+    const int Jp = (J + 63) / 64 * 64;
+    const size_t jd = bf16_chain ? (size_t)Jp * D : 1, jm = bf16_chain ? (size_t)Jp * MLP : 1;
+    Bf16Buf xb(jd), qb(jd), kb(jd), vb(jd), ab(jd), ob(jd), gb(jm), pb(jm);
     if (N % 4 != 0) { fprintf(stderr, "qwenimage21 dit: the grid must hold whole 2 x 2 slots\n"); return false; }
 
     /* the weights (in place) */
@@ -248,6 +266,34 @@ bool dev_dit21_forward(const zimage::SafeTensors& st, const float* packed, int g
             !load_q(st, p + "img_mlp.out", MLP, D, wdn) || !bf(st, p + "attn.norm_q.weight", HEAD, nq) ||
             !bf(st, p + "attn.norm_k.weight", HEAD, nk))
             return false;
+        if (bf16_chain) {
+            /* the BF16 chain, as Z-Image's: the residual X stays FP32; the normed input, the products' outputs and the MLP's values
+             * are BF16 (each rounded once, as the FP32 path's products round their outputs to BF16 too) */
+            sddev::qi21_ln_mod_bf16(X.get(), J, D, EPS, sc1.get(), xb.p);
+            lin16(wq, xb.p, Jp, 0, D, qb.p);
+            lin16(wk, xb.p, Jp, 0, D, kb.p);
+            lin16(wv, xb.p, Jp, 0, D, vb.p);
+            sddev::head_norm_rope_bf16(qb.p, J, HEADS, nq, EPS, frd.get(), qb.p);
+            sddev::head_norm_rope_bf16(kb.p, J, HEADS, nk, EPS, frd.get(), kb.p);
+            /* the text rows (causal among the text) on the FP32 kernel, from their few rows widened; the image rows on the BF16 flash */
+            sddev::from_bf16(qb.p, q.get(), (size_t)L * D);
+            sddev::from_bf16(kb.p, k.get(), (size_t)L * D);
+            sddev::from_bf16(vb.p, v.get(), (size_t)L * D);
+            sddev::attn21_text(q.get(), k.get(), v.get(), J, L, HEADS, att.get());
+            for (int r0 = 0; r0 < N; r0 += qrows)
+                sddev::attention_bf16(qb.p + (size_t)(L + r0) * D, std::min(qrows, N - r0), kb.p, vb.p, J, D, HEADS,
+                                      att.get() + (size_t)(L + r0) * D);
+            sddev::to_bf16(att.get(), ab.p, (size_t)J * D);
+            lin16(wo, ab.p, Jp, 0, D, ob.p);
+            sddev::qi21_gated_add_bf16(X.get(), gt1.get(), ob.p, (size_t)J * D);
+            sddev::qi21_ln_mod_bf16(X.get(), J, D, EPS, sc2.get(), xb.p);
+            lin16(wgu, xb.p, Jp, 0, MLP, gb.p);
+            lin16(wgu, xb.p, Jp, MLP, MLP, pb.p);
+            sddev::swiglu_bf16_in(gb.p, pb.p, gb.p, (size_t)J * MLP);
+            lin16(wdn, gb.p, Jp, 0, D, ob.p);
+            sddev::qi21_gated_add_bf16(X.get(), gt2.get(), ob.p, (size_t)J * D);
+            continue;
+        }
         /* attention: LayerNorm, (1 + scale1), the projections, the per-head RMS norms, the RoPE, the masked attention, the output */
         sddev::layer_norm_plain(X.get(), J, D, EPS, xn.get());
         sddev::mul_1p(xn.get(), sc1.get(), (size_t)J * D);
@@ -260,17 +306,9 @@ bool dev_dit21_forward(const zimage::SafeTensors& st, const float* packed, int g
         sddev::rope(k.get(), J, HEADS, frd.get());
         /* the text rows: causal among the text; the image rows: every token (the FP32 attention, no mask) */
         sddev::attn21_text(q.get(), k.get(), v.get(), J, L, HEADS, att.get());
-        if (bf16_chain) {
-            sddev::to_bf16(q.get() + (size_t)L * D, qb.p, (size_t)N * D);
-            sddev::to_bf16(k.get(), kb.p, (size_t)J * D);
-            sddev::to_bf16(v.get(), vb.p, (size_t)J * D);
-            for (int r0 = 0; r0 < N; r0 += qrows)
-                sddev::attention_bf16(qb.p + (size_t)r0 * D, std::min(qrows, N - r0), kb.p, vb.p, J, D, HEADS, att.get() + (size_t)(L + r0) * D);
-        } else {
-            for (int r0 = 0; r0 < N; r0 += qrows)
-                sddev::attention_f32(q.get() + (size_t)(L + r0) * D, std::min(qrows, N - r0), k.get(), v.get(), J, D, HEADS,
-                                     att.get() + (size_t)(L + r0) * D);
-        }
+        for (int r0 = 0; r0 < N; r0 += qrows)
+            sddev::attention_f32(q.get() + (size_t)(L + r0) * D, std::min(qrows, N - r0), k.get(), v.get(), J, D, HEADS,
+                                 att.get() + (size_t)(L + r0) * D);
         lin_q(wo, att.get(), J, Hd.get(), xr.get(), 0, D, o.get());
         sddev::gated_add(X.get(), gt1.get(), o.get(), (size_t)J * D);
         /* the SwiGLU MLP: gate_layer rows [0, 12288) and proj rows [12288, 24576) of the fused weight, then out(silu(gate) * proj) */

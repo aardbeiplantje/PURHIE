@@ -3251,3 +3251,26 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) solid_hollow(unsigned i
     fv = fv >= 0.0f ? fmaxf(fv, 1e-3f) : fminf(fv, -1e-3f);
     uf[i] = __float_as_uint(fv);
 }
+
+// ---- Qwen-Image 2.1's BF16 chain (qwenimage21_dit.cpp with the BF16 file): the residual stays FP32, the rest goes BF16 between the
+// products. qi21_ln_mod_bf16: y = BF16(LayerNorm(x) (1 + s)) per row of C (no affine; s the per-token scale [rows][C]), the norm and
+// the modulation of zimage_layer_norm_plain and qi21_mul_1p with one rounding; qi21_gated_add_bf16: h += tanh(g) y for BF16 y.
+extern "C" __global__ void __launch_bounds__(SD_THREADS) qi21_ln_mod_bf16(const float* x, int C, float eps, const float* s, uint16_t* y) {
+    __shared__ float red[SD_THREADS];
+    const float* xr = x + (long)blockIdx.x * C;
+    const float* sr = s + (long)blockIdx.x * C;
+    uint16_t* yr = y + (long)blockIdx.x * C;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) sum += xr[i];
+    const float mean = block_sum(sum, red) / (float)C;
+    float q = 0.0f;
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) q += (xr[i] - mean) * (xr[i] - mean);
+    const float inv = rsqrtf(block_sum(q, red) / (float)C + eps);
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) yr[i] = f2bf((xr[i] - mean) * inv * (1.0f + sr[i]));
+}
+
+extern "C" __global__ void __launch_bounds__(SD_THREADS) qi21_gated_add_bf16(float* h, const float* g, const uint16_t* y, long n) {
+    const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (e >= n) return;
+    h[e] += tanhf(g[e]) * bf2f(y[e]);
+}

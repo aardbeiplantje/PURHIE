@@ -137,6 +137,11 @@ bool linear_bf16_out16(const uint16_t* xb, int T, const uint16_t* W, int in, int
 // BF16 output is a fast algorithm, the FP32 output's about four times slower, and the tuner keeps the first candidate's numerics);
 // the output is BF16-rounded. Other shapes: linear_bf16.
 void linear_bf16_via16(const float* x, int T, const uint16_t* W, int in, int out, const float* b, float* y);
+// Qwen-Image 2.1's BF16 chain: y = BF16(LayerNorm(x) (1 + s)) for rows of C (no affine; s the per-token scale [T][C]); h += tanh(g) y for
+// BF16 y; and BF16 values widened to FP32 on the device
+void qi21_ln_mod_bf16(const float* x, int T, int C, float eps, const float* s, uint16_t* y);
+void qi21_gated_add_bf16(float* h, const float* g, const uint16_t* y, size_t n);
+void from_bf16(const uint16_t* x, float* y, size_t n);
 // the same with the output always BF16 (the FP32 product rounded when hipBLASLt does not take the shape)
 bool linear_bf16_xb16(const uint16_t* xb, int T, const uint16_t* W, int in, int out, const float* b, uint16_t* y16);
 // the DiT's BF16 chain: rows of 128 (per token and head): y = rope(rms(x) w), BF16 in and out (y may be x)

@@ -51,7 +51,7 @@ hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn
 hipFunction_t f_ss_affine = nullptr, f_ss_gate_add = nullptr, f_ss_head_norm_rope = nullptr; hipFunction_t f_sp_hash_insert = nullptr, f_sp_neighbor_map = nullptr, f_sp_subm_conv_f16w = nullptr; hipFunction_t f_sp_c2s_mask = nullptr, f_sp_exclusive_scan_serial = nullptr, f_sp_c2s_fill = nullptr, f_sp_c2s_gather = nullptr; hipFunction_t f_simp_qem = nullptr, f_simp_cost = nullptr, f_simp_propagate = nullptr, f_simp_collapse = nullptr, f_simp_compress_v = nullptr, f_simp_compress_f = nullptr; hipFunction_t f_chart_face_geom = nullptr, f_chart_cones = nullptr, f_chart_perims = nullptr, f_chart_costs = nullptr, f_chart_propagate = nullptr, f_chart_collapse = nullptr, f_chart_refine = nullptr;
 hipFunction_t f_attn_flash128 = nullptr, f_attn_flash64 = nullptr;
 hipFunction_t f_bir_window_gather = nullptr, f_bir_window_scatter_add = nullptr, f_bir_window_attn = nullptr, f_bir_patch_merge = nullptr, f_bir_resize_ac = nullptr, f_bir_bn_act = nullptr, f_bir_channel_mean = nullptr, f_bir_fill_channels = nullptr, f_bir_gate = nullptr, f_bir_patches = nullptr, f_bir_deform_cols = nullptr;
-hipFunction_t f_solid_hollow = nullptr, f_solid_reach_init = nullptr, f_solid_unreached = nullptr, f_solid_fill_u32 = nullptr, f_solid_udf = nullptr, f_solid_sources = nullptr, f_solid_edt = nullptr, f_solid_flood_init = nullptr, f_solid_flood_sweep = nullptr, f_solid_field = nullptr, f_solid_row_cells = nullptr, f_solid_cell_edges = nullptr, f_solid_edge_verts = nullptr, f_solid_cell_tris = nullptr;
+hipFunction_t f_qi21_lnm16 = nullptr, f_qi21_ga16 = nullptr, f_solid_hollow = nullptr, f_solid_reach_init = nullptr, f_solid_unreached = nullptr, f_solid_fill_u32 = nullptr, f_solid_udf = nullptr, f_solid_sources = nullptr, f_solid_edt = nullptr, f_solid_flood_init = nullptr, f_solid_flood_sweep = nullptr, f_solid_field = nullptr, f_solid_row_cells = nullptr, f_solid_cell_edges = nullptr, f_solid_edge_verts = nullptr, f_solid_cell_tris = nullptr;
 hipFunction_t f_dino_rope = nullptr; hipFunction_t f_mesh_vertices = nullptr, f_mesh_edge_queries = nullptr, f_sp_lookup = nullptr, f_mesh_edge_valid = nullptr, f_mesh_quads = nullptr, f_mesh_triangles = nullptr; hipFunction_t f_ss_im2col3 = nullptr, f_ss_gemm_f16w = nullptr, f_ss_pixel_shuffle3 = nullptr;
 constexpr int kThreads = 256;
 constexpr int kGroupSplit = 16;  // the group norm's partial sums per group
@@ -140,7 +140,7 @@ bool init() {
         {&f_sp_hash_insert, "sp_hash_insert"}, {&f_sp_neighbor_map, "sp_neighbor_map"}, {&f_sp_subm_conv_f16w, "sp_subm_conv_f16w"},
         {&f_sp_c2s_mask, "sp_c2s_mask"}, {&f_sp_exclusive_scan_serial, "sp_exclusive_scan_serial"}, {&f_sp_c2s_fill, "sp_c2s_fill"}, {&f_sp_c2s_gather, "sp_c2s_gather"},
         {&f_simp_qem, "simp_qem"}, {&f_simp_cost, "simp_cost"}, {&f_simp_propagate, "simp_propagate"}, {&f_simp_collapse, "simp_collapse"}, {&f_simp_compress_v, "simp_compress_v"}, {&f_simp_compress_f, "simp_compress_f"}, {&f_chart_face_geom, "chart_face_geom"}, {&f_chart_cones, "chart_cones"}, {&f_chart_perims, "chart_perims"}, {&f_chart_costs, "chart_costs"}, {&f_chart_propagate, "chart_propagate"}, {&f_chart_collapse, "chart_collapse"}, {&f_chart_refine, "chart_refine"}, {&f_bir_window_gather, "bir_window_gather"}, {&f_bir_window_scatter_add, "bir_window_scatter_add"}, {&f_bir_window_attn, "bir_window_attn"}, {&f_bir_patch_merge, "bir_patch_merge"}, {&f_bir_resize_ac, "bir_resize_ac"}, {&f_bir_bn_act, "bir_bn_act"}, {&f_bir_channel_mean, "bir_channel_mean"}, {&f_bir_fill_channels, "bir_fill_channels"}, {&f_bir_gate, "bir_gate"}, {&f_bir_patches, "bir_patches"}, {&f_bir_deform_cols, "bir_deform_cols"}, {&f_attn_flash128, "attn_flash_d128"}, {&f_attn_flash64, "attn_flash_d64"}, {&f_dino_rope, "dino_rope"}, {&f_mesh_vertices, "mesh_vertices"}, {&f_mesh_edge_queries, "mesh_edge_queries"}, {&f_sp_lookup, "sp_lookup"}, {&f_mesh_edge_valid, "mesh_edge_valid"}, {&f_mesh_quads, "mesh_quads"}, {&f_mesh_triangles, "mesh_triangles"},
-        {&f_solid_hollow, "solid_hollow"}, {&f_solid_reach_init, "solid_reach_init"}, {&f_solid_unreached, "solid_unreached"}, {&f_solid_fill_u32, "solid_fill_u32"}, {&f_solid_udf, "solid_udf"}, {&f_solid_sources, "solid_sources"}, {&f_solid_edt, "solid_edt"}, {&f_solid_flood_init, "solid_flood_init"}, {&f_solid_flood_sweep, "solid_flood_sweep"}, {&f_solid_field, "solid_field"}, {&f_solid_row_cells, "solid_row_cells"}, {&f_solid_cell_edges, "solid_cell_edges"}, {&f_solid_edge_verts, "solid_edge_verts"}, {&f_solid_cell_tris, "solid_cell_tris"},
+        {&f_qi21_lnm16, "qi21_ln_mod_bf16"}, {&f_qi21_ga16, "qi21_gated_add_bf16"}, {&f_solid_hollow, "solid_hollow"}, {&f_solid_reach_init, "solid_reach_init"}, {&f_solid_unreached, "solid_unreached"}, {&f_solid_fill_u32, "solid_fill_u32"}, {&f_solid_udf, "solid_udf"}, {&f_solid_sources, "solid_sources"}, {&f_solid_edt, "solid_edt"}, {&f_solid_flood_init, "solid_flood_init"}, {&f_solid_flood_sweep, "solid_flood_sweep"}, {&f_solid_field, "solid_field"}, {&f_solid_row_cells, "solid_row_cells"}, {&f_solid_cell_edges, "solid_cell_edges"}, {&f_solid_edge_verts, "solid_edge_verts"}, {&f_solid_cell_tris, "solid_cell_tris"},
     };
     for (const Entry& e : entries)
         if (hipModuleGetFunction(e.f, g_mod, e.name) != hipSuccess) return false;
@@ -1136,6 +1136,28 @@ bool linear_bf16_out16(const uint16_t* xb, int T, const uint16_t* W, int in, int
 
 /* the linear with BF16 output, whatever the shape: hipBLASLt's BF16 output when it takes the shape, else the FP32 product
  * rounded to BF16 */
+void qi21_ln_mod_bf16(const float* x, int T, int C, float eps, const float* s, uint16_t* y) {
+    int c = C;
+    float e = eps;
+    void* a[] = {(void*)&x, (void*)&c, (void*)&e, (void*)&s, (void*)&y};
+    launch(f_qi21_lnm16, dim3((unsigned)T, 1, 1), a);
+    sync();
+}
+
+void qi21_gated_add_bf16(float* h, const float* g, const uint16_t* y, size_t n) {
+    long nn = (long)n;
+    void* a[] = {(void*)&h, (void*)&g, (void*)&y, (void*)&nn};
+    launch(f_qi21_ga16, dim3(blocks(n)), a);
+    sync();
+}
+
+void from_bf16(const uint16_t* x, float* y, size_t n) {
+    long nn = (long)n;
+    void* a[] = {(void*)&x, (void*)&y, (void*)&nn};
+    launch(f_bf16_to_f32, dim3(blocks(n)), a);
+    sync();
+}
+
 void linear_bf16_via16(const float* x, int T, const uint16_t* W, int in, int out, const float* b, float* y) {
     if (out <= 0 || T <= 0) return;
     if (!(in % 64 == 0 && out >= 256 && T >= 1024)) {
