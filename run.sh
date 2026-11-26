@@ -51,6 +51,7 @@ exec docker run \
     --device /dev/dri \
     --tmpfs /tmp:rw,suid,exec,size=1G \
     --tmpfs /var/tmp:rw,suid,exec,size=1G \
+    --tmpfs /scratch:rw,size=${ROCM_SCRATCH_SIZE:-4G} \
     $([ -n "$MODELS_DIR"    ] && echo "-v $MODELS_DIR:/models:rw") \
     $([ -n "$ROCM_STORE_DIR" ] && echo "-v $ROCM_STORE_DIR:/kvstore:rw") \
     $([ -n "$HF_HOME" ] && echo "-v $HF_HOME:/hf:rw") \

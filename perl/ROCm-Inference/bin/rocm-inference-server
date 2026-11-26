@@ -14,6 +14,7 @@ use MIME::Base64 qw(encode_base64 decode_base64);
 use Pod::Usage qw(pod2usage);
 use Time::HiRes ();
 use File::Temp ();
+use File::Spec ();
 use ROCm::Inference qw(:all);
 use ROCm::Inference::GGUF qw(gguf_read gguf_type_id);
 use ROCm::Inference::Log;
@@ -27,7 +28,7 @@ GetOptions(\%o, 'model=s', 'models-dir=s', 'models-max=i', 'models-margin=f', 'k
            'name=s', 'draft=s', 'store=s', 'max_tokens=i', 'swa-ring=i', 'stage=s', 'recache', 'kv-type=s',
            'parallel=i', 'prefill-chunk=i', 'embedding-model=s', 'embedding-name=s', 'thinking!', 'preserve-thinking!', 'log!', 'log-level=s', 'log-format=s', 'log-color=s',
            'thinking-low=i', 'thinking-medium=i', 'thinking-high=i',
-           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'mmproj=s', 'whisper=s', 'tts=s', 'tts-codec=s', 'voices=s', 'sd=s', 'minimax=s', 'zimage=s', 'audioldm2=s', 'trellis2=s', 'ffmpeg=s', 'help')
+           'store-max=f', 'store-snapshots=s', 'store-snapshot-every=i', 'debug-stream!', 'mmproj=s', 'whisper=s', 'tts=s', 'tts-codec=s', 'voices=s', 'sd=s', 'minimax=s', 'zimage=s', 'audioldm2=s', 'trellis2=s', 'ffmpeg=s', 'files=s', 'help')
     or pod2usage(2);
 # The log: --nolog is level none; --log-level, --log-format, --log-color are checked by the formatter
 our $LOG = eval { ROCm::Inference::Log->new(level => ($o{log} // 1) ? ($o{'log-level'} // 'info') : 'none',
@@ -145,6 +146,74 @@ elsif ($o{ffmpeg} // $ENV{ROCM_FFMPEG}) {
 }
 else {
     $LOG->info('audio', event => 'ffmpeg', msg => 'ffmpeg: none found (--ffmpeg PATH or ffmpeg on the PATH); mp3, opus and aac speech are refused');
+}
+# ---- The large outputs (the 3D models): files in a scratch directory, not in the server's memory (--files DIR, else
+# ROCM_FILES; else a private directory in /dev/shm, a tmpfs, removed at exit). A file is named rocm-PID-NAME; the server
+# removes its own when it drops them and at exit, and a dead server's at the start. A download through nginx is sent by nginx
+# itself: nginx says it can with the request headers X-Sendfile-Type: X-Accel-Redirect and X-Accel-Mapping: DIR/=/LOCATION/
+# (the convention of Rack::Sendfile), and the answer is the X-Accel-Redirect to the file with no body; other clients get the
+# bytes.
+our $FILES = $o{files} // $ENV{ROCM_FILES};
+if (defined $FILES && length $FILES) {
+    $FILES =~ s{(?<=.)/+\z}{};
+    die "--files: no writable directory $FILES\n" unless -d $FILES && -w _;
+    opendir(my $dh, $FILES) or die "--files: $FILES: $!\n";
+    for my $f (readdir $dh) {
+        my ($pid) = $f =~ /\Arocm-(\d+)-/ or next;
+        unlink "$FILES/$f" unless $pid == $$ || kill(0, $pid);
+    }
+    closedir $dh;
+    $LOG->info('files', event => 'files', msg => "the large outputs (3D models) go to $FILES");
+} else {
+    undef $FILES;  # (made by the first file)
+}
+sub files_dir {
+    return $FILES if defined $FILES;
+    $FILES = File::Temp::tempdir('rocm-inference-files-XXXXXX', DIR => (-d '/dev/shm' && -w _) ? '/dev/shm' : File::Spec->tmpdir,
+                                 CLEANUP => 1);
+    $LOG->info('files', event => 'files', msg => "the large outputs (3D models) go to $FILES (no --files: removed at exit)");
+    return $FILES;
+}
+my (%MY_FILES, $FILES_PID);
+$FILES_PID = $$;
+END { unlink keys %MY_FILES if defined $FILES_PID && $$ == $FILES_PID }  # (not in a forked child)
+sub file_put {  # bytes into a file of $FILES (written whole, then renamed into place): its path, or undef when it fails
+    my ($name, $bytes) = @_;
+    my $path = files_dir() . "/rocm-$$-$name";
+    my $part = "$path.part";
+    my $fh;
+    my $ok = open($fh, '>:raw', $part) && print({$fh} $bytes) && close($fh) && rename($part, $path);
+    unless ($ok) {
+        my $why = "$!";
+        unlink $part;
+        $LOG->warn_(event => 'files', msg => "cannot write $path: $why (kept in memory)");
+        return undef;
+    }
+    $MY_FILES{$path} = 1;
+    return $path;
+}
+sub file_drop {
+    my ($path) = @_;
+    return unless defined $path;
+    unlink $path;
+    delete $MY_FILES{$path};
+}
+# a file of $FILES as the response: nginx sends it when the request says nginx can and the file is under a mapped directory
+# (X-Accel-Redirect, no body); else the bytes
+sub file_response {
+    my ($req, $path, @headers) = @_;
+    my $h = $req->{headers} // {};
+    if (lc($h->{'x-sendfile-type'} // '') eq 'x-accel-redirect') {
+        for my $map (split /,/, $h->{'x-accel-mapping'} // '') {
+            my ($dir, $uri) = $map =~ /\A\s*(\S+?)\s*=\s*(\S+?)\s*\z/ or next;
+            $dir =~ s{/*\z}{/};
+            $uri =~ s{/*\z}{/};
+            return [200, [@headers, 'X-Accel-Redirect' => $uri . substr($path, length $dir)], ''] if index($path, $dir) == 0;
+        }
+    }
+    open my $fh, '<:raw', $path or error(410, "the file is gone ($!)", 'server_error');
+    my $body = do { local $/; <$fh> };
+    return [200, \@headers, $body];
 }
 
 # the GGUF files of a directory and their signature (name, size, time): stat only, read before each audio request
@@ -1513,7 +1582,8 @@ route::post '/v1/images/generations' => sub {
 # (or a data URL), or multipart/form-data with the image file in the part "image"; the options: resolution (512, or 1024: the cascade;
 # 1024 by default), seed (0), faces (700000: the simplification's target), texture_size (4096), remove_background (auto: the alpha
 # channel when the image has one, else BiRefNet; true; false: the whole image). One job at a time (429 while one runs); the image and
-# audio generators answer 503 meanwhile (the job holds the device layer). The last few finished jobs keep their models for downloads.
+# audio generators answer 503 meanwhile (the job holds the device layer). The last few finished jobs keep their models for downloads,
+# as files in $FILES (through nginx, nginx sends them).
 my (%JOB3D, @JOB3D_ORDER, $JOB3D_RUN);
 my $job3d_seq = 0;
 my $JOB3D_KEEP = 4;
@@ -1531,7 +1601,9 @@ sub job3d_reap {  # the running job's state; a finished job's model (or error) i
     return if $p->{status} eq 'running';
     my $glb = eval { $a->{m}->take };
     if (defined $glb) {
-        @$j{qw(status glb bytes)} = ('completed', $glb, length $glb);
+        @$j{qw(status bytes)} = ('completed', length $glb);
+        my $path = file_put("$j->{id}.glb", $glb);  # (kept in memory only when the file cannot be written)
+        if (defined $path) { $j->{file} = $path } else { $j->{glb} = $glb }
     } else {
         $j->{status} = 'failed';
         $j->{error} = ($@ || 'the job ended without a model') =~ s/ at \S+ line \d+\.?\n?\z//r =~ s/\AROCm::Inference: t2_take: //r;
@@ -1541,7 +1613,10 @@ sub job3d_reap {  # the running job's state; a finished job's model (or error) i
     undef $JOB3D_RUN;
     $a->{busy} = 0;
     $a->{used} = ++$stamp;
-    while (@JOB3D_ORDER > $JOB3D_KEEP) { delete $JOB3D{ shift @JOB3D_ORDER } }
+    while (@JOB3D_ORDER > $JOB3D_KEEP) {
+        my $old = delete $JOB3D{ shift @JOB3D_ORDER };
+        file_drop($old->{file}) if $old;
+    }
 }
 sub job3d_busy {  # a running 3D job holds the device layer: the image and audio generators answer 503 meanwhile
     job3d_reap();
@@ -1647,7 +1722,9 @@ route::get '/v1/3d/generations/:id/content' => sub {
     job3d_reap();
     my $j = $JOB3D{ $req->{params}{id} } or error(404, "no 3D generation '$req->{params}{id}'", 'not_found_error');
     error(409, "the 3D generation is $j->{status}" . ($j->{error} ? ": $j->{error}" : '')) unless $j->{status} eq 'completed';
-    return [200, ['Content-Type' => 'model/gltf-binary', 'Content-Disposition' => "attachment; filename=\"$j->{id}.glb\""], $j->{glb}];
+    my @h = ('Content-Type' => 'model/gltf-binary', 'Content-Disposition' => "attachment; filename=\"$j->{id}.glb\"");
+    return file_response($req, $j->{file}, @h) if $j->{file};
+    return [200, \@h, $j->{glb}];
 };
 
 # AudioLDM 2 (text to audio): a JSON body with the prompt, negative_prompt (optional), seconds (1 to 10: the clip's length,
@@ -2337,6 +2414,15 @@ in ADTS (C<audio/aac>). The program is the path given, else the C<ROCM_FFMPEG> e
 PATH, found once at the start (the log says which, or that none was found). Without one, those formats are refused (400),
 and a failing encoder is a 500 with its standard error in the log. The speech's C<stream> with them is refused (400).
 
+=item --files F<dir>
+
+The scratch directory for the large outputs (the 3D models, 50 to 150 MB each), best a tmpfs: a finished model is written
+there (named C<rocm-PID-ID.glb>) and dropped from the server's memory. Else the C<ROCM_FILES> environment variable, else a
+private directory in F</dev/shm> (removed at exit). The server removes its files when it drops a job and at exit, and a dead
+server's files at the start. Behind nginx the download is sent by nginx: with the request headers
+C<X-Sendfile-Type: X-Accel-Redirect> and C<X-Accel-Mapping: DIR/=/LOCATION/> (see L</NGINX>), the answer for a file under
+F<DIR> is an C<X-Accel-Redirect> to F</LOCATION/> with no body; any other client gets the bytes.
+
 =item --draft F<file.gguf> | none
 
 An MTP draft head for speculative decoding (Qwen3.8-Flash-Next). Without it (and without C<--parallel>), a model
@@ -2476,8 +2562,8 @@ C<image>; the options C<resolution> (512, or 1024: the cascade; 1024 by default)
 simplification's target), C<texture_size> (4096) and C<remove_background> (C<auto>: the alpha channel when the image has
 one, else BiRefNet; C<true>; C<false>: the whole image). A job takes minutes (about 3.5 at 512 on this machine), so the reply
 comes at once with the job's C<id>: C<GET /v1/3d/generations/{id}> is its state (C<in_progress> with the stage and its step,
-C<completed>, C<failed> with the error), C<GET /v1/3d/generations/{id}/content> is the model (C<model/gltf-binary>) and
-C<GET /v1/3d/generations> lists the jobs kept (the last four). One job at a time (429 while one runs); the image and audio
+C<completed>, C<failed> with the error), C<GET /v1/3d/generations/{id}/content> is the model (C<model/gltf-binary>: a file in
+C<--files>, sent by nginx when nginx says it can) and C<GET /v1/3d/generations> lists the jobs kept (the last four). One job at a time (429 while one runs); the image and audio
 generators answer 503 meanwhile (the job holds the device layer); chat, embeddings and speech go on.
 
 C<GET /v1/models> lists every model; C<GET /v1/models?kind=image> lists the image models alone. An image (or 3D) model's entry has its
@@ -2494,6 +2580,14 @@ C<description>, a C<usage> example and its C<parameters> (type, default, limits)
             proxy_buffering off;
             proxy_read_timeout 900s;
             client_max_body_size 16m;
+            # the large outputs (--files /scratch): nginx sends them
+            proxy_set_header X-Sendfile-Type X-Accel-Redirect;
+            proxy_set_header X-Accel-Mapping /scratch/=/llm-files/;
+        }
+        location /llm-files/ {
+            internal;
+            alias /scratch/;
+            types { model/gltf-binary glb; }
         }
     }
 

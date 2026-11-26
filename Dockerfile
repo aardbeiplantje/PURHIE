@@ -124,6 +124,8 @@ COPY nginx.conf /nginx.conf
 RUN useradd -N -M -d /app-server/ -u 1000 runtime
 RUN mkdir -p /models      && chown -R runtime:users /models
 RUN mkdir -p /hf          && chown -R runtime:users /hf
+# the server's large outputs (app.sh --files /scratch; run.sh mounts a tmpfs here; nginx.conf serves /rocm-files/ from it)
+RUN mkdir -p /scratch     && chown runtime:users /scratch
 RUN mkdir -p /var/lib/nginx/body  && chown runtime /var/lib/nginx/body
 RUN mkdir -p /var/lib/nginx/proxy && chown runtime /var/lib/nginx/proxy
 RUN mkdir -p /var/lib/nginx/fastcgi && chown runtime /var/lib/nginx/fastcgi

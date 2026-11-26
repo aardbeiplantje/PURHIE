@@ -12,7 +12,8 @@ use Time::HiRes qw(sleep);
 # bin/rocm-inference-server --trellis2 DIR: /v1/3d/generations starts a job on an image (TRELLIS.2, an image to a textured 3D
 # model); GET /v1/3d/generations/ID polls it, GET .../content gives the binary glTF. Checked: the listing (kind 3d), the errors
 # (no image, an image that cannot be decoded), a 512 job, the busy answers while it runs (429 for a second job, 503 for the image
-# generator), the model's header. Needs the TRELLIS.2 files (ROCM_INFERENCE_TEST_TRELLIS2=DIR, as --trellis2 takes them) and an image
+# generator), the model's header, its file in --files and the download as nginx asks for it (X-Accel-Redirect, no body), the file's
+# removal at exit. Needs the TRELLIS.2 files (ROCM_INFERENCE_TEST_TRELLIS2=DIR, as --trellis2 takes them) and an image
 # (ROCM_INFERENCE_TEST_TRELLIS2_IMAGE: a PNG with the object cut out by its alpha channel, or, when DIR holds birefnet.safetensors, a
 # photo that BiRefNet cuts out); about four minutes at 512.
 my $dirt = $ENV{ROCM_INFERENCE_TEST_TRELLIS2};
@@ -25,20 +26,22 @@ my $dir = tempdir(CLEANUP => 1);
 my $sock = "$dir/t2.sock";
 my $J = JSON::PP->new->utf8->canonical;
 
-sub http {
-    my ($method, $target, $data) = @_;
+sub http {  # (status, body, head); extra request header lines after the data
+    my ($method, $target, $data, @headers) = @_;
     my $c = IO::Socket::UNIX->new(Peer => $sock, Type => SOCK_STREAM) or die "connect: $!";
     my $body = defined $data ? $J->encode($data) : '';
-    print $c "$method $target HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: "
-             . length($body) . "\r\n\r\n$body";
+    print $c "$method $target HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n" . join('', map { "$_\r\n" } @headers)
+             . "Content-Length: " . length($body) . "\r\n\r\n$body";
     local $/;
     my ($head, $rest) = split /\r\n\r\n/, <$c>, 2;
     my ($status) = $head =~ m{^HTTP/1\.1 (\d+)};
-    return ($status, $rest);
+    return ($status, $rest, $head);
 }
 
+my $files = "$dir/files";
+mkdir $files or die "$files: $!";
 my $pid = open my $srv, '-|', $^X, (map { "-I$_" } @INC), 'bin/rocm-inference-server', '--trellis2', $dirt,
-    '--listen', $sock, '--nolog';
+    '--listen', $sock, '--files', $files, '--nolog';
 die "cannot start the server: $!" unless $pid;
 for (1 .. 600) { last if -S $sock; sleep 0.1 }
 ok(-S $sock, 'the server with --trellis2 listens') or BAIL_OUT('no server');
@@ -84,9 +87,21 @@ is($state->{status}, 'completed', 'the job completes') or diag substr($body, 0, 
 is($st, 200, 'the model downloads');
 is(substr($body // '', 0, 4), 'glTF', 'the model is a binary glTF');
 is(length($body // ''), $state->{bytes}, 'its length is the one the job gave');
+my $glb = $body // '';
+my $file = "$files/rocm-$pid-$id.glb";
+is(-s $file, $state->{bytes}, 'the model is a file in --files, of that length');
+my $head;
+($st, $body, $head) = http(GET => "/v1/3d/generations/$id/content", undef, 'X-Sendfile-Type: X-Accel-Redirect',
+                           "X-Accel-Mapping: $files/=/rocm-files/");
+is($st, 200, 'the download as nginx asks for it');
+my ($xa) = ($head // '') =~ /^X-Accel-Redirect: (\S+)/mi;
+is($xa, "/rocm-files/rocm-$pid-$id.glb", 'is the X-Accel-Redirect to the file');
+is($body, '', 'with no body');
+like($head // '', qr{^Content-Type: model/gltf-binary}mi, 'and the model\'s Content-Type');
 ($st, $body) = http(GET => '/v1/3d/generations/no-such-job');
 is($st, 404, 'an unknown job: 404');
 
 kill TERM => $pid;
 close $srv;
+ok(!-e $file, 'the server removes its file at exit');
 done_testing;

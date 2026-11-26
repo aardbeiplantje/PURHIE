@@ -42,6 +42,10 @@ start_rocm_inference() {
     else
         which=(--models-dir "${ROCM_MODELS_DIR:-${M_DIR:-/models}}")
     fi
+    # the large outputs (the 3D models) in the scratch tmpfs run.sh mounts at /scratch; nginx sends them (nginx.conf:
+    # /rocm-files/). Without a writable /scratch the server keeps its own directory in /dev/shm
+    local files=${ROCM_FILES:-/scratch}
+    [ -d "$files" ] && [ -w "$files" ] || files=
     # never with the kernel-serializing debug switches
     env -u HIP_LAUNCH_BLOCKING -u AMD_SERIALIZE_KERNEL \
         PERL5LIB="$ROCM_HIP/perl5/lib/perl5${PERL5LIB:+:$PERL5LIB}" \
@@ -51,6 +55,7 @@ start_rocm_inference() {
             ${ROCM_CTX:+--ctx "$ROCM_CTX"} \
             ${ROCM_DRAFT:+--draft "$ROCM_DRAFT"} \
             ${ROCM_STORE:+--store "$ROCM_STORE"} \
+            ${files:+--files "$files"} \
             ${ROCM_ARGS:-} &
     ROCM_PID=$!
 }

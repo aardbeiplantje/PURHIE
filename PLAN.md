@@ -315,6 +315,10 @@ Z-Image-Turbo MVE (aim: 1024 x 1024, 9 steps, under 30 s on ROCm HIP, matching t
     F16 weights read in place, the batch norms as scales and shifts. `birefnet_verify` against the python model's dumps: all 25
     stages within 1e-5 of the norm, the 2000 x 2000 vase mask within 3 of 255 (mean 0.001); 2.8 s a forward. The server's jobs cut
     out photos with no alpha channel with it (`birefnet.safetensors` in DIR or DIR/background_removal), so python is no longer needed.
+    The finished models are files in a scratch tmpfs (2026-11-26: `--files DIR`; the image's `/scratch`, mounted by `run.sh`), not
+    in the server's memory, and nginx sends the downloads (`X-Sendfile-Type` / `X-Accel-Mapping` from nginx, `X-Accel-Redirect`
+    from the server to the internal `/rocm-files/`): 55 MB in 0.02 s through nginx 1.24, the server's part 1 ms; direct clients
+    get the bytes.
     Open: (b) the 1536 cascade
     (memory is no longer the limit; its time is); (c) the normal-map and AO bakes and their GLB inputs; (d) UnwrapMesh's "pec"
     segmenter (ours is CuMesh's charts); (e) python's to_glb clean-up; (f) the simplify stops below its target (667k for 700k), where
