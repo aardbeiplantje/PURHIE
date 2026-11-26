@@ -370,3 +370,36 @@ tokens after a short prompt. Runs vary by about ±5%.
 | Qwen3.8-Flash-Next (177B) | Q4_0_ROCmFP4_FAST (94 GB) | 34–38 tok/s; 48–55 with the MTP head | 826 tok/s |
 
 Profiling: `QWEN_PROFILE=1` (per-section times), `rocprofv3 --kernel-trace` + `tools/prof_summary.py` (per kernel).
+
+## 11. The server's per-model settings
+
+Each chat model's `parallel`, `ctx` and `kv_type` come from, in order: its sidecar `NAME.json` beside the model (read at each
+load; an unknown key or a bad value fails the load and names the file), the host rules in `bin/rocm-inference-server`
+(`@HOST_RULES`: defaults for this host, gfx1151 with 128 GB unified memory; a Qwen3.5 MoE of 60 GB or more gets `parallel` 1,
+because a second 122B-sized load under `--parallel 2` fails its `hipHostRegister`), then the global flags. `GET /v1/models`
+shows each chat model's `parallel`. A new rule or key is a line in `@HOST_RULES` or `%MODEL_KEY_OK`. `t/71-model-config.t`.
+
+## 12. Image to 3D (TRELLIS.2)
+
+`src/trellis_image_to_3d.{h,cpp}` runs the whole pipeline on the device; `src/trellis2_api.h` is its C interface (one job at
+a time on a background thread), served as `POST /v1/3d/generations` (a job id at once; `GET .../{id}` polls it, `.../content`
+is the model). The stages, each checked against its python oracle (`tests/*_verify.cpp`, `/data/trellis2/oracle_*`):
+
+- **Input:** the image's EXIF orientation applied (`src/image.cpp`); the object cut out by the alpha channel or by BiRefNet
+  (`src/birefnet.cpp`: Swin-L, deformable ASPP); cropped to the mask as the ComfyUI workflow does (1.1 margin, 1024 x 1024).
+- **Conditioning:** DINOv3 ViT-L/16 (`src/dinov3.cpp`) at 512, and at 1024 for the cascade (`src/trellis_image.cpp`).
+- **Shape:** the sparse-structure flow and its decoder (`trellis_ss*.cpp`), the shape-SLAT flow (512; the 1024 cascade adds
+  a second flow), the shape decoder's sparse UNet (`trellis_sdec.cpp`), the flexible dual grid mesher (`trellis_mesh.cpp`)
+  and `fill_holes` (`trellis_fill.cpp`). All flows use the fused attention kernels (`attn_flash_d128`, `attn_flash_d64`).
+- **Textured GLB:** the texture flow and decoder (`trellis_tex.cpp`), CuMesh's simplification (`trellis_simplify.cpp`) and
+  chart clustering (`trellis_charts.cpp`) on the device, xatlas per chart, the bake and the GLB (`trellis_bake.cpp`).
+- **For printing** (no texture: the mesh-only GLB and the STL): the mesher's surface has holes, faces turned both ways and
+  thousands of pieces, so it is rebuilt as a closed solid (`trellis_solid.{h,cpp}`, the `solid_*` kernels): the distance to
+  the mesh on a grid of 512 cells across the object, a fill from the border that keeps `close` cells from the mesh (so it
+  cannot go through narrow holes), a field whose zero set is the surface `iso` out from the mesh plus plugs over the sealed
+  holes, and marching tetrahedra on the Kuhn split (a closed 2-manifold, wound outward, by construction). `close` doubles
+  from 4 to 16 when the result is a thin shell (a leak through a wider hole). Hollow prints empty the inside beyond a wall
+  thickness and drill a drain hole per hollow. The simplifier's manifold mode keeps the surface closed (the link
+  condition in its cost kernel). `tests/solid_verify.cpp` checks the device against a host reference and the topology.
+- **Files:** the finished models are files in a scratch tmpfs (`--files`), sent by nginx (`X-Accel-Redirect`); a job
+  belongs to its user (`X-Remote-User`) and has a random 128-bit id.
