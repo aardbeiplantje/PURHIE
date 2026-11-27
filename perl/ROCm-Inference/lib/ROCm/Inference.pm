@@ -997,6 +997,22 @@ sub start {
     return ROCm::Inference::_qi21_start($q->{h}, $prompt, $h, $w, $steps, $seed) == 0 ? 1 : 0;
 }
 
+# $q->start_edit($prompt, $image, resolution => N, steps => N, seed => N): an edit of the condition image (its file's bytes: PNG,
+# JPEG, GIF, WebP): 1 when it is started, 0 when an image is being made already. resolution: the side of the pixel budget (256 to
+# 2048, 1024 by default); the output keeps the image's aspect ratio (the pipeline's output_resolution). Dies on a bad option or an
+# image it cannot read.
+sub start_edit {
+    my ($q, $prompt, $image, %o) = @_;
+    my $res = $o{resolution} // 1024;
+    die "resolution: 256 to 2048, not '$res'\n" unless $res =~ /\A\d+\z/ && $res >= 256 && $res <= 2048;
+    my $steps = $o{steps} // 40;
+    die "steps: 1 to 100, not '$steps'\n" unless $steps =~ /\A\d+\z/ && $steps >= 1 && $steps <= 100;
+    my $seed = $o{seed} // 0;
+    die "seed: a whole number, not '$seed'\n" unless $seed =~ /\A\d+\z/;
+    die "image: the bytes of a picture\n" unless defined $image && length $image;
+    return ROCm::Inference::_qi21_start_edit($q->{h}, $prompt, $image, $res, $steps, $seed) == 0 ? 1 : 0;
+}
+
 # the image: { status => running | done | failed | none, step, steps, seconds }
 sub poll {
     my ($q) = @_;

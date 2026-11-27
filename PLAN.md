@@ -10,9 +10,10 @@ run alone on the machine.
 
 ## ▶ Next
 
-1. **Qwen-Image 2.1: the image edit's server route** (item 16; the engine's edit is verified, 2026-11-27: `qi21_edit`, the
-   stages against `tools/qwenimage21_edit_oracle.py`). Open: an HTTP route with the condition image (it needs aicli's
-   `generate_image` to send the image: ask first), and its speed (the int8 file: about 65 s at 512 x 512, 8 steps).
+1. **Qwen-Image 2.1: the image edit, its speed** (item 16; the engine's edit is verified, 2026-11-27: `qi21_edit`, the
+   stages against `tools/qwenimage21_edit_oracle.py`; served as `POST /v1/images/edits` (2026-11-27, checked by
+   `t/73-qwenimage21.t`), and aicli's `generate_image` sends a picture of the workspace as `image`). Open: the speed (the
+   int8 file: about 65 s at 512 x 512, 8 steps); a cancel for the image (the 3D job has one, item 15).
 2. **Waiting on the user:** the deployed service check (item 1); the design and the row format of the GLM prefill
    snapshots (item 2).
 

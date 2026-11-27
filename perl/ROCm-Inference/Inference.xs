@@ -1832,6 +1832,26 @@ _qi21_start(h, prompt, height, width, steps, seed)
   OUTPUT:
     RETVAL
 
+int
+_qi21_start_edit(h, prompt, image, resolution, steps, seed)
+    IV h
+    SV* prompt
+    SV* image
+    int resolution
+    int steps
+    UV seed
+  CODE:
+    /* an edit of the condition image (its file's bytes, copied by the library) on a background thread: 0 started, 1 an image is being
+     * made; an error croaks (an option, or an image it cannot read) */
+    STRLEN n = 0;
+    const unsigned char* bytes = (const unsigned char*)SvPV(image, n);
+    int r = qi21_start_edit(INT2PTR(qi21_pipe_t*, h), SvPV_nolen(prompt), bytes, (size_t)n, resolution, steps,
+                            (unsigned long long)seed);
+    if (r < 0) croak("ROCm::Inference: qi21_start_edit: %s", qi21_last_error());
+    RETVAL = r;
+  OUTPUT:
+    RETVAL
+
 void
 _qi21_poll(h)
     IV h

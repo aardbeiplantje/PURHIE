@@ -112,12 +112,7 @@ sub aux_load {
         # the device layer registers each loaded model's files for the GPU, and a process can hold only about 29 GB registered
         # (make_room counts RAM, not this): a registration that fails unloads the least recently used idle model, and the load tries
         # again; with none left to unload, the load fails as before
-        my $victim;  # (the least recently used idle model: no sort here, the lexical $a of this sub is not the sort's)
-        if ($why =~ /regist/) {
-            for my $c (grep { $_->{m} && $_ != $a && idle($_) } values %M, values %AUX) {
-                $victim = $c if !$victim || $c->{used} < $victim->{used};
-            }
-        }
+        my $victim = $why =~ /regist/ ? lru_idle_model($a) : undef;
         if (!$victim) {
             $LOG->error(event => 'audio', msg => "$kind $a->{path}: $why");
             die "$why\n";
@@ -371,6 +366,15 @@ my $J = JSON::PP->new->utf8->canonical;
 # and requests (queue, running), used (for least recently used). --model / --embedding-model are loaded at start
 # and stay; --models-dir adds the directory's models, loaded when a request names one.
 my (%M, %default);  # id -> record; kind -> the record a request without 'model' gets
+# the least recently used idle model other than $keep (loaded: its m), or undef
+sub lru_idle_model {
+    my ($keep) = @_;
+    my $victim;
+    for my $c (grep { $_->{m} && $_ != $keep && idle($_) } values %M, values %AUX) {
+        $victim = $c if !$victim || $c->{used} < $victim->{used};
+    }
+    return $victim;
+}
 
 sub model_id { basename($_[0]) =~ s/(?:-\d{5}-of-\d{5})?\.gguf\z//r }
 
@@ -824,7 +828,8 @@ my %IMAGE_INFO = (
     'qwen-image-2.1' => {
         description => 'Text to image with Qwen-Image 2.1 (--qwen-image DIR, or the --zimage directory: the ComfyUI files), an RGBA PNG (the '
                      . 'model draws an alpha channel). 40 steps by default, no guidance; up to 2048 x 2048. Slow: about a minute or more an image; '
-                     . 'the answer waits for it while the server serves the other requests; one image at a time (429 while one is made).',
+                     . 'the answer waits for it while the server serves the other requests; one image at a time (429 while one is made). '
+                     . 'It also edits a picture: POST /v1/images/edits with the picture in base64 (image) and the prompt.',
         usage => 'POST /v1/images/generations {"model":"qwen-image-2.1","prompt":"a red cube on a wooden table","size":"1024x1024","steps":40,"seed":0}',
         parameters => { %IMAGE_COMMON,
             size => { type => 'string', default => '1024x1024', note => 'WIDTHxHEIGHT, multiples of 32 from 256 to 2048' },
@@ -1577,6 +1582,28 @@ route::get '/v1/audio/voices' => sub {
     return { data => \@v };
 };
 
+# POST /v1/images/edits: the edit of a picture by the prompt (qwen-image-2.1, --qwen-image DIR): a JSON body with the image in base64
+# (PNG, JPEG, GIF, WebP, or a data URL), the prompt, the size (the pixel budget: its square root is the side the model works at; 1024x1024
+# by default; the output keeps the picture's shape), steps (40), seed (0) and response_format (b64_json or png), as the generations take them.
+# One image at a time (429 while one is made, 503 while a 3D job runs), as the generations.
+route::post '/v1/images/edits' => sub {
+    my ($req) = @_;
+    my $p = $req->{json};
+    ref $p eq 'HASH' or error(400, 'expected a JSON object (Content-Type: application/json)');
+    my $model = $p->{model} // 'qwen-image-2.1';
+    error(400, "edits: the model is qwen-image-2.1, not '$model'") unless $model eq 'qwen-image-2.1';
+    error(503, 'no image model that edits: start the server with --qwen-image DIR', 'server_error') unless $AUX{qwenimage21};
+    my $b64 = $p->{image};
+    error(400, "'image' is required: the picture in base64 (PNG, JPEG, GIF or WebP) or a data URL") unless defined $b64 && !ref $b64 && length $b64;
+    $b64 =~ s/\Adata:[^,]*,//;
+    my $image = decode_base64($b64);
+    error(400, 'image: empty, or not base64') unless defined $image && length $image;
+    # the picture's type is checked here: the decoding runs on the image's thread, after the answer's status is sent
+    error(400, 'image: not a PNG, JPEG, GIF or WebP picture')
+        unless $image =~ /\A(?:\x89PNG\r\n\x1a\n|\xff\xd8\xff|GIF8[79]a|RIFF[\s\S]{4}WEBP)/;
+    return qi21_request($req, $p, $image);
+};
+
 # OpenAI's image generation: a JSON body with the prompt, the size (WIDTHxHEIGHT, multiples of 8 from 64 to 1024; 512x512 by
 # default; z-image-turbo: multiples of 16, 1024x1024 by default), steps (z-image-turbo: 9 by default), n (1: one image per request) and response_format (b64_json: the PNG in base64 in data[0].b64_json; or png: the
 # PNG bytes as image/png), the optional seed (the latents; 0 by default). One image at a time, on the host (about half a
@@ -1720,8 +1747,8 @@ sub qi21_reap {  # an image whose client left: taken and dropped when it is done
     %QI21 = ();
     $AUX{qwenimage21}{busy} = 0;
 }
-sub qi21_request {
-    my ($req, $p) = @_;
+sub qi21_request {  # an image from the prompt, or with $image (the picture's bytes) an edit of it
+    my ($req, $p, $image) = @_;
     my $prompt = $p->{prompt};
     error(400, "'prompt' is required") unless defined $prompt && !ref $prompt && length $prompt;
     error(400, 'prompt: at most 1000 characters') if length $prompt > 1000;
@@ -1742,13 +1769,18 @@ sub qi21_request {
     error(429, 'an image of qwen-image-2.1 is being made: try again when it is done', 'rate_limit_error') if $QI21{running};
     my $a = $AUX{qwenimage21};
     my $Q = eval { aux_get('qwenimage21') } or error(500, 'qwen-image-2.1: ' . ($@ =~ s/ at \S+ line \d+\.?\n?\z//r), 'server_error');
-    my $started = eval { $Q->start($prompt, size => $size, steps => $steps, seed => $seed) };
-    error(400, ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) =~ s/\AROCm::Inference: qi21_start: //r) unless defined $started;
+    # an edit: the size is the pixel budget (its square root is the side the pipeline works at); the output keeps the picture's shape
+    my ($w, $h) = ROCm::Inference::QwenImage21->size($size);
+    my $res = int(sqrt($w * $h) + 0.5);
+    my $started = eval { $image ? $Q->start_edit($prompt, $image, resolution => $res, steps => $steps, seed => $seed)
+                                : $Q->start($prompt, size => $size, steps => $steps, seed => $seed) };
+    error(400, ($@ =~ s/ at \S+ line \d+\.?\n?\z//r) =~ s/\AROCm::Inference: qi21_start(?:_edit)?: //r) unless defined $started;
     error(429, 'an image of qwen-image-2.1 is being made: try again when it is done', 'rate_limit_error') unless $started;
     %QI21 = (running => 1, t0 => Time::HiRes::time());
     $a->{busy} = 1;
     $a->{used} = ++$stamp;
-    $LOG->info('request', event => 'image', msg => sprintf('qwen-image-2.1: started, %s, %d steps, seed %d', $size, $steps, $seed));
+    $LOG->info('request', event => 'image', msg => sprintf('qwen-image-2.1: %s, %s, %d steps, seed %d', $image ? 'edit started' : 'started',
+        $size, $steps, $seed));
     my $done = 0;
     return pull(200, ['Content-Type' => $fmt eq 'png' ? 'image/png' : 'application/json'], sub {
         return undef if $done;

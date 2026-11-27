@@ -6,7 +6,7 @@ use File::Temp qw(tempdir);
 use IO::Socket::UNIX;
 use Socket qw(SOCK_STREAM);
 use JSON::PP ();
-use MIME::Base64 qw(decode_base64);
+use MIME::Base64 qw(decode_base64 encode_base64);
 use Time::HiRes qw(sleep time);
 
 # bin/rocm-inference-server --qwen-image DIR: qwen-image-2.1 on /v1/images/generations (text to image, an RGBA PNG). Checked: the
@@ -14,7 +14,8 @@ use Time::HiRes qw(sleep time);
 # range), an image made while the server answers other requests (the answer waits in a pull response; /health answers meanwhile; a
 # second image is refused with 429), the PNG (RGBA, the size asked), the b64_json answer, the model loaded afterwards. Needs the ComfyUI
 # models directory with the Qwen-Image 2.1 files (ROCM_INFERENCE_TEST_QWENIMAGE21=DIR, as --qwen-image takes it: diffusion_models/,
-# text_encoders/ with tokenizer.json, vae/); about two minutes (the model's registration, two small images).
+# text_encoders/ with tokenizer.json, vae/); about two minutes (the model's registration, two small images). Also the edit
+# (POST /v1/images/edits: a 32 x 32 picture, 4 steps at 256 x 256).
 my $dirq = $ENV{ROCM_INFERENCE_TEST_QWENIMAGE21};
 plan skip_all => 'set ROCM_INFERENCE_TEST_QWENIMAGE21 (the --qwen-image directory) to run' unless $dirq && -d $dirq;
 plan skip_all => 'Web::Route is not installed' unless eval { require Web::Route; 1 };
@@ -63,6 +64,10 @@ like($body // '', qr/multiples of 32/, 'with the reason');
 ($st, $body) = http(POST => '/v1/images/generations', { model => 'qwen-image-2.1', prompt => 'x', steps => 0 });
 is($st, 400, 'steps 0: refused') or diag $body;
 
+# the model's load (about 20 s here: the registration of its files) is the first image's; a warm-up takes it before the timed part
+($st, $body) = http(POST => '/v1/images/generations', { model => 'qwen-image-2.1', prompt => 'warm up', size => '256x256', steps => 1 });
+is($st, 200, 'a warm-up image (the model loads)') or diag substr($body // '', 0, 300);
+
 # an image while the server serves the others
 my $t0 = time;
 my $c = send_req(POST => '/v1/images/generations', { model => 'qwen-image-2.1', prompt => 'a red cube on a wooden table, soft studio light',
@@ -89,6 +94,40 @@ is_deeply([$w2, $h2], [256, 256], 'b64_json: the PNG in data[0].b64_json');
 ($st, $body) = http(GET => '/v1/models/qwen-image-2.1');
 is(eval { $J->decode($body)->{status}{value} }, 'loaded', 'the model is loaded now');
 
+# the edit (POST /v1/images/edits): the picture in base64 and the prompt; the answer keeps the picture's shape (the size is the pixel
+# budget, here 256 x 256 for a square picture)
+my $square = png_square(32);
+($st, $body) = http(POST => '/v1/images/edits', { prompt => 'make the square blue' });
+is($st, 400, 'an edit without a picture: refused') or diag $body;
+like($body // '', qr/'image' is required/, 'with the reason');
+($st, $body) = http(POST => '/v1/images/edits', { model => 'z-image-turbo', prompt => 'x', image => encode_base64($square, '') });
+is($st, 400, 'an edit with another model: refused');
+($st, $body) = http(POST => '/v1/images/edits', { prompt => 'make the square blue', image => encode_base64($square, ''), size => '300x300' });
+is($st, 400, 'a size that is not a multiple of 32: refused');
+($st, $body) = http(POST => '/v1/images/edits', { prompt => 'make the square blue', image => 'not a picture at all!', size => '256x256' });
+is($st, 400, 'a picture that is not base64 PNG/JPEG: refused') or diag substr($body // '', 0, 200);
+($st, $body) = http(POST => '/v1/images/edits', { prompt => 'make the square blue', image => encode_base64($square, ''),
+                                                  size => '256x256', steps => 4, seed => 5 });
+is($st, 200, 'an edit') or diag substr($body // '', 0, 300);
+my $e64 = eval { $J->decode($body)->{data}[0]{b64_json} };
+my ($ew, $eh, $ect) = png_info(defined $e64 ? decode_base64($e64) : undef);
+is_deeply([$ew, $eh, $ect], [256, 256, 6], 'the edit: a PNG of 256 x 256, RGBA');
+
 kill TERM => $pid;
 close $srv;
 done_testing;
+
+sub png_square {  # an RGBA PNG of $n x $n: a red square on white (the picture of the edit)
+    my ($n) = @_;
+    require Compress::Zlib;
+    my $raw = '';
+    for my $y (0 .. $n - 1) {
+        $raw .= "\0";
+        for my $x (0 .. $n - 1) {
+            $raw .= ($x >= $n / 4 && $x < 3 * $n / 4 && $y >= $n / 4 && $y < 3 * $n / 4) ? "\xff\x00\x00\xff" : "\xff\xff\xff\xff";
+        }
+    }
+    my $chunk = sub { my ($type, $data) = @_; pack('N', length $data) . $type . $data . pack('N', Compress::Zlib::crc32($type . $data)) };
+    return "\x89PNG\r\n\x1a\n" . $chunk->('IHDR', pack('NNCCCCC', $n, $n, 8, 6, 0, 0, 0))
+         . $chunk->('IDAT', Compress::Zlib::compress($raw)) . $chunk->('IEND', '');
+}
