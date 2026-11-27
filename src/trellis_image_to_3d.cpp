@@ -21,8 +21,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <exception>
 #include <mutex>
+#include <stdexcept>
 #include <random>
 #include <thread>
 
@@ -131,6 +133,7 @@ struct ImageTo3D::Impl {
     std::vector<std::pair<std::string, double>> timings;
     std::string error;
     bool ok = false;
+    std::atomic<bool> cancel{false};  // set_cancel: checked at each progress report
 };
 
 ImageTo3D::ImageTo3D(const ImageTo3DFiles& files) : p_(new Impl) {
@@ -173,6 +176,7 @@ const std::string& ImageTo3D::error() const { return p_->error; }
 bool ImageTo3D::has_background_removal() const { return p_->bir != nullptr; }
 const std::vector<uint8_t>& ImageTo3D::last_input() const { return p_->last_input; }
 const std::vector<std::pair<std::string, double>>& ImageTo3D::last_timings() const { return p_->timings; }
+void ImageTo3D::set_cancel(bool on) { p_->cancel = on; }
 
 bool ImageTo3D::generate(const uint8_t* rgba, int w, int h, bool has_alpha, const ImageTo3DOptions& opt, std::vector<uint8_t>& glb,
                          const ImageTo3DProgress& progress) {
@@ -214,6 +218,7 @@ bool ImageTo3D::generate(const uint8_t* rgba, int w, int h, bool has_alpha, cons
         return false;
     }
     auto report = [&](const char* stage, int step, int steps) {
+        if (m.cancel.load()) throw std::runtime_error("cancelled");  // (the job's thread: its error is this message)
         if (progress) progress(stage, step, steps);
     };
     auto t0 = std::chrono::steady_clock::now();
@@ -500,6 +505,7 @@ int t2_start(t2_pipe_t* p, const unsigned char* image, size_t n, int resolution,
         if (p->status == 0) return 1;
     }
     if (p->th.joinable()) p->th.join();
+    p->model->set_cancel(false);
     if (resolution != 512 && resolution != 1024) {
         g_t2_error = "resolution: 512 or 1024";
         return -1;
@@ -622,6 +628,14 @@ int t2_poll(t2_pipe_t* p, char* stage, size_t stage_len, int* step, int* steps, 
         *seconds = p->status == 2 ? 0.0
                                   : std::chrono::duration<double>((p->status == 0 ? std::chrono::steady_clock::now() : p->t1) - p->t0).count();
     return p->status;
+}
+
+int t2_cancel(t2_pipe_t* p) {
+    if (!p) return 0;
+    std::lock_guard<std::mutex> lk(p->mu);
+    if (p->status != 0) return 0;
+    p->model->set_cancel(true);
+    return 1;
 }
 
 int t2_take(t2_pipe_t* p, unsigned char** glb, size_t* n) {

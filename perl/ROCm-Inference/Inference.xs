@@ -1965,6 +1965,15 @@ _t2_poll(h)
     mPUSHi(steps);
     mPUSHn(seconds);
 
+int
+_t2_cancel(h)
+    IV h
+  CODE:
+    /* 1 when a job was running (its cancel requested: it ends as failed, "cancelled"), else 0 */
+    RETVAL = t2_cancel(INT2PTR(t2_pipe_t*, h));
+  OUTPUT:
+    RETVAL
+
 SV*
 _t2_take(h)
     IV h

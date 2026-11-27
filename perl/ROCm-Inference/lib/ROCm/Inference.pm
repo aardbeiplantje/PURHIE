@@ -1102,6 +1102,9 @@ sub poll {
 # the finished job's GLB bytes (the job is cleared); dies with the error of a failed job
 sub take { my ($t) = @_; ROCm::Inference::_t2_take($t->{h}) }
 
+# asks the running job to stop (it ends as failed with the error "cancelled"); 1 when a job was running, else 0
+sub cancel { my ($t) = @_; ROCm::Inference::_t2_cancel($t->{h}) }
+
 sub DESTROY {
     my ($t) = @_;
     ROCm::Inference::_t2_close($t->{h}) if $t->{h};

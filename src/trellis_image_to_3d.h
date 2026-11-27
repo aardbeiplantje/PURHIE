@@ -58,6 +58,10 @@ public:
     const std::vector<uint8_t>& last_input() const;
     const std::vector<std::pair<std::string, double>>& last_timings() const;
 
+    // a cancel request (from another thread): the running generate stops at its next progress report (a sampler's step or a stage)
+    // with the error "cancelled"; set false before a new generate (the server does, when it starts a job)
+    void set_cancel(bool on);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> p_;

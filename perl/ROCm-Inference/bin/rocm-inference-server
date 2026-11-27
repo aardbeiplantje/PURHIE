@@ -98,17 +98,32 @@ sub aux_load {
     my $a = $AUX{$kind} or return undef;
     return $a->{m} if $a->{m};
     make_room($a);
-    my $m = eval {
-        $kind eq 'whisper' ? whisper_load($a->{path})
-      : $kind eq 'tts'     ? speech_load($a->{path}, $a->{codec})
-      : $kind eq 'trellis2' ? ROCm::Inference::Trellis2->new($a->{path}, comfyui => $o{zimage})
-      : $kind eq 'qwenimage21' ? ROCm::Inference::QwenImage21->new($a->{path})
-      :                      sd_load($a->{path});
-    };
-    if (!$m) {
+    my $m;
+    while (1) {
+        $m = eval {
+            $kind eq 'whisper' ? whisper_load($a->{path})
+          : $kind eq 'tts'     ? speech_load($a->{path}, $a->{codec})
+          : $kind eq 'trellis2' ? ROCm::Inference::Trellis2->new($a->{path}, comfyui => $o{zimage})
+          : $kind eq 'qwenimage21' ? ROCm::Inference::QwenImage21->new($a->{path})
+          :                      sd_load($a->{path});
+        };
+        last if $m;
         my $why = ($@ || 'no model') =~ s/ at \S+ line \d+\.?\n?\z//r;
-        $LOG->error(event => 'audio', msg => "$kind $a->{path}: $why");
-        die "$why\n";
+        # the device layer registers each loaded model's files for the GPU, and a process can hold only about 29 GB registered
+        # (make_room counts RAM, not this): a registration that fails unloads the least recently used idle model, and the load tries
+        # again; with none left to unload, the load fails as before
+        my $victim;  # (the least recently used idle model: no sort here, the lexical $a of this sub is not the sort's)
+        if ($why =~ /regist/) {
+            for my $c (grep { $_->{m} && $_ != $a && idle($_) } values %M, values %AUX) {
+                $victim = $c if !$victim || $c->{used} < $victim->{used};
+            }
+        }
+        if (!$victim) {
+            $LOG->error(event => 'audio', msg => "$kind $a->{path}: $why");
+            die "$why\n";
+        }
+        $LOG->info('audio', event => 'unload', msg => "$victim->{id}: its registered memory for $kind");
+        unload($victim);
     }
     $a->{m} = $m;
     $a->{used} = ++$stamp;
@@ -1653,6 +1668,18 @@ sub job3d_reap {  # the running job's state; a finished job's model (or error) i
     }
     my $p = $a->{m}->poll;
     @$j{qw(stage step steps seconds)} = @$p{qw(stage step steps seconds)};
+    # the progress in the log: the stage and its step every 30 s while it runs, and how long the stage has stood at this step (a
+    # stall shows as a growing number there)
+    my $now = Time::HiRes::time();
+    my $key = join ' ', map { $p->{$_} // '' } qw(stage step steps);
+    $j->{key_at} = $now if !defined $j->{key} || $key ne $j->{key};
+    $j->{key} = $key;
+    if ($p->{status} eq 'running' && $now - ($j->{logged_at} // 0) >= 30) {
+        $j->{logged_at} = $now;
+        $LOG->info('request', event => '3d', msg => sprintf('%s: %s%s, %.0f s so far, this step for %.0f s', $j->{id},
+            ($p->{stage} // '') eq '' ? 'starting' : $p->{stage}, ($p->{steps} // 0) ? " $p->{step} of $p->{steps}" : '',
+            $p->{seconds} // 0, $now - $j->{key_at}));
+    }
     return if $p->{status} eq 'running';
     my $glb = eval { $a->{m}->take };
     if (defined $glb) {
@@ -1852,6 +1879,19 @@ route::get '/v1/3d/generations' => sub {
     job3d_reap();
     my $u = job3d_user($req);
     return { object => 'list', data => [ map { job3d_entry($JOB3D{$_}) } grep { $JOB3D{$_}{user} eq $u } reverse @JOB3D_ORDER ] };
+};
+
+# DELETE /v1/3d/generations/ID: stops the job (a running one ends as failed, "cancelled", at its next step or stage; the record
+# stays for its state). 409 when the job is not running.
+route::delete '/v1/3d/generations/:id' => sub {
+    my ($req) = @_;
+    job3d_reap();
+    my $j = job3d_of($req);
+    error(409, "3D generation '$j->{id}' is $j->{status}: only a running one is cancelled", 'invalid_request_error')
+        unless defined $JOB3D_RUN && $JOB3D_RUN eq $j->{id};
+    $AUX{trellis2}{m}->cancel if $AUX{trellis2} && $AUX{trellis2}{m};
+    $LOG->info('request', event => '3d', msg => "$j->{id}: cancel requested");
+    return job3d_entry($j);
 };
 
 route::get '/v1/3d/generations/:id' => sub {

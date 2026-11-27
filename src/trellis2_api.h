@@ -35,6 +35,9 @@ int t2_start(t2_pipe_t* p, const unsigned char* image, size_t n, int resolution,
 int t2_poll(t2_pipe_t* p, char* stage, size_t stage_len, int* step, int* steps, double* seconds);
 /* The finished job's model, GLB or STL (*glb malloc'ed: t2_free), and the job is cleared. 0; -1 when it failed (t2_last_error: its error, and the
  * job is cleared) or no job is done. */
+/* Asks the running job to stop: it ends at its next progress report (a sampler's step, a stage) as a failed job with the error
+ * "cancelled". 1 when a job was running (the request is made), 0 when none is (or no pipeline). */
+int t2_cancel(t2_pipe_t* p);
 int t2_take(t2_pipe_t* p, unsigned char** glb, size_t* n);
 void t2_free(void* ptr);
 
