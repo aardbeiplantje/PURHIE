@@ -1,8 +1,10 @@
 #!/bin/bash
-# serve.sh: this checkout's container (run.sh), restarted when the image changes. image-watch.sh stops the
-# container and returns when a new image appears (a build of this checkout tags one); then this script runs again from
-# the file on disk, so an edited serve.sh takes effect with the next build. It runs no docker commands itself: the
-# container is run.sh's, the watch is image-watch.sh's. Run it from any place: the scripts next to it are used.
+# serve.sh: this checkout's container (run.sh), replaced when the image changes. image-watch.sh stops its command and
+# returns when a new image appears (a build of this checkout tags one); then this script runs again from the file on
+# disk: run.sh runs again, which stops and replaces the container with the new image, and an edited serve.sh takes
+# effect with the next build. It runs no docker commands itself: the container is run.sh's, the watch is image-watch.sh's.
+# Run it from any place: the scripts next to it are used. Run this, not image-watch.sh alone: nothing else starts the
+# container again after an image change.
 #
 #   ./serve.sh                  the defaults below, in the foreground; Ctrl-C stops it
 #   DRY_RUN=1 ./serve.sh        print the commands that would run, and exit

@@ -93,9 +93,11 @@ To trigger an image build, touch the trigger from the repository root: `touch .b
 `build-watch.sh` here, in their shell: it waits for the trigger, runs `docker buildx bake --pull` with the project's
 HEAD commit, and appends the output to `build-watch.log`. The build is done when that log has `done, exit N`.
 
-The user runs `./serve.sh` to serve the container (`run.sh`). `image-watch.sh` stops the container and exits when the
-image changes; `serve.sh` then runs its own file again, so an edit to `serve.sh` takes effect with the next build.
-`serve.sh` runs no docker commands itself: the container is `run.sh`'s and the watch is `image-watch.sh`'s.
+The user runs `./serve.sh` to serve the container (`run.sh`). `image-watch.sh` stops its command and exits when the
+image changes; `serve.sh` then runs its own file again, which runs `run.sh` again: that stops and replaces the container
+with the new image, so an edit to `serve.sh` takes effect with the next build. Running `image-watch.sh` alone does not
+restart the container after a change. `serve.sh` runs no docker commands itself: the container is `run.sh`'s and the watch
+is `image-watch.sh`'s.
 
 Do not run the watchers or `serve.sh` yourself, and do not check whether they are running: you cannot see the user's
 shell. Touch the trigger and report. The image runs nothing by itself.

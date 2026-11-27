@@ -74,7 +74,7 @@ while :; do
         if [ -z "$state" ] || [ "${state:0:1}" = Z ]; then
             wait "$pid"; rc=$?
             pid=
-            echo "== $(date '+%F %T') command exited, exit $rc (it runs again when the image changes)"
+            echo "== $(date '+%F %T') command exited, exit $rc (this watch does not run it again: it exits when the image changes, and serve.sh runs it then)"
         fi
     fi
     sleep "$interval" &
