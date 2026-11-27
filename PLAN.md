@@ -10,12 +10,14 @@ run alone on the machine.
 
 ## ▶ Next
 
-1. **Qwen-Image 2.1: the image edit, its speed** (item 16; the engine's edit is verified, 2026-11-27: `qi21_edit`, the
+1. **OCR: Nanonets-OCR2-3B (Qwen2.5-VL) on the engine** (item 20; the reference is done, 14 of 14 lines exact). Next: the
+   vision tower and M-RoPE stage checks against `/data/ocr-ref/nanonets-doc`.
+2. **Qwen-Image 2.1: the image edit, its speed** (item 16; the engine's edit is verified, 2026-11-27: `qi21_edit`, the
    stages against `tools/qwenimage21_edit_oracle.py`, on the BF16 file too; served as `POST /v1/images/edits` (2026-11-27,
    checked by `t/73-qwenimage21.t`), and aicli's `generate_image` sends a picture of the workspace as `image`). A client that
    leaves cancels its image (`t/75-qwenimage21-cancel.t`: the next image is accepted 4 s after the client left, where 40 steps take
    about 30 s): `qi21_cancel`, checked at each step, the decoder not interrupted.
-2. **Waiting on the user:** the deployed service check (item 1); the design and the row format of the GLM prefill
+3. **Waiting on the user:** the deployed service check (item 1); the design and the row format of the GLM prefill
    snapshots (item 2).
 
 ## Status in brief
@@ -263,6 +265,21 @@ run alone on the machine.
       SKiDL / kicad-cli / Freerouting for boards;
       the local chat models write the code (no new model on the engine). (b) cadrille on the engine (Qwen2-VL-2B and a point
       encoder): an image, or TRELLIS's mesh as points, to editable CadQuery. (c) CAD-Recode (non-commercial licence).
+
+20. **OCR: Nanonets-OCR2-3B (Qwen2.5-VL, 3B) on the engine.** The reference is done (2026-11-27):
+    `tools/ocr_qwen25vl_oracle.py` (transformers 5.5.1, FP32 on the GPU) on a one-page document transcribes 14 of 14 lines
+    exactly. Its outputs are in `/data/ocr-ref/nanonets-doc`: the picture and the truth, the processor's patch rows, the
+    720 merged vision tokens of a 40 x 72 patch grid (`vis_merged.f32`), the prompt ids, the transcription. Pitfall: the
+    checkpoint sets `tie_word_embeddings` only in `text_config`; transformers then leaves `lm_head` random and the answer is
+    noise. The script forces the tie and asserts it.
+    - The engine's path is not started. The vision tower (`vision_config`: 32 blocks, hidden 1280, 16 heads, SwiGLU 3420,
+      RMSNorm, windowed attention of 112 patches except blocks 7, 15, 23, 31; patch 14, temporal 2, merge 2 to 2048; the
+      merger has its own RMSNorm). The language model is Qwen2 (36 layers, hidden 2048, 16 / 2 heads, FFN 11008, rope theta
+      1e6, tied head) with M-RoPE sections [16, 24, 24] in contiguous blocks (Qwen2-VL's layout, not Qwen3-VL's interleave).
+    - The checkpoint is safetensors, loaded as the image models are (decision 2026-11-14): no GGUF conversion.
+    - Stage checks against the oracle, in order: the patch rows, the vision output (`vis_merged.f32`), the prompt's
+      embeddings with the image, the greedy ids, then the transcription. Code to share: the host vision tower of the chat
+      models (the mmproj path) and the device Qwen3-VL tower in `src/qwenimage21_vision.cpp`.
 
 ## Audio, vision and image: what is open per feature
 
