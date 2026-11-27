@@ -88,12 +88,9 @@ int main(int argc, char** argv) {
     std::vector<const char*> vp, mp;
     for (auto& s : vocab) vp.push_back(s.c_str());
     for (auto& s : merges) mp.push_back(s.c_str());
-    qi21_pipe_t* p = qi21_open(dit, vae, te, vp.data(), vp.size(), mp.data(), mp.size());
-    if (!p) {
-        printf("[FAIL] qi21_open: %s\n", qi21_last_error());
-        return 1;
-    }
     tokenizer_t* tok = tokenizer_create(vp.data(), vp.size(), mp.data(), mp.size());
+    {  /* the stages 1 to 7 map and register the files for their own checks; the pipeline (stage 8) registers them again, and the
+     * process's registration limit (about 29 GB) would not hold both: the mappings are released here */
     zimage::SafeTensors st_dit(dit), st_vae(vae), st_te(te);
     if (!st_dit.ok() || !st_vae.ok() || !st_te.ok() || !st_dit.register_device() || !st_vae.register_device() || !st_te.register_device()) {
         printf("[FAIL] the model files\n");
@@ -185,9 +182,15 @@ int main(int argc, char** argv) {
     printf("       the decoder: %d x %d in %.2f s\n", W, H, secs(t0));
     compare("the decoded image", dec.data(), ref_dec.data(), dec.size(), (size_t)H * W, 1e-2, 0.9999);
 
+    }
+    qi21_pipe_t* p = qi21_open(dit, vae, te, vp.data(), vp.size(), mp.data(), mp.size());
+    if (!p) {
+        printf("[FAIL] qi21_open: %s\n", qi21_last_error());
+        return 1;
+    }
     /* 8. the whole chain from the prompt and the seed, against the reference's image */
     std::vector<unsigned char> rgba((size_t)H * W * 4), png;
-    t0 = std::chrono::steady_clock::now();
+    auto t0 = std::chrono::steady_clock::now();
     if (qi21_generate(p, prompt.c_str(), H, W, steps, seed, rgba.data(), nullptr, nullptr) != 0) {
         printf("[FAIL] qi21_generate: %s\n", qi21_last_error());
         return 1;

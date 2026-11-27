@@ -26,7 +26,9 @@ public:
     bool has(const std::string& name) const { return t_.count(name) != 0; }
     /* the tensor as float (BF16 converted), its shape; false if absent (host path) */
     bool get(const std::string& name, std::vector<float>& out, std::vector<size_t>& shape) const;
-    /* device path: the mapping registered for the GPU (read in place, no copy); false if the registration fails */
+    /* device path: the mapping registered for the GPU (read in place, no copy); false if the registration fails. The registration
+     * is released with the object (hipHostUnregister before the unmap: an unmapped range that stays registered keeps its bytes
+     * against the process's registration limit, about 29 GB, until the process ends) */
     bool register_device() const;
     /* a BF16 tensor's bits in the mapping (read in place by the GPU), its shape; false if absent or not BF16 */
     bool bf16_in_place(const std::string& name, const uint16_t*& ptr, std::vector<size_t>& shape) const;
@@ -45,6 +47,7 @@ private:
     const uint8_t* base_ = nullptr;
     size_t size_ = 0;
     size_t data_ = 0;
+    mutable bool registered_ = false;
     std::string error_;
 };
 

@@ -120,7 +120,10 @@ SafeTensors::SafeTensors(const std::string& path) {
 }
 
 SafeTensors::~SafeTensors() {
-    if (base_) munmap((void*)base_, size_);
+    if (base_) {
+        if (registered_) sddev::unregister_weights(base_);  // before the unmap: the registration's bytes are given back
+        munmap((void*)base_, size_);
+    }
 }
 
 bool SafeTensors::get(const std::string& name, std::vector<float>& out, std::vector<size_t>& shape) const {
@@ -143,7 +146,9 @@ bool SafeTensors::get(const std::string& name, std::vector<float>& out, std::vec
 }
 
 bool SafeTensors::register_device() const {
-    return base_ != nullptr && sddev::register_weights(base_, size_);
+    if (base_ == nullptr || !sddev::register_weights(base_, size_)) return false;
+    registered_ = true;
+    return true;
 }
 
 bool SafeTensors::bf16_in_place(const std::string& name, const uint16_t*& ptr, std::vector<size_t>& shape) const {
