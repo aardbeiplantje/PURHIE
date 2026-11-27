@@ -37,6 +37,9 @@ int qi21_generate(qi21_pipe_t* pipe, const char* prompt, int height, int width, 
  * qi21_take: the finished job's image as RGBA PNG bytes (*png malloc'ed: qi21_free), and the job is cleared; 0, or -1 when it failed
  * (qi21_last_error: its error; the job is cleared) or no job is done. qi21_close waits for a running job. */
 int qi21_start(qi21_pipe_t* pipe, const char* prompt, int height, int width, int steps, unsigned long long seed);
+/* qi21_cancel: asks the running job to stop: it ends after its current step as failed with the error "qwen-image 2.1: cancelled"
+ * (the decoder is not interrupted: a second or two). 1 when a job was running (the request is made), 0 when none is. */
+int qi21_cancel(qi21_pipe_t* pipe);
 
 /* The image edit (the pipeline with a condition image): image the condition image's file bytes (PNG, JPEG, ...: image_decode_rgba;
  * the alpha kept, as the VAE reads RGBA), prompt the instruction (it may name the image as <image1>). resolution: the side of the

@@ -1833,6 +1833,15 @@ _qi21_start(h, prompt, height, width, steps, seed)
     RETVAL
 
 int
+_qi21_cancel(h)
+    IV h
+  CODE:
+    /* 1 when an image was being made (its cancel requested: it ends as failed, "cancelled"), else 0 */
+    RETVAL = qi21_cancel(INT2PTR(qi21_pipe_t*, h));
+  OUTPUT:
+    RETVAL
+
+int
 _qi21_start_edit(h, prompt, image, resolution, steps, seed)
     IV h
     SV* prompt

@@ -829,7 +829,8 @@ my %IMAGE_INFO = (
         description => 'Text to image with Qwen-Image 2.1 (--qwen-image DIR, or the --zimage directory: the ComfyUI files), an RGBA PNG (the '
                      . 'model draws an alpha channel). 40 steps by default, no guidance; up to 2048 x 2048. Slow: about a minute or more an image; '
                      . 'the answer waits for it while the server serves the other requests; one image at a time (429 while one is made). '
-                     . 'It also edits a picture: POST /v1/images/edits with the picture in base64 (image) and the prompt.',
+                     . 'It also edits a picture: POST /v1/images/edits with the picture in base64 (image) and the prompt. A client that '
+                     . 'leaves before the image is done cancels it (it stops after its current step).',
         usage => 'POST /v1/images/generations {"model":"qwen-image-2.1","prompt":"a red cube on a wooden table","size":"1024x1024","steps":40,"seed":0}',
         parameters => { %IMAGE_COMMON,
             size => { type => 'string', default => '1024x1024', note => 'WIDTHxHEIGHT, multiples of 32 from 256 to 2048' },
@@ -1802,7 +1803,12 @@ sub qi21_request {  # an image from the prompt, or with $image (the picture's by
         return \$png if $fmt eq 'png';
         require MIME::Base64;
         return \($J->encode({ created => time, data => [{ b64_json => MIME::Base64::encode_base64($png, '') }] }));
-    }, on_close => sub { $QI21{gone} = 1 if $QI21{running} });
+    }, on_close => sub {  # the client left (a stop, a lost connection): nobody wants the image, so it is cancelled
+        return unless $QI21{running};
+        $QI21{gone} = 1;
+        $Q->cancel;
+        $LOG->info('request', event => 'image', msg => 'qwen-image-2.1: the client left: cancelled');
+    });
 }
 sub job3d_entry {
     my ($j) = @_;

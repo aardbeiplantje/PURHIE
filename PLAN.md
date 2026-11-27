@@ -12,8 +12,9 @@ run alone on the machine.
 
 1. **Qwen-Image 2.1: the image edit, its speed** (item 16; the engine's edit is verified, 2026-11-27: `qi21_edit`, the
    stages against `tools/qwenimage21_edit_oracle.py`, on the BF16 file too; served as `POST /v1/images/edits` (2026-11-27,
-   checked by `t/73-qwenimage21.t`), and aicli's `generate_image` sends a picture of the workspace as `image`). Open: a cancel
-   for the image (the 3D job has one, item 15).
+   checked by `t/73-qwenimage21.t`), and aicli's `generate_image` sends a picture of the workspace as `image`). A client that
+   leaves cancels its image (`t/75-qwenimage21-cancel.t`: the next image is accepted 4 s after the client left, where 40 steps take
+   about 30 s): `qi21_cancel`, checked at each step, the decoder not interrupted.
 2. **Waiting on the user:** the deployed service check (item 1); the design and the row format of the GLM prefill
    snapshots (item 2).
 

@@ -15,6 +15,7 @@
 #include "trellis_image.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -238,6 +239,8 @@ struct qi21_pipe {
     std::string error;
     std::vector<uint8_t> png;
     std::chrono::steady_clock::time_point t0, t1;
+    /* a cancel request (qi21_cancel): the sampler stops after its current step, with the error "cancelled" */
+    std::atomic<bool> cancel{false};
     qi21_pipe(const std::string& d, const std::string& v, const std::string& t) : dit(d), vae(v), te(t) {}
 };
 
@@ -315,6 +318,7 @@ void run_edit(qi21_pipe_t* pipe, const std::string& prompt, const unsigned char*
     const std::vector<float> noise = packed_noise(seed, gh, gw);
     std::vector<float> latent(noise.size());
     auto on_step = [&](int i, const float*, const float*) {
+        if (pipe->cancel) throw std::runtime_error("cancelled");
         if (progress) progress(i + 1, steps, user);
     };
     if (!qwenimage21::sample(pipe->dit, noise.data(), gh, gw, c, steps, latent.data(), on_step))
@@ -334,6 +338,7 @@ int start_job(qi21_pipe_t* pipe, int steps,
     {
         std::lock_guard<std::mutex> lk(pipe->mu);
         pipe->status = 0;
+        pipe->cancel = false;
         pipe->step = 0;
         pipe->steps = steps;
         pipe->error.clear();
@@ -361,6 +366,7 @@ int start_job(qi21_pipe_t* pipe, int steps,
         }
         std::lock_guard<std::mutex> lk(pipe->mu);
         pipe->t1 = std::chrono::steady_clock::now();
+        pipe->cancel = false;
         if (err.empty()) {
             pipe->png = std::move(png);
             pipe->status = 1;
@@ -446,6 +452,7 @@ int qi21_generate(qi21_pipe_t* pipe, const char* prompt, int height, int width, 
         const std::vector<float> noise = packed_noise(seed, gh, gw);
         std::vector<float> latent((size_t)N * 64);
         auto on_step = [&](int i, const float*, const float*) {
+            if (pipe->cancel) throw std::runtime_error("cancelled");
             if (progress) progress(i + 1, steps, user);
         };
         if (!qwenimage21::sample(pipe->dit, noise.data(), gh, gw, emb, L, steps, latent.data(), on_step))
@@ -522,6 +529,14 @@ int qi21_edit_size(int w, int h, int resolution, int* width, int* height) {
     if (w < 1 || h < 1 || resolution < 1 || !width || !height) return -1;
     qwenimage21::edit_size(w, h, resolution, *width, *height);
     return 0;
+}
+
+int qi21_cancel(qi21_pipe_t* pipe) {
+    if (!pipe) return 0;
+    std::lock_guard<std::mutex> lk(pipe->mu);
+    if (pipe->status != 0) return 0;
+    pipe->cancel = true;
+    return 1;
 }
 
 int qi21_poll(qi21_pipe_t* pipe, int* step, int* steps, double* seconds) {

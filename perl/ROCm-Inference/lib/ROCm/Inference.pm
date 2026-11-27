@@ -1024,6 +1024,9 @@ sub poll {
 # the finished image's PNG bytes (the job is cleared); dies with the error of a failed one
 sub take { my ($q) = @_; ROCm::Inference::_qi21_take($q->{h}) }
 
+# asks the image being made to stop (it ends as failed with the error "cancelled", after its current step); 1 when one was being made
+sub cancel { my ($q) = @_; ROCm::Inference::_qi21_cancel($q->{h}) }
+
 # the whole image, waiting for it (scripts and tests; the server polls instead): PNG bytes
 sub generate {
     my ($q, $prompt, %o) = @_;
