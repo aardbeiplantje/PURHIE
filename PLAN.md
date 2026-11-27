@@ -120,11 +120,13 @@ run alone on the machine.
 
 13. **The Perl suite on the 122B.** `t/10` and `t/15` fail with `hipHostRegister failed (-3)` on an in-process load of the
     122B (the server's load of the same file works); `t/65-models-dir` hung once on a server (killed); `t/70-stage` ran for
-    hours (killed). The cause of the `hipHostRegister` failure is not known. Lead (2026-11-27): a process can hold about 29 GiB
-    registered (`hipHostRegister` answers invalid argument past it; measured with 1 GB chunks on this host). A registration is
-    given back only by `hipHostUnregister` (not by the unmap), so a model's files must be unregistered when it is unloaded
-    (fixed for `SafeTensors`: its destructor unregisters). Check whether the 122B's in-process load registers more than that.
-
+    hours (killed). Cause (2026-11-27, this container): a process can hold about 29 GiB registered for the device, and
+    `hipHostRegister` answers "invalid argument (-3)" past it. The 122B file is 67 GB; with `--stage` the registered stage is
+    66 GB (`/models/combined-test/Qwen3.5-122B-A10B-FAST.gguf`: the GPU reads nearly all of it), so the load fails there too.
+    Without staging, `t/10` and `t/15` register the whole map at once. The server works on the user's host, so its limit is
+    higher than this container's: the source of the limit was not found here (not the TTM page limit, which is 128 GiB; not
+    the cgroup, which has no limit; not `ulimit -l`). To check on a host: `reg_limit`-style, one 1 GB chunk at a time until
+    the first `invalid argument`. Tests now take `ROCM_INFERENCE_TEST_STAGE` (a tmpfs directory) for the stage option.
 14. **`--parallel 2` and a second big model (122B).** A server under `--parallel 2` that loads one 122B-sized file and then
     another (alpha, beta, alpha under `--models-max 1`) fails at beta's load: `hipHostRegister of 66353926592 bytes (a GGUF
     map) failed: invalid argument (-3)`. `--parallel 1` passes, in one process and across two; so do a single 122B load and

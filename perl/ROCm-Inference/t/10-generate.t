@@ -8,7 +8,16 @@ use ROCm::Inference qw(:all);
 my $path = $ENV{ROCM_INFERENCE_TEST_MODEL};
 plan skip_all => 'set ROCM_INFERENCE_TEST_MODEL to a GGUF model to run' unless $path && -f $path;
 
-my $m = load_model($path);
+# the model loads as the server loads it: with ROCM_INFERENCE_TEST_STAGE (a tmpfs directory, e.g. /dev/shm), the tensors the GPU
+# reads are copied into a stage there and only that is registered for the device. Without it the whole file is registered, which
+# a process can not do for a file of more than about 29 GB (the 122B: 67 GB; PLAN item 13)
+sub load_test {
+    my ($path) = @_;
+    my $stage = $ENV{ROCM_INFERENCE_TEST_STAGE};
+    return load_model($path, length($stage // '') ? {stage => $stage} : undef);
+}
+
+my $m = load_test($path);
 is(set_prefill_batch($m, 512), 0, 'set_prefill_batch before kv_cache_init');
 ok(!eval { set_swa_ring($m, -2); 1 }, 'set_swa_ring: a bad value dies');
 ok(!eval { set_kv_type($m, 'q4'); 1 }, 'set_kv_type: an unknown type dies');
@@ -21,7 +30,7 @@ ok(!eval { set_kv_type($m, 'q8_0'); 1 }, 'set_kv_type after kv_cache_init dies')
 
 # A Q8_0 / Q4_0 KV cache: the same greedy continuation of a plain prompt (quantization noise only)
 for my $type (qw(q8_0 q4_0)) {
-    my $q = load_model($path);
+    my $q = load_test($path);
     is(set_kv_type($q, $type), 0, "set_kv_type $type");
     kv_cache_init($q, 2048);
     my $p = tokenize($q, 'The capital of France is');
