@@ -1141,21 +1141,35 @@ sd_flash_attn(const uint16_t* __restrict__ qb, const uint16_t* __restrict__ kb, 
         mrow[i] = -INFINITY;
         lrow[i] = 0.0f;
     }
-    for (int k0 = 0; k0 < Tkp; k0 += 64) {
+    /* the K and V tiles of a key block go through registers: the global loads of the next block are issued before this block's
+     * products, and written to LDS after them (the same three barriers per block) */
+    uint4 kr[4], vr[4];
+    auto load_tile = [&](int k0) {
         {  // K tile: thread t loads 32 values (of 128) of key t >> 2
             const int r = t >> 2, qq = (t & 3) * 32, gk = k0 + r;
             for (int j = 0; j < 4; ++j) {
-                uint4 v = {0u, 0u, 0u, 0u};
-                if (gk < Tk) v = *reinterpret_cast<const uint4*>(Kp + (long)gk * C + qq + 8 * j);
-                *reinterpret_cast<uint4*>(&Ks[r][qq + 8 * j]) = v;
+                kr[j] = {0u, 0u, 0u, 0u};
+                if (gk < Tk) kr[j] = *reinterpret_cast<const uint4*>(Kp + (long)gk * C + qq + 8 * j);
             }
         }
         {  // V tile (transposed: dims x keys): thread t loads 32 keys (of 64) of dim t >> 1
             const int r = t >> 1, hf = (t & 1) * 32;
             const uint16_t* src = Vp + (long)r * Tkp + k0 + hf;
-            for (int j = 0; j < 4; ++j) *reinterpret_cast<uint4*>(&Vs[r][hf + 8 * j]) = *reinterpret_cast<const uint4*>(src + 8 * j);
+            for (int j = 0; j < 4; ++j) vr[j] = *reinterpret_cast<const uint4*>(src + 8 * j);
         }
-        __syncthreads();
+    };
+    auto store_tile = [&]() {
+        const int rk = t >> 2, qq = (t & 3) * 32, rv = t >> 1, hf = (t & 1) * 32;
+        for (int j = 0; j < 4; ++j) {
+            *reinterpret_cast<uint4*>(&Ks[rk][qq + 8 * j]) = kr[j];
+            *reinterpret_cast<uint4*>(&Vs[rv][hf + 8 * j]) = vr[j];
+        }
+    };
+    load_tile(0);
+    store_tile();
+    __syncthreads();
+    for (int k0 = 0; k0 < Tkp; k0 += 64) {
+        if (k0 + 64 < Tkp) load_tile(k0 + 64);
         f32x8_t S[4];
         for (int nt = 0; nt < 4; ++nt)
             for (int i = 0; i < 8; ++i) S[nt][i] = 0.0f;
@@ -1197,6 +1211,8 @@ sd_flash_attn(const uint16_t* __restrict__ qb, const uint16_t* __restrict__ kb, 
                 O[dt] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, O[dt]);
             }
         }
+        __syncthreads();
+        if (k0 + 64 < Tkp) store_tile();
         __syncthreads();
     }
     for (int i = 0; i < 8; ++i) {
@@ -1616,51 +1632,79 @@ qi_hadamard256(const float* __restrict__ x, int T, int K, const float* __restric
     y[(size_t)t * K + k] = acc;
 }
 
+// The 128 x 128 tile, eight outputs per thread in each direction (the 16 x 16 threads of a block); the k-loop runs in chunks of KC = 32,
+// both operands staged in LDS as [k][row]. Each output's sum runs over k in increasing order, as the 64 x 64 tile with chunks of 16
+// did: the same bits.
 extern "C" __global__ void __launch_bounds__(256)
 qi_linear_i8(const float* __restrict__ x, int T, const int8_t* __restrict__ W, const float* __restrict__ wscale, int in, int out,
              float* __restrict__ y) {
-    __shared__ float As[16][64 + 1];
-    __shared__ float Bs[16][64 + 1];
+    constexpr int KC = 32;  /* the k-chunk staged per barrier pair */
+    __shared__ float As[KC][128 + 4];
+    __shared__ float Bs[KC][128 + 4];
     const int tid = threadIdx.x;
     const int tx = tid & 15, ty = tid >> 4;
-    const int t0 = blockIdx.y * 64, o0 = blockIdx.x * 64;
-    float acc[4][4];
+    const int t0 = blockIdx.y * 128, o0 = blockIdx.x * 128;
+    float acc[8][8];
 #pragma unroll
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 8; ++i)
 #pragma unroll
-        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
-    for (int k0 = 0; k0 < in; k0 += 16) {
+        for (int j = 0; j < 8; ++j) acc[i][j] = 0.0f;
+    for (int k0 = 0; k0 < in; k0 += KC) {
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
+        for (int j = 0; j < KC / 8; ++j) {  /* the activations: 128 rows of KC / 4 float4 (4 k each) */
             const int e = tid + j * 256;
-            const int r = e >> 4, k = e & 15;
-            const int t = t0 + r, o = o0 + r;
-            As[k][r] = (t < T) ? x[(size_t)t * in + k0 + k] : 0.0f;
+            const int r = e / (KC / 4), kq = (e % (KC / 4)) * 4;
+            const int t = t0 + r;
+            const float4 v = (t < T) ? *reinterpret_cast<const float4*>(x + (size_t)t * in + k0 + kq) : make_float4(0.f, 0.f, 0.f, 0.f);
+            As[kq][r] = v.x;
+            As[kq + 1][r] = v.y;
+            As[kq + 2][r] = v.z;
+            As[kq + 3][r] = v.w;
+        }
+#pragma unroll
+        for (int j = 0; j < 128 * KC / 256; ++j) {  /* the weights: 128 rows of KC int8 */
+            const int e = tid + j * 256;
+            const int r = e / KC, k = e % KC;
+            const int o = o0 + r;
             Bs[k][r] = (o < out) ? (float)W[(size_t)o * in + k0 + k] : 0.0f;
         }
         __syncthreads();
 #pragma unroll
-        for (int k = 0; k < 16; ++k) {
-            float a[4], b[4];
+        for (int k = 0; k < KC; ++k) {
+            float a[8], b[8];
+            const float4 a0 = *reinterpret_cast<const float4*>(&As[k][ty * 8]), a1 = *reinterpret_cast<const float4*>(&As[k][ty * 8 + 4]);
+            const float4 b0 = *reinterpret_cast<const float4*>(&Bs[k][tx * 8]), b1 = *reinterpret_cast<const float4*>(&Bs[k][tx * 8 + 4]);
+            a[0] = a0.x;
+            a[1] = a0.y;
+            a[2] = a0.z;
+            a[3] = a0.w;
+            a[4] = a1.x;
+            a[5] = a1.y;
+            a[6] = a1.z;
+            a[7] = a1.w;
+            b[0] = b0.x;
+            b[1] = b0.y;
+            b[2] = b0.z;
+            b[3] = b0.w;
+            b[4] = b1.x;
+            b[5] = b1.y;
+            b[6] = b1.z;
+            b[7] = b1.w;
 #pragma unroll
-            for (int i = 0; i < 4; ++i) a[i] = As[k][ty * 4 + i];
+            for (int i = 0; i < 8; ++i)
 #pragma unroll
-            for (int j = 0; j < 4; ++j) b[j] = Bs[k][tx * 4 + j];
-#pragma unroll
-            for (int i = 0; i < 4; ++i)
-#pragma unroll
-                for (int j = 0; j < 4; ++j) acc[i][j] += a[i] * b[j];
+                for (int j = 0; j < 8; ++j) acc[i][j] += a[i] * b[j];
         }
         __syncthreads();
     }
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const int o = o0 + tx * 4 + j;
+    for (int j = 0; j < 8; ++j) {
+        const int o = o0 + tx * 8 + j;
         if (o >= out) continue;
         const float s = wscale[o];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const int t = t0 + ty * 4 + i;
+        for (int i = 0; i < 8; ++i) {
+            const int t = t0 + ty * 8 + i;
             if (t < T) y[(size_t)t * out + o] = s * acc[i][j];
         }
     }

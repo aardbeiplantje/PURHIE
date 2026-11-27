@@ -1,6 +1,6 @@
 # Project Plan: rocm-hip (Strix Halo, gfx1151)
 
-State as of 2026-11-26. This file holds open work only: the next steps, the open items with what is known about them, the
+State as of 2026-11-27. This file holds open work only: the next steps, the open items with what is known about them, the
 leads, the decisions that still matter, and the measured dead ends. Finished work is in git (the commit messages carry the
 numbers and the checks; this file before the 2026-11-26 pruning is PLAN.md at `7b85ea5`). Design: ARCHITECTURE.md.
 
@@ -12,12 +12,7 @@ run alone on the machine.
 
 1. **OCR: Nanonets-OCR2-3B (Qwen2.5-VL) on the engine** (item 20; the reference is done, 14 of 14 lines exact). Next: the
    vision tower and M-RoPE stage checks against `/data/ocr-ref/nanonets-doc`.
-2. **Qwen-Image 2.1: the image edit, its speed** (item 16; the engine's edit is verified, 2026-11-27: `qi21_edit`, the
-   stages against `tools/qwenimage21_edit_oracle.py`, on the BF16 file too; served as `POST /v1/images/edits` (2026-11-27,
-   checked by `t/73-qwenimage21.t`), and aicli's `generate_image` sends a picture of the workspace as `image`). A client that
-   leaves cancels its image (`t/75-qwenimage21-cancel.t`: the next image is accepted 4 s after the client left, where 40 steps take
-   about 30 s): `qi21_cancel`, checked at each step, the decoder not interrupted.
-3. **Waiting on the user:** the deployed service check (item 1); the design and the row format of the GLM prefill
+2. **Waiting on the user:** the deployed service check (item 1); the design and the row format of the GLM prefill
    snapshots (item 2).
 
 ## Status in brief
@@ -200,9 +195,17 @@ run alone on the machine.
     a unit of the memory policy, about 24 GB, loaded by its first request), the image made on a background thread (`qi21_start`,
     `qi21_poll`, `qi21_take`) while the answer waits in a pull response; 429 for a second image, 503 for the other device
     generators meanwhile; `t/73-qwenimage21.t` (17 checks). The harness's `generate_image` takes the model (aicli `f5a6efa`).
-    Open: the decoder's convolutions on hipBLASLt (about 7 s at 1024: `linear_bf16_f32`; Z-Image's VAE runs BF16 im2col and
-    calibrated algorithms); the text tokens' keys and values could be computed once (`causal_condition`; a few tokens of
-    thousands: small); the ComfyUI workflow runs 25 steps with `simple` and CFG 1 (its own sigmas: not checked).
+    Edit speed (2026-11-27; 1024 x 1024, BF16 file; the stages timed by `qi21_stages`, a step split by an instrumented copy of the
+    DiT): the vision tower 2.0 s, the text encoder over the 1024 image pads 8.7 s (was 11.7), the VAE encoder 0.5 s, the DiT prefix
+    (the condition's keys and values, once) 3.7 s, a step 3.55 s (the linears 2.15 s at hipBLASLt's about 27 TFLOPS; the attention
+    1.3 s: the condition doubles the keys to 8292, at about 12 TFLOPS; the copies 0.02 s), the decode 1.5 s. About 158 s for 40
+    steps (from the stage times; not run end to end), against 127 s for text to image. Done: `qi_linear_i8` on a 128 x 128 tile
+    with 32-wide k-chunks (bit-identical to the 64 x 64 kernel; 1.4 to 2.1 times faster on the text encoder's and the int8 DiT's
+    shapes), and the flash attention loads the next K and V tile before the products (bit-identical; 8 to 20% on its calls at
+    these shapes, but the 128-row tail call is slower: about 0.1 s a step in the pipeline). Open: `sd_flash_attn` keeps Q in 64
+    registers and spills 46 of 256 VGPRs (`-Rpass-analysis=kernel-resource-usage`); a kernel under the limit is the lever, worth
+    at most about 0.5 s a step. The text encoder runs at about 2 TFLOPS end to end (its int8 linears about 4). The ComfyUI workflow
+    runs 25 steps with `simple` and CFG 1 (its own sigmas: not checked).
     The image edit (2026-11-27): the condition image goes through the Qwen3-VL vision tower (`src/qwenimage21_vision.cpp`, all
     in FP32 with the BF16 weights read in place: a BF16 chain compounded to 10% over the 27 blocks), the text encoder with the
     image pads (`dev_text21_encode_vl`: the M-RoPE positions, the deepstack features after layers 0 to 2), the VAE encoder

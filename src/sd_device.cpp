@@ -713,7 +713,7 @@ void linear_convrot(const float* x, int T, const int8_t* W, const float* wscale,
     void* ha[] = {(void*)&x, (void*)&T, (void*)&in, (void*)&H, (void*)&xr};
     check(hip_launch(f_qi_hadamard, (unsigned)(in / 256), (unsigned)T, 1, 256, 1, 1, 0, nullptr, ha, nullptr), "qi_hadamard256");
     void* la[] = {(void*)&xr, (void*)&T, (void*)&W, (void*)&wscale, (void*)&in, (void*)&out, (void*)&y};
-    check(hip_launch(f_qi_linear_i8, (unsigned)((out + 63) / 64), (unsigned)((T + 63) / 64), 1, 256, 1, 1, 0, nullptr, la,
+    check(hip_launch(f_qi_linear_i8, (unsigned)((out + 127) / 128), (unsigned)((T + 127) / 128), 1, 256, 1, 1, 0, nullptr, la,
                                 nullptr),
           "qi_linear_i8");
     sync();
