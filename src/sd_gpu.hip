@@ -443,11 +443,11 @@ zq_rope_half(float* x, int T, int heads, const float* cs, const float* sn, long 
     v[p + P] = b * c + a * s0;
 }
 // causal attention with grouped KV heads: out[t][h][d] = softmax_j<=t(q[t][h] . k[j][h / (H / KVH)] / sqrt(128)) v[j][kvh][d].
-// One block per (query t, head h); the scores in dynamic shared memory (T floats: the launch passes 4 T bytes).
+// One block per (query t0 + blockIdx.x, head h); the scores in dynamic shared memory (t0 + gridDim.x floats: the launch passes them).
 extern "C" __global__ void __launch_bounds__(128)
-zq_causal_attn(const float* q, const float* k, const float* v, int T, int H, int KVH, float* out) {
+zq_causal_attn(const float* q, const float* k, const float* v, int T, int H, int KVH, int t0, float* out) {
     extern __shared__ float sc[];
-    const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    const int t = t0 + blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     const int D = 128, kvh = h / (H / KVH);
     const float scale = rsqrtf((float)D);
     const float* qv = q + ((long)t * H + h) * D;
@@ -1485,17 +1485,20 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) qv_rms16(const float* x
 // upsampling (qv_upsample2_tok's mapping), so the upsampled grid is never written. One block per row: the nine taps' channel rows
 // read (coalesced, two channels per 4-byte load) into shared memory (18 C bytes, dynamic), then the 9 C values written in order,
 // two per 4-byte store. C even.
+// mode 2: the encoder's downsampler (ZeroPad2d((0, 1, 0, 1)) then the 3 x 3 convolution of stride 2): the output grid H x W, the input
+// 2H x 2W, the taps (2h + dy, 2w + dx) for dy, dx in 0..2, zero past the right and bottom edges.
 extern "C" __global__ void __launch_bounds__(SD_THREADS)
-qv_patch16(const uint16_t* x, int H, int W, int C, int up2, int p0, int n, uint16_t* P) {
+qv_patch16(const uint16_t* x, int H, int W, int C, int mode, int p0, int n, uint16_t* P) {
     extern __shared__ uint32_t s2[];  /* 9 C BF16 values, as pairs */
     const uint16_t* s = reinterpret_cast<const uint16_t*>(s2);
     const int r = blockIdx.x;
     if (r >= n) return;
-    const int p = p0 + r, h = p / W, w = p % W, Wi = W >> up2, C2 = C / 2;
+    const int up2 = mode == 1, down2 = mode == 2;
+    const int p = p0 + r, h = p / W, w = p % W, Wi = down2 ? 2 * W : W >> up2, C2 = C / 2;
 #pragma unroll
     for (int t = 0; t < 9; ++t) {
-        const int ih = h + t / 3 - 1, iw = w + t % 3 - 1;
-        const bool in = ih >= 0 && ih < H && iw >= 0 && iw < W;
+        const int ih = down2 ? 2 * h + t / 3 : h + t / 3 - 1, iw = down2 ? 2 * w + t % 3 : w + t % 3 - 1;
+        const bool in = down2 ? ih < 2 * H && iw < 2 * W : ih >= 0 && ih < H && iw >= 0 && iw < W;
         const uint32_t* xr = reinterpret_cast<const uint32_t*>(x + (in ? ((long)(ih >> up2) * Wi + (iw >> up2)) * C : 0));
         for (int c = threadIdx.x; c < C2; c += SD_THREADS) {
             const uint32_t v = xr[c];
@@ -1509,6 +1512,65 @@ qv_patch16(const uint16_t* x, int H, int W, int C, int up2, int p0, int n, uint1
         const int j = 2 * q, c0 = j / 9, t0 = j % 9, c1 = (j + 1) / 9, t1 = (j + 1) % 9;
         o[q] = (uint32_t)s[t0 * C + c0] | ((uint32_t)s[t1 * C + c1] << 16);
     }
+}
+
+// Qwen-Image 2.1's encoder shortcut (AvgDown3D, one frame; token-major): y [Ho Wo][Cout] from x [2Ho 2Wo][Cin], factor_s 2 (or 1:
+// fs = 1, x [Ho Wo][Cin]) and factor_t ft (1, or 2: a zero frame padded in front of the one frame). The Cin ft fs^2 channels (c, t,
+// sh, sw) are averaged in consecutive groups of Cin ft fs^2 / Cout per output channel; a tap of the padded frame reads zero.
+extern "C" __global__ void __launch_bounds__(SD_THREADS)
+qv_avgdown(const float* x, int Ho, int Wo, int Cin, int Cout, int ft, int fs, float* y) {
+    const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (e >= (long)Ho * Wo * Cout) return;
+    const int o = (int)(e % Cout);
+    const long q = e / Cout;
+    const int ho = (int)(q / Wo), wo = (int)(q % Wo), per = ft * fs * fs, gs = Cin * per / Cout, Wi = Wo * fs;
+    float acc = 0.0f;
+    for (int g = 0; g < gs; ++g) {
+        const int j = o * gs + g, c = j / per, rem = j % per, t = rem / (fs * fs), sh = (rem % (fs * fs)) / fs, sw = rem % fs;
+        if (ft == 2 && t == 0) continue;
+        acc += x[((long)(ho * fs + sh) * Wi + (wo * fs + sw)) * Cin + c];
+    }
+    y[e] = acc / (float)gs;
+}
+
+// LayerNorm of each row x[t][C] with BF16 weight and bias (Qwen3-VL's vision tower; sd_layer_norm reads FP16): y = (x - mean)
+// rsqrt(var + eps) * w + b, biased variance
+extern "C" __global__ void __launch_bounds__(SD_THREADS)
+qv_layer_norm_bf16(const float* x, int C, const uint16_t* w, const uint16_t* b, float eps, float* y) {
+    __shared__ float red[SD_THREADS];
+    const float* xr = x + (long)blockIdx.x * C;
+    float* yr = y + (long)blockIdx.x * C;
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) s += xr[i];
+    const float mean = block_sum(s, red) / (float)C;
+    float q = 0.0f;
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) {
+        const float d = xr[i] - mean;
+        q += d * d;
+    }
+    const float inv = rsqrtf(block_sum(q, red) / (float)C + eps);
+    for (int i = threadIdx.x; i < C; i += SD_THREADS) yr[i] = (xr[i] - mean) * inv * bf2f(w[i]) + bf2f(b[i]);
+}
+
+// Qwen-Image 2.1's encoder conv_in (3 x 3, 4 input channels, 96 outputs; BF16 weights [96][4][3][3] read in place): the image
+// [4][H][W] (channel-major FP32) to y [H W][96] (token-major), zero padding 1, for the output pixels p0 .. p0 + n - 1 (one thread
+// per output value; n * 96 threads)
+extern "C" __global__ void __launch_bounds__(SD_THREADS)
+qv_conv_in4(const float* img, int H, int W, const uint16_t* w, const uint16_t* b, int p0, int n, float* y) {
+    const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
+    if (e >= (long)n * 96) return;
+    const int o = (int)(e % 96);
+    const long p = p0 + e / 96;
+    const int h = (int)(p / W), x = (int)(p % W);
+    float acc = bf2f(b[o]);
+    for (int c = 0; c < 4; ++c)
+        for (int ky = 0; ky < 3; ++ky)
+            for (int kx = 0; kx < 3; ++kx) {
+                const int yy = h + ky - 1, xx = x + kx - 1;
+                if (yy >= 0 && yy < H && xx >= 0 && xx < W)
+                    acc += img[((long)c * H + yy) * W + xx] * bf2f(w[((o * 4 + c) * 3 + ky) * 3 + kx]);
+            }
+    y[p * 96 + o] = acc;
 }
 
 // y[r][c] = y16[r][c] + b[c] (+ res[r][c]): the BF16 product back in FP32 with the BF16 bias and, when res is given, the residual
@@ -1638,13 +1700,14 @@ extern "C" __global__ void __launch_bounds__(SD_THREADS) qi21_gated_add(float* h
     h[e] += tanhf(g[e]) * y[e];
 }
 
-// The text queries of Qwen-Image 2.1's attention: query i (i < L) sees the keys 0..i (causal among the text). q, k, v, out: [J][heads][128]
-// (only the first L rows are read and written). One thread per (query, head): L * heads threads, a few keys each.
+// The text queries of Qwen-Image 2.1's attention: query i (r0 <= i < r0 + n) sees the keys 0..i (causal; the condition images before
+// it included). q, k, v, out: [rows][heads][128] (the rows r0..r0 + n of q and out, the keys 0..r0 + n - 1). One thread per (query,
+// head): n * heads threads.
 extern "C" __global__ void __launch_bounds__(SD_THREADS)
-qi21_attn(const float* q, const float* k, const float* v, int J, int L, int heads, float* out) {
+qi21_attn(const float* q, const float* k, const float* v, int r0, int n, int heads, float* out) {
     const long e = (long)blockIdx.x * SD_THREADS + threadIdx.x;
-    if (e >= (long)L * heads) return;
-    const int i = (int)(e / heads), h = (int)(e % heads);
+    if (e >= (long)n * heads) return;
+    const int i = r0 + (int)(e / heads), h = (int)(e % heads);
     const int D = 128;
     const float scale = rsqrtf((float)D);
     const int kmax = i + 1;

@@ -91,12 +91,12 @@ bool load_conv(const zimage::SafeTensors& st, const std::string& prefix, int cin
     return bf(st, prefix + ".weight", (size_t)cout * cin * k, c.W) && bf(st, prefix + ".bias", (size_t)cout, c.b);
 }
 
-/* y [H W][cout] = conv(x16) + b (+ res: another buffer than y) for the BF16 input x16 ([H W][cin]; up2: [(H / 2) (W / 2)][cin], read
- * through the nearest 2x upsampling). The rows per product are fixed by the patch width (kChunk16 values, a multiple of 64 rows), the
+/* y [H W][cout] = conv(x16) + b (+ res: another buffer than y) for the BF16 input x16 ([H W][cin]; pm 1: [(H / 2) (W / 2)][cin], read
+ * through the nearest 2x upsampling; pm 2: [2H 2W][cin], the encoder's stride-2 downsampler). The rows per product are fixed by the patch width (kChunk16 values, a multiple of 64 rows), the
  * last product ending at the last row (it overlaps its neighbour, whose rows it writes again with the same values: one shape per
  * layer, tuned once, and the same shape at every image size for the larger layers). A product hipBLASLt does not take is the
  * qi21_linear_bf16 kernel's on the widened patches, rounded as hipBLASLt's. */
-void conv(const uint16_t* x16, int H, int W, bool up2, const Conv& c, const float* res, float* y) {
+void conv(const uint16_t* x16, int H, int W, int pm, const Conv& c, const float* res, float* y) {
     const int HW = H * W;
     const int K = c.mode == 0 ? c.cin : 9 * c.cin;
     const int rows = std::min(HW, std::max(64, (int)(kChunk16 / (size_t)K) / 64 * 64));
@@ -105,7 +105,7 @@ void conv(const uint16_t* x16, int H, int W, bool up2, const Conv& c, const floa
         const int s = std::min(p0, HW - rows);
         const uint16_t* in = x16 + (size_t)s * c.cin;
         if (c.mode != 0) {
-            sddev::patches_bf16(x16, H, W, c.cin, up2, s, rows, P.get());
+            sddev::patches_bf16(x16, H, W, c.cin, pm, s, rows, P.get());
             in = P.get();
         }
         if (!sddev::linear_blt16(in, rows, c.W, K, c.cout, Y.get())) {
@@ -132,7 +132,7 @@ bool resnet(const zimage::SafeTensors& st, const std::string& p, const float* x,
         Buf16 h16((size_t)HW * cin);
         sddev::rms_tok_bf16(x, HW, cin, g1, true, h16.get());
         DevBuf a((size_t)HW * cout);
-        conv(h16.get(), H, W, false, c1, nullptr, a.get());
+        conv(h16.get(), H, W, 0, c1, nullptr, a.get());
         sddev::rms_tok_bf16(a.get(), HW, cout, g2, true, a16.get());
     }
     out = DevBuf((size_t)HW * cout);
@@ -141,11 +141,11 @@ bool resnet(const zimage::SafeTensors& st, const std::string& p, const float* x,
         {
             Buf16 x16((size_t)HW * cin);
             sddev::to_bf16(x, x16.get(), (size_t)HW * cin);
-            conv(x16.get(), H, W, false, sc, nullptr, s.get());
+            conv(x16.get(), H, W, 0, sc, nullptr, s.get());
         }
-        conv(a16.get(), H, W, false, c2, s.get(), out.get());
+        conv(a16.get(), H, W, 0, c2, s.get(), out.get());
     } else {
-        conv(a16.get(), H, W, false, c2, x, out.get());
+        conv(a16.get(), H, W, 0, c2, x, out.get());
     }
     return true;
 }
@@ -170,7 +170,7 @@ bool attention_block(const zimage::SafeTensors& st, const std::string& p, const 
             ci.b = bq + (size_t)i * C;
             ci.cin = C;
             ci.cout = C;
-            conv(n16.get(), H, W, false, ci, nullptr, qkv[i]);
+            conv(n16.get(), H, W, 0, ci, nullptr, qkv[i]);
         }
     }
     DevBuf o((size_t)HW * C);
@@ -183,7 +183,7 @@ bool attention_block(const zimage::SafeTensors& st, const std::string& p, const 
     Buf16 o16((size_t)HW * C);
     sddev::to_bf16(o.get(), o16.get(), (size_t)HW * C);
     out = DevBuf((size_t)HW * C);
-    conv(o16.get(), H, W, false, pj, x, out.get());
+    conv(o16.get(), H, W, 0, pj, x, out.get());
     return true;
 }
 
@@ -208,9 +208,9 @@ bool dev_vae21_decode(const zimage::SafeTensors& st, const float* latent, int gh
         Buf16 z16((size_t)H0 * W0 * C0), y16((size_t)H0 * W0 * C0);
         DevBuf y((size_t)H0 * W0 * C0);
         sddev::to_bf16(z.get(), z16.get(), (size_t)H0 * W0 * C0);
-        conv(z16.get(), H0, W0, false, pq, nullptr, y.get());
+        conv(z16.get(), H0, W0, 0, pq, nullptr, y.get());
         sddev::to_bf16(y.get(), y16.get(), (size_t)H0 * W0 * C0);
-        conv(y16.get(), H, W, false, cin_conv, nullptr, x.get());
+        conv(y16.get(), H, W, 0, cin_conv, nullptr, x.get());
     }
 
     /* the middle: resnet, attention, resnet (gh x gw, 1152 channels) */
@@ -253,7 +253,7 @@ bool dev_vae21_decode(const zimage::SafeTensors& st, const float* latent, int gh
         H *= 2;
         W *= 2;
         x = DevBuf((size_t)H * W * oc);
-        conv(cur16.get(), H, W, true, uc, sc.get(), x.get());
+        conv(cur16.get(), H, W, 1, uc, sc.get(), x.get());
     }
 
     /* the head: RMS norm (144), SiLU, the 3 x 3 conv to 4 channels */
@@ -265,7 +265,7 @@ bool dev_vae21_decode(const zimage::SafeTensors& st, const float* latent, int gh
         Buf16 hn16((size_t)H * W * 144);
         sddev::rms_tok_bf16(x.get(), H * W, 144, gamma, true, hn16.get());
         x = DevBuf();
-        conv(hn16.get(), H, W, false, head, nullptr, o.get());
+        conv(hn16.get(), H, W, 0, head, nullptr, o.get());
     }
 
     /* token-major [h][w][4] to channel-major [4][H][W], clamped */
@@ -274,6 +274,79 @@ bool dev_vae21_decode(const zimage::SafeTensors& st, const float* latent, int gh
     for (int c = 0; c < 4; ++c)
         for (int p = 0; p < H * W; ++p) out[(size_t)c * H * W + p] = std::min(1.0f, std::max(-1.0f, tok[(size_t)p * 4 + c]));
     return H == 16 * H0 && W == 16 * W0;
+}
+
+bool dev_vae21_encode(const zimage::SafeTensors& st, const float* image, int H, int W, float* latent) {
+    if (!sddev::enabled()) { fprintf(stderr, "qwenimage21 vae: no device\n"); return false; }
+    if (H < 16 || W < 16 || H % 16 || W % 16) { fprintf(stderr, "qwenimage21 vae: the image must be a multiple of 16\n"); return false; }
+    /* conv_in (encoder.conv1, 3 x 3 of the frame, 4 -> 96): the four input channels are too few for the patch route, so the
+     * channel-major convolution of the image, then token-major */
+    const uint16_t *w_in = nullptr, *b_in = nullptr;
+    if (!bf(st, "encoder.conv1.weight", (size_t)96 * 4 * 9, w_in) || !bf(st, "encoder.conv1.bias", 96, b_in)) return false;
+    DevBuf x((size_t)H * W * 96);
+    {
+        DevBuf img((size_t)4 * H * W);
+        std::memcpy(img.get(), image, sizeof(float) * (size_t)4 * H * W);
+        sddev::conv_in4_tok(img.get(), H, W, w_in, b_in, x.get());
+    }
+    /* the down blocks (in, out, factor_t of the shortcut; the last keeps the size): two resnets, then (blocks 0 to 3) the stride-2
+     * convolution, plus the average-down shortcut of the block's input (the last block: its input itself). The temporal
+     * downsamplers' time_conv does not run on the first (only) frame. */
+    const int blk_in[5] = {96, 96, 192, 384, 768}, blk_out[5] = {96, 192, 384, 768, 768}, factor_t[5] = {1, 2, 2, 2, 1};
+    for (int b = 0; b < 5; ++b) {
+        const std::string base = "encoder.downsamples." + std::to_string(b) + ".downsamples.";
+        DevBuf xin = std::move(x), cur;
+        const float* src = xin.get();
+        for (int j = 0; j < 2; ++j) {
+            DevBuf r;
+            if (!resnet(st, base + std::to_string(j), src, H, W, j == 0 ? blk_in[b] : blk_out[b], blk_out[b], r)) return false;
+            cur = std::move(r);
+            src = cur.get();
+        }
+        const int oc = blk_out[b];
+        if (b == 4) {
+            x = DevBuf((size_t)H * W * oc);
+            sddev::avgdown_tok(xin.get(), H, W, blk_in[b], oc, 1, 1, x.get());
+            sddev::add(x.get(), cur.get(), (size_t)H * W * oc);
+            continue;
+        }
+        Conv dc;
+        if (!load_conv(st, base + "2.resample.1", oc, oc, 1, dc)) return false;
+        const int Ho = H / 2, Wo = W / 2;
+        DevBuf sc((size_t)Ho * Wo * oc);
+        sddev::avgdown_tok(xin.get(), Ho, Wo, blk_in[b], oc, factor_t[b], 2, sc.get());
+        xin = DevBuf();
+        Buf16 cur16((size_t)H * W * oc);
+        sddev::to_bf16(cur.get(), cur16.get(), (size_t)H * W * oc);
+        cur = DevBuf();
+        H = Ho;
+        W = Wo;
+        x = DevBuf((size_t)H * W * oc);
+        conv(cur16.get(), H, W, 2, dc, sc.get(), x.get());
+    }
+    /* the middle: resnet, attention, resnet (768 channels) */
+    DevBuf r1, a1, r2;
+    if (!resnet(st, "encoder.middle.0", x.get(), H, W, 768, 768, r1)) return false;
+    if (!attention_block(st, "encoder.middle.1", r1.get(), H, W, 768, a1)) return false;
+    if (!resnet(st, "encoder.middle.2", a1.get(), H, W, 768, 768, r2)) return false;
+    /* the head: RMS norm, SiLU, the 3 x 3 conv to 128 (the mean and the log-variance), then quant_conv (the file's conv1, 1 x 1) */
+    const uint16_t* gamma = nullptr;
+    Conv head, qc;
+    if (!bf(st, "encoder.head.0.gamma", 768, gamma) || !load_conv(st, "encoder.head.2", 768, 128, 1, head) ||
+        !load_conv(st, "conv1", 128, 128, 0, qc))
+        return false;
+    DevBuf h((size_t)H * W * 128), q((size_t)H * W * 128);
+    {
+        Buf16 n16((size_t)H * W * 768), h16((size_t)H * W * 128);
+        sddev::rms_tok_bf16(r2.get(), H * W, 768, gamma, true, n16.get());
+        conv(n16.get(), H, W, 0, head, nullptr, h.get());
+        sddev::to_bf16(h.get(), h16.get(), (size_t)H * W * 128);
+        conv(h16.get(), H, W, 0, qc, nullptr, q.get());
+    }
+    /* the mean (the first 64 channels: the distribution's mode), normalised ((z - mean) / std), token-major: the packed latent */
+    for (int p = 0; p < H * W; ++p)
+        for (int c = 0; c < 64; ++c) latent[(size_t)p * 64 + c] = (q.get()[(size_t)p * 128 + c] - kMean[c]) / kStd[c];
+    return true;
 }
 
 }  // namespace qwenimage21

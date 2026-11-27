@@ -46,7 +46,7 @@ hipFunction_t f_audio_gemm = nullptr, f_audio_ln = nullptr, f_audio_attn = nullp
 hipFunction_t f_gemm_ah = nullptr, f_gemm_af = nullptr, f_im2col = nullptr, f_gn_sum = nullptr, f_gn_sq = nullptr,
               f_gn_apply = nullptr, f_silu = nullptr, f_add = nullptr, f_upsample2 = nullptr, f_softmax = nullptr,
               f_layer_norm = nullptr, f_rms_norm = nullptr, f_zm_modulate = nullptr, f_zm_gate_add = nullptr, f_zm_swiglu = nullptr, f_zm_rope = nullptr, f_zm_ln_plain = nullptr, f_gn_f32 = nullptr, f_to_tok = nullptr, f_to_chw = nullptr, f_zq_rope = nullptr, f_zq_attn = nullptr, f_geglu = nullptr, f_gemm_bf = nullptr, f_gemm_wmma = nullptr, f_gemm_wmma128 = nullptr, f_softmax_bf16w = nullptr, f_flash = nullptr, f_gemm_wmma256 = nullptr, f_gemm_wmma256b = nullptr, f_gemm_wmma128bb = nullptr, f_transpose_pad_bf16 = nullptr,
-              f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr, f_qi_linear_f8 = nullptr, f_qi_rms_f8 = nullptr, f_qi_affine = nullptr, f_qi_gelu = nullptr, f_qv_rms = nullptr, f_qv_patch = nullptr, f_qv_bias = nullptr, f_qv_upsample = nullptr, f_qi_hadamard = nullptr, f_qi_linear_i8 = nullptr, f_qi21_zc = nullptr, f_qi21_gather = nullptr, f_qi21_mul = nullptr, f_qi21_gated = nullptr, f_qi21_attn = nullptr, f_qi21_lbf = nullptr, f_qi21_dupup = nullptr, f_gemm_af128 = nullptr, f_transpose_bf16 = nullptr, f_bias_cm = nullptr, f_zm_rms_mod_bf16 = nullptr, f_zm_swiglu_bf16 = nullptr, f_bf16_to_f32 = nullptr, f_round_bf16 = nullptr, f_gn_sum_part = nullptr, f_gn_var_part = nullptr, f_gn_apply_part = nullptr, f_im2col_bf16_tile = nullptr, f_hnr16 = nullptr, f_count_diff = nullptr, f_tp16 = nullptr, f_rga16 = nullptr, f_sw16 = nullptr, f_qv_patch16 = nullptr, f_qv_from16b = nullptr, f_qv_rms16 = nullptr;
+              f_to_bf16 = nullptr, f_transpose_pad = nullptr, f_softmax_bf16 = nullptr, f_qi_linear_f8 = nullptr, f_qi_rms_f8 = nullptr, f_qi_affine = nullptr, f_qi_gelu = nullptr, f_qv_rms = nullptr, f_qv_patch = nullptr, f_qv_bias = nullptr, f_qv_upsample = nullptr, f_qi_hadamard = nullptr, f_qi_linear_i8 = nullptr, f_qi21_zc = nullptr, f_qi21_gather = nullptr, f_qi21_mul = nullptr, f_qi21_gated = nullptr, f_qi21_attn = nullptr, f_qi21_lbf = nullptr, f_qi21_dupup = nullptr, f_gemm_af128 = nullptr, f_transpose_bf16 = nullptr, f_bias_cm = nullptr, f_zm_rms_mod_bf16 = nullptr, f_zm_swiglu_bf16 = nullptr, f_bf16_to_f32 = nullptr, f_round_bf16 = nullptr, f_gn_sum_part = nullptr, f_gn_var_part = nullptr, f_gn_apply_part = nullptr, f_im2col_bf16_tile = nullptr, f_hnr16 = nullptr, f_count_diff = nullptr, f_tp16 = nullptr, f_rga16 = nullptr, f_sw16 = nullptr, f_qv_patch16 = nullptr, f_qv_avgdown = nullptr, f_qv_lnb = nullptr, f_qv_convin4 = nullptr, f_qv_from16b = nullptr, f_qv_rms16 = nullptr;
 
 hipFunction_t f_ss_affine = nullptr, f_ss_gate_add = nullptr, f_ss_head_norm_rope = nullptr; hipFunction_t f_sp_hash_insert = nullptr, f_sp_neighbor_map = nullptr, f_sp_subm_conv_f16w = nullptr; hipFunction_t f_sp_c2s_mask = nullptr, f_sp_exclusive_scan_serial = nullptr, f_sp_c2s_fill = nullptr, f_sp_c2s_gather = nullptr; hipFunction_t f_simp_qem = nullptr, f_simp_cost = nullptr, f_simp_propagate = nullptr, f_simp_collapse = nullptr, f_simp_compress_v = nullptr, f_simp_compress_f = nullptr; hipFunction_t f_chart_face_geom = nullptr, f_chart_cones = nullptr, f_chart_perims = nullptr, f_chart_costs = nullptr, f_chart_propagate = nullptr, f_chart_collapse = nullptr, f_chart_refine = nullptr;
 hipFunction_t f_attn_flash128 = nullptr, f_attn_flash64 = nullptr;
@@ -126,7 +126,7 @@ bool init() {
         const char* name;
     };
     const Entry entries[] = {
-        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"}, {&f_gemm_af128, "sd_gemm_af128"}, {&f_transpose_bf16, "sd_transpose_bf16"}, {&f_bias_cm, "sd_bias_cm"}, {&f_zm_rms_mod_bf16, "zimage_rms_mod_bf16"}, {&f_zm_swiglu_bf16, "zimage_swiglu_bf16"}, {&f_bf16_to_f32, "sd_bf16_to_f32"}, {&f_round_bf16, "sd_round_bf16"}, {&f_gn_sum_part, "zimage_gn_sum"}, {&f_gn_var_part, "zimage_gn_var"}, {&f_gn_apply_part, "zimage_gn_apply"}, {&f_im2col_bf16_tile, "sd_im2col_bf16_tile"}, {&f_hnr16, "zimage_head_norm_rope_bf16"}, {&f_count_diff, "sd_count_diff"}, {&f_tp16, "zimage_transpose_pad_bf16_in"}, {&f_rga16, "zimage_rms_gate_add_bf16"}, {&f_sw16, "zimage_swiglu_bf16_in"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_gemm_wmma256, "sd_gemm_wmma256"}, {&f_gemm_wmma256b, "sd_gemm_wmma256b"}, {&f_flash, "sd_flash_attn"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"}, {&f_qi_linear_f8, "qi_linear_f8"}, {&f_qi_rms_f8, "qi_rms_norm_f8"}, {&f_qi_affine, "qi_affine"}, {&f_qi_gelu, "qi_gelu_tanh"}, {&f_qv_rms, "qv_rms_tok"}, {&f_qv_patch, "qv_patch"}, {&f_qv_patch16, "qv_patch16"}, {&f_qv_rms16, "qv_rms16"}, {&f_qv_from16b, "qv_from16_bias"}, {&f_qv_bias, "qv_bias_tok"}, {&f_qv_upsample, "qv_upsample2_tok"}, {&f_qi_hadamard, "qi_hadamard256"}, {&f_qi_linear_i8, "qi_linear_i8"}, {&f_qi21_zc, "qi21_zc_rms"}, {&f_qi21_gather, "qi21_gather_mod"}, {&f_qi21_mul, "qi21_mul_1p"}, {&f_qi21_gated, "qi21_gated_add"}, {&f_qi21_attn, "qi21_attn"}, {&f_qi21_lbf, "qi21_linear_bf16"}, {&f_qi21_dupup, "qi21_dupup"},
+        {&f_gemm_ah, "sd_gemm_ah"},     {&f_gemm_af, "sd_gemm_af"}, {&f_gemm_af128, "sd_gemm_af128"}, {&f_transpose_bf16, "sd_transpose_bf16"}, {&f_bias_cm, "sd_bias_cm"}, {&f_zm_rms_mod_bf16, "zimage_rms_mod_bf16"}, {&f_zm_swiglu_bf16, "zimage_swiglu_bf16"}, {&f_bf16_to_f32, "sd_bf16_to_f32"}, {&f_round_bf16, "sd_round_bf16"}, {&f_gn_sum_part, "zimage_gn_sum"}, {&f_gn_var_part, "zimage_gn_var"}, {&f_gn_apply_part, "zimage_gn_apply"}, {&f_im2col_bf16_tile, "sd_im2col_bf16_tile"}, {&f_hnr16, "zimage_head_norm_rope_bf16"}, {&f_count_diff, "sd_count_diff"}, {&f_tp16, "zimage_transpose_pad_bf16_in"}, {&f_rga16, "zimage_rms_gate_add_bf16"}, {&f_sw16, "zimage_swiglu_bf16_in"},     {&f_im2col, "sd_im2col"}, {&f_gemm_bf, "sd_gemm_bf"}, {&f_gemm_wmma, "sd_gemm_wmma"}, {&f_gemm_wmma128, "sd_gemm_wmma128"}, {&f_gemm_wmma128bb, "sd_gemm_wmma128bb"}, {&f_gemm_wmma256, "sd_gemm_wmma256"}, {&f_gemm_wmma256b, "sd_gemm_wmma256b"}, {&f_flash, "sd_flash_attn"}, {&f_transpose_pad_bf16, "sd_transpose_pad_bf16"}, {&f_to_bf16, "sd_to_bf16"}, {&f_qi_linear_f8, "qi_linear_f8"}, {&f_qi_rms_f8, "qi_rms_norm_f8"}, {&f_qi_affine, "qi_affine"}, {&f_qi_gelu, "qi_gelu_tanh"}, {&f_qv_rms, "qv_rms_tok"}, {&f_qv_patch, "qv_patch"}, {&f_qv_patch16, "qv_patch16"}, {&f_qv_avgdown, "qv_avgdown"}, {&f_qv_lnb, "qv_layer_norm_bf16"}, {&f_qv_convin4, "qv_conv_in4"}, {&f_qv_rms16, "qv_rms16"}, {&f_qv_from16b, "qv_from16_bias"}, {&f_qv_bias, "qv_bias_tok"}, {&f_qv_upsample, "qv_upsample2_tok"}, {&f_qi_hadamard, "qi_hadamard256"}, {&f_qi_linear_i8, "qi_linear_i8"}, {&f_qi21_zc, "qi21_zc_rms"}, {&f_qi21_gather, "qi21_gather_mod"}, {&f_qi21_mul, "qi21_mul_1p"}, {&f_qi21_gated, "qi21_gated_add"}, {&f_qi21_attn, "qi21_attn"}, {&f_qi21_lbf, "qi21_linear_bf16"}, {&f_qi21_dupup, "qi21_dupup"},
         {&f_audio_gemm, "audio_gemm_f32"}, {&f_audio_ln, "audio_ln_affine_f32"}, {&f_audio_attn, "audio_causal_attn_f32"},
         {&f_audio_attn_g, "audio_attn_f32"}, {&f_audio_gelu_erf, "audio_gelu_erf_f32"}, {&f_audio_rms, "audio_rms_f32"}, {&f_audio_gelu_mul, "audio_gelu_tanh_mul_f32"}, {&f_audio_add_channel, "audio_add_channel_f32"}, {&f_audio_copy, "audio_copy_f32"},
         {&f_audio_conv1d, "audio_conv1d_f32"}, {&f_audio_convt1d, "audio_conv_transpose1d_f32"}, {&f_audio_leaky, "audio_leaky_relu_f32"},
@@ -660,11 +660,33 @@ void rms_tok_bf16(const float* x, int HW, int C, const uint16_t* g, bool silu, u
     sync();
 }
 
-void patches_bf16(const uint16_t* x16, int H, int W, int C, bool up2, int p0, int n, uint16_t* P16) {
-    if (C % 2 != 0 || (up2 && (H % 2 != 0 || W % 2 != 0))) throw std::runtime_error("patches_bf16: odd channels or grid");
-    int u = up2 ? 1 : 0;
+void patches_bf16(const uint16_t* x16, int H, int W, int C, int mode, int p0, int n, uint16_t* P16) {
+    if (C % 2 != 0 || (mode == 1 && (H % 2 != 0 || W % 2 != 0)) || mode < 0 || mode > 2)
+        throw std::runtime_error("patches_bf16: odd channels or grid, or a bad mode");
+    int u = mode;
     void* a[] = {(void*)&x16, (void*)&H, (void*)&W, (void*)&C, (void*)&u, (void*)&p0, (void*)&n, (void*)&P16};
     check(hip_launch(f_qv_patch16, (unsigned)n, 1, 1, kThreads, 1, 1, (unsigned)(18 * C), nullptr, a, nullptr), "qv_patch16");
+    sync();
+}
+
+void conv_in4_tok(const float* img, int H, int W, const uint16_t* w, const uint16_t* b, float* y) {
+    const long pix = (long)H * W;
+    const long rows = std::max<long>(1, (16L << 20) / 96);  /* about 16M values per launch (AGENTS.md: short launches) */
+    for (long p0 = 0; p0 < pix; p0 += rows) {
+        const int n = (int)std::min<long>(rows, pix - p0);
+        int hh = H, ww = W, pp = (int)p0, nn = n;
+        const float* im = img;
+        void* a[] = {(void*)&im, (void*)&hh, (void*)&ww, (void*)&w, (void*)&b, (void*)&pp, (void*)&nn, (void*)&y};
+        launch(f_qv_convin4, dim3((unsigned)(((long)n * 96 + kThreads - 1) / kThreads), 1, 1), a);
+        sync();
+    }
+}
+
+void avgdown_tok(const float* x, int Ho, int Wo, int Cin, int Cout, int ft, int fs, float* y) {
+    if ((Cin * ft * fs * fs) % Cout != 0) throw std::runtime_error("avgdown_tok: the channels do not group");
+    long n = (long)Ho * Wo * Cout;
+    void* a[] = {(void*)&x, (void*)&Ho, (void*)&Wo, (void*)&Cin, (void*)&Cout, (void*)&ft, (void*)&fs, (void*)&y};
+    launch(f_qv_avgdown, dim3((unsigned)((n + kThreads - 1) / kThreads), 1, 1), a);
     sync();
 }
 
@@ -744,11 +766,23 @@ void dupup(const float* x, int H, int W, int in, int out, int factor_t, float* y
     sync();
 }
 
+void attn21_causal(const float* q, const float* k, const float* v, int r0, int n, int heads, float* out) {
+    /* in launches of at most about 256K query-key pairs per head (one thread per row and head walks its keys) */
+    for (int a = r0; a < r0 + n;) {
+        int m = 0;
+        for (long pairs = 0; a + m < r0 + n && (m == 0 || pairs + a + m + 1 <= (256L << 10)); ++m) pairs += a + m + 1;
+        long cnt = (long)m * heads;
+        int s0 = a;
+        void* args[] = {(void*)&q, (void*)&k, (void*)&v, (void*)&s0, (void*)&m, (void*)&heads, (void*)&out};
+        launch(f_qi21_attn, dim3((unsigned)((cnt + kThreads - 1) / kThreads), 1, 1), args);
+        sync();
+        a += m;
+    }
+}
+
 void attn21_text(const float* q, const float* k, const float* v, int J, int L, int heads, float* out) {
-    long n = (long)L * heads;
-    void* a[] = {(void*)&q, (void*)&k, (void*)&v, (void*)&J, (void*)&L, (void*)&heads, (void*)&out};
-    launch(f_qi21_attn, dim3((unsigned)((n + kThreads - 1) / kThreads), 1, 1), a);
-    sync();
+    (void)J;
+    attn21_causal(q, k, v, 0, L, heads, out);
 }
 
 /* Device-only scratch: hipMalloc memory for a buffer the host never reads or writes (the BF16 copy of a large linear's input).
@@ -1347,9 +1381,19 @@ void rope_half(float* x, int T, int heads, const float* cos, const float* sin) {
 }
 
 void causal_attn(const float* q, const float* k, const float* v, int T, int H, int KVH, float* out) {
-    void* a[] = {(void*)&q, (void*)&k, (void*)&v, (void*)&T, (void*)&H, (void*)&KVH, (void*)&out};
-    check(hip_launch(f_zq_attn, (unsigned)T, (unsigned)H, 1, 128, 1, 1, (unsigned)(sizeof(float) * (size_t)T), nullptr, a, nullptr), "causal attention");
-    sync();
+    /* the scores of a row in shared memory: at most 16384 keys (64 KB) */
+    if (T > 16384) throw std::runtime_error("sd device: causal attention of more than 16384 tokens");
+    /* the query rows in launches of about 512K query-key pairs (about 20 ms at 32 heads), each launch's work growing with its rows */
+    for (int t0 = 0; t0 < T;) {
+        int n = 0;
+        for (long pairs = 0; t0 + n < T && (n == 0 || pairs + t0 + n + 1 <= (512L << 10)); ++n) pairs += t0 + n + 1;
+        int tt = T, hh = H, kk = KVH, s0 = t0;
+        void* a[] = {(void*)&q, (void*)&k, (void*)&v, (void*)&tt, (void*)&hh, (void*)&kk, (void*)&s0, (void*)&out};
+        check(hip_launch(f_zq_attn, (unsigned)n, (unsigned)H, 1, 128, 1, 1, (unsigned)(sizeof(float) * (size_t)(t0 + n)), nullptr, a, nullptr),
+              "causal attention");
+        sync();
+        t0 += n;
+    }
 }
 
 void to_tokens(const float* x, int C, int HW, float* y) {
@@ -1609,6 +1653,12 @@ void rope(float* q, int T, int heads, const float* fr) {
 void rms_norm(const float* x, int T, int C, const uint16_t* w, float eps, float* y) {
     void* a[] = {(void*)&x, (void*)&C, (void*)&w, (void*)&eps, (void*)&y};
     launch(f_rms_norm, dim3((unsigned)T, 1, 1), a);
+    sync();
+}
+
+void layer_norm_bf16(const float* x, int T, int C, const uint16_t* w, const uint16_t* b, float eps, float* y) {
+    void* a[] = {(void*)&x, (void*)&C, (void*)&w, (void*)&b, (void*)&eps, (void*)&y};
+    launch(f_qv_lnb, dim3((unsigned)T, 1, 1), a);
     sync();
 }
 

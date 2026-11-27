@@ -10,8 +10,9 @@ run alone on the machine.
 
 ## ▶ Next
 
-1. **Qwen-Image 2.1: the image edit** (item 16; the text-to-image model is served since 2026-11-26, its BF16 chain done):
-   the reference image's conditioning, its oracle, an edit route.
+1. **Qwen-Image 2.1: the image edit's server route** (item 16; the engine's edit is verified, 2026-11-27: `qi21_edit`, the
+   stages against `tools/qwenimage21_edit_oracle.py`). Open: an HTTP route with the condition image (it needs aicli's
+   `generate_image` to send the image: ask first), and its speed (the int8 file: about 65 s at 512 x 512, 8 steps).
 2. **Waiting on the user:** the deployed service check (item 1); the design and the row format of the GLM prefill
    snapshots (item 2).
 
@@ -117,7 +118,10 @@ run alone on the machine.
 
 13. **The Perl suite on the 122B.** `t/10` and `t/15` fail with `hipHostRegister failed (-3)` on an in-process load of the
     122B (the server's load of the same file works); `t/65-models-dir` hung once on a server (killed); `t/70-stage` ran for
-    hours (killed). The cause of the `hipHostRegister` failure is not known.
+    hours (killed). The cause of the `hipHostRegister` failure is not known. Lead (2026-11-27): a process can hold about 29 GiB
+    registered (`hipHostRegister` answers invalid argument past it; measured with 1 GB chunks on this host). A registration is
+    given back only by `hipHostUnregister` (not by the unmap), so a model's files must be unregistered when it is unloaded
+    (fixed for `SafeTensors`: its destructor unregisters). Check whether the 122B's in-process load registers more than that.
 
 14. **`--parallel 2` and a second big model (122B).** A server under `--parallel 2` that loads one 122B-sized file and then
     another (alpha, beta, alpha under `--models-max 1`) fails at beta's load: `hipHostRegister of 66353926592 bytes (a GGUF
@@ -192,10 +196,18 @@ run alone on the machine.
     generators meanwhile; `t/73-qwenimage21.t` (17 checks). The harness's `generate_image` takes the model (aicli `f5a6efa`).
     Open: the decoder's convolutions on hipBLASLt (about 7 s at 1024: `linear_bf16_f32`; Z-Image's VAE runs BF16 im2col and
     calibrated algorithms); the text tokens' keys and values could be computed once (`causal_condition`; a few tokens of
-    thousands: small); the ComfyUI workflow runs 25 steps with `simple` and CFG 1 (its own sigmas: not checked). Then the edit: no reference-image input and no edit
-    route exist; needs the edit conditioning in the 2.1 DiT (how the reference image enters, confirmed against the
-    reference edit pipeline), a stage check against its python oracle, and a server route. The ComfyUI edit workflow is in
-    the uploads (`image_qwen_image_2_1_image_edit`), with the Edit Lightning LoRA.
+    thousands: small); the ComfyUI workflow runs 25 steps with `simple` and CFG 1 (its own sigmas: not checked).
+    The image edit (2026-11-27): the condition image goes through the Qwen3-VL vision tower (`src/qwenimage21_vision.cpp`, all
+    in FP32 with the BF16 weights read in place: a BF16 chain compounded to 10% over the 27 blocks), the text encoder with the
+    image pads (`dev_text21_encode_vl`: the M-RoPE positions, the deepstack features after layers 0 to 2), the VAE encoder
+    (`dev_vae21_encode`: conv_in on BF16 weights in place, the residual down blocks with the average-down shortcut), and the DiT
+    with the condition's tokens (`Dit21`: the prefix of text and condition keys and values once, each step the target's rows).
+    Image pixels: `condition_pixels` (composited over white), the resize of `resize_condition` in Pillow's fixed point
+    (`trellis::resize_pillow8`: exact against Pillow 13). `qi21_edit`, `qi21_start_edit`, `qi21_edit_size`. The check
+    `tests/qwenimage21_edit_verify.cpp` (512 x 512 from the red cube, 8 steps): the vision tower 2.5e-5, the text embeddings
+    2.5e-5, the condition's latent 6.5e-3 (BF16 weights; cosine 0.9988), the first velocity 3e-4, the final latent 4e-4, the
+    decoder 2.3e-3, the whole edit 54.8 dB against the diffusers' image (every pixel within 3 levels). The text-to-image check
+    still passes (47.3 dB). The sizes from `calculate_dimensions` and the resize match Pillow exactly.
 
 17. **Z-Image-Turbo: what is open.** Served (`--zimage DIR`, `z-image-turbo` on `/v1/images/generations`, steps 9 by
     default, sizes in multiples of 16 from 64 to 1024, 1024 x 1024 by default). Nine steps at 1024: 24.25 s of DiT and VAE

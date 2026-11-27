@@ -85,6 +85,45 @@ std::vector<uint8_t> resize_pil8(const uint8_t* px, int w, int h, int ch, int ow
     return out;
 }
 
+// Pillow's own arithmetic (ImagingResample, 8 bits): the taps normalised in double, then rounded to 22-bit integers (round half away
+// from zero), the sums of the integers from a half-unit bias, and the shift by 22 bits clipped to 8 bits; the horizontal pass, then
+// the vertical one
+std::vector<uint8_t> resize_pillow8(const uint8_t* px, int w, int h, int ch, int ow, int oh, PilFilter f) {
+    constexpr int kPrec = 22;
+    auto quantise = [](const std::vector<Taps>& taps) {
+        std::vector<Taps> q = taps;
+        for (Taps& t : q)
+            for (double& wt : t.w) {
+                const double k = wt * (double)(1 << kPrec);
+                wt = (double)(int)(k < 0 ? k - 0.5 : k + 0.5);
+            }
+        return q;
+    };
+    auto clip = [](long long v) {
+        const long long r = v >> kPrec;
+        return (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));
+    };
+    const std::vector<Taps> tx = quantise(pil_taps(w, ow, f)), ty = quantise(pil_taps(h, oh, f));
+    std::vector<uint8_t> tmp((size_t)h * ow * ch), out((size_t)oh * ow * ch);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < ow; ++x)
+            for (int c = 0; c < ch; ++c) {
+                long long s = 1LL << (kPrec - 1);
+                for (size_t k = 0; k < tx[x].w.size(); ++k)
+                    s += (long long)tx[x].w[k] * px[((size_t)y * w + tx[x].first + k) * ch + c];
+                tmp[((size_t)y * ow + x) * ch + c] = clip(s);
+            }
+    for (int y = 0; y < oh; ++y)
+        for (int x = 0; x < ow; ++x)
+            for (int c = 0; c < ch; ++c) {
+                long long s = 1LL << (kPrec - 1);
+                for (size_t k = 0; k < ty[y].w.size(); ++k)
+                    s += (long long)ty[y].w[k] * tmp[((size_t)(ty[y].first + k) * ow + x) * ch + c];
+                out[((size_t)y * ow + x) * ch + c] = clip(s);
+            }
+    return out;
+}
+
 std::vector<uint8_t> resize_lanczos_rgb8(const uint8_t* rgb, int w, int h, int ow, int oh) {
     return resize_pil8(rgb, w, h, 3, ow, oh, PilFilter::Lanczos);
 }

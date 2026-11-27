@@ -115,13 +115,19 @@ void patches(const float* x, int H, int W, int C, int mode, int p0, int n, float
 void bias_tok(float* y, long rows, int C, const uint16_t* b);
 void upsample2_tok(const float* x, int H, int W, int C, float* y);
 // the BF16 route of those convolutions (Qwen-Image 2.1's VAE; BF16 buffers in device memory): the RMS norm (then SiLU when silu)
-// rounded to BF16; the mode 1 patches P16 [n][9C] of a BF16 input (C even; up2: the input is the (H / 2) x (W / 2) grid, read
-// through the nearest 2x upsampling); y = y16 + b (+ res, when given: another buffer than y) widened to FP32 (rows x C, b BF16);
-// and hipBLASLt's BF16 product with a BF16 output for any shape the library takes (xb: T x in, rows 16-byte aligned: in % 8 == 0;
-// no bias): false when it does not take it (or hipBLASLt is off), the caller's FP32 path then
+// rounded to BF16; the 3 x 3 patches P16 [n][9C] of a BF16 input for the output grid H x W (C even; mode 0: the input is H x W,
+// padded by 1; 1: the input is the (H / 2) x (W / 2) grid, read through the nearest 2x upsampling; 2: the input is 2H x 2W, read
+// with stride 2 and zero past the right and bottom edges: the encoder's downsampler); y = y16 + b (+ res, when given: another
+// buffer than y when rows are written twice) widened to FP32 (rows x C, b BF16); the encoder's average-down shortcut (AvgDown3D of
+// one frame: factor_s fs, 1 or 2; factor_t ft, 2 averaging a zero frame in); and hipBLASLt's BF16 product with a BF16 output for any
+// shape the library takes (xb: T x in, rows 16-byte aligned: in % 8 == 0; no bias): false when it does not take it (or hipBLASLt is
+// off), the caller's FP32 path then
 void rms_tok_bf16(const float* x, int HW, int C, const uint16_t* g, bool silu, uint16_t* y);
-void patches_bf16(const uint16_t* x16, int H, int W, int C, bool up2, int p0, int n, uint16_t* P16);
+void patches_bf16(const uint16_t* x16, int H, int W, int C, int mode, int p0, int n, uint16_t* P16);
 void from16_bias_tok(const uint16_t* y16, long rows, int C, const uint16_t* b, const float* res, float* y);
+void avgdown_tok(const float* x, int Ho, int Wo, int Cin, int Cout, int ft, int fs, float* y);
+// the encoder's conv_in: the image [4][H][W] (FP32, channel-major) through BF16 weights [96][4][3][3] and bias [96] (in place) to y [H W][96]
+void conv_in4_tok(const float* img, int H, int W, const uint16_t* w, const uint16_t* b, float* y);
 bool linear_blt16(const uint16_t* xb, int T, const uint16_t* W, int in, int out, uint16_t* y);
 // Qwen-Image 2.1's ConvRot linear (sd_gpu.hip qi_hadamard256 and qi_linear_i8): int8 weights W [out][in] in place with per-row
 // scales, the input rotated by H (the regular Hadamard of 256, normalised) per block; xr: T * in floats of scratch (sddev::alloc)
@@ -135,6 +141,8 @@ void gated_add(float* h, const float* g, const float* y, size_t n);
 void linear_bf16_f32(const float* x, int T, const uint16_t* W, int in, int out, float* y);
 void dupup(const float* x, int H, int W, int in, int out, int factor_t, float* y);
 void attn21_text(const float* q, const float* k, const float* v, int J, int L, int heads, float* out);
+// the same causal rule for the rows [r0, r0 + n): row i sees the keys 0..i (FP32 [rows][heads][128])
+void attn21_causal(const float* q, const float* k, const float* v, int r0, int n, int heads, float* out);
 // The same with bfloat16 weights (the checkpoint's BF16, raw bits): y[t][o] = b[o] + sum_i x[t][i] W[o][i]
 void linear_bf16(const float* x, int T, const uint16_t* W, int in, int out, const float* b, float* y);
 // the same with the input already BF16 (xb: T x in, row-major; device-only memory from dalloc or alloc): no conversion
@@ -207,6 +215,8 @@ void silu(float* x, size_t n);
 void add(float* out, const float* x, size_t n);
 void upsample2(const float* x, int C, int H, int W, float* y);
 void layer_norm(const float* x, int T, int C, const uint16_t* w, const uint16_t* b, float eps, float* y);
+// the same with BF16 weight and bias (sd_gpu.hip qv_layer_norm_bf16; the Qwen3-VL vision tower)
+void layer_norm_bf16(const float* x, int T, int C, const uint16_t* w, const uint16_t* b, float eps, float* y);
 void rms_norm(const float* x, int T, int C, const uint16_t* w, float eps, float* y);
 // Z-Image's block ops (sd_gpu.hip): x[t][c] *= s[c]; out[t][c] += g[c] * y[t][c]; g = silu(a) * b; the RoPE rotation of
 // q [T][heads][128] by fr [T][64][2] = (cos, sin) per pair

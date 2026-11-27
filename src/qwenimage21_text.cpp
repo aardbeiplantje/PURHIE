@@ -1,10 +1,13 @@
 /* Qwen-Image 2.1's text encoder on the device: see qwenimage21_text.h. The embedding rows are dequantised and rotated on the host (a
- * lookup of T rows); everything else is on the device: the ConvRot linears, the RMS norms (BF16 weights), rotate-half RoPE, causal
- * grouped-query attention (one score per key in shared memory: T <= 1024), SwiGLU. */
+ * lookup of the text tokens' rows; the image pads take the vision tower's tokens); everything else is on the device: the ConvRot
+ * linears (in pieces of rows: short launches), the RMS norms (BF16 weights), rotate-half RoPE (M-RoPE's angles with an image), causal
+ * grouped-query attention (one score per key in shared memory: T <= 8192 here), SwiGLU. The deepstack features are added at the pads
+ * on the host (the residual stream is in mapped memory; a few rows once). */
 #include "qwenimage21_text.h"
 
 #include "sd_device.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -74,11 +77,32 @@ bool bf(const zimage::SafeTensors& st, const std::string& name, size_t count, co
     return true;
 }
 
-}  // namespace
+/* y [T][out] = the ConvRot linear of x, the rows in pieces of about 40 ms of the int8 kernel's work (AGENTS.md: short launches; xr
+ * the rotated input's scratch, [rows][in]) */
+void lin(const QLin& L, const float* x, int T, const float* H, float* xr, float* y) {
+    const int most = std::max(64, (int)(4e10 / ((double)L.out * L.in)) / 64 * 64);
+    const int pieces = (T + most - 1) / most, rows = (T + pieces - 1) / pieces;
+    for (int r0 = 0; r0 < T; r0 += rows) {
+        const int n = std::min(rows, T - r0);
+        sddev::linear_convrot(x + (size_t)r0 * L.in, n, L.W, L.s, H, L.in, L.out, xr, y + (size_t)r0 * L.out);
+    }
+}
 
-bool dev_text21_encode(const zimage::SafeTensors& st, const int* ids, int T, float* out) {
+const int kImagePad = 151655;
+
+bool encode(const zimage::SafeTensors& st, const int* ids, int T, const int* pos, const float* img, const float* ds, int n_img,
+            float* out) {
     if (!sddev::enabled()) { fprintf(stderr, "qwenimage21 text: no device\n"); return false; }
-    if (T < 1 || T > 1024) { fprintf(stderr, "qwenimage21 text: %d tokens (1 to 1024)\n", T); return false; }
+    if (T < 1 || T > 8192) { fprintf(stderr, "qwenimage21 text: %d tokens (1 to 8192)\n", T); return false; }
+    /* the image pads' rows, in order */
+    std::vector<int> pads;
+    if (img)
+        for (int t = 0; t < T; ++t)
+            if (ids[t] == kImagePad) pads.push_back(t);
+    if ((int)pads.size() != (img ? n_img : 0)) {
+        fprintf(stderr, "qwenimage21 text: %zu image pads for %d image tokens\n", pads.size(), img ? n_img : 0);
+        return false;
+    }
 
     /* the Hadamard of 256 (the same as the DiT's ConvRot layers) */
     static const double H4[4][4] = {{1, 1, 1, -1}, {1, 1, -1, 1}, {1, -1, 1, 1}, {-1, 1, 1, 1}};
@@ -108,8 +132,10 @@ bool dev_text21_encode(const zimage::SafeTensors& st, const int* ids, int T, flo
     DevBuf X((size_t)T * HID);
     {
         std::vector<float> rows((size_t)T * HID);
+        for (size_t k = 0; k < pads.size(); ++k) std::memcpy(rows.data() + (size_t)pads[k] * HID, img + k * HID, sizeof(float) * HID);
         for (int t = 0; t < T; ++t) {
             if (ids[t] < 0 || ids[t] >= VOCAB) { fprintf(stderr, "qwenimage21 text: token %d out of range\n", ids[t]); return false; }
+            if (img && ids[t] == kImagePad) continue;
             const int8_t* q = Eq + (size_t)ids[t] * HID;
             const float s = Es[ids[t]];
             for (int b = 0; b < HID / 256; ++b)
@@ -122,13 +148,16 @@ bool dev_text21_encode(const zimage::SafeTensors& st, const int* ids, int T, flo
         std::memcpy(X.get(), rows.data(), rows.size() * 4);
     }
 
-    /* RoPE: rotate-half at theta 5e6, the cos and sin per position [T][64] */
+    /* RoPE: rotate-half at theta 5e6, the cos and sin per position [T][64]; with M-RoPE positions, frequency i takes the height
+     * (i % 3 == 1) or the width (i % 3 == 2) position below 60, else the temporal one (apply_interleaved_mrope, [24, 20, 20]) */
     DevBuf cs((size_t)T * 64), sn((size_t)T * 64);
     for (int t = 0; t < T; ++t)
         for (int i = 0; i < 64; ++i) {
             const double f = std::pow(THETA, -2.0 * i / HD);
-            cs.get()[t * 64 + i] = (float)std::cos(t * f);
-            sn.get()[t * 64 + i] = (float)std::sin(t * f);
+            const int axis = i < 60 && i % 3 ? i % 3 : 0;
+            const double p = pos ? (double)pos[(size_t)axis * T + t] : (double)t;
+            cs.get()[t * 64 + i] = (float)std::cos(p * f);
+            sn.get()[t * 64 + i] = (float)std::sin(p * f);
         }
 
     DevBuf xr((size_t)T * MLP), h((size_t)T * HID), q((size_t)T * HID), k((size_t)T * KV * HD), v((size_t)T * KV * HD),
@@ -146,26 +175,45 @@ bool dev_text21_encode(const zimage::SafeTensors& st, const int* ids, int T, flo
             return false;
         /* attention */
         sddev::rms_norm(X.get(), T, HID, ln1, EPS, h.get());
-        sddev::linear_convrot(h.get(), T, wq.W, wq.s, H.get(), HID, HEADS * HD, xr.get(), q.get());
-        sddev::linear_convrot(h.get(), T, wk.W, wk.s, H.get(), HID, KV * HD, xr.get(), k.get());
-        sddev::linear_convrot(h.get(), T, wv.W, wv.s, H.get(), HID, KV * HD, xr.get(), v.get());
+        lin(wq, h.get(), T, H.get(), xr.get(), q.get());
+        lin(wk, h.get(), T, H.get(), xr.get(), k.get());
+        lin(wv, h.get(), T, H.get(), xr.get(), v.get());
         sddev::rms_norm(q.get(), T * HEADS, HD, qn, EPS, q.get());
         sddev::rms_norm(k.get(), T * KV, HD, kn, EPS, k.get());
         sddev::rope_half(q.get(), T, HEADS, cs.get(), sn.get());
         sddev::rope_half(k.get(), T, KV, cs.get(), sn.get());
         sddev::causal_attn(q.get(), k.get(), v.get(), T, HEADS, KV, att.get());
-        sddev::linear_convrot(att.get(), T, wo.W, wo.s, H.get(), HEADS * HD, HID, xr.get(), o.get());
+        lin(wo, att.get(), T, H.get(), xr.get(), o.get());
         sddev::add(X.get(), o.get(), (size_t)T * HID);
         /* SwiGLU */
         sddev::rms_norm(X.get(), T, HID, ln2, EPS, h.get());
-        sddev::linear_convrot(h.get(), T, wg.W, wg.s, H.get(), HID, MLP, xr.get(), g.get());
-        sddev::linear_convrot(h.get(), T, wu.W, wu.s, H.get(), HID, MLP, xr.get(), u.get());
+        lin(wg, h.get(), T, H.get(), xr.get(), g.get());
+        lin(wu, h.get(), T, H.get(), xr.get(), u.get());
         sddev::swiglu(g.get(), u.get(), g.get(), (size_t)T * MLP);
-        sddev::linear_convrot(g.get(), T, wd.W, wd.s, H.get(), MLP, HID, xr.get(), d.get());
+        lin(wd, g.get(), T, H.get(), xr.get(), d.get());
         sddev::add(X.get(), d.get(), (size_t)T * HID);
+        /* the deepstack features at the pads after the first layers (_deepstack_process) */
+        if (ds && l < 3)
+            for (size_t i = 0; i < pads.size(); ++i) {
+                float* x = X.get() + (size_t)pads[i] * HID;
+                const float* a = ds + ((size_t)l * n_img + i) * HID;
+                for (int c = 0; c < HID; ++c) x[c] += a[c];
+            }
     }
     std::memcpy(out, X.get(), sizeof(float) * (size_t)T * HID);
     return true;
+}
+
+}  // namespace
+
+bool dev_text21_encode(const zimage::SafeTensors& st, const int* ids, int T, float* out) {
+    return encode(st, ids, T, nullptr, nullptr, nullptr, 0, out);
+}
+
+bool dev_text21_encode_vl(const zimage::SafeTensors& st, const int* ids, int T, const int* pos, const float* img, const float* ds,
+                          int n_img, float* out) {
+    if (!pos || !img || n_img < 1) { fprintf(stderr, "qwenimage21 text: the image input is incomplete\n"); return false; }
+    return encode(st, ids, T, pos, img, ds, n_img, out);
 }
 
 }  // namespace qwenimage21

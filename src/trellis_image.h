@@ -20,5 +20,7 @@ std::vector<uint8_t> resize_lanczos_rgb8(const uint8_t* rgb, int w, int h, int o
 // stretched by the reduction (antialiased), a horizontal then a vertical pass, rounded and clipped to 8 bits.
 enum class PilFilter { Bilinear, Bicubic, Lanczos };
 std::vector<uint8_t> resize_pil8(const uint8_t* px, int w, int h, int ch, int ow, int oh, PilFilter f);
+// The same resize in Pillow's fixed-point arithmetic (its 22-bit taps and integer sums): exact against Pillow's output.
+std::vector<uint8_t> resize_pillow8(const uint8_t* px, int w, int h, int ch, int ow, int oh, PilFilter f);
 
 }  // namespace trellis
