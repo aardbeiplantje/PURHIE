@@ -28,8 +28,7 @@ run alone on the machine.
   `--parallel`), and `bin/rocm-convert`. The AI harness (`./aicli.git`, its own repository) has tools for each generator.
 - **Deployment:** the image is built from this repository (`docker-bake.hcl`) from GitHub `main`; the user's watcher
   restarts the container from each new image; a build starts when `.build-trigger` is touched. Last completed build:
-  2026-11-27 (exit 0) from `86da4db`, the version stamp of the user's checkout. A build of `6356adf` (the edit's kernels, item
-  16) was triggered on 2026-11-27; its result is not recorded here yet.
+  2026-11-27 (exit 0) from `6356adf` (the edit's kernels, item 16; the version stamp in `build-watch.log`, 12:59).
 - **Tests:** `make regress` (quick tier) passed 47 of 47 on 2026-11-16 (not rerun since); `make regress-full` has not
   been run. The 3D server test `t/72-trellis2.t`: 53 of 53 (2026-11-26).
 
