@@ -11,9 +11,9 @@ run alone on the machine.
 ## ▶ Next
 
 1. **Qwen-Image 2.1: the image edit, its speed** (item 16; the engine's edit is verified, 2026-11-27: `qi21_edit`, the
-   stages against `tools/qwenimage21_edit_oracle.py`; served as `POST /v1/images/edits` (2026-11-27, checked by
-   `t/73-qwenimage21.t`), and aicli's `generate_image` sends a picture of the workspace as `image`). Open: the speed (the
-   int8 file: about 65 s at 512 x 512, 8 steps); a cancel for the image (the 3D job has one, item 15).
+   stages against `tools/qwenimage21_edit_oracle.py`, on the BF16 file too; served as `POST /v1/images/edits` (2026-11-27,
+   checked by `t/73-qwenimage21.t`), and aicli's `generate_image` sends a picture of the workspace as `image`). Open: a cancel
+   for the image (the 3D job has one, item 15).
 2. **Waiting on the user:** the deployed service check (item 1); the design and the row format of the GLM prefill
    snapshots (item 2).
 
@@ -209,6 +209,9 @@ run alone on the machine.
     2.5e-5, the condition's latent 6.5e-3 (BF16 weights; cosine 0.9988), the first velocity 3e-4, the final latent 4e-4, the
     decoder 2.3e-3, the whole edit 54.8 dB against the diffusers' image (every pixel within 3 levels). The text-to-image check
     still passes (47.3 dB). The sizes from `calculate_dimensions` and the resize match Pillow exactly.
+   On the BF16 file (what the server loads when it is present; oracle in `/data/zimage-ref/qwenimage2/edit_bf16`, the check
+   `qwenimage21_edit_verify DIR IMAGE DIT`): every stage passes too: the first velocity 2.4e-3, the final latent 3.0e-3, the
+   whole edit 54.6 dB; the sampler takes 7.3 s at 512 x 512 (the int8 file: 68 s).
 
 17. **Z-Image-Turbo: what is open.** Served (`--zimage DIR`, `z-image-turbo` on `/v1/images/generations`, steps 9 by
     default, sizes in multiples of 16 from 64 to 1024, 1024 x 1024 by default). Nine steps at 1024: 24.25 s of DiT and VAE

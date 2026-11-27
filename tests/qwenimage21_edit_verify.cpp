@@ -5,7 +5,8 @@
  * the deepstack features at the pads), the condition's latent (the VAE encoder), the sampler with the condition (the velocity of the
  * first step, the latent after it, the final latent), the decoder, and the whole edit from the image's bytes (qi21_edit) against the
  * reference image. Each stage takes the reference's own inputs. Run from build/co (the kernels).
- * Usage: qwenimage21_edit_verify [DIR] [IMAGE]  (IMAGE: the condition image's file, default DIR's ../pipe/image.png) */
+ * Usage: qwenimage21_edit_verify [DIR] [IMAGE] [DIT]  (IMAGE: the condition image's file, default ../pipe/image.png; DIT: the
+ * diffusion model's file, the int8 ConvRot one by default) */
 #include "qwenimage21_pipe.h"
 
 #include "image.h"
@@ -77,6 +78,8 @@ static double secs(std::chrono::steady_clock::time_point t0) {
 int main(int argc, char** argv) {
     const std::string dir = argc > 1 ? argv[1] : "/data/zimage-ref/qwenimage2/edit";
     const std::string image_path = argc > 2 ? argv[2] : "/data/zimage-ref/qwenimage2/pipe/image.png";
+    /* the diffusion model: the int8 ConvRot file by default (the oracle's dequantised weights), or the BF16 file (argv 3) */
+    const std::string dit = argc > 3 ? argv[3] : "/comfyui/diffusion_models/qwen_image_2.1_int8_convrot.safetensors";
     const char* te = "/comfyui/text_encoders/qwen3vl_8b_int8_convrot.safetensors";
     zimage::SafeTensors st_te(te);
     if (!st_te.ok() || !st_te.register_device()) {
@@ -144,7 +147,7 @@ int main(int argc, char** argv) {
 
     /* 3 to 6 need the text encoder, the VAE and the DiT mapped for the device: the stages' own registrations, released with them */
     {
-        zimage::SafeTensors st_dit("/comfyui/diffusion_models/qwen_image_2.1_int8_convrot.safetensors");
+        zimage::SafeTensors st_dit(dit);
         zimage::SafeTensors st_vae("/comfyui/vae/qwen_image_2.1_vae_bf16.safetensors");
         if (!st_dit.ok() || !st_vae.ok() || !st_dit.register_device() || !st_vae.register_device()) {
             printf("[FAIL] the DiT or the VAE files\n");
@@ -248,7 +251,7 @@ int main(int argc, char** argv) {
             printf("[FAIL] the condition image %s\n", image_path.c_str());
             return 1;
         }
-        qi21_pipe_t* p = qi21_open("/comfyui/diffusion_models/qwen_image_2.1_int8_convrot.safetensors", "/comfyui/vae/qwen_image_2.1_vae_bf16.safetensors",
+        qi21_pipe_t* p = qi21_open(dit.c_str(), "/comfyui/vae/qwen_image_2.1_vae_bf16.safetensors",
                                    "/comfyui/text_encoders/qwen3vl_8b_int8_convrot.safetensors", vp.data(), vp.size(), mp.data(), mp.size());
         if (!p) {
             printf("[FAIL] qi21_open: %s\n", qi21_last_error());
